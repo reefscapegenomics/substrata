@@ -1,9 +1,16 @@
+# Usage:
+# conda env create -f environment.yml
+# conda activate substrata
+# python -m pip install -e .
+
 name: substrata
 channels:
   - conda-forge
 dependencies:
   - python=3.10
   - open3d
+  - opencv-python
+  - torch
   - joblib
   - pandas
   - scikit-learn
