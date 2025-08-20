@@ -89,29 +89,15 @@ class Transform:
 
     @classmethod
     def shift_to_positive_xy(cls, pcd: object) -> "Transform":
-        """Translate a point cloud so all X–Y coordinates become non-negative.
+        min_x = np.min(pcd.points[:, 0])
+        min_y = np.min(pcd.points[:, 1])
+        x_offset = -min_x if min_x < 0 else 0
+        y_offset = -min_y if min_y < 0 else 0
+        translation_matrix = np.eye(4)
+        translation_matrix[0, 3] = x_offset
+        translation_matrix[1, 3] = y_offset
 
-        The method looks only at ``pcd.points`` (any array-like with shape
-        ``(N, 3)`` or ``(N, ≥3)``).  It computes the minimum X and Y values
-        and returns a transform that shifts the cloud by
-        ``(−min_x, −min_y, 0)`` *if* either minimum is negative.
-
-        Args:
-            pcd: Any object exposing a ``points`` attribute compatible with
-                 ``np.asarray`` (e.g. Open3D point cloud or your
-                 ``PointCloud`` wrapper).
-
-        Returns:
-            Transform: Pure translation ensuring all X and Y become ≥ 0.
-        """
-        pts = np.asarray(pcd.points)
-        if pts.ndim != 2 or pts.shape[1] < 2:
-            raise ValueError("`pcd.points` must be an (N, 3)-like array.")
-
-        min_x, min_y = pts[:, 0].min(), pts[:, 1].min()
-        dx = -min_x if min_x < 0 else 0.0
-        dy = -min_y if min_y < 0 else 0.0
-        return cls.from_translation((dx, dy, 0.0))
+        return translation_matrix
 
     @classmethod
     def from_axis_angle(cls, axis: FloatArray, angle_rad: float) -> "Transform":
@@ -195,38 +181,53 @@ class Transform:
     # ------------------------------------------------------------------ up-vector helper
 
     @classmethod
-    def from_up_vector(cls, up: "Vector | npt.ArrayLike") -> "Transform":
-        """Build a rotation that aligns the global ``+Z`` axis with *up*.
-
-        The algorithm mirrors the earlier helper you showed (`get_up_vector_transform`):
-        1. Find two intrinsic Euler angles that rotate ``+Z`` onto the target
-           vector:
-           • ``theta_xz`` — rotation about **Y** (how much we tilt in XZ plane)
-           • ``psi_yz``   — rotation about **X** (tilt in YZ plane)
-        2. Construct a Z-Y-X intrinsic rotation with angles
-           ``[0, theta_xz, psi_yz]``.
-
-        Args:
-            up: Desired up vector. May be a ``Vector`` instance or any 3/4-element
-                 array-like object.
-
-        Returns:
-            Transform: Rotation that maps global Z onto *up*.
-        """
-        # Ensure we have a Vector and extract its xyz components
+    def from_up_vector_legacy(cls, up: "Vector | npt.ArrayLike") -> "Transform":
+        """Build a rotation that mimics the legacy get_up_vector_transform (intrinsic Z–Y–X)."""
+        # Use the same angle definitions as the legacy helper:
+        # theta_xz = atan2(-vx, -vz), psi_yz = atan2(-vy, -vz)
         v = up.xyz if isinstance(up, Vector) else Vector(up).xyz
+        theta_xz = np.arctan2(-v[0], -v[2])
+        psi_yz = np.arctan2(-v[1], -v[2])
 
-        # Normalise (guard against zero length)
+        cb, sb = np.cos(theta_xz), np.sin(theta_xz)
+        cg, sg = np.cos(psi_yz), np.sin(psi_yz)
+
+        # Intrinsic Z–Y–X with α=0 reduces to this 3×3 (matches legacy formula)
+        R = np.array(
+            [
+                [cb, sb * sg, sb * cg],
+                [0.0, cg, -sg],
+                [-sb, cb * sg, cb * cg],
+            ],
+            dtype=float,
+        )
+
+        T = np.eye(4, dtype=float)
+        T[:3, :3] = R
+        return cls(T)
+
+    @classmethod
+    def from_up_vector(cls, up: "Vector | npt.ArrayLike") -> "Transform":
+        """Rotate so the supplied up-vector maps to global +Z."""
+        v = up.xyz if isinstance(up, Vector) else Vector(up).xyz
         v = v / np.linalg.norm(v)
 
-        # Angle between projection onto XZ-plane and +Z  (rotation about Y)
-        theta_xz = np.arctan2(v[0], v[2])
+        z = np.array([0.0, 0.0, 1.0])
 
-        # Angle between vector and its XZ projection (rotation about X)
-        psi_yz = -np.arctan2(v[1], np.sqrt(v[0] ** 2 + v[2] ** 2))
+        # Collinear cases
+        if np.allclose(v, z):
+            return cls.identity()
+        if np.allclose(v, -z):
+            return cls.from_axis_angle([1.0, 0.0, 0.0], np.pi)
 
-        # Build rotation: intrinsic Z-Y-X with z=0, y=theta_xz, x=psi_yz
-        return cls.from_euler(psi_yz, theta_xz, 0.0)
+        # Find rotation that sends v → z
+        axis = np.cross(v, z)
+        s = np.linalg.norm(axis)
+        c = float(np.dot(v, z))
+        axis = axis / s
+        angle = np.arctan2(s, c)
+
+        return cls.from_axis_angle(axis, angle)
 
     @classmethod
     def align_x_to_vector(cls, v: "Vector | npt.ArrayLike") -> "Transform":
@@ -238,7 +239,46 @@ class Transform:
 
         # angle between +X (1,0) and projected vector, measured CCW about +Z
         theta = np.arctan2(vec[1], vec[0])
-        return cls.from_euler(rx=0.0, ry=0.0, rz=theta)  # rotate about Z
+        # legacy code used a clockwise (negative) rotation;
+        # keep that so the visual result stays identical
+        return cls.from_euler(rx=0.0, ry=0.0, rz=-theta)  # rotate about Z
+
+    # ------------------------------------------------------------------ upslope helper
+    @classmethod
+    def ensure_pos_y_is_upslope(cls, pcd: "npt.ArrayLike | object") -> "Transform":
+        """
+        Rotate 180 ° about the global +Z axis so the cloud’s **+Y axis points
+        “upslope”** (positive correlation with Z).
+
+        It reproduces the behaviour of the legacy
+        ``get_y_axis_facing_upslope_transform``:
+
+            • If corr(Y, Z) < 0  → flip by π around Z.
+            • Otherwise          → identity.
+
+        Parameters
+        ----------
+        pcd
+            Object exposing a ``points`` attribute (Open3D / decorated cloud) or
+            an ``(N, 3)`` array-like of XYZ coordinates.
+
+        Returns
+        -------
+        Transform
+            The appropriate rotation (identity or 180 ° Z-rotation).
+        """
+        # Obtain the raw (N, 3) point array
+        pts = np.asarray(pcd.points) if hasattr(pcd, "points") else np.asarray(pcd)
+        if pts.ndim != 2 or pts.shape[1] < 3:
+            raise ValueError("`pcd` must provide an (N, ≥3) point array.")
+
+        if len(pts) < 2:  # not enough data for correlation
+            return cls.identity()
+
+        r = np.corrcoef(pts[:, 1], pts[:, 2])[0, 1]  # corr(Y, Z)
+        # after the clockwise X-axis alignment, positive r means Y points
+        # upslope, so we need to rotate when r < 0
+        return cls.from_euler(0.0, 0.0, np.pi) if r < 0 else cls.identity()
 
     @classmethod
     def align_normal_to_z(cls, normal: "Vector | npt.ArrayLike") -> "Transform":
@@ -416,3 +456,44 @@ def calculate_vector_angle(opposite_y, adjacent_x):
         calculate_angle_between_two_lengths
     """
     return np.degrees(np.arctan2(opposite_y, adjacent_x))
+
+
+def transform_coords(coords: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Transforms a 3D coordinate using a 4x4 homogeneous transformation matrix.
+
+    Args:
+        coords (np.ndarray): A 3-element vector representing the 3D point.
+        transform (np.ndarray): A 4x4 homogeneous transformation matrix.
+
+    Returns:
+        np.ndarray: The transformed 3D coordinate.
+
+    Raises:
+        ValueError: If `coords` is not a 3-element vector or `transform` is not a 4x4 matrix.
+    """
+    if hasattr(transform, "__class__") and transform.__class__.__name__ == "Transform":
+        transform = transform.matrix
+    if transform.shape != (4, 4):
+        raise ValueError("Transformation matrix must be of shape (4,4).")
+    if coords.shape != (3,):
+        raise ValueError("Coordinate must be a 3-element vector.")
+    hom_coords = np.append(coords, 1)
+    transformed = np.dot(transform, hom_coords)[:3]
+    return transformed
+
+
+def sample_points_along_line(start_coord, target_coord, step_size):
+    """
+    Sample points along a line segment between start_coord and target_coord
+    author: PB
+    """
+    vector = target_coord - start_coord
+    dist = np.linalg.norm(vector)
+    if dist < step_size:
+        return np.array([start_coord])
+    unit_vector = vector / dist
+    n = int(dist // step_size)
+    dists = np.arange(0, n * step_size, step_size)
+    if dists.size == 0 or dists[-1] < dist:
+        dists = np.append(dists, dist)
+    return start_coord + dists[:, None] * unit_vector
