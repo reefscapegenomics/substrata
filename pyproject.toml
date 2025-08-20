@@ -1,0 +1,16 @@
+[build-system]
+requires      = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "substrata"
+version         = "0.1.0"
+description     = "Utilities for 3-D geometry and point-cloud handling"
+readme          = "README.md"
+requires-python = ">=3.9"
+authors         = [{ name = "Reefscape Genomics Lab" }]
+
+dependencies = [
+    "numpy>=1.22",
+]
+# optional: include license, classifiers, etc. 
