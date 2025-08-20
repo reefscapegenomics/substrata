@@ -1,0 +1,17 @@
+name: substrata
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - open3d
+  - joblib
+  - pandas
+  - scikit-learn
+  - tqdm
+  - ffmpeg
+  - pip
+  - pip:
+      - tqdm-joblib
+      - fpdf2
+      - gspread
+      - net-tools
