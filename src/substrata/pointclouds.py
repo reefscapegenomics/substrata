@@ -918,7 +918,7 @@ def _stream_sample_ply_to_arrays(
     return points, colors, normals
 
 
-def decimate_ply_file_fast(
+def decimate_ply_file(
     input_path: str,
     output_path: str,
     target_points: int,
