@@ -49,19 +49,29 @@ def show(geoms, Jupyter=False):
         vis.run()
 
 
-def plot(pcd, point_size=2, width=10, height=4, max_output_points=50000, title=None):
+def plot(
+    pcd,
+    point_size=2,
+    width=10,
+    height=4,
+    max_output_points=50000,
+    title=None,
+    ax=None,
+):
     """
-    Plots a point cloud, decimating the points to speed up rendering.
+    Plot a 3D point cloud, with optional decimation for speed.
 
     Args:
         pcd: The point cloud object (Open3D format or SimplePointCloud).
         point_size (int): Size of the points in the scatter plot.
-        width (int): Width of the figure.
-        height (int): Height of the figure.
-        decimation_factor (int): Factor by which to decimate the point cloud.
+        width (int): Width of the figure (if creating a new figure).
+        height (int): Height of the figure (if creating a new figure).
+        max_output_points (int): Maximum number of points to plot.
+        title (str | None): Title for the plot.
+        ax (matplotlib.axes.Axes | None): Optional 3D axes to draw into.
 
     Returns:
-        matplotlib.figure.Figure: The generated figure.
+        matplotlib.figure.Figure | None: New figure if created, otherwise None.
     """
     # Convert to Open3D point cloud if necessary.
     if isinstance(pcd, pointclouds.SimplePointCloud):
@@ -84,8 +94,13 @@ def plot(pcd, point_size=2, width=10, height=4, max_output_points=50000, title=N
         points = points[indices]
         colors = colors[indices]
 
-    fig = plt.figure(figsize=(width, height))
-    ax = fig.add_subplot(111, projection="3d")
+    created_fig = False
+    if ax is None:
+        fig = plt.figure(figsize=(width, height))
+        ax = fig.add_subplot(111, projection="3d")
+        created_fig = True
+    else:
+        fig = ax.figure
     ax.set_box_aspect((width, height, height))
     ax.scatter(
         points[:, 0],
@@ -114,7 +129,7 @@ def plot(pcd, point_size=2, width=10, height=4, max_output_points=50000, title=N
     if title is not None:
         ax.set_title(title)
     ax.set_rasterized(True)
-    return fig
+    return fig if created_fig else None
 
 
 def plot_2d(
@@ -1074,31 +1089,60 @@ def show_intercept_point(intercept_point):
 
 
 def plot_2d_ortho(
-    pcd, resolution=0.005, color_attr="colors", figsize=None, save_path=None
+    pcd,
+    resolution=None,
+    color_attr="colors",
+    figsize=None,
+    save_path=None,
+    ax=None,
+    title=None,
+    show=True,
 ):
     """
     Create and display a top-down orthomosaic (splat) of a point cloud.
 
     Args:
-        pcd (o3d.geometry.PointCloud): Input point cloud.
-        resolution (float): Ground sampling distance (m per pixel).
+        pcd: Input point cloud (supports PointCloud, SimplePointCloud, or o3d PointCloud-like).
+        resolution (float | None): Ground sampling distance in meters per
+            pixel. If None, choose a resolution based on point count and
+            plot size.
         color_attr (str): Attribute for color ('colors' or 'intensities').
-        figsize (tuple): Figure size for matplotlib (width, height).
-        save_path (str, optional): If provided, save the image to this file.
+        figsize (tuple): Figure size for matplotlib (width, height) when creating a new figure.
+        save_path (str | None): If provided, save the image to this file.
+        ax (matplotlib.axes.Axes | None): Optional axes to draw into; if None, creates a new fig.
+        title (str | None): Optional title for the plot.
+        show (bool): Whether to call plt.show() when creating a new figure.
 
     Returns:
-        np.ndarray: HxWx3 uint8 splat image.
+        tuple[np.ndarray, matplotlib.figure.Figure | None]: (image array, figure if created else None).
     """
     # Extract points
     pts = np.asarray(pcd.points)
     xs = pts[:, 0]
     ys = pts[:, 1]
 
-    # Compute bounds and image size
+    # Compute bounds
     min_x, max_x = xs.min(), xs.max()
     min_y, max_y = ys.min(), ys.max()
-    width = int(np.ceil((max_x - min_x) / resolution))
-    height = int(np.ceil((max_y - min_y) / resolution))
+    extent_x = max(max_x - min_x, 1e-9)
+    extent_y = max(max_y - min_y, 1e-9)
+
+    # Choose resolution heuristically if not provided
+    print(f"Resolution: {resolution}")
+    if resolution is None:
+        n_pts = max(len(pts), 1)
+        # Target total pixels ~ n_pts/10, bounded for practicality
+        target_pixels = int(np.clip(n_pts / 10.0, 2e5, 2e6))
+        aspect = extent_x / extent_y
+        width_px = int(max(256, np.sqrt(target_pixels * max(aspect, 1e-6))))
+        height_px = int(max(256, target_pixels / max(width_px, 1)))
+        resolution = extent_x / width_px
+    else:
+        width_px = int(np.ceil(extent_x / resolution))
+        height_px = int(np.ceil(extent_y / resolution))
+
+    width = width_px
+    height = height_px
 
     # Prepare splat and count buffers
     splat = np.zeros((height, width, 3), dtype=np.float64)
@@ -1120,28 +1164,40 @@ def plot_2d_ortho(
             splat[iy, ix] += col
             counts[iy, ix] += 1
 
-    # Normalize
+    # Normalize and set background (no points) to white
     mask = counts > 0
     splat[mask] /= counts[mask][:, None]
+    splat[~mask] = 1.0
 
     # Convert to uint8
     img = (np.clip(splat, 0, 1) * 255).astype(np.uint8)
 
-    # Set figsize so that each point is one pixel (1 inch = 100 pixels in matplotlib by default)
+    # Set figsize to match pixel size (1 inch = dpi pixels)
     if figsize is None:
         dpi = plt.rcParams.get("figure.dpi", 100)
         figsize = (width / dpi, height / dpi)
 
-    fig = plt.figure(figsize=figsize)
-    plt.imshow(img)
-    plt.axis("off")
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
+    created_fig = False
+    if ax is None:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111)
+        created_fig = True
     else:
-        plt.show()
+        fig = ax.figure
 
-    return img
+    ax.imshow(img)
+    ax.axis("off")
+    if title is not None:
+        ax.set_title(title)
+
+    if save_path is not None and created_fig:
+        fig.savefig(save_path, bbox_inches="tight", pad_inches=0)
+    if created_fig and show:
+        plt.show()
+    if created_fig and not show:
+        plt.close(fig)
+
+    return img, (fig if created_fig else None)
 
 
 def plot_camera_view_from_pcd(
@@ -1688,27 +1744,36 @@ def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:
     plt.show()
 
 
-def plot_angles_2d(
+def plot_views(
     pcd,
     point_size=2,
-    width=12,
-    height=8,
+    width=8,
+    height=12,
     max_output_points=50000,
     title=None,
+    ortho_resolution=None,
 ):
     """
-    Create a 2×2 panel of 2D views: top-down (XY), front (XZ), and both sides (YZ and −YZ).
+    Create a composite figure with:
+      - Row 1 (full width): orthoprojection using plot_2d_ortho, titled with pcd.filepath
+      - Row 2 (full width): 3D plot using plot(), titled "3D view (N points)"
+      - Row 3 (two columns): top-down (XY) and front (XZ) views
+      - Row 4 (two columns): side (Y–Z) and side (−Y–Z) views
     """
     # Convert to Open3D point cloud if necessary
     if isinstance(pcd, pointclouds.SimplePointCloud):
         o3d_pcd = pcd.get_o3d_pcd()
+        filepath = getattr(pcd, "filepath", None)
+        n_points = len(pcd.points)
     else:
         o3d_pcd = pcd.o3d_pcd
+        filepath = getattr(pcd, "filepath", None)
+        n_points = len(np.asarray(o3d_pcd.points))
 
     points = np.asarray(o3d_pcd.points)
     colors = np.asarray(o3d_pcd.colors)
 
-    # Decimate to speed up plotting (same logic as plot_2d)
+    # Decimate once for the 2D scatter views
     if len(points) > max_output_points:
         logger.info(
             f"Decimating point cloud from {len(points)} to {max_output_points} points"
@@ -1717,10 +1782,15 @@ def plot_angles_2d(
         indices = np.random.choice(
             len(points), size=len(points) // decimation_factor, replace=False
         )
-        points = points[indices]
-        colors = colors[indices]
+        points_scatter = points[indices]
+        colors_scatter = colors[indices]
+    else:
+        points_scatter = points
+        colors_scatter = colors
 
     def set_equal_2d(ax, x, y):
+        # Keep the same units on X and Y by enforcing equal aspect and
+        # using a square view that encloses the data.
         xmin, xmax = np.min(x), np.max(x)
         ymin, ymax = np.min(y), np.max(y)
         cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
@@ -1729,37 +1799,99 @@ def plot_angles_2d(
         ax.set_ylim(cy - half, cy + half)
         ax.set_aspect("equal", adjustable="box")
 
-    fig, axes = plt.subplots(2, 2, figsize=(width, height), constrained_layout=True)
+    fig = plt.figure(figsize=(width, height))
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.1, 1.2, 0.85, 0.85])
 
-    # Top-down (XY)
-    ax = axes[0, 0]
-    ax.scatter(points[:, 0], points[:, 1], c=colors, s=point_size, edgecolor="none")
-    ax.set_title("Top-down (X–Y)")
-    set_equal_2d(ax, points[:, 0], points[:, 1])
+    # Row 1: Orthoprojection (full width)
+    ax_ortho = fig.add_subplot(gs[0, :])
+    ortho_title = (
+        os.path.basename(filepath) if filepath is not None else "Orthoprojection"
+    )
+    plot_2d_ortho(
+        pcd if hasattr(pcd, "points") else o3d_pcd,
+        resolution=ortho_resolution,
+        ax=ax_ortho,
+        title=ortho_title,
+        show=False,
+    )
 
-    # Front (XZ)
-    ax = axes[0, 1]
-    ax.scatter(points[:, 0], points[:, 2], c=colors, s=point_size, edgecolor="none")
-    ax.set_title("Front (X–Z)")
-    set_equal_2d(ax, points[:, 0], points[:, 2])
+    # Row 2: 3D plot (full width)
+    ax_3d = fig.add_subplot(gs[1, :], projection="3d")
+    plot_title = f"3D view ({n_points:,} points)"
+    data_mins = points.min(axis=0)
+    data_maxs = points.max(axis=0)
+    data_ranges = np.maximum(data_maxs - data_mins, 1e-9)
+    plot(pcd, point_size=point_size, ax=ax_3d, title=plot_title)
+    ax_3d.set_box_aspect(tuple(data_ranges))
+    try:
+        ax_3d.margins(0)
+    except Exception:
+        pass
 
-    # Side (Y–Z)
-    ax = axes[1, 0]
-    ax.scatter(points[:, 1], points[:, 2], c=colors, s=point_size, edgecolor="none")
-    ax.set_title("Side (Y–Z)")
-    set_equal_2d(ax, points[:, 1], points[:, 2])
+    # Row 3: Top-down (XY) and Front (XZ)
+    ax_xy = fig.add_subplot(gs[2, 0])
+    ax_xz = fig.add_subplot(gs[2, 1])
+    ax_xy.scatter(
+        points_scatter[:, 0],
+        points_scatter[:, 1],
+        c=colors_scatter,
+        s=point_size,
+        edgecolor="none",
+    )
+    ax_xy.set_title("Top-down (X–Y)", pad=6)
+    set_equal_2d(ax_xy, points_scatter[:, 0], points_scatter[:, 1])
 
-    # Opposite side (−Y–Z) to mirror the other direction
-    ax = axes[1, 1]
-    ax.scatter(-points[:, 1], points[:, 2], c=colors, s=point_size, edgecolor="none")
-    ax.set_title("Side (−Y–Z)")
-    set_equal_2d(ax, -points[:, 1], points[:, 2])
+    ax_xz.scatter(
+        points_scatter[:, 0],
+        points_scatter[:, 2],
+        c=colors_scatter,
+        s=point_size,
+        edgecolor="none",
+    )
+    ax_xz.set_title("Front (X–Z)", pad=6)
+    set_equal_2d(ax_xz, points_scatter[:, 0], points_scatter[:, 2])
+
+    # Row 4: Side (Y–Z) and Side (−Y–Z)
+    ax_yz = fig.add_subplot(gs[3, 0])
+    ax_nyz = fig.add_subplot(gs[3, 1])
+    ax_yz.scatter(
+        points_scatter[:, 1],
+        points_scatter[:, 2],
+        c=colors_scatter,
+        s=point_size,
+        edgecolor="none",
+    )
+    ax_yz.set_title("Side (Y–Z)", pad=6)
+    set_equal_2d(ax_yz, points_scatter[:, 1], points_scatter[:, 2])
+
+    ax_nyz.scatter(
+        -points_scatter[:, 1],
+        points_scatter[:, 2],
+        c=colors_scatter,
+        s=point_size,
+        edgecolor="none",
+    )
+    ax_nyz.set_title("Side (−Y–Z)", pad=6)
+    set_equal_2d(ax_nyz, -points_scatter[:, 1], points_scatter[:, 2])
 
     if title is not None:
-        fig.suptitle(title)
+        fig.suptitle(title, y=0.995)
 
-    # Rasterize for large point counts
-    for ax in axes.ravel():
+    # Fine-tune layout to minimize whitespace while avoiding overlaps (A4 margins ≈ 0.5 in)
+    margin_in = 0.5
+    fig.subplots_adjust(
+        left=margin_in / width,
+        right=1.0 - (margin_in / width),
+        top=1.0 - (margin_in / height),
+        bottom=margin_in / height,
+        wspace=0.10,
+        hspace=0.20,
+    )
+
+    # Rasterize scatter-heavy 2D axes
+    for ax in (ax_xy, ax_xz, ax_yz, ax_nyz):
         ax.set_rasterized(True)
+        ax.margins(x=0.04, y=0.04)
+        ax.tick_params(pad=2)
 
     return fig

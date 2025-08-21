@@ -887,11 +887,6 @@ def visualize_camera_matches_grid_heatmap(
     }
 
 
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-
-
 def match_frame_feature(frame, orthomosaic_path, ratio_thresh=0.75):
     """
     Locate a frame in an orthomosaic via SIFT and draw its corners.

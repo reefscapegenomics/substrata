@@ -471,12 +471,20 @@ def transform_coords(coords: np.ndarray, transform: np.ndarray) -> np.ndarray:
     Raises:
         ValueError: If `coords` is not a 3-element vector or `transform` is not a 4x4 matrix.
     """
-    if hasattr(transform, "__class__") and transform.__class__.__name__ == "Transform":
+    # Accept our Transform class or anything with .mat/.matrix
+    if hasattr(transform, "mat"):
+        transform = transform.mat
+    elif hasattr(transform, "matrix"):
         transform = transform.matrix
+
+    transform = np.asarray(transform, dtype=float)
     if transform.shape != (4, 4):
         raise ValueError("Transformation matrix must be of shape (4,4).")
+
+    coords = np.asarray(coords, dtype=float)
     if coords.shape != (3,):
         raise ValueError("Coordinate must be a 3-element vector.")
+
     hom_coords = np.append(coords, 1)
     transformed = np.dot(transform, hom_coords)[:3]
     return transformed
