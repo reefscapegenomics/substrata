@@ -15,6 +15,8 @@ import struct
 # Local Modules
 from substrata import geometry, settings
 from substrata.geometry import Transform
+import substrata.annotations as annotations
+from matplotlib.backends.backend_pdf import PdfPages
 
 if TYPE_CHECKING:  # hint-only imports
     from substrata.annotations import (
@@ -306,6 +308,79 @@ class PointCloud:
             title=title,
         )
 
+    def plot_views(
+        self,
+        point_size: int = 2,
+        width: float = 8,
+        height: float = 12,
+        max_output_points: int = 50000,
+        title: str | None = None,
+        ortho_resolution: float | None = None,
+    ):
+        """Render the composite views for this point cloud.
+
+        A thin wrapper over ``substrata.visualizations.plot_views``.
+        """
+        from substrata.visualizations import plot_views as _plot_views
+
+        return _plot_views(
+            self,
+            point_size=point_size,
+            width=width,
+            height=height,
+            max_output_points=max_output_points,
+            title=title,
+            ortho_resolution=ortho_resolution,
+        )
+
+    def save_pdf(
+        self,
+        filepath: str | None = None,
+        point_size: int = 2,
+        width: float = 8,
+        height: float = 12,
+        max_output_points: int = 50000,
+        title: str | None = None,
+        ortho_resolution: float | None = None,
+    ) -> str:
+        """Save the composite views to a single-page PDF.
+
+        Uses a non-interactive backend and closes figures after saving,
+        similar to ``Scalebars.save_pdf``.
+
+        Returns the output filepath.
+        """
+        import matplotlib
+
+        backend_original = matplotlib.get_backend()
+        matplotlib.use("Agg", force=True)
+        try:
+            if filepath is None:
+                base, _ = os.path.splitext(self.filepath or "pointcloud")
+                filepath = f"{base}_views.pdf"
+
+            from substrata.visualizations import plot_views as _plot_views
+
+            fig = _plot_views(
+                self,
+                point_size=point_size,
+                width=width,
+                height=height,
+                max_output_points=max_output_points,
+                title=title,
+                ortho_resolution=ortho_resolution,
+            )
+            pdf = PdfPages(filepath)
+            pdf.savefig(fig)
+            pdf.close()
+            # Ensure figure is closed to free memory
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+            return filepath
+        finally:
+            matplotlib.use(backend_original, force=True)
+
     def reduce_pcd_to_points_in_mesh(self, mesh) -> None:
         """Reduce the number of points by sampling points from a target mesh.
 
@@ -565,7 +640,6 @@ class PointCloud:
         Raises:
             ValueError: If neither target_coord nor vector is provided, or if both are provided.
         """
-        from substrata import annotations
 
         # Ensure that either a target_coord or a vector is provided
         if (target_coord is None and vector is None) or (

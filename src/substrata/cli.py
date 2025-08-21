@@ -1,6 +1,8 @@
 # cli.py
 import argparse
-from substrata import pointclouds, annotations
+from substrata.pointclouds import PointCloud, decimate_ply_file
+from substrata.annotations import Annotations, Scalebars
+from substrata import settings
 
 
 def main():
@@ -36,10 +38,22 @@ def main():
         "--no-progress", action="store_true", help="Disable progress bars during load."
     )
 
+    # views
+    p_views = subparsers.add_parser(
+        "views", help="Save composite views PDF for a point cloud."
+    )
+    p_views.add_argument("pcd_filename", type=str, help="Input point cloud (PLY).")
+    p_views.add_argument("output_pdf", type=str, help="Output PDF filepath.")
+    p_views.add_argument(
+        "--full",
+        action="store_true",
+        help="Load full point cloud without decimation (may be large).",
+    )
+
     args = parser.parse_args()
 
     if args.command == "decimate":
-        pointclouds.decimate_ply_file(
+        decimate_ply_file(
             input_path=args.input,
             output_path=args.output,
             target_points=args.target,
@@ -47,23 +61,29 @@ def main():
         )
     elif args.command == "scalebars":
         # 1) load PCD (optionally streaming-decimate on load)
-        pcd = pointclouds.PointCloud(args.pcd_filename, max_points=args.max_points)
+        pcd = PointCloud(args.pcd_filename, max_points=args.max_points)
 
         # 2) load markers as annotations
-        anns = annotations.Annotations()
+        anns = Annotations()
         anns.get_annotations_from_file(
             args.markers_filename, header=True, orig_coords_only=False
         )
 
         # 3) create Scalebars, attach target coords from annotations
         # Expect the CSV to provide labels matching scalebar target1/target2 labels
-        sb = annotations.Scalebars(
+        sb = Scalebars(
             scalebar_data=settings.RGL_SCALEBARS, target_data=anns
         )  # scalebar_data populated via target_data
         # If your scalebar_data must come from a file, replace the above with your loader.
 
         # 4) save PDF
         sb.save_pdf(pcd, filepath=args.output_pdf)
+    elif args.command == "views":
+        # Load point cloud with optional streaming decimation to ~50M points
+        max_pts = None if args.full else 50_000_000
+        pcd = PointCloud(args.pcd_filename, max_points=max_pts)
+        # Save composite views PDF
+        pcd.save_pdf(filepath=args.output_pdf)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,14 @@ class Cameras:
             self.data[cam_id].transform_coords(transform_matrix)
         self.world_transform = np.dot(np.array(transform_matrix), self.world_transform)
 
+    def apply_transform(self, transform_matrix):
+        """Alias for transform_coords for compatibility.
+
+        Args:
+            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+        """
+        self.transform_coords(transform_matrix)
+
     def get_original_coords(self, transform_matrix):
         """Restore original camera coordinates and transforms.
 
@@ -446,9 +454,13 @@ class Camera:
             cam_coords = self.coords
             cam_transform = self.camera_transform
 
+        # Ensure array type and shape for inversion
+        cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
+
         proj_point = np.dot(np.linalg.inv(cam_transform), np.append(coords, 1))
         x_norm = proj_point[0] / proj_point[2]
         y_norm = proj_point[1] / proj_point[2]
+
         r2 = x_norm**2 + y_norm**2
         radial = (
             1 + self.parent.k1 * r2 + self.parent.k2 * r2**2 + self.parent.k3 * r2**3
@@ -547,7 +559,8 @@ class Camera:
 
         # Transform the direction vector from camera to world coordinates.
         # For directions, apply only the rotation part of self.transform.
-        R = self.camera_transform[:3, :3]
+        transform_matrix = np.array(self.camera_transform, dtype=float).reshape((4, 4))
+        R = transform_matrix[:3, :3]
         vec_world = R.dot(vec_cam)
         vec_world /= np.linalg.norm(vec_world)
 
@@ -966,6 +979,31 @@ class ImageMatch:
         if self.pixel_scale:
             print(f"Pixel scale: {self.pixel_scale}")
             print(f"Pixels per mm: {self.pixels_per_mm}")
+        # Print classification information if available
+        if hasattr(self, "classification") and self.classification:
+            cls = self.classification
+            label = cls.get("label")
+            conf = cls.get("confidence")
+            print(f"Classification: {label}")
+            if conf is not None:
+                try:
+                    print(f"Classification confidence: {float(conf):.3f}")
+                except Exception:
+                    print(f"Classification confidence: {conf}")
+            probs = cls.get("probs")
+            if isinstance(probs, dict) and len(probs) > 0:
+                try:
+                    top_items = sorted(
+                        probs.items(), key=lambda kv: kv[1], reverse=True
+                    )[:5]
+                    print("Top probabilities:")
+                    for k, v in top_items:
+                        try:
+                            print(f" - {k}: {float(v):.3f}")
+                        except Exception:
+                            print(f" - {k}: {v}")
+                except Exception:
+                    pass
         if self.masks:
             cropped_img = visualizations.get_crop_img_from_masks(
                 self, crop_w, crop_h, single_mask=single_mask

@@ -2,10 +2,16 @@ README.md
 pyproject.toml
 setup.cfg
 src/substrata/__init__.py
+src/substrata/annotations.py
+src/substrata/cameras.py
+src/substrata/classification.py
+src/substrata/cli.py
 src/substrata/geometry.py
 src/substrata/logging.py
 src/substrata/measurements.py
 src/substrata/pointclouds.py
+src/substrata/segmentation.py
+src/substrata/settings.py
 src/substrata/visualizations.py
 src/substrata.egg-info/PKG-INFO
 src/substrata.egg-info/SOURCES.txt

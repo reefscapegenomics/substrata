@@ -14,7 +14,14 @@ from tqdm_joblib import tqdm_joblib
 from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
-from substrata import settings, measurements, cameras, visualizations
+from substrata import (
+    settings,
+    measurements,
+    cameras,
+    visualizations,
+    geometry,
+    pointclouds,
+)
 from substrata.logging import logger
 
 
@@ -301,15 +308,23 @@ class Annotations:
     #     pcd.points = utility.Vector3dVector(self.get_all_coords())
     #     return pcd
 
-    def transform_coords(self, transform_matrix):
+    def transform_coords(self, transform):
         """Apply a transformation to all annotation coordinates.
 
         Args:
-            transform_matrix (np.ndarray): A 4x4 transformation matrix.
+            transform (np.ndarray or Transform): A 4x4 transformation matrix or a Transform instance.
         """
+        # Accept either a 4x4 matrix or a Transform instance
+        if hasattr(transform, "matrix"):
+            matrix = np.array(transform.matrix)
+        else:
+            matrix = np.array(transform)
         for ann_id in self.data:
-            self.data[ann_id].transform_coords(transform_matrix)
-        self.world_transform = np.dot(np.array(transform_matrix), self.world_transform)
+            self.data[ann_id].transform_coords(transform)
+        self.world_transform = np.dot(matrix, self.world_transform)
+
+    # Alias for compatibility
+    apply_transform = transform_coords
 
     def get_original_coords(self, transform_matrix):
         """Revert transformed coordinates using the given transformation.
