@@ -1128,7 +1128,6 @@ def plot_2d_ortho(
     extent_y = max(max_y - min_y, 1e-9)
 
     # Choose resolution heuristically if not provided
-    print(f"Resolution: {resolution}")
     if resolution is None:
         n_pts = max(len(pts), 1)
         # Target total pixels ~ n_pts/10, bounded for practicality

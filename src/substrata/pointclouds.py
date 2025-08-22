@@ -230,29 +230,32 @@ class PointCloud:
 
     def apply_orientation_transforms(
         self,
-        scale_factor: float,
-        up_vector: np.ndarray,
-        depth_offset: float,
+        scale_factor: Optional[float],
+        up_vector: Optional[np.ndarray],
+        depth_offset: Optional[float],
         z_axis_rotation: bool = False,
         plot=False,
     ) -> None:
         """Apply a standardized set of orientations at once."""
         # Compute each transform on the current, already-updated cloud
-        self.apply_transform(
-            Transform.from_scale(scale_factor),
-            plot=plot,
-            plot_title="Transform.from_scale" if plot else None,
-        )
-        self.apply_transform(
-            Transform.from_up_vector(up_vector),
-            plot=plot,
-            plot_title="Transform.from_up_vector" if plot else None,
-        )
-        self.apply_transform(
-            Transform.from_depth_offset(depth_offset),
-            plot=plot,
-            plot_title="Transform.from_depth_offset" if plot else None,
-        )
+        if scale_factor is not None:
+            self.apply_transform(
+                Transform.from_scale(scale_factor),
+                plot=plot,
+                plot_title="Transform.from_scale" if plot else None,
+            )
+        if up_vector is not None:
+            self.apply_transform(
+                Transform.from_up_vector(up_vector),
+                plot=plot,
+                plot_title="Transform.from_up_vector" if plot else None,
+            )
+        if depth_offset is not None:
+            self.apply_transform(
+                Transform.from_depth_offset(depth_offset),
+                plot=plot,
+                plot_title="Transform.from_depth_offset" if plot else None,
+            )
         self.apply_transform(
             Transform.align_x_to_vector(self.principal_axis_xy_2D()),
             plot=plot,
