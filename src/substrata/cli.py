@@ -49,6 +49,12 @@ def main():
         action="store_true",
         help="Load full point cloud without decimation (may be large).",
     )
+    p_views.add_argument(
+        "--auto-orient",
+        dest="auto_orient",
+        action="store_true",
+        help="Auto-orient the point cloud prior to saving (scale/up/offset skipped).",
+    )
 
     args = parser.parse_args()
 
@@ -82,6 +88,9 @@ def main():
         # Load point cloud with optional streaming decimation to ~50M points
         max_pts = None if args.full else 50_000_000
         pcd = PointCloud(args.pcd_filename, max_points=max_pts)
+        # Optionally run auto-orientation with default/None params (skips scale/up/offset)
+        if getattr(args, "auto_orient", False):
+            pcd.apply_orientation_transforms(None, None, None)
         # Save composite views PDF
         pcd.save_pdf(filepath=args.output_pdf)
 
