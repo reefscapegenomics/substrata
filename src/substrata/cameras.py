@@ -878,6 +878,21 @@ class ImageMatch:
         )
         self.mask = self.masks[0]
 
+    def classify(self, classifier, crop_size=None):
+        """
+        Classify the image match using a FastAI learner.
+
+        Args:
+            classifier: Loaded FastAI learner or path to a .pkl learner.
+            crop_size: Optional int (square) or (width, height) tuple for center crop.
+
+        Returns:
+            dict: Classification result with label, confidence, probabilities, and pred_idx.
+        """
+        from substrata.classification import classify_image_match
+
+        return classify_image_match(self, classifier, crop_size)
+
     def get_mask_surface_area(self, predictor=None):
         """
         Calculate the surface area of the mask in the image.
@@ -996,12 +1011,19 @@ class ImageMatch:
                     top_items = sorted(
                         probs.items(), key=lambda kv: kv[1], reverse=True
                     )[:5]
-                    print("Top probabilities:")
-                    for k, v in top_items:
-                        try:
-                            print(f" - {k}: {float(v):.3f}")
-                        except Exception:
-                            print(f" - {k}: {v}")
+                    print(
+                        "Top probabilities: "
+                        + ", ".join(
+                            [
+                                (
+                                    f"{k}: {float(v):.3f}"
+                                    if isinstance(v, (float, int))
+                                    else f"{k}: {v}"
+                                )
+                                for k, v in top_items
+                            ]
+                        )
+                    )
                 except Exception:
                     pass
         if self.masks:

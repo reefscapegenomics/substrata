@@ -5,6 +5,7 @@ from io import BytesIO
 
 # Third-Party Libraries
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import numpy as np
 import cv2
 import ffmpeg
@@ -606,6 +607,11 @@ def get_crop_img(img_path, crop_x, crop_y, crop_w, crop_h):
     right = min(w_img, right)
     bottom = min(h_img, bottom)
 
+    # If the requested crop falls completely outside the image, raise an error
+    if left >= right or top >= bottom:
+        raise ValueError(
+            f"Crop area falls outside image bounds: center=({crop_x}, {crop_y}), size=({crop_w}x{crop_h}), image={img_path}"
+        )
     cropped_img = img[top:bottom, left:right]
     return cropped_img
 
@@ -935,6 +941,240 @@ def show_grid_cells(
             ax_right.axis("equal")
 
     plt.tight_layout()
+    return plt
+
+
+def show_classified_grid_cells(
+    pcd,
+    bboxes,
+    annotations,
+    show_points=False,
+    point_size=1,
+    title=None,
+    label_colors=None,
+    max_output_points=50000,
+    use_grayscale_points=False,
+):
+    """
+    Show a 2D plot with grid cells colored by majority classification.
+
+    Given a point cloud, a list of grid cell bounding boxes, and an
+    `Annotations` object, determine for each cell which annotations fall
+    within the cell bounds and color the cell based on the majority
+    classification label from `annotation.image_match.classification['label']`.
+
+    - Cells with no classified annotations are colored gray.
+    - Grid cell outlines are not drawn; only the filled cell color is shown.
+
+    Args:
+        pcd: Point cloud (SimplePointCloud or Open3D PointCloud-like).
+        bboxes: List of bounding boxes, where each item is
+            (min_corner[x, y], max_corner[x, y]). A single bbox can also be
+            passed as ((x_min, y_min), (x_max, y_max)).
+        annotations: An `Annotations` instance.
+        show_points (bool): If True, scatter the XY points as a background.
+        point_size (int): Marker size for background points when shown.
+        title (str | None): Optional title for the plot.
+        label_colors (dict | None): Optional mapping {label: matplotlib color}.
+
+    Returns:
+        matplotlib.pyplot: The pyplot module for further manipulation or display.
+    """
+    # Normalize bboxes input: accept a single bbox as well
+    if (
+        isinstance(bboxes, (list, tuple))
+        and len(bboxes) == 2
+        and isinstance(bboxes[0], (list, tuple))
+        and isinstance(bboxes[1], (list, tuple))
+        and len(bboxes[0]) == 2
+        and len(bboxes[1]) == 2
+        and not (
+            isinstance(bboxes[0][0], (list, tuple))
+            or isinstance(bboxes[1][0], (list, tuple))
+        )
+    ):
+        bboxes = [bboxes]
+
+    # Extract points (for optional background) and decimate for speed
+    if hasattr(pcd, "o3d_pcd"):
+        pts = np.asarray(pcd.o3d_pcd.points)
+        cols = (
+            np.asarray(pcd.o3d_pcd.colors)
+            if hasattr(pcd.o3d_pcd, "colors")
+            and np.asarray(pcd.o3d_pcd.colors).size > 0
+            else None
+        )
+    else:
+        pts = np.asarray(pcd.points)
+        cols = (
+            np.asarray(pcd.colors)
+            if hasattr(pcd, "colors") and np.asarray(pcd.colors).size > 0
+            else None
+        )
+
+    # Decimate like plot()
+    if len(pts) > max_output_points:
+        logger.info(
+            f"Decimating point cloud from {len(pts)} to {max_output_points} points"
+        )
+        decimation_factor = len(pts) // max_output_points
+        indices = np.random.choice(
+            len(pts), size=len(pts) // decimation_factor, replace=False
+        )
+        pts = pts[indices]
+        if cols is not None and len(cols) == len(indices) * decimation_factor:
+            cols = cols[indices]
+
+    points = pts
+
+    fig = plt.figure(figsize=(12, 5))
+    gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
+    ax_left = fig.add_subplot(gs[0, 0])
+    ax_left.set_aspect("equal")
+    ax_right = fig.add_subplot(gs[0, 1])
+
+    # Optional background points in grayscale
+    if show_points and points.size > 0:
+        if use_grayscale_points:
+            plot_cols = np.full((points.shape[0], 3), 0.6, dtype=float)
+        else:
+            plot_cols = cols if cols is not None and len(cols) == len(points) else "b"
+        ax_left.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=point_size,
+            c=plot_cols,
+            alpha=0.5,
+            edgecolor="none",
+        )
+
+    # Build default label color mapping if not provided
+    if label_colors is None:
+        # Collect labels present in annotations
+        labels = []
+        for ann in annotations.data.values():
+            im = getattr(ann, "image_match", None)
+            cls = getattr(im, "classification", None)
+            if isinstance(cls, dict) and "label" in cls and cls["label"] is not None:
+                labels.append(str(cls["label"]))
+        unique_labels = sorted(set(labels))
+        cmap = plt.cm.get_cmap("tab20", max(1, len(unique_labels)))
+        label_colors = {lbl: cmap(i) for i, lbl in enumerate(unique_labels)}
+
+    # Helper to compute majority label for a bbox
+    def majority_label_for_bbox(min_corner, max_corner):
+        counts = {}
+        for ann in annotations.data.values():
+            x, y = ann.coords[0], ann.coords[1]
+            if (min_corner[0] <= x < max_corner[0]) and (
+                min_corner[1] <= y < max_corner[1]
+            ):
+                im = getattr(ann, "image_match", None)
+                cls = getattr(im, "classification", None)
+                if isinstance(cls, dict):
+                    lbl = cls.get("label", None)
+                else:
+                    lbl = None
+                if lbl is not None:
+                    lbl = str(lbl)
+                    counts[lbl] = counts.get(lbl, 0) + 1
+        if not counts:
+            return None
+        # Return the label with highest count (break ties deterministically by label name)
+        max_count = max(counts.values())
+        candidates = sorted([lbl for lbl, c in counts.items() if c == max_count])
+        return candidates[0] if candidates else None
+
+    # Draw filled rectangles for each bbox colored by majority label
+    labels_present = set()
+    label_counts_by_cell = {}
+    for bbox in bboxes:
+        min_corner, max_corner = bbox
+        label = majority_label_for_bbox(min_corner, max_corner)
+        if label is None:
+            face_color = (0.7, 0.7, 0.7)  # gray for missing
+        else:
+            face_color = label_colors.get(label, (0.7, 0.7, 0.7))
+            labels_present.add(label)
+            label_counts_by_cell[label] = label_counts_by_cell.get(label, 0) + 1
+
+        if label is None:
+            label_counts_by_cell["No data"] = label_counts_by_cell.get("No data", 0) + 1
+
+        x_vals = [min_corner[0], max_corner[0]]
+        y_vals = [min_corner[1], max_corner[1]]
+        width = x_vals[1] - x_vals[0]
+        height = y_vals[1] - y_vals[0]
+        rect = plt.Rectangle(
+            (x_vals[0], y_vals[0]),
+            width,
+            height,
+            facecolor=face_color,
+            edgecolor="none",
+            alpha=0.6,
+        )
+        ax_left.add_patch(rect)
+
+    if title is not None:
+        ax_left.set_title(title)
+
+    # Build legend: include only labels present plus a gray "No data"
+    handles = []
+    for lbl in sorted(labels_present):
+        handles.append(
+            mpatches.Patch(
+                facecolor=label_colors.get(lbl, (0.7, 0.7, 0.7)),
+                edgecolor="none",
+                label=str(lbl),
+            )
+        )
+    handles.append(
+        mpatches.Patch(facecolor=(0.7, 0.7, 0.7), edgecolor="none", label="No data")
+    )
+    if len(handles) > 0:
+        ax_left.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.05),
+            ncol=min(len(handles), 6),
+            frameon=False,
+        )
+
+    # Right panel: bar chart with counts per category (including No data)
+    if label_counts_by_cell:
+        categories = list(
+            sorted([k for k in label_counts_by_cell.keys() if k != "No data"])
+        )
+        counts = [label_counts_by_cell[c] for c in categories]
+        # Append No data at the end if present
+        if "No data" in label_counts_by_cell:
+            categories.append("No data")
+            counts.append(label_counts_by_cell["No data"])
+
+        bar_colors = [
+            label_colors.get(c, (0.7, 0.7, 0.7)) if c != "No data" else (0.7, 0.7, 0.7)
+            for c in categories
+        ]
+        x_pos = np.arange(len(categories))
+        ax_right.bar(x_pos, counts, color=bar_colors)
+        ax_right.set_xticks(x_pos)
+        ax_right.set_xticklabels([str(c) for c in categories], rotation=45, ha="right")
+        ax_right.set_ylabel("Count")
+        ax_right.set_title("Cells per class")
+        ax_right.margins(x=0.05)
+
+    # Tight layout and return pyplot
+    plt.tight_layout()
+
+    # Match right plot area height to left plot area height
+    try:
+        left_pos = ax_left.get_position()
+        right_pos = ax_right.get_position()
+        ax_right.set_position(
+            [right_pos.x0, left_pos.y0, right_pos.width, left_pos.height]
+        )
+    except Exception:
+        pass
     return plt
 
 

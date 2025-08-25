@@ -302,6 +302,69 @@ class Annotations:
                 # ann.image_matches.append(match) TODO: INCORRECT
         return image_matches
 
+    def classify_image_matches(self, classifier, crop_size=None, print_summary=False):
+        """Classify all image matches for annotations that have them.
+
+        Args:
+            classifier: Loaded FastAI learner or path to a .pkl learner.
+            crop_size: Optional int (square) or (width, height) tuple for center crop.
+            print_summary (bool): Whether to print classification category counts.
+
+        Returns:
+            dict: Mapping of annotation IDs to classification results.
+        """
+        results = {}
+        for ann in tqdm(self.data.values(), desc="Classifying image matches"):
+            if ann.image_match is not None:
+                try:
+                    result = ann.image_match.classify(classifier, crop_size)
+                    results[ann.id] = result
+                except Exception as e:
+                    logger.warning(
+                        f"Classification failed for annotation {ann.id}: {e}"
+                    )
+                    results[ann.id] = None
+            else:
+                results[ann.id] = None
+
+        # Print summary if requested
+        if print_summary:
+            self._print_classification_summary(results)
+
+        return results
+
+    def _print_classification_summary(self, results):
+        """Print a summary of classification results.
+
+        Args:
+            results (dict): Classification results from classify_image_matches.
+        """
+        # Count classifications
+        label_counts = {}
+        total_annotations = len(results)
+        successful_classifications = 0
+
+        for ann_id, result in results.items():
+            if result is not None and isinstance(result, dict):
+                label = result.get("label", "Unknown")
+                label_counts[label] = label_counts.get(label, 0) + 1
+                successful_classifications += 1
+
+        # Print summary
+        print(f"\nClassification Summary:")
+        print(f"Total annotations: {total_annotations}")
+        print(f"Successfully classified: {successful_classifications}")
+        print(
+            f"Failed classifications: {total_annotations - successful_classifications}"
+        )
+
+        if label_counts:
+            print(f"\nClassification categories:")
+            for label, count in sorted(label_counts.items()):
+                percentage = (count / successful_classifications) * 100
+                print(f"  {label}: {count} ({percentage:.1f}%)")
+        print()
+
     # def get_pcd(self):
     #     """Get a point cloud of all annotation coordinates."""
     #     pcd = geometry.PointCloud()
@@ -769,7 +832,6 @@ class Annotation:
                         image_match.potentially_obstructed = False
                         image_matches.append(image_match)
                 else:
-                    print("No pcd provided")
                     # If no pcd provided: add image_match regardless
                     image_matches.append(image_match)
 

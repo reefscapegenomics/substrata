@@ -495,8 +495,6 @@ class PointCloud:
         Returns:
             Annotations object containing the found intercept points.
         """
-        from substrata import annotations
-
         # Iterate through all XY points and find the corresponding 3D intercept points
         intercept_points = annotations.Annotations()
         for idx, xy_point in enumerate(tqdm(xy_coords)):
@@ -546,8 +544,6 @@ class PointCloud:
         Returns:
             InterceptAnnotation object if found, None otherwise.
         """
-        from substrata import annotations
-
         # Ensure the point cloud has a KDTree for XY coordinates.
         used_search_radius = search_radius
         if not hasattr(self, "o3d_pcd_tree_xy"):

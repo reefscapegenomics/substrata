@@ -38,6 +38,37 @@ def _center_crop(
     return img.crop((left, top, right, bottom))
 
 
+def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
+    """
+    Load a FastAI image classifier (learner), similar to get_sam2_predictor.
+
+    Args:
+        checkpoint: Path to the learner .pkl file.
+        device: Optional 'cuda' or 'cpu'. If None, auto-detect.
+
+    Returns:
+        Loaded FastAI Learner.
+    """
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(f"Learner file not found: {checkpoint}")
+
+    try:
+        import torch  # lazy
+
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    except Exception:
+        dev = device or "cpu"
+
+    # Load on CPU by default, then move if needed
+    learn = load_learner(checkpoint, cpu=True)
+    if dev != "cpu":
+        try:
+            learn.to(dev)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("Could not move learner to device '%s'; using CPU.", dev)
+    return learn
+
+
 def _ensure_learner(classifier: Union[str, Any]):
     """
     Ensure we have a FastAI learner object. If a string path is provided, load it.
@@ -47,18 +78,9 @@ def _ensure_learner(classifier: Union[str, Any]):
 
     Returns:
         A FastAI Learner instance.
-
-    Raises:
-        FileNotFoundError: If the provided path does not exist.
-        RuntimeError: If loading the learner fails.
     """
     if isinstance(classifier, str):
-        if not os.path.isfile(classifier):
-            raise FileNotFoundError(f"Learner file not found: {classifier}")
-        try:
-            return load_learner(classifier)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load learner from {classifier}: {e}") from e
+        return get_image_classifier(classifier)
     return classifier
 
 
@@ -70,14 +92,14 @@ def classify_image_match(
     """
     Run an image classifier on an ImageMatch and attach the result to the instance.
 
-    - Loads a FastAI learner (if `classifier` is a path).
+    - Accepts a loaded FastAI learner (recommended) or a path (will be loaded).
     - Optionally center-crops the source image to `crop_size`.
     - Calls learner.predict on the PIL image.
     - Stores the result on `image_match.classification` and returns it.
 
     Args:
         image_match: An instance of `cameras.ImageMatch`.
-        classifier: Path to a FastAI .pkl learner or an already loaded learner.
+        classifier: Loaded FastAI learner or path to a .pkl learner.
         crop_size: Optional int (square) or (width, height) tuple for center crop.
 
     Returns:
@@ -109,7 +131,6 @@ def classify_image_match(
         try:
             vocab = getattr(getattr(learn, "dls", None), "vocab", None)
             if vocab is not None and pred_probs is not None:
-                # Convert to {class_name: probability}
                 probs = pred_probs.tolist()
                 probs_map = {str(vocab[i]): float(probs[i]) for i in range(len(vocab))}
         except Exception:
