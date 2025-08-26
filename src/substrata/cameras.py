@@ -147,10 +147,8 @@ class Cameras:
         """
         cameras_subset = Cameras()
         for cam in self.data.values():
-            print(cam.filepath)
-            if cam.filepath.endswith(postfix) or cam.filepath.endswith(
-                postfix + os.sep
-            ):
+            folder = os.path.dirname(cam.filepath)
+            if folder.endswith(postfix) or folder.endswith(postfix + os.sep):
                 cameras_subset.data[cam.cam_id] = cam
         return cameras_subset
 
