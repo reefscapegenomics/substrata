@@ -3,6 +3,8 @@ import argparse
 from substrata.pointclouds import PointCloud, decimate_ply_file
 from substrata.annotations import Annotations, Scalebars
 from substrata import settings
+import os
+import re
 
 
 def main():
@@ -56,6 +58,87 @@ def main():
         help="Auto-orient the point cloud prior to saving (scale/up/offset skipped).",
     )
 
+    # firefish
+    p_ff = subparsers.add_parser(
+        "firefish",
+        help=(
+            "Run FireFish/Cameras alignment: initialize FireFish + Cameras and "
+            "determine up vector/output PDF."
+        ),
+    )
+    p_ff.add_argument(
+        "--firefish-file",
+        dest="firefish_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to FireFish file. Default: <cwd_basename>_firefish.txt in current folder."
+        ),
+    )
+    p_ff.add_argument(
+        "--cams-xml",
+        dest="cams_xml",
+        type=str,
+        default=None,
+        help=(
+            "Path to .cams.xml file. Default: <cwd_basename>.cams.xml in current folder."
+        ),
+    )
+    p_ff.add_argument(
+        "--cams-meta",
+        dest="cams_meta",
+        type=str,
+        default=None,
+        help=(
+            "Path to cameras metadata .meta.json file. Default: <cwd_basename>.meta.json."
+        ),
+    )
+    p_ff.add_argument(
+        "--target-depth",
+        dest="target_depth",
+        type=int,
+        default=None,
+        help=(
+            "Optional target depth in meters. Default: extracted from <cwd_basename> pattern _<int>m_."
+        ),
+    )
+    p_ff.add_argument(
+        "--pdf-output",
+        dest="pdf_output",
+        type=str,
+        default=None,
+        help=(
+            "Optional output PDF filepath. Default: <cwd_basename>_firefish.pdf in current folder."
+        ),
+    )
+    p_ff.add_argument(
+        "--cam-depths-file",
+        dest="cam_depths_file",
+        type=str,
+        default=None,
+        help=(
+            "Optional CSV to store camera depths. Default: <cwd_basename>_camdepths.csv in current folder."
+        ),
+    )
+    p_ff.add_argument(
+        "--depth-outlier-threshold",
+        dest="depth_outlier_thresh",
+        type=int,
+        default=None,
+        help=(
+            "Optional depth/outlier threshold (meters). Defaults to FireFish.determine_up_vector default."
+        ),
+    )
+    p_ff.add_argument(
+        "--pcd-filename",
+        dest="pcd_filename",
+        type=str,
+        default=None,
+        help=(
+            "Optional point cloud (PLY) filepath to load and use during up-vector determination."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.command == "decimate":
@@ -93,6 +176,51 @@ def main():
             pcd.apply_orientation_transforms(None, None, None)
         # Save composite views PDF
         pcd.save_pdf(filepath=args.output_pdf)
+    elif args.command == "firefish":
+        # Build defaults from current directory name
+        cwd = os.getcwd()
+        base = os.path.basename(cwd.rstrip(os.sep))
+
+        firefish_file = args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt")
+        cams_xml = args.cams_xml or os.path.join(cwd, f"{base}.cams.xml")
+        cams_meta = args.cams_meta or os.path.join(cwd, f"{base}.meta.json")
+
+        # Infer target depth if not provided: find _<int>m_ pattern
+        target_depth = args.target_depth
+        if target_depth is None:
+            m = re.search(r"_(\d+)m_", base)
+            if m:
+                try:
+                    target_depth = int(m.group(1))
+                except Exception:
+                    target_depth = None
+
+        pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_firefish.pdf")
+        cam_depths_file = args.cam_depths_file or os.path.join(
+            cwd, f"{base}_camdepths.csv"
+        )
+
+        # Lazy import to avoid overhead when unused
+        from substrata.firefish import FireFish
+        from substrata.cameras import Cameras
+
+        ff = FireFish(firefish_file)
+        cams = Cameras(cams_meta_filepath=cams_meta, cams_xml_filepath=cams_xml)
+
+        # depth_outlier_thresh is passed through only if provided; otherwise rely on default
+        kwargs = {
+            "camdepths_filepath": cam_depths_file,
+            "pdf_output_filepath": pdf_output,
+        }
+        if args.depth_outlier_thresh is not None:
+            kwargs["depth_and_outlier_threshold"] = args.depth_outlier_thresh
+
+        # Load point cloud (default to <cwd_basename>.ply in current folder)
+        pcd_filename = args.pcd_filename or os.path.join(cwd, f"{base}.ply")
+        pcd = PointCloud(pcd_filename)
+
+        # Run up-vector determination
+        ff.determine_up_vector(cams, target_depth, pcd, **kwargs)
 
 
 if __name__ == "__main__":
