@@ -147,6 +147,7 @@ class Cameras:
         """
         cameras_subset = Cameras()
         for cam in self.data.values():
+            print(cam.filepath)
             if cam.filepath.endswith(postfix) or cam.filepath.endswith(
                 postfix + os.sep
             ):
