@@ -13,15 +13,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
-from PIL.ExifTags import TAGS
 from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 # Local Modules
 from substrata import visualizations, settings
+from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
 
@@ -288,18 +289,42 @@ class Cameras:
         """
         self.filepath_replace = ["", base_path]
 
-    def get_cam_dists(self, pcd, beam_angle):
+    def get_cam_dists(
+        self, pcd, beam_angle, n_jobs=-1, backend="threading", verbose=False
+    ):
         """Calculate camera distances to a point cloud.
 
         For each camera, compute the distance to the given point cloud based on
-        the provided beam angle.
+        the provided beam angle. If ``n_jobs != 1`` (default -1: all CPUs), this
+        will parallelize the computation using joblib with a threading backend
+        by default, which avoids pickling the non-serializable point cloud object.
 
         Args:
             pcd: A point cloud object.
             beam_angle (float): The beam angle for distance calculation.
+            n_jobs (int): Number of parallel workers. Use 1 for sequential; -1 for all CPUs.
+            backend (str): joblib backend. Use "threading" to avoid pickling ``pcd``.
+            verbose (bool): If True, print the distance for each camera.
         """
-        for cam in tqdm(self.data.values(), desc="Calculating camera distances..."):
-            cam.camdist = pcd.get_cam_dist(cam, beam_angle)
+        cams_list = list(self.data.values())
+        if n_jobs in (None, 1):
+            for cam in tqdm(cams_list, desc="Calculating camera distances..."):
+                cam.camdist = pcd.get_cam_dist(cam, beam_angle)
+                if verbose:
+                    print(
+                        f"Camera {getattr(cam, 'cam_id', None)}: Distance = {cam.camdist}"
+                    )
+        else:
+            with tqdm_joblib(
+                tqdm(total=len(cams_list), desc="Calculating camera distances...")
+            ):
+                dists = Parallel(n_jobs=n_jobs, backend=backend)(
+                    delayed(pcd.get_cam_dist)(cam, beam_angle) for cam in cams_list
+                )
+            for cam, dist in zip(cams_list, dists):
+                cam.camdist = dist
+                if verbose:
+                    print(f"Camera {getattr(cam, 'cam_id', None)}: Distance = {dist}")
 
     def get_datetime_originals(self):
         """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""
