@@ -184,6 +184,7 @@ def main():
         # Save composite views PDF
         pcd.save_pdf(filepath=args.output_pdf)
     elif args.command == "firefish":
+        ### TODO: MAKE GENERIC
         # Build defaults from current directory name
         cwd = os.getcwd()
         base = os.path.basename(cwd.rstrip(os.sep))
@@ -224,7 +225,7 @@ def main():
 
         # Load point cloud (default to <cwd_basename>.ply in current folder)
         pcd_filename = args.pcd_filename or os.path.join(cwd, f"{base}.ply")
-        pcd = PointCloud(pcd_filename)
+        pcd = PointCloud(pcd_filename, max_points=50000000)
 
         # Run up-vector determination
         ff.determine_up_vector(

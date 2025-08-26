@@ -300,7 +300,7 @@ class FireFish:
         if cams_filepath_postfix_filter is not None:
             cams = cams.subset_by_filepath_postfix(cams_filepath_postfix_filter)
             print(
-                f"Filtered cameras to {len(cams)} cameras using postfix {cams_filepath_postfix_filter}"
+                f"Filtered cameras to {len(cams.items())} cameras using postfix {cams_filepath_postfix_filter}"
             )
 
         # Check if pcd has undergone a transformation (scaling)
