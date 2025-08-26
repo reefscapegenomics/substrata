@@ -128,11 +128,28 @@ class Cameras:
             prefix (str): Prefix to filter camera IDs.
 
         Returns:
-            Annotations: New container with matching annotations.
+            Cameras: New container with matching cameras.
         """
         cameras_subset = Cameras()
         for cam in self.data.values():
             if cam.filename.startswith(prefix):
+                cameras_subset.data[cam.cam_id] = cam
+        return cameras_subset
+
+    def subset_by_filepath_postfix(self, postfix):
+        """Return a subset of cameras whose containing folder ends with a given postfix.
+
+        Args:
+            postfix (str): Postfix string to match at the end of the containing folder.
+
+        Returns:
+            Cameras: New container with matching cameras.
+        """
+        cameras_subset = Cameras()
+        for cam in self.data.values():
+            if cam.filepath.endswith(postfix) or cam.filepath.endswith(
+                postfix + os.sep
+            ):
                 cameras_subset.data[cam.cam_id] = cam
         return cameras_subset
 

@@ -287,6 +287,7 @@ class FireFish:
         cams,
         target_depth,
         pcd,
+        cams_filepath_postfix_filter=None,
         camdepths_filepath=None,
         pdf_output_filepath=None,
         depth_and_outlier_threshold=3,
@@ -295,6 +296,10 @@ class FireFish:
         Workflow method that will determine offset, then up vector and then outputs
         visualizations for manual review.
         """
+        # Optionally filter cameras by filepath postfix
+        if cams_filepath_postfix_filter is not None:
+            cams = cams.subset_by_filepath_postfix(cams_filepath_postfix_filter)
+
         # Check if pcd has undergone a transformation (scaling)
         if len(pcd.transforms) == 0:
             logger.warning(

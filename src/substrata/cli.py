@@ -138,6 +138,13 @@ def main():
             "Optional point cloud (PLY) filepath to load and use during up-vector determination."
         ),
     )
+    p_ff.add_argument(
+        "--camspath-postfix",
+        dest="camspath_postfix",
+        type=str,
+        default=".photos",
+        help=("Optional filter for cameras by filepath postfix (e.g., '.photos')."),
+    )
 
     args = parser.parse_args()
 
@@ -220,7 +227,13 @@ def main():
         pcd = PointCloud(pcd_filename)
 
         # Run up-vector determination
-        ff.determine_up_vector(cams, target_depth, pcd, **kwargs)
+        ff.determine_up_vector(
+            cams,
+            target_depth,
+            pcd,
+            cams_filepath_postfix_filter=args.camspath_postfix,
+            **kwargs,
+        )
 
 
 if __name__ == "__main__":
