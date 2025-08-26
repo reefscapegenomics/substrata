@@ -53,7 +53,7 @@ class FireFish:
         ]  # TO FIX
         cam_dists = [cam.camdist for cam in cams_with_datetime]
         cam_timestamps = [
-            utils.get_unix_time(cam.datetime) + offset for cam in cams_with_datetime
+            get_unix_time(cam.datetime) + offset for cam in cams_with_datetime
         ]
 
         firefish_timestamps = self.data["unixtime"].to_numpy()
@@ -98,7 +98,7 @@ class FireFish:
         ]  # TO FIX
         first_camera_time = cams_with_datetime[0].datetime
         first_firefish_time = self.data.iloc[0]["unixtime"]
-        return utils.get_time_diff_in_secs(first_firefish_time, first_camera_time)
+        return get_time_diff_in_secs(first_firefish_time, first_camera_time)
 
     def filter_by_depth_range(self, min_depth, max_depth):
         """Filter the DataFrame for values within a certain range."""
@@ -152,7 +152,7 @@ class FireFish:
             ]  # TO FIX
             first_camera_time = cams_with_datetime[0].datetime
             first_firefish_time = filtered_data.iloc[0]["unixtime"]
-            starting_offset = utils.get_time_diff_in_secs(
+            starting_offset = get_time_diff_in_secs(
                 first_firefish_time, first_camera_time
             )
             cameras_time_delta = cams.get_time_delta_between_first_and_last_photo()
@@ -224,7 +224,7 @@ class FireFish:
         cam_ids = []
 
         for cam in cams_with_datetime:
-            cam_time_adjusted = utils.get_unix_time(cam.datetime) + offset
+            cam_time_adjusted = get_unix_time(cam.datetime) + offset
             match = self.data[self.data["unixtime"] == cam_time_adjusted]
             if not match.empty:
                 cam_ids.append(cam.cam_id)
@@ -384,3 +384,39 @@ class FireFish:
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
         plt.show()
         return fig
+
+
+def get_unix_time(unknown_datetime):
+    """Converts an unknown datetime representation to a Unix timestamp.
+
+    Args:
+        unknown_datetime (str or numeric): The datetime to convert. If a string, it
+            should match the format specified in settings.CAM_DATETIME_FORMAT. Otherwise,
+            it is assumed to already be a Unix timestamp.
+
+    Returns:
+        float: The Unix timestamp corresponding to the given datetime.
+    """
+    if isinstance(unknown_datetime, str):
+        return datetime.strptime(
+            unknown_datetime, settings.CAM_DATETIME_FORMAT
+        ).timestamp()
+    else:
+        return unknown_datetime
+
+
+def get_time_diff_in_secs(datetime1, datetime2):
+    """Calculates the time difference in seconds between two datetime values.
+
+    Args:
+        datetime1 (str or numeric): The first datetime value. If a string, it should
+            conform to settings.CAM_DATETIME_FORMAT.
+        datetime2 (str or numeric): The second datetime value. If a string, it should
+            conform to settings.CAM_DATETIME_FORMAT.
+
+    Returns:
+        int: The difference between datetime1 and datetime2 in seconds.
+    """
+    datetime1_unix = get_unix_time(datetime1)
+    datetime2_unix = get_unix_time(datetime2)
+    return int(datetime1_unix - datetime2_unix)
