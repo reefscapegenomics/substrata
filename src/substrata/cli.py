@@ -1,6 +1,6 @@
 # cli.py
 import argparse
-from substrata.pointclouds import PointCloud, decimate_ply_file
+from substrata.pointclouds import PointCloud, decimate_ply_file, ply_head
 from substrata.annotations import Annotations, Scalebars
 from substrata import settings
 import os
@@ -20,6 +20,20 @@ def main():
     p_dec.add_argument("target", type=int, help="Number of points to keep.")
     p_dec.add_argument(
         "--no-progress", action="store_true", help="Disable progress bars."
+    )
+
+    # head (PLY preview)
+    p_head = subparsers.add_parser(
+        "head", help="Show first N vertex rows from a PLY file."
+    )
+    p_head.add_argument("pcd_filename", type=str, help="Input PLY file.")
+    p_head.add_argument(
+        "-n",
+        "--num",
+        dest="num",
+        type=int,
+        default=5,
+        help="Number of vertex rows to display (default: 5).",
     )
 
     # scalebars
@@ -235,6 +249,8 @@ def main():
             cams_filepath_postfix_filter=args.camspath_postfix,
             **kwargs,
         )
+    elif args.command == "head":
+        ply_head(args.pcd_filename, n=args.num, print_output=True)
 
 
 if __name__ == "__main__":

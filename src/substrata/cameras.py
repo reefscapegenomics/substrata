@@ -289,9 +289,7 @@ class Cameras:
         """
         self.filepath_replace = ["", base_path]
 
-    def get_cam_dists(
-        self, pcd, beam_angle, n_jobs=-1, backend="threading", verbose=False
-    ):
+    def get_cam_dists(self, pcd, beam_angle, n_jobs=-1, backend="threading"):
         """Calculate camera distances to a point cloud.
 
         For each camera, compute the distance to the given point cloud based on
@@ -304,16 +302,11 @@ class Cameras:
             beam_angle (float): The beam angle for distance calculation.
             n_jobs (int): Number of parallel workers. Use 1 for sequential; -1 for all CPUs.
             backend (str): joblib backend. Use "threading" to avoid pickling ``pcd``.
-            verbose (bool): If True, print the distance for each camera.
         """
         cams_list = list(self.data.values())
         if n_jobs in (None, 1):
             for cam in tqdm(cams_list, desc="Calculating camera distances..."):
                 cam.camdist = pcd.get_cam_dist(cam, beam_angle)
-                if verbose:
-                    print(
-                        f"Camera {getattr(cam, 'cam_id', None)}: Distance = {cam.camdist}"
-                    )
         else:
             with tqdm_joblib(
                 tqdm(total=len(cams_list), desc="Calculating camera distances...")
@@ -323,8 +316,6 @@ class Cameras:
                 )
             for cam, dist in zip(cams_list, dists):
                 cam.camdist = dist
-                if verbose:
-                    print(f"Camera {getattr(cam, 'cam_id', None)}: Distance = {dist}")
 
     def get_datetime_originals(self):
         """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""

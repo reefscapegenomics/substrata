@@ -867,6 +867,127 @@ def _reservoir_slots(n_vertices: int, k: int, rng=None):
             yield j if j < k else None
 
 
+def ply_head(input_path: str, n: int = 5, print_output: bool = True):
+    """Peek the first N vertex records of a PLY file.
+
+    Supports both binary little/big-endian and ASCII PLYs. Parses the header
+    to determine vertex property layout and then reads and prints the first
+    ``n`` vertices. Returns a list of dicts for programmatic use.
+
+    Args:
+        input_path: Path to the PLY file.
+        n: Number of vertex records to display.
+        print_output: If True, print a concise view similar to "head".
+
+    Returns:
+        list[dict]: Parsed vertex records (up to N), each as {prop_name: value}.
+    """
+    records = []
+    with open(input_path, "rb") as fin:
+        fmt, endian, n_vertices, vprops, rec_size, header_lines = _parse_ply_header(fin)
+
+        # Compute header size to seek to vertex data
+        header_size = sum(len(l) for l in header_lines)
+        prop_types = [t for t, _ in vprops]
+        prop_names = [name for _, name in vprops]
+
+        # Helper: decide a concise subset of keys to show if printing
+        def subset_keys(names):
+            preferred = (
+                "x",
+                "y",
+                "z",
+                "nx",
+                "ny",
+                "nz",
+                "red",
+                "green",
+                "blue",
+                "confidence",
+            )
+            keys = [k for k in preferred if k in names]
+            return keys if keys else list(names[:6])
+
+        if fmt.startswith("binary_"):
+            # Build struct fmt string for one vertex
+            try:
+                row_fmt = endian + "".join(ply_type_struct[t] for t in prop_types)
+            except KeyError as e:
+                raise ValueError(f"Unsupported PLY type in header: {e}") from e
+
+            fin.seek(header_size)
+            if print_output:
+                print("columns:", ", ".join(prop_names))
+            max_rows = min(int(n_vertices), int(n))
+            for i in range(max_rows):
+                row = fin.read(rec_size)
+                if len(row) < rec_size:
+                    break
+                vals = struct.unpack(row_fmt, row)
+                rec = dict(zip(prop_names, vals))
+                records.append(rec)
+                if print_output:
+                    keys = subset_keys(prop_names)
+                    view = ", ".join(f"{k}={rec[k]!r}" for k in keys if k in rec)
+                    print(f"{i} {view}")
+        elif fmt == "ascii":
+            # Read ASCII vertex lines after header
+            fin.seek(header_size)
+            # Map PLY scalar types to Python casts
+            float_types = {
+                "float",
+                "double",
+                "float32",
+                "float64",
+            }
+            int_types = {
+                "char",
+                "uchar",
+                "short",
+                "ushort",
+                "int",
+                "uint",
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+            }
+
+            casts = []
+            for t in prop_types:
+                if t in float_types:
+                    casts.append(float)
+                elif t in int_types:
+                    casts.append(int)
+                else:
+                    # Fallback: keep as string
+                    casts.append(lambda x: x)
+
+            if print_output:
+                print("columns:", ", ".join(prop_names))
+            max_rows = min(int(n_vertices), int(n))
+            for i in range(max_rows):
+                line = fin.readline()
+                if not line:
+                    break
+                parts = line.decode("ascii", "ignore").strip().split()
+                if len(parts) < len(prop_names):
+                    break
+                vals = [cast(parts[idx]) for idx, cast in enumerate(casts)]
+                rec = dict(zip(prop_names, vals))
+                records.append(rec)
+                if print_output:
+                    keys = subset_keys(prop_names)
+                    view = ", ".join(f"{k}={rec[k]!r}" for k in keys if k in rec)
+                    print(f"{i} {view}")
+        else:
+            raise ValueError(f"Unsupported PLY format: {fmt}")
+
+    return records
+
+
 def _stream_sample_ply_to_arrays(
     input_path: str,
     target_points: int,
