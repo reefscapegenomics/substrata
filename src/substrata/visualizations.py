@@ -953,7 +953,7 @@ def show_classified_grid_cells(
     title=None,
     label_colors=None,
     max_output_points=50000,
-    use_grayscale_points=False,
+     k=False,
 ):
     """
     Show a 2D plot with grid cells colored by majority classification.
