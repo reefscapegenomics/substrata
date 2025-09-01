@@ -90,7 +90,6 @@ class FireFish:
             ax2.set_xlim([min(cam_timestamps), max(cam_timestamps)])
 
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
-        plt.show()
         return fig
 
     def get_offset_of_first_photo_from_firefish_start(self, cams):
@@ -331,6 +330,9 @@ class FireFish:
             target_depth=target_depth,
             depth_and_outlier_threshold=depth_and_outlier_threshold,
         )
+        print(
+            f"Determined camera time offset for target depth {target_depth}m: {offset}s"
+        )
         pdf.savefig(fig)
 
         # Determine up vector
@@ -392,7 +394,6 @@ class FireFish:
         ax2.tick_params(axis="y", labelcolor=color)
 
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
-        plt.show()
         return fig
 
 
