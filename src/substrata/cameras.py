@@ -345,14 +345,16 @@ class Cameras:
             int: The difference in seconds between the first and last camera
                 timestamps.
         """
+        import substrata.firefish as firefish
+
         cams_with_datetime = [
             cam for cam in self.data.values() if hasattr(cam, "datetime")
         ]
         first_cam = cams_with_datetime[0]
         last_cam = cams_with_datetime[-1]
         return int(
-            utils.get_unix_time(last_cam.datetime)
-            - utils.get_unix_time(first_cam.datetime)
+            firefish.get_unix_time(last_cam.datetime)
+            - firefish.get_unix_time(first_cam.datetime)
         )
 
     def get_up_vector_from_camera_depths(self):
