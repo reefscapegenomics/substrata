@@ -1,7 +1,7 @@
 # Standard Library
 import logging
 import os
-import datetime
+from datetime import datetime
 import sys
 
 # Third-Party Libraries
