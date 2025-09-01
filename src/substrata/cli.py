@@ -160,6 +160,84 @@ def main():
         help=("Optional filter for cameras by filepath postfix (e.g., '.photos')."),
     )
 
+    # cams2video
+    p_c2v = subparsers.add_parser(
+        "cams2video",
+        help=(
+            "Create a video from cameras by drawing image matches; supports optional SAM predictor and PCD."
+        ),
+    )
+    p_c2v.add_argument(
+        "--cams-xml",
+        dest="cams_xml",
+        type=str,
+        default=None,
+        help=(
+            "Path to .cams.xml file. Default: <cwd_basename>.cams.xml in current folder."
+        ),
+    )
+    p_c2v.add_argument(
+        "--cams-meta",
+        dest="cams_meta",
+        type=str,
+        default=None,
+        help=(
+            "Path to cameras metadata .meta.json file. Default: <cwd_basename>.meta.json."
+        ),
+    )
+    p_c2v.add_argument(
+        "--annotations-file",
+        dest="annotations_file",
+        type=str,
+        default=None,
+        help=("Path to annotations CSV. Required for drawing matches (no default)."),
+    )
+    p_c2v.add_argument(
+        "--pcd-filename",
+        dest="pcd_filename",
+        type=str,
+        default=None,
+        help=(
+            "Optional point cloud (PLY) filepath. Default: <cwd_basename>.ply in current folder."
+        ),
+    )
+    p_c2v.add_argument(
+        "--sam-checkpoint",
+        dest="sam_checkpoint",
+        type=str,
+        default=None,
+        help=("Optional SAM2 checkpoint to enable segmentation overlays on frames."),
+    )
+    p_c2v.add_argument(
+        "--sam-config",
+        dest="sam_config",
+        type=str,
+        default="sam2_hiera_l.yaml",
+        help=("Optional SAM2 model config (default: sam2_hiera_l.yaml)."),
+    )
+    p_c2v.add_argument(
+        "--output-path",
+        dest="output_path",
+        type=str,
+        default=None,
+        help=(
+            "Directory to save frames and video. Default: <cwd_basename>_video in current folder."
+        ),
+    )
+    p_c2v.add_argument(
+        "--use-label-column",
+        dest="use_label_column",
+        action="store_true",
+        help=("Use label column from annotations when drawing matches (default: off)."),
+    )
+    p_c2v.add_argument(
+        "--resize-width",
+        dest="resize_width",
+        type=int,
+        default=None,
+        help=("Optional width to resize images when creating frames (pixels)."),
+    )
+
     args = parser.parse_args()
 
     if args.command == "decimate":
@@ -251,6 +329,60 @@ def main():
         )
     elif args.command == "head":
         ply_head(args.pcd_filename, n=args.num, print_output=True)
+    elif args.command == "cams2video":
+        # Build defaults from current directory name
+        cwd = os.getcwd()
+        base = os.path.basename(cwd.rstrip(os.sep))
+
+        cams_xml = args.cams_xml or os.path.join(cwd, f"{base}.cams.xml")
+        cams_meta = args.cams_meta or os.path.join(cwd, f"{base}.meta.json")
+        output_path = args.output_path or os.path.join(cwd, f"{base}_video")
+        pcd_filename = args.pcd_filename or os.path.join(cwd, f"{base}.ply")
+
+        # Required: annotations
+        if not args.annotations_file:
+            raise SystemExit(
+                "--annotations-file is required for cams2video (no default)."
+            )
+
+        # Lazy imports
+        from substrata.cameras import Cameras
+        from substrata import visualizations
+        from substrata.segmentation import get_sam2_predictor
+
+        # Initialize Cameras
+        cams = Cameras(cams_meta_filepath=cams_meta, cams_xml_filepath=cams_xml)
+
+        # Initialize Annotations
+        anns = Annotations()
+        anns.get_annotations_from_file(
+            args.annotations_file, header=True, orig_coords_only=False
+        )
+
+        # Initialize PCD
+        pcd = PointCloud(pcd_filename) if pcd_filename else None
+
+        # Optional SAM2 predictor
+        sam_predictor = None
+        if args.sam_checkpoint:
+            sam_predictor = get_sam2_predictor(
+                args.sam_checkpoint, model_cfg=args.sam_config
+            )
+
+        # Ensure output directory exists
+        if not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+
+        # Create video
+        visualizations.create_video_from_cams(
+            cams,
+            anns,
+            output_path,
+            sam_predictor=sam_predictor,
+            pcd=pcd,
+            use_label_column=args.use_label_column,
+            resize_width=args.resize_width,
+        )
 
 
 if __name__ == "__main__":
