@@ -14,3 +14,6 @@ dependencies = [
     "numpy>=1.22",
 ]
 # optional: include license, classifiers, etc. 
+
+[project.scripts]
+substrata = "substrata.cli:main"

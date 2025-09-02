@@ -9,8 +9,8 @@ channels:
 dependencies:
   - python=3.10
   - open3d
-  - opencv-python
-  - torch
+  - opencv
+  - pytorch
   - joblib
   - pandas
   - scikit-learn
