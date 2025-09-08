@@ -89,6 +89,11 @@ class Annotations:
             if annotation.image_match is not None
         }
 
+    @property
+    def world_transform_is_identity(self) -> bool:
+        """Check if the world_transform is the identity matrix."""
+        return np.allclose(self.world_transform, np.eye(4))
+
     def append(self, annotation):
         if annotation.id in self.data:
             raise ValueError(f"Annotation with id {annotation.id} already exists.")
@@ -800,10 +805,15 @@ class Annotation:
         intercept_radius=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
         reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
         reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
+        enabled_cameras_only=True,
     ):
         """Get all cameras where the annotation is in view."""
         image_matches = []
         for cam in cams:
+            # Skip disabled cameras if enabled_cameras_only is True
+            if enabled_cameras_only and hasattr(cam, 'enabled') and cam.enabled is False:
+                continue
+                
             # Get pixel coordinates for each camera
             x, y, depth, relevance = cam.get_pixel_coords(
                 self.orig_coords, use_orig_coords=use_orig_coords
@@ -996,6 +1006,12 @@ class Scalebars:
             Scalebar(pred_scalebar[0], pred_scalebar[1], pred_scalebar[2])
             for pred_scalebar in scalebar_data
         ]
+        # Initialize summary attributes
+        self.scalebars = None
+        self.scalefactor = None
+        self.var = None
+        self.sterr = None
+        
         if target_data is not None:
             # If target_data is an Annotations instance, convert to dict of coords
             if hasattr(target_data, "data") and isinstance(target_data.data, dict):
@@ -1007,6 +1023,51 @@ class Scalebars:
                 self.store_target_coords(target_data_dict)
             else:
                 self.store_target_coords(target_data)
+    
+    def __str__(self) -> str:
+        """
+        Returns a summary of the scalebars and their calculated metrics.
+        """
+        lines = ["Scalebars("]
+        
+        # Basic information
+        lines.append(f"  num_scalebars={len(self.data)},")
+        
+        # Show individual scalebar details
+        for i, scalebar in enumerate(self.data):
+            target1_set = scalebar.target1_coords is not None
+            target2_set = scalebar.target2_coords is not None
+            scalebar_summary = f"  scalebar_{i+1}='{scalebar.target1_label}'-'{scalebar.target2_label}' ({scalebar.length}m)"
+            if target1_set and target2_set:
+                # Calculate scaled distance using raw_dist and overall scalefactor
+                if hasattr(scalebar, 'raw_dist') and self.scalefactor is not None:
+                    scaled_distance = scalebar.raw_dist * self.scalefactor
+                    residual = scaled_distance - scalebar.length
+                    scalebar_summary += f" [dist={scaled_distance:.4f}, residual={residual:+.4f}]"
+                else:
+                    scalebar_summary += f" [coords_set]"
+            elif target1_set or target2_set:
+                scalebar_summary += f" [partial_coords]"
+            else:
+                scalebar_summary += f" [no_coords]"
+            lines.append(scalebar_summary + ",")
+        
+        # Summary statistics (if calculated)
+        if self.scalefactor is not None:
+            lines.append(f"  calculated_scalefactor={self.scalefactor:.6f},")
+        if self.var is not None:
+            lines.append(f"  variance={self.var:.10f},")
+        if self.sterr is not None:
+            lines.append(f"  std_error={self.sterr:.10f},")
+        if self.scalebars is not None:
+            lines.append(f"  valid_scalebars={self.scalebars}")
+        
+        # Remove trailing comma from last line if present
+        if len(lines) > 1 and lines[-1].endswith(','):
+            lines[-1] = lines[-1][:-1]
+        
+        lines.append(")")
+        return "\n".join(lines)
 
     def store_target_coords(self, target_data):
         for target_label, target_coords in target_data.items():
@@ -1136,8 +1197,8 @@ class Scalebar(object):
             x2 = float(self.target2_coords[0])
             y2 = float(self.target2_coords[1])
             z2 = float(self.target2_coords[2])
-            dist = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
-            self.scalefactor = self.length / dist
+            self.raw_dist = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
+            self.scalefactor = self.length / self.raw_dist
             # logger.info(
             #     f"Scalebar: {self.target1_label} - {self.target2_label}: {dist} m"
             #     f" ({self.length} m)"

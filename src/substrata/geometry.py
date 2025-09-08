@@ -85,7 +85,7 @@ class Transform:
 
         A positive ``dz`` moves geometry *toward* the viewer if +Z is up.
         """
-        return cls.from_translation((0.0, 0.0, -float(dz)))
+        return cls.from_translation((0.0, 0.0, float(dz)))
 
     @classmethod
     def shift_to_positive_xy(cls, pcd: object) -> "Transform":

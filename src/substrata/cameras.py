@@ -78,6 +78,11 @@ class Cameras:
     def items(self):
         return self.data.items()
 
+    @property
+    def world_transform_is_identity(self) -> bool:
+        """Check if the world_transform is the identity matrix."""
+        return np.allclose(self.world_transform, np.eye(4))
+
     def append(self, cam):
         if cam.cam_id in self.data:
             raise ValueError(f"Camera with id {cam.cam_id} already exists.")
@@ -170,6 +175,16 @@ class Cameras:
                     cam_data["center"],
                     cam_data["path"],
                 )
+                if "reference" in cam_data:
+                    self.data[cam_id].reference = cam_data["reference"]
+                    self.data[cam_id].depth = cam_data["reference"][2]
+                if "reference_accuracy" in cam_data:
+                    self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
+                    self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
+                if "center_crs" in cam_data:
+                    self.data[cam_id].center_crs = cam_data["center_crs"]
+                if "enabled" in cam_data:
+                    self.data[cam_id].enabled = bool(cam_data["enabled"])
 
     def get_cam_sensor_parameters_from_file(self, cams_xml_filepath):
         """Get sensor information from a .cams.xml file (Metashape export).
@@ -357,11 +372,14 @@ class Cameras:
             - firefish.get_unix_time(first_cam.datetime)
         )
 
-    def get_up_vector_from_camera_depths(self):
+    def get_up_vector_from_camera_depths(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD, plot=False):
         """Compute the up vector using least-squares regression on camera depths.
 
         Fits a linear regression between the camera 3D points and their depths to
         find the dominant depth direction. Also stores predicted depths and errors.
+
+        Args:
+            plot (bool): If True, create a visualization of the regression fit.
 
         Returns:
             np.ndarray: The coefficient vector representing the up vector.
@@ -369,27 +387,68 @@ class Cameras:
         cams_filtered = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth") and hasattr(cam, "coords")
+            if hasattr(cam, "depth") 
+            and hasattr(cam, "coords") 
+            and (not hasattr(cam, "depth_acc") 
+                 or cam.depth_acc <= depth_accuracy_threshold)
         ]
+    
+        num_matches = len(cams_filtered)
+        if num_matches < 2:
+            # Not enough points to fit a regression
+            raise ValueError(
+                f"Not enough matching cameras/depths for regression (found {num_matches})"
+            )
+
         cam_ids = [cam.cam_id for cam in cams_filtered]
         points = np.array([cam.coords for cam in cams_filtered])
         depths = np.array([cam.depth for cam in cams_filtered])
+
+        # 1) Fit a linear regression model:  depth ≈ intercept + coef·(x,y,z)
         model = LinearRegression()
         model.fit(points, depths)
+        coef = model.coef_  # shape (3,)
+        depth_offset = model.intercept_
+
+        # 2) Evaluate sign so that stepping along 'coef' decreases depth:
+        centroid = np.mean(points, axis=0)  # single 3D point
+        depth_centroid = model.predict([centroid])[0]
+
+        # Take a small step in the direction of 'coef' and predict depth
+        step_size = 1.0
+        p_step = centroid + step_size * coef
+        depth_step = model.predict([p_step])[0]
+
+        # If stepping along coef yields a more negative depth, flip it
+        if depth_step < depth_centroid:
+            coef = -coef
+
+        # 3) Store predicted depths and residuals from the (original) linear model
         depths_predicted = model.predict(points)
         depths_residuals = depths - depths_predicted
-        for i, cam_id in enumerate(cam_ids):
-            self.data[cam_id].depth_pred = depths_predicted[i]
-            self.data[cam_id].depth_residual = depths_residuals[i]
+
         mse = mean_squared_error(depths, depths_predicted)
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(depths, depths_predicted)
         r2 = r2_score(depths, depths_predicted)
-        print(f"Mean Squared Error (MSE): {mse}")
-        print(f"Root Mean Squared Error (RMSE): {rmse}")
-        print(f"Mean Absolute Error (MAE): {mae}")
-        print(f"R-squared (R^2): {r2}")
-        return model.coef_
+
+        for idx, cam_id in enumerate(cam_ids):
+            self.data[cam_id].depth_pred = depths_predicted[idx]
+            self.data[cam_id].depth_residual = depths_residuals[idx]
+
+        # Build a dict of residuals if you need them downstream
+        cam_depth_residuals = dict(zip(cam_ids, depths_residuals))
+
+        # 4) Plot the regression fit if requested
+        if plot:
+            from substrata import visualizations
+            visualizations.plot_depth_regression(
+                depths, depths_predicted, depths_residuals, 
+                r2, rmse, mae, num_matches, coef, depth_offset
+            )
+
+        # 5) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
+        return coef, depth_offset, mse, rmse, mae, r2, cam_depth_residuals, num_matches
 
 
 class Camera:
@@ -1068,8 +1127,23 @@ class ImageMatch:
             cropped_img = visualizations.get_crop_img(
                 self.cam.filepath, self.x, self.y, crop_w, crop_h
             )
-        cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
+        # cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
+        # plt.imshow(cropped_img)
+        # plt.show()
+        
+        # Expecting PIL image, display directly
         plt.imshow(cropped_img)
+        
+        # Highlight the center pixel in red
+        if hasattr(cropped_img, 'size'):  # PIL image
+            center_x = cropped_img.size[0] // 2
+            center_y = cropped_img.size[1] // 2
+        else:  # numpy array
+            center_y, center_x = cropped_img.shape[:2]
+            center_x = center_x // 2
+            center_y = center_y // 2
+        
+        plt.plot(center_x, center_y, 'ro', markersize=8)
         plt.show()
 
 

@@ -169,7 +169,7 @@ class FireFish:
 
         def safe_get_mae(offset, n_treshold=50):
             try:
-                result = self.get_up_vector_from_camera_depths(cams, offset)
+                result = self.get_up_vector_from_camera_depths_with_offset(cams, offset)
                 mae = result[4]
                 num_matches = result[7]
                 # If mae is nan, inf, or result is not valid, skip
@@ -211,7 +211,7 @@ class FireFish:
         fig = self.__plot_matches(offsets, maes, maes)
         return lowest_mae_offset, fig
 
-    def get_up_vector_from_camera_depths(self, cams, offset):
+    def get_up_vector_from_camera_depths_with_offset(self, cams, offset):
         """Compute the up vector by doing a least-squared regression between the
         3D points and camera depths to find the vector that is most strongly
         associated with the camera depth measurements. Also returns depth offset
@@ -345,7 +345,7 @@ class FireFish:
             r2,
             cam_depth_residuals,
             num_matches,
-        ) = self.get_up_vector_from_camera_depths(cams, offset)
+        ) = self.get_up_vector_from_camera_depths_with_offset(cams, offset)
         cams.save_camera_attributes(camdepths_filepath)
 
         # Visualize altitude matches

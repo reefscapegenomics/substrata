@@ -1,0 +1,2 @@
+[console_scripts]
+substrata = substrata.cli:main

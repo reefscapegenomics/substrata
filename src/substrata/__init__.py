@@ -9,6 +9,7 @@ from .logging import logger
 from .annotations import *
 from .cameras import *
 from .pointclouds import *
+from .initializer import *
 
 from .measurements import *
 

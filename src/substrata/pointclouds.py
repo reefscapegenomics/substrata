@@ -92,7 +92,7 @@ class PointCloud:
         """
         self.o3d_pcd = o3d.geometry.PointCloud()
         self.name: Optional[str] = None
-        self.world_transform: np.ndarray = np.eye(4)  # identity matrix
+        self.world_transform: np.ndarray = np.eye(4)  # TODO: use Geometry.Transform
         self.transforms: List[np.ndarray] = []
         if filepath:
             self.read_point_cloud(filepath, max_points)
@@ -146,6 +146,11 @@ class PointCloud:
         """
         bounding_box = self.o3d_pcd.get_axis_aligned_bounding_box()
         return [bounding_box.get_min_bound(), bounding_box.get_max_bound()]
+    
+    @property
+    def world_transform_is_identity(self) -> bool:
+        """Check if the world_transform is the identity matrix."""
+        return np.allclose(self.world_transform, np.eye(4))
 
     def read_point_cloud(
         self,
@@ -1124,14 +1129,18 @@ def decimate_ply_file(
         fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
 
         k = max(0, min(int(target_points), n_vertices))
-        out_header = _make_output_header(fmt, vprops, k)
-        with open(output_path, "wb") as fout:
-            fout.write(out_header)
-
-            if k == 0:
-                return
-            if k >= n_vertices:
-                # fast stream copy
+        if k == 0:
+            # Write empty PLY file
+            out_header = _make_output_header(fmt, vprops, 0)
+            with open(output_path, "wb") as fout:
+                fout.write(out_header)
+            return
+            
+        if k >= n_vertices:
+            # fast stream copy - no decimation needed
+            out_header = _make_output_header(fmt, vprops, n_vertices)
+            with open(output_path, "wb") as fout:
+                fout.write(out_header)
                 bytes_left = n_vertices * rec_size
                 with tqdm(
                     total=n_vertices, unit="vtx", disable=not show_progress
@@ -1143,41 +1152,53 @@ def decimate_ply_file(
                         fout.write(chunk)
                         bytes_left -= len(chunk)
                         pbar.update(len(chunk) // rec_size)
-                return
+            return
 
-            rng = np.random.default_rng()
-            taken = 0
-            seen = 0
-            remaining = n_vertices
-            rec_dtype = np.dtype(f"V{rec_size}")  # “opaque” record view
-            chunk_recs = max(1, chunk_bytes // rec_size)
+        # Two-pass approach: first pass to collect samples, second pass to write with correct header
+        rng = np.random.default_rng()
+        taken = 0
+        seen = 0
+        remaining = n_vertices
+        rec_dtype = np.dtype(f"V{rec_size}")  # "opaque" record view
+        chunk_recs = max(1, chunk_bytes // rec_size)
+        
+        # Collect all selected vertex data first
+        selected_vertices = []
 
-            with tqdm(
-                total=n_vertices,
-                unit="vtx",
-                desc="Read/Sample",
-                disable=not show_progress,
-            ) as pbar:
-                while remaining > 0 and taken < k:
-                    to_read = int(min(remaining, chunk_recs))
-                    buf = fin.read(to_read * rec_size)
-                    if len(buf) != to_read * rec_size:
-                        raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
+        with tqdm(
+            total=n_vertices,
+            unit="vtx",
+            desc="Read/Sample",
+            disable=not show_progress,
+        ) as pbar:
+            while remaining > 0 and taken < k:
+                to_read = int(min(remaining, chunk_recs))
+                buf = fin.read(to_read * rec_size)
+                if len(buf) != to_read * rec_size:
+                    raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
 
-                    # Vectorized selection
-                    need = k - taken
-                    p = min(1.0, need / remaining)
-                    mask = rng.random(to_read) < p
+                # Vectorized selection
+                need = k - taken
+                p = min(1.0, need / remaining)
+                mask = rng.random(to_read) < p
 
-                    # Assemble selected records as bytes in one go
-                    arr = np.frombuffer(buf, dtype=rec_dtype, count=to_read)
-                    sel = arr[mask]
-                    if sel.size > need:
-                        sel = sel[rng.choice(sel.size, size=need, replace=False)]
-                    if sel.size:
-                        fout.write(sel.tobytes())
-                        taken += sel.size
+                # Assemble selected records as bytes in one go
+                arr = np.frombuffer(buf, dtype=rec_dtype, count=to_read)
+                sel = arr[mask]
+                if sel.size > need:
+                    sel = sel[rng.choice(sel.size, size=need, replace=False)]
+                if sel.size:
+                    selected_vertices.append(sel.tobytes())
+                    taken += sel.size
 
-                    seen += to_read
-                    remaining = n_vertices - seen
-                    pbar.update(to_read)
+                seen += to_read
+                remaining = n_vertices - seen
+                pbar.update(to_read)
+        
+        # Now write the file with the correct vertex count
+        actual_count = taken
+        out_header = _make_output_header(fmt, vprops, actual_count)
+        with open(output_path, "wb") as fout:
+            fout.write(out_header)
+            for vertex_data in selected_vertices:
+                fout.write(vertex_data)

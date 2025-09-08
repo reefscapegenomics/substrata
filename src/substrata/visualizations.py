@@ -542,54 +542,74 @@ def save_img(img_path, save_path, highlight_pixels=None):
     cv2.imwrite(save_path, image)
 
 
-def show_cam_residuals(cams, cam_depth_residuals, transform=np.eye(4)):
-    """Show camera residuals"""
-    # Filter cameras based on cam_id being in cam_depth_residuals keys
+def show_cam_residuals(cams, width=10, height=5):
+    """Show camera residuals using cam.depth_residual for each camera.
+    
+    Cameras with depth_residual are colored by residual value (blue-white-red).
+    Cameras without depth_residual are shown in gray.
+    
+    Args:
+        cams: Camera collection with data attribute containing cameras
+        width (float): Figure width in inches (default: 10)
+        height (float): Figure height in inches (default: 5)
+    """
+    # Filter cameras that have both coords and depth_residual
     cams_with_depths_and_coords = [
-        cam for cam in cams.data.values() if cam.cam_id in cam_depth_residuals
+        cam for cam in cams.data.values()
+        if hasattr(cam, "coords") and hasattr(cam, "depth_residual") and cam.coords is not None
     ]
-    points = np.array([cam.coords for cam in cams_with_depths_and_coords])
-
-    # Apply transformation
-    points_homogeneous = np.c_[points, np.ones(points.shape[0])]
-    points_homogeneous = points_homogeneous.T
-    transformed_points_homogeneous = np.dot(transform, points_homogeneous)
-    transformed_points = transformed_points_homogeneous[:3].T
-
-    # Get residuals from cam_depth_residuals
-    residuals = np.array(
-        [cam_depth_residuals[cam.cam_id] for cam in cams_with_depths_and_coords]
-    )
-
-    # Normalize the residuals (z-values) for color mapping
-    max_abs_residual = max(abs(residuals))
-    norm = plt.Normalize(vmin=-max_abs_residual, vmax=max_abs_residual)
-    cmap = plt.cm.bwr  # Blue-White-Red colormap
+    
+    # Filter cameras that have coords but no depth_residual
+    cams_without_depths = [
+        cam for cam in cams.data.values()
+        if hasattr(cam, "coords") and cam.coords is not None and 
+        (not hasattr(cam, "depth_residual") or cam.depth_residual is None)
+    ]
+    
+    if not cams_with_depths_and_coords and not cams_without_depths:
+        raise ValueError("No cameras with coords found.")
 
     # Plot
-    fig = plt.figure()
-    plt.scatter(
-        transformed_points[:, 0],
-        transformed_points[:, 1],
-        c=residuals,
-        cmap=cmap,
-        norm=norm,
-        edgecolor="black",
-    )
-    plt.colorbar(label="Residual (z-value)")
-    plt.title("Residuals Plot (as color)")
+    fig = plt.figure(figsize=(width, height))
+    
+    # Plot cameras with depth residuals
+    if cams_with_depths_and_coords:
+        points = np.array([cam.coords for cam in cams_with_depths_and_coords])
+        residuals = np.array([cam.depth_residual for cam in cams_with_depths_and_coords])
+
+        # Normalize the residuals (z-values) for color mapping
+        max_abs_residual = max(abs(residuals))
+        norm = plt.Normalize(vmin=-max_abs_residual, vmax=max_abs_residual)
+        cmap = plt.cm.bwr  # Blue-White-Red colormap
+
+        plt.scatter(
+            points[:, 0],
+            points[:, 1],
+            c=residuals,
+            cmap=cmap,
+            norm=norm,
+            edgecolor="black"
+        )
+        plt.colorbar(label="Residual (z-value)")
+    
+    # Plot cameras without depth residuals in gray
+    if cams_without_depths:
+        points_no_depths = np.array([cam.coords for cam in cams_without_depths])
+        plt.scatter(
+            points_no_depths[:, 0],
+            points_no_depths[:, 1],
+            c="gray",
+            edgecolor="black"
+        )
+    
+    plt.title("Camera Residuals Plot")
+    plt.xlabel("X coordinate")
+    plt.ylabel("Y coordinate")
     plt.show()
     return fig
 
-    ## Plot
-    # x_values = np.arange(len(residuals))
-    # plt.scatter(x_values, residuals, alpha=0.5)
-    # plt.axhline(0, color='red', linestyle='--', linewidth=1)  # Horizontal line at y = 0
-    # plt.title('Residuals Plot (as value)')
-    # plt.show()
 
-
-def get_crop_img(img_path, crop_x, crop_y, crop_w, crop_h):
+def get_crop_img_cv2(img_path, crop_x, crop_y, crop_w, crop_h):
     """Get cropped image"""
     img = cv2.imread(img_path)
     if img is None:
@@ -613,6 +633,32 @@ def get_crop_img(img_path, crop_x, crop_y, crop_w, crop_h):
             f"Crop area falls outside image bounds: center=({crop_x}, {crop_y}), size=({crop_w}x{crop_h}), image={img_path}"
         )
     cropped_img = img[top:bottom, left:right]
+    return cropped_img
+
+
+def get_crop_img(img_path, crop_x, crop_y, crop_w, crop_h):
+    """Get cropped image using PIL"""
+    from PIL import Image
+    
+    img = Image.open(img_path)
+    
+    left = int(crop_x - crop_w / 2)
+    top = int(crop_y - crop_h / 2)
+    right = left + int(crop_w)
+    bottom = top + int(crop_h)
+
+    w_img, h_img = img.size
+    left = max(0, left)
+    top = max(0, top)
+    right = min(w_img, right)
+    bottom = min(h_img, bottom)
+
+    # If the requested crop falls completely outside the image, raise an error
+    if left >= right or top >= bottom:
+        raise ValueError(
+            f"Crop area falls outside image bounds: center=({crop_x}, {crop_y}), size=({crop_w}x{crop_h}), image={img_path}"
+        )
+    cropped_img = img.crop((left, top, right, bottom))
     return cropped_img
 
 
@@ -702,7 +748,7 @@ def save_cropped_image_matches_to_pdf(
     print(f"PDF created: {output_filepath}")
 
 
-def get_crop_img_from_masks(
+def get_crop_img_from_masks( #TODO: needs PIL version
     image_match,
     output_img_w=1000,
     output_img_h=1000,
@@ -1424,7 +1470,7 @@ def plot_2d_ortho(
     else:
         fig = ax.figure
 
-    ax.imshow(img)
+    ax.imshow(img, origin='lower')
     ax.axis("off")
     if title is not None:
         ax.set_title(title)
@@ -1981,6 +2027,62 @@ def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:
     plt.ylabel("Y")
     plt.title("XY PCA")
     plt.show()
+
+
+def plot_depth_regression(
+    depths, depths_predicted, depths_residuals, 
+    r2, rmse, mae, num_matches, coef, depth_offset
+):
+    """
+    Plot depth regression analysis with actual vs predicted depths and residual analysis.
+    
+    Args:
+        depths (np.ndarray): Actual depth values
+        depths_predicted (np.ndarray): Predicted depth values from regression
+        depths_residuals (np.ndarray): Residuals (actual - predicted)
+        r2 (float): R-squared score
+        rmse (float): Root mean square error
+        mae (float): Mean absolute error
+        num_matches (int): Number of data points used
+        coef (np.ndarray): Regression coefficients (up vector)
+        depth_offset (float): Depth offset from regression
+    
+    Returns:
+        matplotlib.figure.Figure: The generated figure
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot 1: Actual vs Predicted depths
+    ax1.scatter(depths, depths_predicted, alpha=0.6, edgecolor='black')
+    ax1.plot([depths.min(), depths.max()], [depths.min(), depths.max()], 'r--', lw=2, label='Perfect fit')
+    ax1.set_xlabel('Actual Depth (m)')
+    ax1.set_ylabel('Predicted Depth (m)')
+    ax1.set_title(f'Depth Regression Fit\nR² = {r2:.3f}, RMSE = {rmse:.3f}m')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Residuals vs Predicted
+    ax2.scatter(depths_predicted, depths_residuals, alpha=0.6, edgecolor='black')
+    ax2.axhline(y=0, color='r', linestyle='--', lw=2, label='Zero residual')
+    ax2.set_xlabel('Predicted Depth (m)')
+    ax2.set_ylabel('Residuals (m)')
+    ax2.set_title(f'Residual Analysis\nMAE = {mae:.3f}m, n = {num_matches}')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary statistics
+    print(f"\nRegression Summary:")
+    print(f"  Cameras used: {num_matches}")
+    print(f"  R² score: {r2:.4f}")
+    print(f"  RMSE: {rmse:.4f} m")
+    print(f"  MAE: {mae:.4f} m")
+    print(f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]")
+    print(f"  Depth offset: {depth_offset:.4f} m")
+    
+    return fig
 
 
 def plot_views(
