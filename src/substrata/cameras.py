@@ -53,8 +53,9 @@ class Cameras:
     def coords(self):
         return [camera.coords for camera in self.data.values()]
 
-    def depths(self):
-        return [camera.depth for camera in self.data.values()]
+    # @property
+    # def depths(self):
+    #     return [camera.depth for camera in self.data.values()]
 
     def __getitem__(self, key):
         return self.data[key]
@@ -442,14 +443,41 @@ class Cameras:
         # 4) Plot the regression fit if requested
         if plot:
             from substrata import visualizations
-            visualizations.plot_depth_regression(
-                depths, depths_predicted, depths_residuals, 
-                r2, rmse, mae, num_matches, coef, depth_offset
-            )
+            visualizations.plot_depth_regression(depths, depths_predicted)
+
+        # Print summary statistics
+        print(f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]")
+        print(f"  Depth offset: {depth_offset:.4f} m")
 
         # 5) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
         return coef, depth_offset, mse, rmse, mae, r2, cam_depth_residuals, num_matches
-
+    
+    def get_depths_and_preds(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD):
+        cams_filtered = [
+            cam
+            for cam in self.data.values()
+            if hasattr(cam, "depth") 
+            and hasattr(cam, "depth_pred") 
+            and (not hasattr(cam, "depth_acc") 
+                 or cam.depth_acc <= depth_accuracy_threshold)
+        ]
+        
+        depths = [camera.depth for camera in cams_filtered] 
+        depths_pred = [camera.depth_pred for camera in cams_filtered]
+        return depths, depths_pred
+    
+    def get_depths_and_z_coords(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD):
+        cams_filtered = [
+            cam
+            for cam in self.data.values()
+            if hasattr(cam, "depth") 
+            and hasattr(cam, "coords") 
+            and (not hasattr(cam, "depth_acc") 
+                 or cam.depth_acc <= depth_accuracy_threshold)
+        ]
+        depths = [camera.depth for camera in cams_filtered]
+        z_coords = [camera.coords[2] for camera in cams_filtered]
+        return depths, z_coords
 
 class Camera:
     """Class that holds information about a single camera."""

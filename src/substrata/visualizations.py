@@ -2029,59 +2029,69 @@ def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:
     plt.show()
 
 
-def plot_depth_regression(
-    depths, depths_predicted, depths_residuals, 
-    r2, rmse, mae, num_matches, coef, depth_offset
-):
+def plot_depth_regression(depths, depths_predicted):
     """
     Plot depth regression analysis with actual vs predicted depths and residual analysis.
-    
+
+    Only the arrays of actual depths and predicted depths are required. Residuals and
+    evaluation metrics are computed internally.
+
     Args:
-        depths (np.ndarray): Actual depth values
-        depths_predicted (np.ndarray): Predicted depth values from regression
-        depths_residuals (np.ndarray): Residuals (actual - predicted)
-        r2 (float): R-squared score
-        rmse (float): Root mean square error
-        mae (float): Mean absolute error
-        num_matches (int): Number of data points used
-        coef (np.ndarray): Regression coefficients (up vector)
-        depth_offset (float): Depth offset from regression
-    
+        depths (np.ndarray): Actual depth values.
+        depths_predicted (np.ndarray): Predicted depth values from regression.
+
     Returns:
-        matplotlib.figure.Figure: The generated figure
+        matplotlib.figure.Figure: The generated figure.
     """
+    depths = np.asarray(depths, dtype=float)
+    depths_predicted = np.asarray(depths_predicted, dtype=float)
+
+    # Compute residuals and metrics
+    depths_residuals = depths - depths_predicted
+    num_matches = int(len(depths))
+    mse = float(np.mean((depths - depths_predicted) ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(depths - depths_predicted)))
+    ss_res = float(np.sum((depths - depths_predicted) ** 2))
+    ss_tot = float(np.sum((depths - np.mean(depths)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
+
     # Plot 1: Actual vs Predicted depths
-    ax1.scatter(depths, depths_predicted, alpha=0.6, edgecolor='black')
-    ax1.plot([depths.min(), depths.max()], [depths.min(), depths.max()], 'r--', lw=2, label='Perfect fit')
-    ax1.set_xlabel('Actual Depth (m)')
-    ax1.set_ylabel('Predicted Depth (m)')
-    ax1.set_title(f'Depth Regression Fit\nR² = {r2:.3f}, RMSE = {rmse:.3f}m')
+    ax1.scatter(depths, depths_predicted, alpha=0.6, edgecolor="black")
+    ax1.plot(
+        [depths.min(), depths.max()],
+        [depths.min(), depths.max()],
+        "r--",
+        lw=2,
+        label="Perfect fit",
+    )
+    ax1.set_xlabel("Actual Depth (m)")
+    ax1.set_ylabel("Predicted Depth (m)")
+    ax1.set_title(f"Depth Regression Fit\nR² = {r2:.3f}, RMSE = {rmse:.3f}m")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    
+
     # Plot 2: Residuals vs Predicted
-    ax2.scatter(depths_predicted, depths_residuals, alpha=0.6, edgecolor='black')
-    ax2.axhline(y=0, color='r', linestyle='--', lw=2, label='Zero residual')
-    ax2.set_xlabel('Predicted Depth (m)')
-    ax2.set_ylabel('Residuals (m)')
-    ax2.set_title(f'Residual Analysis\nMAE = {mae:.3f}m, n = {num_matches}')
+    ax2.scatter(depths_predicted, depths_residuals, alpha=0.6, edgecolor="black")
+    ax2.axhline(y=0, color="r", linestyle="--", lw=2, label="Zero residual")
+    ax2.set_xlabel("Predicted Depth (m)")
+    ax2.set_ylabel("Residuals (m)")
+    ax2.set_title(f"Residual Analysis\nMAE = {mae:.3f}m, n = {num_matches}")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.show()
-    
+
     # Print summary statistics
-    print(f"\nRegression Summary:")
+    print("\nRegression Summary:")
     print(f"  Cameras used: {num_matches}")
     print(f"  R² score: {r2:.4f}")
     print(f"  RMSE: {rmse:.4f} m")
     print(f"  MAE: {mae:.4f} m")
-    print(f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]")
-    print(f"  Depth offset: {depth_offset:.4f} m")
-    
+
     return fig
 
 
