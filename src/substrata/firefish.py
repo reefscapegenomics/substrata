@@ -1,7 +1,7 @@
 # Standard Library
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
 
 # Third-Party Libraries
@@ -163,24 +163,21 @@ class FireFish:
         # Calculate error statistics for offset range
         error_stats = []
 
-        # for offset in tqdm(range(time_range[0], time_range[1], time_step), desc="Evaluating errors for offsets..."):
-        #     model_coef, mse, rmse, mae, r2, cam_depth_residuals = self.get_up_vector_from_camera_depths(cams, offset)
-        #     error_stats.append({'offset': offset, 'mae': mae})
-
-        def safe_get_mae(offset, n_treshold=50):
+        def safe_get_mae(offset, n_treshold=100):
             try:
                 result = self.get_up_vector_from_camera_depths_with_offset(cams, offset)
-                mae = result[4]
-                num_matches = result[7]
+                # Return tuple is: (coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches)
+                mae = result[5]
+                num_matches = result[8]
                 # If mae is nan, inf, or result is not valid, skip
                 if np.isnan(mae) or np.isinf(mae) or num_matches < n_treshold:
                     return None
                 return {"offset": offset, "mae": mae}
-            except ValueError as e:
-                logger.warning(f"Skipping offset {offset} due to error: {e}")
-                return None
+            # except ValueError as e:
+            #     logger.warning(f"Skipping offset {offset} due to error: {e}")
+            #     return None
             except Exception as e:
-                logger.error(f"Unexpected error at offset {offset}: {e}")
+                #logger.error(f"Unexpected error at offset {offset}: {e}")
                 return None
 
         error_stats = Parallel(n_jobs=-1)(
@@ -236,11 +233,9 @@ class FireFish:
 
         num_matches = len(cam_points)
 
-        if num_matches < 2:
+        if num_matches < 50:
             # Not enough points to fit a regression
-            raise ValueError(
-                f"Not enough matching cameras/depths for regression (found {num_matches})"
-            )
+            raise ValueError()
 
         points = np.array(cam_points)
         depths = np.array(cam_depths)
@@ -250,6 +245,7 @@ class FireFish:
         model.fit(points, depths)
         coef = model.coef_  # shape (3,)
         depth_offset = model.intercept_
+        depth_per_unit = np.linalg.norm(coef)
 
         # 2) Evaluate sign so that stepping along 'coef' decreases depth:
         centroid = np.mean(points, axis=0)  # single 3D point
@@ -281,7 +277,7 @@ class FireFish:
         cam_depth_residuals = dict(zip(cam_ids, depths_residuals))
 
         # 4) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
-        return coef, depth_offset, mse, rmse, mae, r2, cam_depth_residuals, num_matches
+        return coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches
 
     def determine_up_vector(
         self,
@@ -289,19 +285,29 @@ class FireFish:
         target_depth,
         pcd,
         cams_filepath_postfix_filter=None,
+        cams_filename_prefix_filter=None,
         camdepths_filepath=None,
         pdf_output_filepath=None,
         depth_and_outlier_threshold=3,
+        offset=None,
     ):
         """
         Workflow method that will determine offset, then up vector and then outputs
         visualizations for manual review.
+
+        Optionally filter cameras by filepath postfix or prefix.
         """
         # Optionally filter cameras by filepath postfix
         if cams_filepath_postfix_filter is not None:
             cams = cams.subset_by_filepath_postfix(cams_filepath_postfix_filter)
             print(
                 f"Filtered cameras to {len(cams.items())} cameras using postfix {cams_filepath_postfix_filter}"
+            )
+        # Optionally filter cameras by filename prefix
+        if cams_filename_prefix_filter is not None:
+            cams = cams.subset_by_filename_prefix(cams_filename_prefix_filter)
+            print(
+                f"Filtered cameras to {len(cams.items())} cameras using prefix {cams_filename_prefix_filter}"
             )
 
         # Check if pcd has undergone a transformation (scaling)
@@ -324,21 +330,26 @@ class FireFish:
             cams.get_cam_dists(pcd, 15)
             cams.save_camera_attributes(camdepths_filepath)
 
-        # Determine camera time offset
-        offset, fig = self.determine_camera_time_offset(
-            cams,
-            target_depth=target_depth,
-            depth_and_outlier_threshold=depth_and_outlier_threshold,
-        )
-        print(
-            f"Determined camera time offset for target depth {target_depth}m: {offset}s"
-        )
-        pdf.savefig(fig)
+        # Determine camera time offset unless provided manually
+        if offset is None:
+            offset, fig = self.determine_camera_time_offset(
+                cams,
+                target_depth=target_depth,
+                depth_and_outlier_threshold=depth_and_outlier_threshold,
+            )
+            print(
+                f"Determined camera time offset for target depth {target_depth}m: {offset}s"
+            )
+            pdf.savefig(fig)
+        else:
+            self.remove_outlier_altitudes(depth_and_outlier_threshold)
+            print(f"Using manually provided time offset: {offset}s")
 
         # Determine up vector
         (
             up_vector,
             depth_offset,
+            depth_per_unit,
             mse,
             rmse,
             mae,
@@ -355,7 +366,7 @@ class FireFish:
         pdf.savefig(fig)
 
         # Apply transformations to pointcloud
-        pcd.apply_orientation_transforms(1, up_vector, depth_offset)
+        pcd.apply_orientation_transforms(1, up_vector, depth_offset, depth_per_unit)
 
         # # Convert cameras to annotations for visualization
         # cams_reload = cameras.Cameras(cams.cams_meta_filepath, cams.cams_xml_filepath)
@@ -366,10 +377,10 @@ class FireFish:
         fig = visualizations.plot(pcd, width=30, height=8, title=pcd.name)
         pdf.savefig(fig)
 
-        # Output text summary
+        # Output text summary including actual time offset
         text = [
-            "Timepoint: {0}\nUp vector: {1}\nDepth offset: {2}\n\nWorld Transform:\n{3}\n".format(
-                pcd.name, up_vector, depth_offset, pcd.world_transform
+            "Timepoint: {0}\nUp vector: {1}\nDepth offset: {2}\nDepth per unit: {3}\nTime offset: {4}s\n\nWorld Transform:\n{5}\n".format(
+                pcd.name, up_vector, depth_offset, depth_per_unit, offset, pcd.world_transform
             )
         ]
         fig = visualizations.plot_text("\n".join(text))
@@ -377,7 +388,7 @@ class FireFish:
         print(text)
 
         pdf.close()
-        return up_vector, depth_offset, pcd.world_transform
+        return up_vector, depth_offset, depth_per_unit, pcd.world_transform
 
     @staticmethod
     def __plot_matches(x_values, series1, series2):
@@ -398,23 +409,11 @@ class FireFish:
 
 
 def get_unix_time(unknown_datetime):
-    """Converts an unknown datetime representation to a Unix timestamp.
-
-    Args:
-        unknown_datetime (str or numeric): The datetime to convert. If a string, it
-            should match the format specified in settings.CAM_DATETIME_FORMAT. Otherwise,
-            it is assumed to already be a Unix timestamp.
-
-    Returns:
-        float: The Unix timestamp corresponding to the given datetime.
-    """
     if isinstance(unknown_datetime, str):
         return datetime.strptime(
             unknown_datetime, settings.CAM_DATETIME_FORMAT
-        ).timestamp()
-    else:
-        return unknown_datetime
-
+        ).replace(tzinfo=timezone.utc).timestamp()
+    return unknown_datetime
 
 def get_time_diff_in_secs(datetime1, datetime2):
     """Calculates the time difference in seconds between two datetime values.

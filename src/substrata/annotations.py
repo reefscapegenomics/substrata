@@ -301,10 +301,14 @@ class Annotations:
         """Get the first image match for each annotation."""
         image_matches = {}
         for ann in tqdm(self.data.values(), desc="Getting first image matches"):
-            match = ann.get_first_image_match(cams, pcd)
-            if match:
-                image_matches[ann.id] = match
-                # ann.image_matches.append(match) TODO: INCORRECT
+            try:
+                match = ann.get_first_image_match(cams, pcd)
+                if match:
+                    image_matches[ann.id] = match
+                    # ann.image_matches.append(match) TODO: INCORRECT
+            except Exception as e:
+                print(f"Warning: Failed to get image match for annotation {ann.id}: {e}")
+                continue
         return image_matches
 
     def classify_image_matches(self, classifier, crop_size=None, print_summary=False):
@@ -337,6 +341,17 @@ class Annotations:
             self._print_classification_summary(results)
 
         return results
+    
+    def assign_image_match_classification_to_label(self):
+        """ Iterate over all annotations and assign the classification to the label.
+        """
+        for ann in self.data.values():
+            if ann.image_match is not None:
+                ann.label = ann.image_match.classification["label"]
+                ann.label_conf = -1
+            else:
+                ann.label = None
+                ann.label_conf = None
 
     def _print_classification_summary(self, results):
         """Print a summary of classification results.

@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 
 # Third-Party Libraries
 import cv2
+from joblib.externals.cloudpickle.cloudpickle import _property_reduce
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -84,6 +85,10 @@ class Cameras:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
+    @property
+    def group_names(self):
+        return sorted({cam.group for cam in self.data.values() if hasattr(cam, "group")})
+
     def append(self, cam):
         if cam.cam_id in self.data:
             raise ValueError(f"Camera with id {cam.cam_id} already exists.")
@@ -102,9 +107,20 @@ class Cameras:
             self.data[cam_id].transform_coords(transform_matrix)
         self.world_transform = np.dot(np.array(transform_matrix), self.world_transform)
 
+    def reset_transform(self):
+        """Reset all camera coordinates and transforms to their original state.
+
+        Applies the inverse of the current world_transform to all cameras,
+        then sets world_transform to the identity matrix.
+        """
+        if not self.world_transform_is_identity:
+            for cam_id in self.data:
+                self.data[cam_id].reverse_transform_coords(self.world_transform)
+            self.world_transform = np.eye(4)
+
     def apply_transform(self, transform_matrix):
         """Alias for transform_coords for compatibility.
-
+f
         Args:
             transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
@@ -158,6 +174,25 @@ class Cameras:
             if folder.endswith(postfix) or folder.endswith(postfix + os.sep):
                 cameras_subset.data[cam.cam_id] = cam
         return cameras_subset
+
+    def subset_by_group(self, group_name):
+        """Return a subset of cameras that belong to a given group.
+
+        Args:
+            group_name (str): Name of the group (as given by `Camera.group`).
+
+        Returns:
+            Cameras: New container with cameras from the requested group.
+        """
+        cameras_subset = Cameras()
+        for cam in self.data.values():
+            if getattr(cam, "group", None) == group_name:
+                cameras_subset.data[cam.cam_id] = cam
+        return cameras_subset
+
+    # Convenience alias to match the requested call-site: Cameras.group("name")
+    def group(self, group_name):
+        return self.subset_by_group(group_name)
 
     def get_cams_from_file(self, cams_meta_filepath):
         """Load cameras from a JSON file and store them in the container.
@@ -410,6 +445,7 @@ class Cameras:
         model.fit(points, depths)
         coef = model.coef_  # shape (3,)
         depth_offset = model.intercept_
+        depth_per_unit = np.linalg.norm(coef)
 
         # 2) Evaluate sign so that stepping along 'coef' decreases depth:
         centroid = np.mean(points, axis=0)  # single 3D point
@@ -450,9 +486,16 @@ class Cameras:
         print(f"  Depth offset: {depth_offset:.4f} m")
 
         # 5) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
-        return coef, depth_offset, mse, rmse, mae, r2, cam_depth_residuals, num_matches
+        return coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches
     
-    def get_depths_and_preds(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD):
+    def get_depths_and_preds(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD, recalculate = True):
+        
+        if recalculate:
+            for cam in self.data.values():
+                if hasattr(cam, "depth"):
+                    cam.depth_pred = cam.depth_in_m
+                    cam.depth_residual = cam.depth - cam.depth_pred
+
         cams_filtered = [
             cam
             for cam in self.data.values()
@@ -461,7 +504,6 @@ class Cameras:
             and (not hasattr(cam, "depth_acc") 
                  or cam.depth_acc <= depth_accuracy_threshold)
         ]
-        
         depths = [camera.depth for camera in cams_filtered] 
         depths_pred = [camera.depth_pred for camera in cams_filtered]
         return depths, depths_pred
@@ -478,6 +520,19 @@ class Cameras:
         depths = [camera.depth for camera in cams_filtered]
         z_coords = [camera.coords[2] for camera in cams_filtered]
         return depths, z_coords
+
+    def show_depth_residuals(self, width=15, height=5, recalculate=True):
+        """Show camera residuals using cam.depth_residual for each camera.
+        
+        Args:
+            width (float): Figure width in inches (default: 10)
+            height (float): Figure height in inches (default: 5)
+            recalculate (bool): If True, recalculate the depth residuals (default: True)
+        """
+        depths, z_coords = self.get_depths_and_preds(recalculate=recalculate)
+        fig = visualizations.plot_depth_regression(depths, z_coords, width=width, height=height)
+        fig2 = visualizations.plot_cam_residuals(self, width=width, height=height)
+        return fig, fig2
 
 class Camera:
     """Class that holds information about a single camera."""
@@ -535,6 +590,65 @@ class Camera:
             return self.orig_filepath
         else:
             return self._get_updated_filepath()
+
+    @property
+    def group(self):
+        """Derive a grouping label from the camera's filepath.
+
+        Rule:
+        - Use the name of the immediate containing folder by default.
+        - If that folder name contains a '.', use the text after the first '.'
+          as the group name (e.g., "20241008.auv→ "auv")
+        - Further split the group by prefixing with the first part of the filename
+          before the first underscore (e.g., "PR_20250608.jpg" → "PR").
+        - Final group is "<folder_group>_<filename_prefix>" (e.g., "auv_PR").
+        - BUT: Only use the "<folder_group>_<filename_prefix>" form if there are multiple unique filename prefixes among all cameras in the parent container. If all are the same, just use "<folder_group>".
+        """
+        try:
+            folder = os.path.basename(os.path.dirname(self.filepath))
+            if not folder:
+                return None
+            # Handle folder group extraction
+            if "." in folder:
+                parts = folder.split(".", 1)
+                folder_group = parts[1] if len(parts) > 1 and parts[1] else folder
+            else:
+                folder_group = folder
+
+            # Handle filename prefix extraction
+            filename = self.filename
+            if "_" in filename:
+                filename_prefix = filename.split("_", 1)[0]
+            else:
+                filename_prefix = os.path.splitext(filename)[0]
+
+            # Determine if there are multiple unique filename prefixes in the parent
+            parent = getattr(self, "parent", None)
+            unique_prefixes = set()
+            if parent is not None and hasattr(parent, "data"):
+                for cam in parent.data.values():
+                    fname = cam.filename
+                    if "_" in fname:
+                        prefix = fname.split("_", 1)[0]
+                    else:
+                        prefix = os.path.splitext(fname)[0]
+                    unique_prefixes.add(prefix)
+            else:
+                # If no parent, fallback to just this camera's prefix
+                unique_prefixes.add(filename_prefix)
+
+            if len(unique_prefixes) > 1:
+                group = f"{folder_group}_{filename_prefix}"
+            else:
+                group = folder_group
+            return group
+        except Exception:
+            return None
+    
+    @property
+    def depth_in_m(self):
+        return (self.parent.depth_per_unit / self.parent.scale_factor) * (self.coords[2] - self.parent.depth_offset) + self.parent.depth_offset
+
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.
@@ -676,14 +790,28 @@ class Camera:
         # Create a direction vector in camera space. Here, we assume the
         # image plane is at unit distance (z = 1).
         vec_cam = np.array([x_norm, y_norm, 1.0])
-        vec_cam /= np.linalg.norm(vec_cam)
+        
+        # Check for invalid values
+        if np.any(np.isnan(vec_cam)) or np.any(np.isinf(vec_cam)):
+            raise ValueError(f"Invalid camera vector computed for pixel ({x_img}, {y_img}): {vec_cam}")
+        
+        vec_cam_norm = np.linalg.norm(vec_cam)
+        if vec_cam_norm == 0:
+            raise ValueError(f"Zero-length camera vector for pixel ({x_img}, {y_img})")
+        
+        vec_cam /= vec_cam_norm
 
         # Transform the direction vector from camera to world coordinates.
         # For directions, apply only the rotation part of self.transform.
         transform_matrix = np.array(self.camera_transform, dtype=float).reshape((4, 4))
         R = transform_matrix[:3, :3]
         vec_world = R.dot(vec_cam)
-        vec_world /= np.linalg.norm(vec_world)
+        
+        vec_world_norm = np.linalg.norm(vec_world)
+        if vec_world_norm == 0:
+            raise ValueError(f"Zero-length world vector for pixel ({x_img}, {y_img})")
+        
+        vec_world /= vec_world_norm
 
         return vec_world
 

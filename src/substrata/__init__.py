@@ -19,6 +19,8 @@ from .geometry import *
 
 from .settings import *
 
+from .classification import *
+
 # from .firefish import *
 # from .utils import *
 # from .initializer import *

@@ -42,16 +42,23 @@ class ProjectInitializer:
         self.thumbnail_path = None
         self.classes_filepath = None
         self.world_transform =  np.eye(4)
-        self.scale_factor = 1.0
-        self.up_vector = geometry.Vector([0.0, 0.0, 1.0])
-        self.depth_offset = 0.0
+        self.scale_factor = None
+        self.up_vector = None
+        self.depth_offset = None
+        self.depth_per_unit = None
 
         # If project_path is given, search for files with default naming conventions
         # in the directory to establish configuration.
         if path is not None:
-            self.init_with_path(path)
+            current_folder_name = os.path.basename(os.path.abspath(path))
+            yaml_path = os.path.join(path, f"{current_folder_name}.yaml")
+            if os.path.isfile(yaml_path):
+                self.init_with_yaml(yaml_path)
+            else:
+                self.init_with_path(path)
 
-        # If YAML file is provided, read the YAML file to establish configuration.
+        # If YAML file is provided, read the YAML file to establish configuration,
+        # and overwrite any values set by the path.
         if yaml is not None:
             self.init_with_yaml(yaml)
     
@@ -132,18 +139,32 @@ class ProjectInitializer:
             yaml_config.get("cams_meta_json")
         )
         self.cams_xml_filepath = self.__add_path_if_needed(yaml_config.get("cams_xml"))
+        self.markers_filepath = self.__add_path_if_needed(yaml_config.get("markers"))
         self.annotations_filepath = self.__add_path_if_needed(
             yaml_config.get("annotations")
         )
         self.annotations_last_highest_id = yaml_config.get("annotations_last_highest_id")
         self.classes_filepath = self.__add_path_if_needed(yaml_config.get("classes"))
-        self.scale_factor = yaml_config.get("scale_factor", 1.0)
-        self.world_transform = np.array(yaml_config.get("world_transform"), dtype=float)
+        self.scale_factor = yaml_config.get("scale_factor", None)
+        wt = yaml_config.get("world_transform")
+        if wt is not None:
+            self.world_transform = np.array(wt, dtype=float)
         self.photos_path = self.__add_path_if_needed(yaml_config.get("photos_path"))
         self.cropped_path = self.__add_path_if_needed(yaml_config.get("cropped_path"))
         self.thumbnail_path = self.__add_path_if_needed(
             yaml_config.get("thumbnails_path")
         )
+        # Optional orientation-related fields
+        up = yaml_config.get("up_vector")
+        if up is not None:
+            from substrata.geometry import Vector
+            self.up_vector = Vector(up)
+        d_off = yaml_config.get("depth_offset")
+        if d_off is not None:
+            self.depth_offset = float(d_off)
+        dpu = yaml_config.get("depth_per_unit")
+        if dpu is not None:
+            self.depth_per_unit = float(dpu)
 
     @property
     def pcd_filepath(self):
@@ -192,9 +213,22 @@ class ProjectInitializer:
             config["thumbnails_path"] = os.path.basename(self.thumbnail_path)
         if self.classes_filepath is not None:
             config["classes"] = os.path.basename(self.classes_filepath)
-        config["scale_factor"] = float(self.scale_factor)
+        if self.scale_factor is not None:
+            config["scale_factor"] = float(self.scale_factor)
         if self.world_transform is not None:
             config["world_transform"] = self.world_transform.tolist()
+        # Optional orientation-related fields
+        if self.up_vector is not None:
+            up_val = getattr(self.up_vector, "xyz", self.up_vector)
+            if hasattr(up_val, "tolist"):
+                up_list = up_val.tolist()
+            else:
+                up_list = list(up_val)
+            config["up_vector"] = [float(v) for v in up_list]
+        if self.depth_offset is not None:
+            config["depth_offset"] = float(self.depth_offset)
+        if self.depth_per_unit is not None:
+            config["depth_per_unit"] = float(self.depth_per_unit)
         
         if filepath is None:
             filepath = self.yaml_path
@@ -268,14 +302,17 @@ class ProjectInitializer:
         classes_path = os.path.join(filepath, "classes.csv")
         self.classes_filepath = classes_path if os.path.exists(classes_path) else None
 
-    def initialize(self):
+    def initialize(self, apply_transform=True):
         """
         Instantiate the PointCloud, Cameras, and Annotations objects
+
+        Args:
+            no_transform (bool): If True, do not apply world_transform to loaded objects.
         """
         if self.ply_filepath:
             print(f"Loading pointcloud from {self.ply_filepath}")
             self.pcd = pointclouds.PointCloud(self.ply_filepath)
-            if not self.world_transform_is_identity:
+            if apply_transform and not self.world_transform_is_identity:
                 self.pcd.apply_transform(self.world_transform)
         
         if self.cams_meta_json_filepath and self.cams_xml_filepath:
@@ -283,50 +320,61 @@ class ProjectInitializer:
                 f"Loading cameras from {self.cams_meta_json_filepath} and {self.cams_xml_filepath}"
             )
             self.cams = cameras.Cameras(self.cams_meta_json_filepath, self.cams_xml_filepath)
-            if not self.world_transform_is_identity:
+            if apply_transform and not self.world_transform_is_identity:
                 self.cams.transform_coords(self.world_transform)
        
         if self.markers_filepath:
             print(f"Loading markers from {self.markers_filepath}")
             self.markers = annotations.Annotations(self.markers_filepath)
-            if not self.world_transform_is_identity:
+            if apply_transform and not self.world_transform_is_identity:
                 self.markers.transform_coords(self.world_transform)
 
         if self.annotations_filepath:
             print(f"Loading annotations from {self.annotations_filepath}")
             self.annotations = annotations.Annotations(self.annotations_filepath)
-            if not self.world_transform_is_identity:
+            if apply_transform and not self.world_transform_is_identity:
                 self.annotations.transform_coords(self.world_transform)
     
-    def orient(self):
-        """ 
-        Uses Pointcloud.apply_orientation_transforms to calculate the world_transform,
-        and then applies the world_transform to the pointcloud, cameras, markers, and annotations.
+    
+    def scale(self):
+        """
+        Compute project scale factor if missing. Does not apply any transforms.
+        """
+        if self.scale_factor is None:
+            self.scalebars = annotations.Scalebars(settings.RGL_SCALEBARS, self.markers)
+            self.scale_factor = self.scalebars.calc_scalefactor()
 
-        Will also calculate the scale_factor, up_vector, and depth_offset if default values are set.
+    def scale_and_orient(self):
+        """
+        Apply orientation (and scaling) transforms to the point cloud and related assets
+        using current values in scale_factor, up_vector, depth_offset, depth_per_unit.
+        Computes missing orientation values if absent.
         """
         if self.pcd is None:
             raise ValueError('Pointcloud is not initialized')
 
-        # Calculate scale_factor, up_vector, and depth_offset if default values are set
-        if self.scale_factor == 1.0:
-            self.scalebars = annotations.Scalebars(settings.RGL_SCALEBARS, 
-                                                   self.markers)
-            self.scale_factor = self.scalebars.calc_scalefactor()
-        if self.up_vector.xyz.tolist() == [0.0, 0.0, 1.0] and self.depth_offset == 0.0:
-            self.up_vector, self.depth_offset, *_ = self.cams.get_up_vector_from_camera_depths()
+        # Ensure required parameters are present
+        if (self.up_vector is None) or (self.depth_offset is None) or (self.depth_per_unit is None):
+            self.up_vector, self.depth_offset, self.depth_per_unit, *_ = self.cams.get_up_vector_from_camera_depths()
+        if self.scale_factor is None:
+            # If scale not computed, do it now
+            self.scale()
 
-        # Orient the pointcloud
+        # Apply to pointcloud
         if not self.pcd.world_transform_is_identity:
-            print(f'Warning: Pointcloud already has a world_transform, this will add to it: {self.pcd.world_transform}')
-        self.pcd.apply_orientation_transforms(self.scale_factor, self.up_vector, self.depth_offset)
+            print(f'Warning: Pointcloud already has a world_transform , this will add to it: {self.pcd.world_transform}')
+        self.pcd.apply_orientation_transforms(self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit)
         self.world_transform = self.pcd.world_transform
 
-        # Orient the cameras/markers/annotations
+        # Propagate to cameras/markers/annotations
         if hasattr(self, 'cams') and self.cams is not None:
             if not self.cams.world_transform_is_identity:
                 print(f'Warning: Camera already has a world_transform, this will add to it: {self.cams.world_transform}')
             self.cams.transform_coords(self.world_transform)
+            self.cams.scale_factor = self.scale_factor
+            self.cams.depth_offset = self.depth_offset
+            self.cams.depth_per_unit = self.depth_per_unit
+
         if hasattr(self, 'markers') and self.markers is not None:
             if not self.markers.world_transform_is_identity:
                 print(f'Warning: Markers already have a world_transform, this will add to it: {self.markers.world_transform}')
@@ -335,6 +383,7 @@ class ProjectInitializer:
             if not self.annotations.world_transform_is_identity:
                 print(f'Warning: Annotations already have a world_transform, this will add to it: {self.annotations.world_transform}')
             self.annotations.transform_coords(self.world_transform)
+
 
     def __add_path_if_needed(self, filename):
         # If filename is an absolute path or contains directories, use it as is.

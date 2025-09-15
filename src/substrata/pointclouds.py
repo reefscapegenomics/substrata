@@ -238,10 +238,21 @@ class PointCloud:
         scale_factor: Optional[float],
         up_vector: Optional[np.ndarray],
         depth_offset: Optional[float],
+        depth_scale_factor: Optional[float],
         z_axis_rotation: bool = False,
         plot=False,
     ) -> None:
         """Apply a standardized set of orientations at once."""
+        # Log all optional arguments that were passed on
+        logger.info(
+            "Apply orientation transforms: "
+            f"scale_factor={scale_factor}, "
+            f"up_vector={up_vector}, "
+            f"depth_offset={depth_offset}, "
+            f"depth_scale_factor={depth_scale_factor}, "
+            f"z_axis_rotation={z_axis_rotation}, "
+            f"plot={plot}"
+        )
         # Compute each transform on the current, already-updated cloud
         if scale_factor is not None:
             self.apply_transform(
@@ -249,18 +260,23 @@ class PointCloud:
                 plot=plot,
                 plot_title="Transform.from_scale" if plot else None,
             )
+            self.scale_factor = scale_factor
         if up_vector is not None:
             self.apply_transform(
                 Transform.from_up_vector(up_vector),
                 plot=plot,
                 plot_title="Transform.from_up_vector" if plot else None,
             )
+            self.up_vector = up_vector
         if depth_offset is not None:
             self.apply_transform(
                 Transform.from_depth_offset(depth_offset),
                 plot=plot,
                 plot_title="Transform.from_depth_offset" if plot else None,
             )
+            self.depth_offset = depth_offset
+        if depth_scale_factor is not None:
+            self.depth_scale_factor = depth_scale_factor
         self.apply_transform(
             Transform.align_x_to_vector(self.principal_axis_xy_2D()),
             plot=plot,

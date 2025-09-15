@@ -1,38 +1,308 @@
-# cli.py
+# Standard Library
 import argparse
-from substrata.pointclouds import PointCloud, decimate_ply_file, ply_head
-from substrata.annotations import Annotations, Scalebars
-from substrata import settings
 import os
 import re
+
+# Third-Party Libraries
+import yaml
+import numpy as np
+
+# Local Modules
+from substrata.pointclouds import PointCloud, decimate_ply_file, ply_head
+from substrata.initializer import ProjectInitializer
+from substrata.annotations import Annotations, Scalebars
+from substrata import settings
+
+# ---------------------------- helpers: parents & defaults ----------------------------
+
+## Removed cameras parent; firefish/cams2video now rely on initializer
+
+
+
+def _cwd_base():
+    cwd = os.getcwd()
+    base = os.path.basename(cwd.rstrip(os.sep))
+    return base, cwd
+
+
+def _infer_target_depth(base: str, explicit_depth):
+    if explicit_depth is not None:
+        return explicit_depth
+    m = re.search(r"_(\d+)m_", base)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _get_output_filepath(init: ProjectInitializer, postfix: str):
+    """Get the output filepath from the initializer and the postfix."""
+    return os.path.join(init.path or os.getcwd(), f"{init.id}_{postfix}")
+
+# -------------------------------------- handlers -------------------------------------
+
+def handle_decimate(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    input_path = args.input or init.ply_full_path
+    if not input_path:
+        raise SystemExit("No input PLY found. Provide --input or ensure initializer finds a PLY in CWD.")
+
+    # Default output: initializer's decimated path or <id>_dec50M.ply beside the source
+    default_output = init.ply_dec_path or os.path.join(init.path or cwd, f"{init.id}_dec50M.ply")
+    output_path = args.output or default_output
+
+    decimate_ply_file(
+        input_path=input_path,
+        output_path=output_path,
+        target_points=args.points,
+        show_progress=True,
+    )
+
+def handle_head(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    input_path = args.input or init.ply_full_path
+    if not input_path:
+        raise SystemExit("No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD.")
+
+    ply_head(input_path, n=args.num, print_output=True)
+
+
+def handle_scalebars(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # 1) resolve inputs
+    pcd_path = args.input or init.ply_full_path
+    if not pcd_path:
+        raise SystemExit("No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD.")
+
+    markers_path = args.markers or init.markers_filepath
+    if not markers_path:
+        raise SystemExit("No markers file found. Provide --markers or ensure initializer finds a markers CSV in CWD.")
+
+    # 2) load PCD (optionally streaming-decimate on load)
+    pcd = PointCloud(pcd_path, max_points=args.points)
+
+    # 3) load markers as annotations
+    anns = Annotations()
+    anns.get_annotations_from_file(markers_path, header=True)
+
+    # 4) create Scalebars, attach target coords from annotations
+    sb = Scalebars(scalebar_data=settings.RGL_SCALEBARS, target_data=anns)
+
+    # 5) save PDF
+    output_pdf = args.output_pdf or _get_output_filepath(init, "scalebars.pdf")
+    sb.save_pdf(pcd, filepath=output_pdf)
+
+    # 6) optionally persist scale factor to YAML
+    if getattr(args, "save_yaml", False):
+        try:
+            scale_factor = sb.calc_scalefactor()
+            init.scale_factor = float(scale_factor)
+            yaml_path = init.yaml_path or os.path.join(init.path or os.getcwd(), f"{init.id}.yaml")
+            init.save_config_to_yaml(yaml_path)
+            print(f"Saved scale_factor to YAML: {yaml_path}")
+        except Exception as e:
+            print(f"Warning: failed to save scale_factor to YAML: {e}")
+
+
+def handle_views(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # Allow explicit override of PLY path
+    if args.input:
+        init.pcd_filepath = args.input
+
+    # Initialize project (loads PCD, cameras/markers if available)
+    init.initialize()
+
+    # Optional orientation via initializer workflow - ignore if world_transform is already set
+    if getattr(args, "auto_orient", False):
+        if init.world_transform_is_identity:
+            init.scale_and_orient()
+        else:
+            print(f"Warning: world_transform is already set, skipping auto-orientation")
+
+    # Save composite views PDF from initialized point cloud
+    output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
+    init.pcd.save_pdf(filepath=output_pdf)
+
+
+def handle_firefish(args):
+    # Build defaults from current directory name
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    target_depth = _infer_target_depth(base, args.target_depth)
+    pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_firefish.pdf")
+    cam_depths_file = args.cam_depths_file or os.path.join(cwd, f"{base}_camdepths.csv")
+
+    # Initialize FireFish file
+    from substrata.firefish import FireFish
+    ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
+
+    # depth_outlier_thresh is passed through only if provided; otherwise rely on default
+    kwargs = {
+        "camdepths_filepath": cam_depths_file,
+        "pdf_output_filepath": pdf_output,
+    }
+    if args.depth_outlier_thresh is not None:
+        kwargs["depth_and_outlier_threshold"] = args.depth_outlier_thresh
+
+    if args.input:
+        init.pcd_filepath = args.input
+
+    init.initialize(apply_transform=False)
+
+    # Only apply scale_factor (if specified or needed for save_yaml)
+    if init.scale_factor is not None or getattr(args, "save_yaml", False):
+        init.scale()
+        from substrata.geometry import Transform
+        init.world_transform = Transform.from_scale(init.scale_factor)
+
+    init.initialize(apply_transform=True)
+    pcd = init.pcd
+    cams = init.cams
+
+    # Optional subset by camera group name
+    if getattr(args, "cams_group", None):
+        try:
+            cams = cams.subset_by_group(args.cams_group)
+            print(f"Subsetting cameras to group '{args.cams_group}' → {len(cams.items())} cameras")
+        except Exception:
+            pass
+
+    # Run up-vector determination
+    up_vector, depth_offset, depth_per_unit, _ = ff.determine_up_vector(
+        cams,
+        target_depth,
+        pcd,
+        offset=args.offset,
+        **kwargs,
+    )
+
+    # Optionally persist orientation results to YAML
+    if getattr(args, "save_yaml", False):
+        try:
+            # Re-initialize the pointcloud with no transform
+            init.world_transform = np.eye(4)
+            init.initialize()
+
+            # Set scaling/orientation values
+            init.up_vector = up_vector
+            init.depth_offset = float(depth_offset)
+            init.depth_per_unit = float(depth_per_unit)
+
+            init.scale_and_orient()
+            # Save values to YAML
+            yaml_path = init.yaml_path or os.path.join(init.path or os.getcwd(), f"{init.id}.yaml")
+            init.save_config_to_yaml(yaml_path)
+            print(f"Saved orientation to YAML: {yaml_path}")
+        except Exception as e:
+            print(f"Warning: failed to save orientation to YAML: {e}")
+
+
+def handle_cams2video(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+    from substrata import visualizations
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # Allow explicit override of PLY path
+    if args.input:
+        init.pcd_filepath = args.input
+    # Allow explicit override of annotations path
+    if args.annotations_file:
+        init.annotations_filepath = args.annotations_file
+
+    # Initialize (loads PCD and cameras if available)
+    init.initialize()
+
+    # Resolve annotations (optional)
+    anns = None
+    anns_path = init.annotations_filepath
+    if anns_path:
+        try:
+            anns = Annotations()
+            anns.get_annotations_from_file(anns_path, header=True, orig_coords_only=False)
+        except Exception:
+            anns = None
+
+    # Optional subset by camera group name
+    cams_for_video = init.cams
+    if getattr(args, "cams_group", None):
+        try:
+            cams_for_video = init.cams.subset_by_group(args.cams_group)
+        except Exception:
+            pass
+
+    # Compute output path and ensure directory
+    output_mp4 = args.output_mp4 or _get_output_filepath(init, "cams.mp4")
+    # Create video directly to requested output path
+    visualizations.create_annotated_video(
+        cams_for_video,
+        anns,
+        output_filename=output_mp4,
+        pcd=init.pcd,
+        use_label_column=args.use_label_column,
+        resize_width=args.resolution,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # decimate
+    # decimate (initializer-driven defaults)
     p_dec = subparsers.add_parser(
-        "decimate", help="Decimate a binary PLY to a target number of points."
+        "decimate",
+        help=(
+            "Decimate a PLY. With no args, uses initializer on CWD, output to <id>_dec50M.ply, target=50,000,000."
+        ),
     )
-    p_dec.add_argument("input", type=str, help="Path to input binary PLY file.")
-    p_dec.add_argument("output", type=str, help="Path to output PLY file.")
-    p_dec.add_argument("target", type=int, help="Number of points to keep.")
     p_dec.add_argument(
-        "--no-progress", action="store_true", help="Disable progress bars."
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
     )
+    p_dec.add_argument(
+        "--output", dest="output", type=str, default=None,
+        help="Optional explicit output PLY path (defaults to <id>_dec50M.ply).",
+    )
+    p_dec.add_argument(
+            "-n", "--points", dest="points", type=int, default=50_000_000,
+            help="Number of points to keep (default: 50,000,000).",
+    ) 
 
     # head (PLY preview)
     p_head = subparsers.add_parser(
         "head", help="Show first N vertex rows from a PLY file."
     )
-    p_head.add_argument("pcd_filename", type=str, help="Input PLY file.")
     p_head.add_argument(
-        "-n",
-        "--num",
-        dest="num",
-        type=int,
-        default=5,
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_head.add_argument(
+        "-n", dest="num", type=int, default=5,
         help="Number of vertex rows to display (default: 5).",
     )
 
@@ -41,35 +311,42 @@ def main():
         "scalebars",
         help="Generate scalebar PDF from a point cloud and marker annotations.",
     )
-    p_sb.add_argument("pcd_filename", type=str, help="Input point cloud (PLY).")
-    p_sb.add_argument("markers_filename", type=str, help="Markers CSV for annotations.")
-    p_sb.add_argument("output_pdf", type=str, help="Output PDF filepath.")
     p_sb.add_argument(
-        "--max-points",
-        type=int,
-        default=None,
-        help="Optional streaming decimation during load.",
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
     )
     p_sb.add_argument(
-        "--no-progress", action="store_true", help="Disable progress bars during load."
+        "--markers", dest="markers", type=str, default=None,
+        help="Optional explicit markers CSV path (overrides initializer).",
+    )
+    p_sb.add_argument(
+        "--output_pdf", dest="output_pdf", type=str, default=None,
+        help="Optional output PDF filepath.",
+    )
+    p_sb.add_argument(
+        "-n", "--points", dest="points", type=int, default=50000000,
+        help="Optional max points to stream-load PLY (decimation on load).",
+    )
+    p_sb.add_argument(
+        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        help="Save computed scale_factor into a YAML config for this project.",
     )
 
     # views
     p_views = subparsers.add_parser(
         "views", help="Save composite views PDF for a point cloud."
     )
-    p_views.add_argument("pcd_filename", type=str, help="Input point cloud (PLY).")
-    p_views.add_argument("output_pdf", type=str, help="Output PDF filepath.")
     p_views.add_argument(
-        "--full",
-        action="store_true",
-        help="Load full point cloud without decimation (may be large).",
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
     )
     p_views.add_argument(
-        "--auto-orient",
-        dest="auto_orient",
-        action="store_true",
-        help="Auto-orient the point cloud prior to saving (scale/up/offset skipped).",
+        "--output_pdf", dest="output_pdf", type=str, default=None, 
+        help="Output PDF filepath.",
+    )
+    p_views.add_argument(
+        "--auto-orient", dest="auto_orient", action="store_true",
+        help="Initialize and orient the project before saving.",
     )
 
     # firefish
@@ -81,31 +358,8 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--firefish-file",
-        dest="firefish_file",
-        type=str,
-        default=None,
-        help=(
-            "Path to FireFish file. Default: <cwd_basename>_firefish.txt in current folder."
-        ),
-    )
-    p_ff.add_argument(
-        "--cams-xml",
-        dest="cams_xml",
-        type=str,
-        default=None,
-        help=(
-            "Path to .cams.xml file. Default: <cwd_basename>.cams.xml in current folder."
-        ),
-    )
-    p_ff.add_argument(
-        "--cams-meta",
-        dest="cams_meta",
-        type=str,
-        default=None,
-        help=(
-            "Path to cameras metadata .meta.json file. Default: <cwd_basename>.meta.json."
-        ),
+        "--firefish-file", dest="firefish_file", type=str, default=None,
+        help=("Path to FireFish file. Default: <cwd_basename>_firefish.txt in current folder."),
     )
     p_ff.add_argument(
         "--target-depth",
@@ -144,245 +398,81 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--pcd-filename",
-        dest="pcd_filename",
+        "--cams-group",
+        dest="cams_group",
         type=str,
         default=None,
         help=(
-            "Optional point cloud (PLY) filepath to load and use during up-vector determination."
+            "Optional camera group name to subset (uses Cameras.subset_by_group)."
         ),
     )
     p_ff.add_argument(
-        "--camspath-postfix",
-        dest="camspath_postfix",
-        type=str,
-        default=".photos",
-        help=("Optional filter for cameras by filepath postfix (e.g., '.photos')."),
+        "--offset",
+        dest="offset",
+        type=int,
+        default=None,
+        help=(
+            "Manually set time offset in seconds; skips automatic offset determination."
+        ),
+    )
+    p_ff.add_argument(
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    # removed --camspath-postfix (use --cams-group instead)
+    p_ff.add_argument(
+        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        help="Save computed up_vector, depth_offset, depth_per_unit into YAML.",
     )
 
     # cams2video
     p_c2v = subparsers.add_parser(
         "cams2video",
         help=(
-            "Create a video from cameras by drawing image matches; supports optional SAM predictor and PCD."
+            "Create a video from cameras by drawing image matches (initializer-driven)."
         ),
     )
     p_c2v.add_argument(
-        "--cams-xml",
-        dest="cams_xml",
-        type=str,
-        default=None,
-        help=(
-            "Path to .cams.xml file. Default: <cwd_basename>.cams.xml in current folder."
-        ),
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
     )
     p_c2v.add_argument(
-        "--cams-meta",
-        dest="cams_meta",
-        type=str,
-        default=None,
-        help=(
-            "Path to cameras metadata .meta.json file. Default: <cwd_basename>.meta.json."
-        ),
+        "--annotations", dest="annotations_file", type=str, default=None,
+        help=("Path to annotations CSV. Uses initializer if omitted."),
     )
     p_c2v.add_argument(
-        "--annotations-file",
-        dest="annotations_file",
-        type=str,
-        default=None,
-        help=("Path to annotations CSV. Required for drawing matches (no default)."),
-    )
-    p_c2v.add_argument(
-        "--pcd-filename",
-        dest="pcd_filename",
-        type=str,
-        default=None,
-        help=(
-            "Optional point cloud (PLY) filepath. Default: <cwd_basename>.ply in current folder."
-        ),
-    )
-    p_c2v.add_argument(
-        "--sam-checkpoint",
-        dest="sam_checkpoint",
-        type=str,
-        default=None,
-        help=("Optional SAM2 checkpoint to enable segmentation overlays on frames."),
-    )
-    p_c2v.add_argument(
-        "--sam-config",
-        dest="sam_config",
-        type=str,
-        default="sam2_hiera_l.yaml",
-        help=("Optional SAM2 model config (default: sam2_hiera_l.yaml)."),
-    )
-    p_c2v.add_argument(
-        "--output-path",
-        dest="output_path",
-        type=str,
-        default=None,
-        help=(
-            "Directory to save frames and video. Default: <cwd_basename>_video in current folder."
-        ),
-    )
-    p_c2v.add_argument(
-        "--use-label-column",
-        dest="use_label_column",
-        action="store_true",
+        "-l", "--label", dest="use_label_column", action="store_true",
         help=("Use label column from annotations when drawing matches (default: off)."),
     )
     p_c2v.add_argument(
-        "--resize-width",
-        dest="resize_width",
-        type=int,
-        default=None,
+        "-r", "--resolution", dest="resolution", type=int, default=None,
         help=("Optional width to resize images when creating frames (pixels)."),
+    )
+    p_c2v.add_argument(
+        "--cams-group",
+        dest="cams_group",
+        type=str,
+        default=None,
+        help=(
+            "Optional camera group name to subset (uses Cameras.subset_by_group)."
+        ),
+    )
+    p_c2v.add_argument(
+        "--output_mp4", dest="output_mp4", type=str, default=None,
+        help="Optional output MP4 filepath (default: <id>_cams.mp4).",
     )
 
     args = parser.parse_args()
 
-    if args.command == "decimate":
-        decimate_ply_file(
-            input_path=args.input,
-            output_path=args.output,
-            target_points=args.target,
-            show_progress=not args.no_progress,
-        )
-    elif args.command == "scalebars":
-        # 1) load PCD (optionally streaming-decimate on load)
-        pcd = PointCloud(args.pcd_filename, max_points=args.max_points)
-
-        # 2) load markers as annotations
-        anns = Annotations()
-        anns.get_annotations_from_file(
-            args.markers_filename, header=True, orig_coords_only=False
-        )
-
-        # 3) create Scalebars, attach target coords from annotations
-        # Expect the CSV to provide labels matching scalebar target1/target2 labels
-        sb = Scalebars(
-            scalebar_data=settings.RGL_SCALEBARS, target_data=anns
-        )  # scalebar_data populated via target_data
-        # If your scalebar_data must come from a file, replace the above with your loader.
-
-        # 4) save PDF
-        sb.save_pdf(pcd, filepath=args.output_pdf)
-    elif args.command == "views":
-        # Load point cloud with optional streaming decimation to ~50M points
-        max_pts = None if args.full else 50_000_000
-        pcd = PointCloud(args.pcd_filename, max_points=max_pts)
-        # Optionally run auto-orientation with default/None params (skips scale/up/offset)
-        if getattr(args, "auto_orient", False):
-            pcd.apply_orientation_transforms(None, None, None)
-        # Save composite views PDF
-        pcd.save_pdf(filepath=args.output_pdf)
-    elif args.command == "firefish":
-        ### TODO: MAKE GENERIC
-        # Build defaults from current directory name
-        cwd = os.getcwd()
-        base = os.path.basename(cwd.rstrip(os.sep))
-
-        firefish_file = args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt")
-        cams_xml = args.cams_xml or os.path.join(cwd, f"{base}.cams.xml")
-        cams_meta = args.cams_meta or os.path.join(cwd, f"{base}.meta.json")
-
-        # Infer target depth if not provided: find _<int>m_ pattern
-        target_depth = args.target_depth
-        if target_depth is None:
-            m = re.search(r"_(\d+)m_", base)
-            if m:
-                try:
-                    target_depth = int(m.group(1))
-                except Exception:
-                    target_depth = None
-
-        pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_firefish.pdf")
-        cam_depths_file = args.cam_depths_file or os.path.join(
-            cwd, f"{base}_camdepths.csv"
-        )
-
-        # Lazy import to avoid overhead when unused
-        from substrata.firefish import FireFish
-        from substrata.cameras import Cameras
-
-        ff = FireFish(firefish_file)
-        cams = Cameras(cams_meta_filepath=cams_meta, cams_xml_filepath=cams_xml)
-
-        # depth_outlier_thresh is passed through only if provided; otherwise rely on default
-        kwargs = {
-            "camdepths_filepath": cam_depths_file,
-            "pdf_output_filepath": pdf_output,
-        }
-        if args.depth_outlier_thresh is not None:
-            kwargs["depth_and_outlier_threshold"] = args.depth_outlier_thresh
-
-        # Load point cloud (default to <cwd_basename>.ply in current folder)
-        pcd_filename = args.pcd_filename or os.path.join(cwd, f"{base}.ply")
-        pcd = PointCloud(pcd_filename, max_points=50000000)
-
-        # Run up-vector determination
-        ff.determine_up_vector(
-            cams,
-            target_depth,
-            pcd,
-            cams_filepath_postfix_filter=args.camspath_postfix,
-            **kwargs,
-        )
-    elif args.command == "head":
-        ply_head(args.pcd_filename, n=args.num, print_output=True)
-    elif args.command == "cams2video":
-        # Build defaults from current directory name
-        cwd = os.getcwd()
-        base = os.path.basename(cwd.rstrip(os.sep))
-
-        cams_xml = args.cams_xml or os.path.join(cwd, f"{base}.cams.xml")
-        cams_meta = args.cams_meta or os.path.join(cwd, f"{base}.meta.json")
-        output_path = args.output_path or os.path.join(cwd, f"{base}_video")
-        pcd_filename = args.pcd_filename or os.path.join(cwd, f"{base}.ply")
-
-        # Required: annotations
-        if not args.annotations_file:
-            raise SystemExit(
-                "--annotations-file is required for cams2video (no default)."
-            )
-
-        # Lazy imports
-        from substrata.cameras import Cameras
-        from substrata import visualizations
-        from substrata.segmentation import get_sam2_predictor
-
-        # Initialize Cameras
-        cams = Cameras(cams_meta_filepath=cams_meta, cams_xml_filepath=cams_xml)
-
-        # Initialize Annotations
-        anns = Annotations()
-        anns.get_annotations_from_file(
-            args.annotations_file, header=True, orig_coords_only=False
-        )
-
-        # Initialize PCD
-        pcd = PointCloud(pcd_filename) if pcd_filename else None
-
-        # Optional SAM2 predictor
-        sam_predictor = None
-        if args.sam_checkpoint:
-            sam_predictor = get_sam2_predictor(
-                args.sam_checkpoint, model_cfg=args.sam_config
-            )
-
-        # Ensure output directory exists
-        if not os.path.exists(output_path):
-            os.makedirs(output_path, exist_ok=True)
-
-        # Create video
-        visualizations.create_video_from_cams(
-            cams,
-            anns,
-            output_path,
-            sam_predictor=sam_predictor,
-            pcd=pcd,
-            use_label_column=args.use_label_column,
-            resize_width=args.resize_width,
-        )
+    handlers = {
+        "decimate": handle_decimate,
+        "head": handle_head,
+        "scalebars": handle_scalebars,
+        "views": handle_views,
+        "firefish": handle_firefish,
+        "cams2video": handle_cams2video,
+    }
+    handlers[args.command](args)
 
 
 if __name__ == "__main__":

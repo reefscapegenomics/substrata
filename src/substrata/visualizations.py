@@ -1,7 +1,9 @@
 # Standard Library
 import os
 import tempfile
+import shutil
 from io import BytesIO
+import subprocess
 
 # Third-Party Libraries
 import matplotlib.pyplot as plt
@@ -542,69 +544,152 @@ def save_img(img_path, save_path, highlight_pixels=None):
     cv2.imwrite(save_path, image)
 
 
-def show_cam_residuals(cams, width=10, height=5):
-    """Show camera residuals using cam.depth_residual for each camera.
-    
-    Cameras with depth_residual are colored by residual value (blue-white-red).
-    Cameras without depth_residual are shown in gray.
+def plot_cam_residuals(cams, width=10, height=5):
+    """Plot camera residuals with two side-by-side views: X–Y and X–Z.
+
+    - Points are colored by depth residual (blue–white–red, symmetric limits).
+    - Marker shapes encode Camera.group.
+    - Marker fill/shape encodes depth accuracy bins.
+
+    Accuracy encoding (if cam.depth_acc present):
+        • Best (lowest bin): filled markers
+        • Mid bin: hollow markers (facecolor='none')
+        • Worst bin: 'x' markers
     
     Args:
         cams: Camera collection with data attribute containing cameras
-        width (float): Figure width in inches (default: 10)
-        height (float): Figure height in inches (default: 5)
+        width (float): Base width per panel (final fig is ~2×width)
+        height (float): Figure height in inches
     """
-    # Filter cameras that have both coords and depth_residual
-    cams_with_depths_and_coords = [
-        cam for cam in cams.data.values()
-        if hasattr(cam, "coords") and hasattr(cam, "depth_residual") and cam.coords is not None
-    ]
-    
-    # Filter cameras that have coords but no depth_residual
-    cams_without_depths = [
-        cam for cam in cams.data.values()
-        if hasattr(cam, "coords") and cam.coords is not None and 
-        (not hasattr(cam, "depth_residual") or cam.depth_residual is None)
-    ]
-    
-    if not cams_with_depths_and_coords and not cams_without_depths:
+    cams_all = [cam for cam in cams.data.values() if hasattr(cam, "coords") and cam.coords is not None]
+    if not cams_all:
         raise ValueError("No cameras with coords found.")
 
-    # Plot
-    fig = plt.figure(figsize=(width, height))
-    
-    # Plot cameras with depth residuals
-    if cams_with_depths_and_coords:
-        points = np.array([cam.coords for cam in cams_with_depths_and_coords])
-        residuals = np.array([cam.depth_residual for cam in cams_with_depths_and_coords])
+    # Split by residual availability
+    cams_res = [cam for cam in cams_all if hasattr(cam, "depth_residual") and cam.depth_residual is not None]
+    cams_nores = [cam for cam in cams_all if cam not in cams_res]
 
-        # Normalize the residuals (z-values) for color mapping
-        max_abs_residual = max(abs(residuals))
-        norm = plt.Normalize(vmin=-max_abs_residual, vmax=max_abs_residual)
-        cmap = plt.cm.bwr  # Blue-White-Red colormap
+    # Color mapping by residuals (symmetric around 0)
+    if cams_res:
+        residuals = np.array([cam.depth_residual for cam in cams_res], dtype=float)
+        max_abs_res = float(np.max(np.abs(residuals))) if residuals.size else 1.0
+        max_abs_res = max(max_abs_res, 1e-9)
+        norm = plt.Normalize(vmin=-max_abs_res, vmax=max_abs_res)
+    else:
+        residuals = np.array([])
+        norm = plt.Normalize(vmin=-1.0, vmax=1.0)
+    cmap = plt.cm.bwr
 
-        plt.scatter(
-            points[:, 0],
-            points[:, 1],
-            c=residuals,
-            cmap=cmap,
-            norm=norm,
-            edgecolor="black"
-        )
-        plt.colorbar(label="Residual (z-value)")
-    
-    # Plot cameras without depth residuals in gray
-    if cams_without_depths:
-        points_no_depths = np.array([cam.coords for cam in cams_without_depths])
-        plt.scatter(
-            points_no_depths[:, 0],
-            points_no_depths[:, 1],
-            c="gray",
-            edgecolor="black"
-        )
-    
-    plt.title("Camera Residuals Plot")
-    plt.xlabel("X coordinate")
-    plt.ylabel("Y coordinate")
+    # Determine camera groups (for fill style)
+    try:
+        group_names = cams.group_names if hasattr(cams, "group_names") else sorted({getattr(cam, "group", None) for cam in cams_all})
+        group_names = [g for g in group_names if g is not None]
+    except Exception:
+        group_names = []
+    group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(sorted(group_names))}  # True → filled, False → hollow
+
+    # Build numerical accuracy groups (rounded) for cams with residuals
+    def _round_acc(val: float) -> float | None:
+        return float(np.round(val, 6)) if np.isfinite(val) else None
+
+    acc_values_res = sorted({
+        _round_acc(getattr(cam, "depth_acc", np.nan))
+        for cam in cams_res
+        if np.isfinite(getattr(cam, "depth_acc", np.nan))
+    })
+    acc_present = len(acc_values_res) > 0
+    best_acc_value = acc_values_res[0] if acc_present else None
+
+    # Marker shapes per accuracy value
+    marker_cycle = ["o", "s", "^", "v", "D", "P", "X", "<", ">", "*", "h"]
+    acc_to_marker = {acc: marker_cycle[i % len(marker_cycle)] for i, acc in enumerate(acc_values_res)}
+    default_marker = "o"
+
+    # Helper to plot into an axis given x and y indices (0=x,1=y,2=z)
+    def plot_axis(ax, x_idx: int, y_idx: int):
+        # Plot with residuals for cams_res
+        if cams_res:
+            # Organize by (accuracy_marker, group_fill)
+            by_key = {}
+            for cam, res in zip(cams_res, residuals):
+                g = getattr(cam, "group", None)
+                filled = group_to_fill.get(g, True)
+                acc_val = _round_acc(getattr(cam, "depth_acc", np.nan))
+                marker = acc_to_marker.get(acc_val, default_marker)
+                key = (marker, filled)
+                arr = by_key.setdefault(key, {"x": [], "y": [], "c": []})
+                arr["x"].append(cam.coords[x_idx])
+                arr["y"].append(cam.coords[y_idx])
+                arr["c"].append(res)
+
+            for (marker, filled), data in by_key.items():
+                xs = np.array(data["x"], dtype=float)
+                ys = np.array(data["y"], dtype=float)
+                cs = np.array(data["c"], dtype=float)
+                if filled:
+                    ax.scatter(xs, ys, c=cs, cmap=cmap, norm=norm, marker=marker, edgecolor="black", linewidths=0.7)
+                else:
+                    ax.scatter(xs, ys, facecolors='none', edgecolors=cmap(norm(cs)), marker=marker, linewidths=1.0)
+
+        # Cameras without residuals shown in gray
+        if cams_nores:
+            xs = np.array([cam.coords[x_idx] for cam in cams_nores], dtype=float)
+            ys = np.array([cam.coords[y_idx] for cam in cams_nores], dtype=float)
+            # Use default marker but gray color; filled to distinguish "no residuals"
+            ax.scatter(xs, ys, c="gray", marker=default_marker, edgecolor="black", linewidths=0.5)
+
+        ax.grid(True, alpha=0.3)
+
+    # Build the side-by-side figure
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(width, height), constrained_layout=True)
+
+    # Left: X–Y
+    plot_axis(ax_left, 0, 1)
+    ax_left.set_xlabel("X coordinate")
+    ax_left.set_ylabel("Y coordinate")
+    ax_left.set_title("Camera residuals (X–Y)")
+
+    # Right: X–Z
+    plot_axis(ax_right, 0, 2)
+    ax_right.set_xlabel("X coordinate")
+    ax_right.set_ylabel("Z coordinate")
+    ax_right.set_title("Camera residuals (X–Z)")
+
+    # Shared colorbar (only if residuals exist)
+    if cams_res:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=[ax_left, ax_right], fraction=0.046, pad=0.04)
+        cbar.set_label("Depth residual (m)")
+
+    # Legends: groups and accuracy bins
+    from matplotlib.lines import Line2D
+
+    # Group legend (fill style only; use a consistent circle marker)
+    group_handles = []
+    for g in sorted(group_to_fill.keys()):
+        if group_to_fill[g]:
+            group_handles.append(Line2D([0], [0], marker='o', color='w', label=str(g), markerfacecolor='black', markeredgecolor='black', markersize=8, linewidth=0))
+        else:
+            group_handles.append(Line2D([0], [0], marker='o', color='w', label=str(g), markerfacecolor='none', markeredgecolor='black', markersize=8, linewidth=0))
+
+    # Accuracy legend (numerical groups) + no-residuals group
+    acc_handles = []
+    acc_labels = []
+    if acc_present:
+        for acc_val in acc_values_res:
+            acc_handles.append(Line2D([0], [0], marker=acc_to_marker.get(acc_val, default_marker), color='w', label=f"{acc_val}", markerfacecolor='black', markeredgecolor='black', markersize=8, linewidth=0))
+            acc_labels.append(str(acc_val))
+    # Add "no residuals" group
+    if cams_nores:
+        acc_handles.append(Line2D([0], [0], marker='o', color='w', label='no residuals', markerfacecolor='gray', markeredgecolor='black', markersize=8, linewidth=0))
+
+    # Place legends
+    if group_handles:
+        ax_left.legend(handles=group_handles, title="Groups", loc="upper right", frameon=False)
+    if acc_handles:
+        ax_right.legend(handles=acc_handles, title="Accuracy (numeric)", loc="upper right", frameon=False)
+
     plt.show()
     return fig
 
@@ -999,7 +1084,6 @@ def show_classified_grid_cells(
     title=None,
     label_colors=None,
     max_output_points=50000,
-     k=False,
 ):
     """
     Show a 2D plot with grid cells colored by majority classification.
@@ -1013,7 +1097,7 @@ def show_classified_grid_cells(
     - Grid cell outlines are not drawn; only the filled cell color is shown.
 
     Args:
-        pcd: Point cloud (SimplePointCloud or Open3D PointCloud-like).
+        pcd: Point cloud (SimplePointCloud or PointCloud).
         bboxes: List of bounding boxes, where each item is
             (min_corner[x, y], max_corner[x, y]). A single bbox can also be
             passed as ((x_min, y_min), (x_max, y_max)).
@@ -1081,10 +1165,7 @@ def show_classified_grid_cells(
 
     # Optional background points in grayscale
     if show_points and points.size > 0:
-        if use_grayscale_points:
-            plot_cols = np.full((points.shape[0], 3), 0.6, dtype=float)
-        else:
-            plot_cols = cols if cols is not None and len(cols) == len(points) else "b"
+        plot_cols = np.full((points.shape[0], 3), 0.6, dtype=float)  # Default to grayscale
         ax_left.scatter(
             points[:, 0],
             points[:, 1],
@@ -1134,7 +1215,8 @@ def show_classified_grid_cells(
     # Draw filled rectangles for each bbox colored by majority label
     labels_present = set()
     label_counts_by_cell = {}
-    for bbox in bboxes:
+    print(f"Drawing {len(bboxes)} bounding boxes")
+    for i, bbox in enumerate(bboxes):
         min_corner, max_corner = bbox
         label = majority_label_for_bbox(min_corner, max_corner)
         if label is None:
@@ -1160,6 +1242,22 @@ def show_classified_grid_cells(
             alpha=0.6,
         )
         ax_left.add_patch(rect)
+
+    # Set axis limits based on bbox data
+    if bboxes:
+        all_x_coords = []
+        all_y_coords = []
+        for bbox in bboxes:
+            min_corner, max_corner = bbox
+            all_x_coords.extend([min_corner[0], max_corner[0]])
+            all_y_coords.extend([min_corner[1], max_corner[1]])
+        
+        if all_x_coords and all_y_coords:
+            x_min, x_max = min(all_x_coords), max(all_x_coords)
+            y_min, y_max = min(all_y_coords), max(all_y_coords)
+            print(f"Setting axis limits: X=[{x_min:.2f}, {x_max:.2f}], Y=[{y_min:.2f}, {y_max:.2f}]")
+            ax_left.set_xlim(x_min, x_max)
+            ax_left.set_ylim(y_min, y_max)
 
     if title is not None:
         ax_left.set_title(title)
@@ -1737,16 +1835,26 @@ def draw_image_matches_within_camera(
     draw = ImageDraw.Draw(image)
 
     # Try to load a TrueType font; fall back to the default if it fails.
+    # Use a smaller font size for better visibility if the text is not showing up.
     try:
-        font = ImageFont.truetype("/Library/Fonts/Arial.ttf", 100)
+        # Try to load a common cross-platform font; fall back to default if not found
+        font = ImageFont.truetype("DejaVuSans.ttf", 300)
     except Exception as e:
-        print("Error loading TrueType font:", e)
+        print(f"Error loading DejaVuSans font: {e}")
         font = ImageFont.load_default()
 
     # Define offsets for the ellipse and text.
     circle_radius = 50
     text_offset_x = circle_radius + 50  # Offset text to the right of the ellipse.
     text_offset_y = -50  # Slightly above the center of the ellipse.
+
+    # If no matches provided, optionally resize and return the base image
+    if not image_matches:
+        if resize_width is not None:
+            orig_width, orig_height = image.size
+            new_height = int(orig_height * resize_width / orig_width)
+            image = image.resize((resize_width, new_height))
+        return image
 
     # Draw ellipses and labels.
     for match in image_matches:
@@ -1852,39 +1960,115 @@ def save_image_matches_within_camera(
     image.save(os.path.join(output_path, cam.filename))
 
 
-def create_video_from_cams(
+
+def create_annotated_video(
     cams,
     annotations,
-    output_path,
+    output_filename="cams_video.mp4",
     sam_predictor=None,
     pcd=None,
     use_label_column=False,
     resize_width=None,
 ):
-    """ """
+    """
+    Create a video from cameras, optionally drawing annotation overlays.
 
-    # Generate image matches for each camera and save them to disk.
-    for cam in tqdm(cams, total=len(cams.items()), desc="Generating frames for video"):
-        image_matches = cam.get_image_matches(annotations, pcd=pcd)
-        if sam_predictor:
-            for match in image_matches:
-                match.get_sam2_masks(sam_predictor)
+    If no annotations and no overlays are requested, delegates to
+    create_video_from_cams for a faster direct ffmpeg path.
+    """
 
-        save_image_matches_within_camera(
-            image_matches,
-            cam,
-            output_path,
-            use_label_column,
-            resize_width,
-        )
-    # Create a video from the saved images.
-    print("Creating video from frames...")
-    # ffmpeg.set_ffmpeg = "/opt/homebrew/bin/ffmpeg"  # TO REMOVE
-    (
-        ffmpeg.input(f"{output_path}/*.JPG", pattern_type="glob", framerate=2)
-        .output(f"{output_path}/output.mp4", r=1)
-        .run()
-    )
+    # Create a temporary directory for saving image matches
+    temp_image_matches_output = tempfile.mkdtemp(prefix="image_matches_")
+
+    try:
+        # Generate image matches for each camera and save them to disk.
+        if annotations is not None:
+            for cam in tqdm(cams, total=len(cams.items()), desc="Generating annotated frames for video"):
+                image_matches = cam.get_image_matches(annotations, pcd=pcd)
+                if sam_predictor:
+                    for match in image_matches:
+                        match.get_sam2_masks(sam_predictor)
+
+                save_image_matches_within_camera(
+                    image_matches,
+                    cam,
+                    temp_image_matches_output,
+                    use_label_column,
+                    resize_width,
+                )
+        else:
+            from joblib import Parallel, delayed
+
+            def save_cam_image(cam):
+                image_matches = None
+                save_image_matches_within_camera(
+                    image_matches,
+                    cam,
+                    temp_image_matches_output,
+                    use_label_column,
+                    resize_width,
+                )
+
+            cams_list = list(cams)
+            Parallel(n_jobs=-1)(
+                delayed(save_cam_image)(cam)
+                for cam in tqdm(cams_list, desc="Generating frames for video (without annotations)")
+            )
+        # Create a video from the saved images.
+        print("Creating video from frames...")
+
+        # Build a concat list to preserve camera order and avoid glob issues
+        file_list_path = None
+        target_width = resize_width
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+                file_list_path = f.name
+                # Determine ordered list of cams used
+                ordered_cams = list(cams) if annotations is None else list(cams)
+                last_img = None
+                for cam in ordered_cams:
+                    out_path = os.path.join(temp_image_matches_output, cam.filename)
+                    if os.path.isfile(out_path):
+                        f.write(f"file '{out_path}'\n")
+                        f.write("duration 0.5\n")
+                        last_img = out_path
+                if last_img is not None:
+                    f.write(f"file '{last_img}'\n")
+
+            # Compute safe target width if not provided
+            if target_width is None and last_img is not None:
+                try:
+                    with Image.open(last_img) as im:
+                        w, _ = im.size
+                        if w > 4096:
+                            target_width = 4096
+                except Exception:
+                    target_width = None
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", file_list_path,
+                "-vsync", "vfr",
+            ]
+            if target_width is not None:
+                cmd += ["-vf", f"scale={int(target_width)}:-2"]
+            cmd += [
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                output_filename,
+            ]
+            subprocess.run(cmd, check=True)
+        finally:
+            if file_list_path and os.path.exists(file_list_path):
+                try:
+                    os.remove(file_list_path)
+                except Exception:
+                    pass
+    finally:
+        # Clean up the temporary directory after creating the video
+        shutil.rmtree(temp_image_matches_output, ignore_errors=True)
 
 
 def visualize_elevation_angle(pcd, plane_coeffs, elevation_angle, output_filename=None):
@@ -2029,7 +2213,7 @@ def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:
     plt.show()
 
 
-def plot_depth_regression(depths, depths_predicted):
+def plot_depth_regression(depths, depths_predicted, width=10, height=5):
     """
     Plot depth regression analysis with actual vs predicted depths and residual analysis.
 
@@ -2056,7 +2240,7 @@ def plot_depth_regression(depths, depths_predicted):
     ss_tot = float(np.sum((depths - np.mean(depths)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(width, height))
 
     # Plot 1: Actual vs Predicted depths
     ax1.scatter(depths, depths_predicted, alpha=0.6, edgecolor="black")
@@ -2084,13 +2268,6 @@ def plot_depth_regression(depths, depths_predicted):
 
     plt.tight_layout()
     plt.show()
-
-    # Print summary statistics
-    print("\nRegression Summary:")
-    print(f"  Cameras used: {num_matches}")
-    print(f"  R² score: {r2:.4f}")
-    print(f"  RMSE: {rmse:.4f} m")
-    print(f"  MAE: {mae:.4f} m")
 
     return fig
 
