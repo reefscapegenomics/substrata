@@ -465,18 +465,37 @@ class Annotations:
                 annotations_subset.data[ann.id] = ann
         return annotations_subset
 
-    def subset_by_label(self, label_string):
-        """Return a subset of annotations with the given label.
+    def subset_by_label(self, label_string_or_list):
+        """Return a subset of annotations with the given label or labels.
 
         Args:
-            label_string (str): Label value to filter annotations.
+            label_string_or_list (str or list of str): Label value(s) to filter annotations.
 
         Returns:
-            Annotations: New container with annotations that match the label.
+            Annotations: New container with annotations that match the label(s).
+        """
+        if isinstance(label_string_or_list, str):
+            label_set = {label_string_or_list}
+        else:
+            label_set = set(label_string_or_list)
+        annotations_subset = Annotations()
+        for ann in self.data.values():
+            if ann.label in label_set:
+                annotations_subset.data[ann.id] = ann
+        return annotations_subset
+
+    def subset_by_label_prefix(self, prefix):
+        """Return a subset of annotations where the label contains the given prefix.
+
+        Args:
+            prefix (str): Prefix to search for in annotation labels.
+
+        Returns:
+            Annotations: New container with annotations whose label contains the prefix.
         """
         annotations_subset = Annotations()
         for ann in self.data.values():
-            if ann.label == label_string:
+            if ann.label is not None and prefix in ann.label:
                 annotations_subset.data[ann.id] = ann
         return annotations_subset
 

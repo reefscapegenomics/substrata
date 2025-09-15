@@ -757,6 +757,13 @@ def save_to_tmp_file(image):
 
 def encode_to_png_buffer(image):
     """Encode image to JPG buffer"""
+    # Convert PIL image to numpy array if needed
+    if hasattr(image, 'size'):  # PIL image
+        image = np.array(image)
+        # Convert RGB to BGR for OpenCV
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    
     success, buffer = cv2.imencode(".jpg", image)
     if not success:
         raise IOError("Could not encode image to JPG.")
