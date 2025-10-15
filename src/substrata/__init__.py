@@ -15,7 +15,7 @@ from .measurements import *
 
 # from .examples import *
 from .visualizations import *
-from .geometry import *
+from .geom import *
 
 from .settings import *
 

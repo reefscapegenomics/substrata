@@ -1,5 +1,6 @@
 # Standard Library
 import csv
+import datetime
 import json
 import logging
 import os
@@ -20,12 +21,49 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 from joblib import Parallel, delayed
+import exifread
 
 # Local Modules
-from substrata import visualizations, settings
+from substrata import visualizations, settings, geom
 from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
+
+
+class Sensor:
+    """Class that holds calibration parameters for a specific camera sensor."""
+
+    def __init__(self, sensor_id, label, resolution, calibration_params):
+        """Initialize a Sensor instance.
+
+        Args:
+            sensor_id (int): Unique sensor identifier.
+            label (str): Sensor label/description.
+            resolution (dict): Dictionary with 'width' and 'height' keys.
+            calibration_params (dict): Dictionary containing calibration parameters.
+        """
+        self.sensor_id = sensor_id
+        self.label = label
+        self.width = resolution['width']
+        self.height = resolution['height']
+        
+        # Calibration parameters
+        self.f = calibration_params['f']
+        self.cx_metashape = calibration_params['cx']
+        self.cy_metashape = calibration_params['cy']
+        self.b1 = calibration_params.get('b1', 0.0)
+        self.b2 = calibration_params.get('b2', 0.0)
+        self.k1 = calibration_params['k1']
+        self.k2 = calibration_params['k2']
+        self.k3 = calibration_params['k3']
+        self.p1 = calibration_params['p1']
+        self.p2 = calibration_params['p2']
+        
+        # Derived parameters
+        self.fx = self.f + self.b1
+        self.fy = self.f
+        self.cx = self.width / 2 + self.cx_metashape
+        self.cy = self.height / 2 + self.cy_metashape
 
 
 class Cameras:
@@ -42,6 +80,7 @@ class Cameras:
             cams_xml_filepath (str, optional): Path to the cameras XML file.
         """
         self.data = {}
+        self.sensors = {}  # Dict mapping sensor_id -> Sensor instance
         self.world_transform = np.eye(4)
         if cams_meta_filepath:
             self.cams_meta_filepath = cams_meta_filepath
@@ -76,6 +115,10 @@ class Cameras:
 
     def __next__(self):
         return next(self._iter)
+
+    def __len__(self):
+        """Return the number of cameras in the collection."""
+        return len(self.data)
 
     def items(self):
         return self.data.items()
@@ -190,6 +233,23 @@ f
                 cameras_subset.data[cam.cam_id] = cam
         return cameras_subset
 
+    def subset_by_sensor(self, sensor_id):
+        """Return a subset of cameras that use a specific sensor.
+
+        Args:
+            sensor_id (int): The sensor ID to filter by.
+
+        Returns:
+            Cameras: New container with cameras using the specified sensor.
+        """
+        cameras_subset = Cameras()
+        for cam in self.data.values():
+            if getattr(cam, "sensor_id", None) == sensor_id:
+                cameras_subset.data[cam.cam_id] = cam
+        if len(cameras_subset.data) == 0:
+            print(f"No cameras found with sensor_id={sensor_id}")
+        return cameras_subset
+
     # Convenience alias to match the requested call-site: Cameras.group("name")
     def group(self, group_name):
         return self.subset_by_group(group_name)
@@ -203,58 +263,137 @@ f
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
         for cam_id, cam_data in data["cameras"].items():
-            if cam_data["center"] is not None:
-                self.data[cam_id] = Camera(
-                    self,
-                    cam_id,
-                    cam_data["transform"],
-                    cam_data["center"],
-                    cam_data["path"],
-                )
-                if "reference" in cam_data:
-                    self.data[cam_id].reference = cam_data["reference"]
-                    self.data[cam_id].depth = cam_data["reference"][2]
-                if "reference_accuracy" in cam_data:
-                    self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
-                    self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
-                if "center_crs" in cam_data:
-                    self.data[cam_id].center_crs = cam_data["center_crs"]
-                if "enabled" in cam_data:
-                    self.data[cam_id].enabled = bool(cam_data["enabled"])
+            #if cam_data["center"] is not None:
+            self.data[cam_id] = Camera(
+                self,
+                cam_id,
+                cam_data["transform"],
+                cam_data["center"],
+                cam_data["path"],
+            )
+            if "reference" in cam_data:
+                self.data[cam_id].reference = cam_data["reference"]
+                self.data[cam_id].depth = cam_data["reference"][2]
+            if "reference_accuracy" in cam_data:
+                self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
+                self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
+            if "center_crs" in cam_data:
+                self.data[cam_id].center_crs = cam_data["center_crs"]
+            if "enabled" in cam_data:
+                self.data[cam_id].enabled = bool(cam_data["enabled"])
 
     def get_cam_sensor_parameters_from_file(self, cams_xml_filepath):
-        """Get sensor information from a .cams.xml file (Metashape export).
-
-        Converts sensor parameters using information from:
-        https://www.agisoft.com/forum/index.php?topic=7523.0
+        """Parse XML file and create Sensor objects, then assign to cameras.
 
         Args:
             cams_xml_filepath (str): Path to the XML file with sensor parameters.
         """
         tree = ET.parse(cams_xml_filepath)
         root = tree.getroot()
-        calibration = root.find('.//calibration[@type="frame"][@class="adjusted"]')
-        if calibration is not None:
-            self.f = float(calibration.find("f").text)
-            self.cx_metashape = float(calibration.find("cx").text)
-            self.cy_metashape = float(calibration.find("cy").text)
-            b1_element = calibration.find("b1")
-            self.b1 = float(b1_element.text) if b1_element is not None else 0.0
-            b2_element = calibration.find("b1")
-            self.b2 = float(b2_element.text) if b2_element is not None else 0.0
-            self.k1 = float(calibration.find("k1").text)
-            self.k2 = float(calibration.find("k2").text)
-            self.k3 = float(calibration.find("k3").text)
-            self.p1 = float(calibration.find("p1").text)
-            self.p2 = float(calibration.find("p2").text)
-            self.width = int(calibration.find("resolution").attrib["width"])
-            self.height = int(calibration.find("resolution").attrib["height"])
-            self.fx = self.f + self.b1
-            self.fy = self.f
-            self.cx = self.width / 2 + self.cx_metashape
-            self.cy = self.height / 2 + self.cy_metashape
-        else:
-            sys.exit("No calibration elements found!")
+        
+        # 1. Parse all sensors and create Sensor objects
+        sensors_section = root.find('.//sensors')
+        if sensors_section is None:
+            sys.exit("No sensors section found in XML file!")
+            
+        for sensor_elem in sensors_section.findall('sensor'):
+            sensor_id = int(sensor_elem.get('id'))
+            label = sensor_elem.get('label', 'unknown')
+            
+            # Parse resolution
+            resolution_elem = sensor_elem.find('resolution')
+            if resolution_elem is None:
+                logger.warning(f"No resolution found for sensor {sensor_id}, skipping...")
+                continue
+                
+            resolution = {
+                'width': int(resolution_elem.get('width')),
+                'height': int(resolution_elem.get('height'))
+            }
+            
+            # Parse calibration
+            calibration = sensor_elem.find('.//calibration[@type="frame"][@class="adjusted"]')
+            if calibration is not None:
+                # Helper function to safely get float values
+                def get_float_or_zero(elem, name, default=0.0):
+                    found_elem = elem.find(name)
+                    if found_elem is not None and found_elem.text is not None:
+                        try:
+                            return float(found_elem.text)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Invalid {name} value for sensor {sensor_id}, using default {default}")
+                            return default
+                    else:
+                        logger.warning(f"Missing {name} for sensor {sensor_id}, using default {default}")
+                        return default
+                
+                calib_params = {
+                    'f': get_float_or_zero(calibration, 'f'),
+                    'cx': get_float_or_zero(calibration, 'cx'),
+                    'cy': get_float_or_zero(calibration, 'cy'),
+                    'k1': get_float_or_zero(calibration, 'k1'),
+                    'k2': get_float_or_zero(calibration, 'k2'),
+                    'k3': get_float_or_zero(calibration, 'k3'),
+                    'p1': get_float_or_zero(calibration, 'p1'),
+                    'p2': get_float_or_zero(calibration, 'p2'),
+                }
+                
+                # Handle optional b1, b2 parameters
+                b1_elem = calibration.find('b1')
+                if b1_elem is not None and b1_elem.text is not None:
+                    try:
+                        calib_params['b1'] = float(b1_elem.text)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid b1 value for sensor {sensor_id}, using default 0.0")
+                        calib_params['b1'] = 0.0
+                else:
+                    calib_params['b1'] = 0.0
+                    
+                b2_elem = calibration.find('b2')
+                if b2_elem is not None and b2_elem.text is not None:
+                    try:
+                        calib_params['b2'] = float(b2_elem.text)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid b2 value for sensor {sensor_id}, using default 0.0")
+                        calib_params['b2'] = 0.0
+                else:
+                    calib_params['b2'] = 0.0
+                
+                # Create Sensor instance
+                sensor = Sensor(sensor_id, label, resolution, calib_params)
+                self.sensors[sensor_id] = sensor
+            else:
+                logger.warning(f"No calibration found for sensor {sensor_id}, skipping...")
+        
+        # 2. Parse cameras and assign sensor references
+        cameras_section = root.find('.//cameras')
+        if cameras_section is None:
+            logger.warning("No cameras section found in XML file!")
+            return
+            
+        assigned_count = 0
+        xml_cam_ids = []
+        json_cam_ids = list(self.data.keys())
+        
+        for camera_elem in cameras_section.findall('.//camera'):
+            cam_id = camera_elem.get('id')
+            sensor_id = int(camera_elem.get('sensor_id'))
+            xml_cam_ids.append(cam_id)
+            
+            # Find matching camera in our data and assign sensor
+            if cam_id in self.data:
+                self.data[cam_id].sensor_id = sensor_id
+                self.data[cam_id].sensor = self.sensors.get(sensor_id)
+                if self.data[cam_id].sensor is not None:
+                    assigned_count += 1
+                else:
+                    logger.warning(f"No sensor found for camera {cam_id} with sensor_id {sensor_id}")
+            else:
+                logger.warning(f"Camera {cam_id} from XML not found in loaded cameras")
+    
+        
+        if not self.sensors:
+            sys.exit("No valid sensors found in XML file!")
 
     def load_camera_attributes(self, input_filepath):
         """Load camera attributes from a CSV file.
@@ -322,6 +461,60 @@ f
                         "depth_res": getattr(cam, "depth_residual", None),
                     }
                 )
+    
+    def get_timematches(self, other_cams):
+        """Get the timematches between the cameras.
+
+        Args:
+            other_cams (Cameras): The other cameras to match against.
+        """
+        timematches = []
+        for cam in self.data.values():
+            other_cam = other_cams.get_camera_by_datetime(cam.datetime)
+            if other_cam is not None:
+                timematches.append((cam, other_cam))
+            else:
+                raise ValueError(f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}")
+        return timematches
+    
+    def get_centers_and_transforms_based_on_timematch(self, other_cams, offset_xyz=None):
+        """
+        Adopt the centers and transform from other cameras based on a timesync. 
+        Provide an offset_xyz in the camera's local coordinate system to apply to the camera positions.
+
+        Args:
+            other_cams (Cameras): The other cameras to match against.
+            offset_xyz (array-like): [x, y, z] offsets in the camera's local coordinate system.
+        """
+        for cam in self.data.values():
+            other_cam = other_cams.get_camera_by_datetime(cam.datetime)
+            if other_cam is not None:
+                if offset_xyz is not None:
+                    # Transform offset_xyz from camera coordinate system to world coordinates
+                    # Extract rotation matrix from camera transform and orthonormalize it
+                    rotation_matrix = np.array(other_cam.camera_transform, dtype=float)[:3, :3]
+                    # Use SVD to obtain the nearest rotation (handles potential scaling/shear)
+                    U, _, Vt = np.linalg.svd(rotation_matrix)
+                    R = U @ Vt
+                    # Ensure a proper rotation with det(R) == +1
+                    if np.linalg.det(R) < 0:
+                        Vt[-1, :] *= -1
+                        R = U @ Vt
+                    # Transform the offset to world coordinates using the pure rotation
+                    world_offset = R @ np.array(offset_xyz, dtype=float)
+                    # Add the transformed offset to the camera position
+                    cam.coords = other_cam.coords + world_offset
+                    # Also apply the offset to the camera_transform translation
+                    cam.camera_transform = other_cam.camera_transform.copy()
+                    cam.camera_transform[:3, 3] = np.array(cam.camera_transform[:3, 3], dtype=float) + world_offset
+                    cam.reverse_transform_coords(other_cam.parent.world_transform)
+                else:
+                    cam.coords = other_cam.coords
+                    cam.camera_transform = other_cam.camera_transform
+                    cam.orig_coords = other_cam.orig_coords
+                    cam.orig_camera_transform = other_cam.orig_camera_transform
+            else:
+                raise ValueError(f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}")
 
     def set_filepath_replace(self, find_str, replace_str):
         """Set a find/replace pair for adjusting filepaths.
@@ -368,12 +561,12 @@ f
             for cam, dist in zip(cams_list, dists):
                 cam.camdist = dist
 
-    def get_datetime_originals(self):
+    def get_datetime_originals(self, offset_secs=None):
         """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""
         for cam in tqdm(
             self.data.values(), desc="Retrieving timestamps from camera files..."
         ):
-            cam.datetime = cam.get_datetime_original()
+            cam.datetime = cam.get_datetime_original(offset_secs)
 
     def get_camera_by_filename(self, filename):
         """Get a camera object by its filename.
@@ -386,6 +579,17 @@ f
         """
         for cam in self.data.values():
             if cam.filename == filename or cam.filename == filename + ".jpg":
+                return cam
+        return None
+
+    def get_camera_by_datetime(self, datetime):
+        """Get a camera object by its datetime.
+
+        Args:
+            datetime (str): The datetime to search for.
+        """
+        for cam in self.data.values():
+            if cam.datetime == datetime:
                 return cam
         return None
 
@@ -556,6 +760,8 @@ class Camera:
         self.coords = self.orig_coords = coords
         self.orig_filepath = path
         self.filename = os.path.basename(path)
+        self.sensor_id = None  # Will be set during XML parsing
+        self.sensor = None     # Will reference the Sensor instance
 
     @property
     def vector(self):
@@ -656,8 +862,9 @@ class Camera:
         Args:
             transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
-        self.coords = self.__transform_coords(self.coords, transform_matrix)
-        self.camera_transform = np.dot(transform_matrix, self.camera_transform)
+        if self.coords is not None:
+            self.coords = self.__transform_coords(self.coords, transform_matrix)
+            self.camera_transform = np.dot(transform_matrix, self.camera_transform)
 
     def reverse_transform_coords(self, transform):
         """Restore original coordinates by applying the inverse
@@ -668,15 +875,17 @@ class Camera:
         """
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = self.__transform_coords(self.coords, inverse_transform)
-        self.camera_transform = np.dot(inverse_transform, self.camera_transform)
+        self.orig_camera_transform = np.dot(inverse_transform, self.camera_transform) ### CHECK: changed this from camera_transform to orig_camera_transform
 
-    def get_pixel_coords(self, coords, use_orig_coords=False):
+    def get_pixel_coords(self, coords, use_orig_coords=False, required_to_be_in_view=True):
         """Compute the image pixel coordinates from original 3D coordinates.
 
         Projects a 3D point and applies lens distortion correction.
 
         Args:
             coords (list or np.ndarray): The original 3D point.
+            use_orig_coords (bool): If True, use the original coordinates.
+            required_to_be_in_view (bool): If True, only return the pixel coordinates if the point is in view.
 
         Returns:
             tuple: (x, y, depth, relevance metric) or
@@ -692,39 +901,40 @@ class Camera:
         # Ensure array type and shape for inversion
         cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
 
+
         proj_point = np.dot(np.linalg.inv(cam_transform), np.append(coords, 1))
         x_norm = proj_point[0] / proj_point[2]
         y_norm = proj_point[1] / proj_point[2]
 
         r2 = x_norm**2 + y_norm**2
         radial = (
-            1 + self.parent.k1 * r2 + self.parent.k2 * r2**2 + self.parent.k3 * r2**3
+            1 + self.sensor.k1 * r2 + self.sensor.k2 * r2**2 + self.sensor.k3 * r2**3
         )
         x_dist = (
             x_norm * radial
-            + 2 * self.parent.p1 * x_norm * y_norm
-            + self.parent.p2 * (r2 + 2 * x_norm**2)
+            + 2 * self.sensor.p1 * x_norm * y_norm
+            + self.sensor.p2 * (r2 + 2 * x_norm**2)
         )
         y_dist = (
             y_norm * radial
-            + self.parent.p1 * (r2 + 2 * y_norm**2)
-            + 2 * self.parent.p2 * x_norm * y_norm
+            + self.sensor.p1 * (r2 + 2 * y_norm**2)
+            + 2 * self.sensor.p2 * x_norm * y_norm
         )
-        x_img = self.parent.fx * x_dist + self.parent.cx
-        y_img = self.parent.fy * y_dist + self.parent.cy
+        x_img = self.sensor.fx * x_dist + self.sensor.cx
+        y_img = self.sensor.fy * y_dist + self.sensor.cy
         in_view = (
-            r2 * self.parent.fx**2 < 1.01 * self.parent.width**2
-            and 0 <= x_img <= self.parent.width
-            and 0 <= y_img <= self.parent.height
+            r2 * self.sensor.fx**2 < 1.01 * self.sensor.width**2
+            and 0 <= x_img <= self.sensor.width
+            and 0 <= y_img <= self.sensor.height
         )
-        if in_view:
+        if in_view or not required_to_be_in_view:
             dist_sq = np.sum((cam_coords - coords) ** 2)
             rm = np.abs(
-                (np.abs(proj_point[2]) + dist_sq) / (self.parent.fx * self.parent.fy)
+                (np.abs(proj_point[2]) + dist_sq) / (self.sensor.fx * self.sensor.fy)
             ) * (
                 10
-                + np.abs(x_img - 0.5 * self.parent.width)
-                + np.abs(y_img - 0.5 * self.parent.height)
+                + np.abs(x_img - 0.5 * self.sensor.width)
+                + np.abs(y_img - 0.5 * self.sensor.height)
             )
             return (int(round(x_img)), int(round(y_img)), float(proj_point[2]), rm)
         else:
@@ -752,12 +962,12 @@ class Camera:
             center) and direction is a normalized 3D vector in world coordinates.
         """
         # Retrieve camera intrinsics and distortion parameters.
-        cx = self.parent.cx
-        cy = self.parent.cy
-        fx = self.parent.fx
-        fy = self.parent.fy
-        k1, k2, k3 = self.parent.k1, self.parent.k2, self.parent.k3
-        p1, p2 = self.parent.p1, self.parent.p2
+        cx = self.sensor.cx
+        cy = self.sensor.cy
+        fx = self.sensor.fx
+        fy = self.sensor.fy
+        k1, k2, k3 = self.sensor.k1, self.sensor.k2, self.sensor.k3
+        p1, p2 = self.sensor.p1, self.sensor.p2
 
         # Convert pixel coordinates to normalized (distorted) coords.
         x_dist = (x_img - cx) / fx
@@ -935,21 +1145,57 @@ class Camera:
         """
         visualizations.show_img(self.filepath, highlight_pixels=highlight_pixels)
 
-    def get_datetime_original(self):
-        """Retrieve the DateTimeOriginal from the image file EXIF data.
+    def get_datetime_original(self, offset_secs=None):
+        """Retrieve the DateTimeOriginal from the image file EXIF data, with optional offset.
+
+        Args:
+            offset_secs (float or int, optional): If provided, apply this many seconds to the EXIF datetime.
 
         Returns:
-            str or None: The DateTimeOriginal value if found, else None.
+            str or None: The (possibly offset) DateTimeOriginal value as a string, else None.
         """
         if not os.path.isfile(self.filepath):
             logger.error(f"Image file not found: {self.filepath}")
             return None
+        
+        # Try using exifread first (more comprehensive)
+        try:
+            with open(self.filepath, 'rb') as f:
+                tags = exifread.process_file(f, details=False)
+                
+                if 'EXIF DateTimeOriginal' in tags:
+                    dt_orig = str(tags['EXIF DateTimeOriginal'])
+                    if offset_secs is not None:
+                        dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
+                        dt_offset = dt + datetime.timedelta(seconds=offset_secs)
+                        return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
+                    else:
+                        return dt_orig
+                elif 'Image DateTime' in tags:
+                    dt_orig = str(tags['Image DateTime'])
+                    if offset_secs is not None:
+                        dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
+                        dt_offset = dt + datetime.timedelta(seconds=offset_secs)
+                        return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
+                    else:
+                        return dt_orig
+        except ImportError:
+            pass
+        except Exception as e:
+            pass
+        
+        # Fallback to PIL
         image = Image.open(self.filepath)
         exif_data = image.getexif()
         if exif_data:
             dt_orig = exif_data.get(36867) or exif_data.get(306)
             if dt_orig:
-                return dt_orig
+                if offset_secs is not None:
+                    dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
+                    dt_offset = dt + datetime.timedelta(seconds=offset_secs)
+                    return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
+                else:
+                    return dt_orig
             else:
                 logger.error(f"No exif DateTimeOriginal for: {self.filepath}")
                 return None

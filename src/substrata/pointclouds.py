@@ -13,8 +13,8 @@ from collections.abc import Iterable
 import struct
 
 # Local Modules
-from substrata import geometry, settings
-from substrata.geometry import Transform
+from substrata import geom, settings
+from substrata.geom import Transform
 import substrata.annotations as annotations
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -678,7 +678,7 @@ class PointCloud:
 
         # Discretize the line segment between start_coord and target_coord
         # using intercept_radius as step distance
-        sample_points = geometry.sample_points_along_line(
+        sample_points = geom.sample_points_along_line(
             origin_coord, target_coord, search_radius
         )
         sample_point_neighbors = []
@@ -719,7 +719,7 @@ class PointCloud:
                    vector is projected.
 
         Returns:
-            geometry.Vector: Unit-length 4-vector lying in the requested plane.
+            geom.Vector: Unit-length 4-vector lying in the requested plane.
 
         Raises:
             ValueError: If *plane* is not "xy", "xz", or "yz".
@@ -740,7 +740,7 @@ class PointCloud:
         else:
             raise ValueError("plane must be 'xy', 'xz', or 'yz'")
 
-        return geometry.Vector(v_proj)
+        return geom.Vector(v_proj)
 
     def principal_axis_xy_2D(self) -> "Vector":
         """Return the dominant PCA eigen-vector in XY-space.
@@ -751,12 +751,12 @@ class PointCloud:
             (`measurements.conduct_xy_PCA`, which should return
             ``eigenvalues, eigenvectors`` like the 3-D version).
         2.  Takes the first eigen-vector *(v_x, v_y)*, normalises it, and
-            returns it as a `geometry.Vector` lying in the XY-plane
+            returns it as a `geom.Vector` lying in the XY-plane
             (Z-component set to 0).
 
         Returns
         -------
-        geometry.Vector
+        geom.Vector
             Unit-length 4-vector `[v_x, v_y, 0, 1]` representing the
             dominant horizontal direction.
         """
@@ -767,7 +767,7 @@ class PointCloud:
         vec = np.array([vx, vy, 0.0])
         vec /= np.linalg.norm(vec)
 
-        return geometry.Vector(vec)
+        return geom.Vector(vec)
 
 
 class SimplePointCloud:

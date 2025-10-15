@@ -1339,10 +1339,10 @@ def show_intercept_point(intercept_point):
     A dashed line connects the query and selected point, and a 3D
     cylinder (centered at the query XY) represents the search radius.
     """
-    xy_coord = intercept_point.estimated_coords[0:2]
+    xy_coord = intercept_point.estimated_intercept_coords[0:2]
     search_radius = intercept_point.search_radius
     candidates = np.array(intercept_point.simple_pcd.points)
-    intercept = np.array(intercept_point.estimated_coords)
+    intercept = np.array(intercept_point.estimated_intercept_coords)
     selected = np.array(intercept_point.coords)
 
     # Create figure with two panels: left panel for 3D plot, right panel for 2D plot.
@@ -1845,7 +1845,7 @@ def draw_image_matches_within_camera(
     # Use a smaller font size for better visibility if the text is not showing up.
     try:
         # Try to load a common cross-platform font; fall back to default if not found
-        font = ImageFont.truetype("DejaVuSans.ttf", 300)
+        font = ImageFont.truetype("DejaVuSans.ttf", 100)
     except Exception as e:
         print(f"Error loading DejaVuSans font: {e}")
         font = ImageFont.load_default()
@@ -1986,23 +1986,34 @@ def create_annotated_video(
 
     # Create a temporary directory for saving image matches
     temp_image_matches_output = tempfile.mkdtemp(prefix="image_matches_")
+    print(f"Temporary image matches output: {temp_image_matches_output}")
 
     try:
         # Generate image matches for each camera and save them to disk.
         if annotations is not None:
-            for cam in tqdm(cams, total=len(cams.items()), desc="Generating annotated frames for video"):
-                image_matches = cam.get_image_matches(annotations, pcd=pcd)
-                if sam_predictor:
-                    for match in image_matches:
-                        match.get_sam2_masks(sam_predictor)
+            print(f"Processing {len(cams)} cameras with annotations...")
+            for cam in tqdm(cams, total=len(cams), desc="Generating annotated frames for video"):
+                try:
+                    # Check if camera has valid filepath
+                    if not hasattr(cam, 'filepath') or not cam.filepath or not os.path.exists(cam.filepath):
+                        print(f"Warning: Camera {cam.cam_id} has invalid filepath: {getattr(cam, 'filepath', 'None')}")
+                        continue
+                    
+                    image_matches = cam.get_image_matches(annotations, pcd=pcd)
+                    if sam_predictor:
+                        for match in image_matches:
+                            match.get_sam2_masks(sam_predictor)
 
-                save_image_matches_within_camera(
-                    image_matches,
-                    cam,
-                    temp_image_matches_output,
-                    use_label_column,
-                    resize_width,
-                )
+                    save_image_matches_within_camera(
+                        image_matches,
+                        cam,
+                        temp_image_matches_output,
+                        use_label_column,
+                        resize_width,
+                    )
+                except Exception as e:
+                    print(f"Error processing camera {cam.cam_id}: {e}")
+                    continue
         else:
             from joblib import Parallel, delayed
 
@@ -2033,12 +2044,23 @@ def create_annotated_video(
                 # Determine ordered list of cams used
                 ordered_cams = list(cams) if annotations is None else list(cams)
                 last_img = None
+                frames_found = 0
                 for cam in ordered_cams:
                     out_path = os.path.join(temp_image_matches_output, cam.filename)
                     if os.path.isfile(out_path):
                         f.write(f"file '{out_path}'\n")
                         f.write("duration 0.5\n")
                         last_img = out_path
+                        frames_found += 1
+                    else:
+                        print(f"Warning: Frame not found for camera {cam.cam_id}: {out_path}")
+                
+                if frames_found == 0:
+                    print("Error: No frames were generated for the video")
+                    print(f"Temporary directory contents: {os.listdir(temp_image_matches_output)}")
+                    return
+                
+                print(f"Found {frames_found} frames for video creation")
                 if last_img is not None:
                     f.write(f"file '{last_img}'\n")
 
@@ -2057,7 +2079,8 @@ def create_annotated_video(
                 "-f", "concat",
                 "-safe", "0",
                 "-i", file_list_path,
-                "-vsync", "vfr",
+                "-r", "2",  # Set output framerate to 2 fps
+                "-vsync", "cfr",  # Use constant frame rate with -r
             ]
             if target_width is not None:
                 cmd += ["-vf", f"scale={int(target_width)}:-2"]

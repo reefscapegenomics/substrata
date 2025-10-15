@@ -145,6 +145,10 @@ def handle_views(args):
     output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
     init.pcd.save_pdf(filepath=output_pdf)
 
+    if getattr(args, "save_yaml", False):
+        # Save values to YAML
+        yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
+        init.save_config_to_yaml(yaml_path)
 
 def handle_firefish(args):
     # Build defaults from current directory name
@@ -175,7 +179,7 @@ def handle_firefish(args):
     # Only apply scale_factor (if specified or needed for save_yaml)
     if init.scale_factor is not None or getattr(args, "save_yaml", False):
         init.scale()
-        from substrata.geometry import Transform
+        from substrata.geom import Transform
         init.world_transform = Transform.from_scale(init.scale_factor)
 
     init.initialize(apply_transform=True)
@@ -242,19 +246,26 @@ def handle_cams2video(args):
     anns = None
     anns_path = init.annotations_filepath
     if anns_path:
-        try:
-            anns = Annotations()
-            anns.get_annotations_from_file(anns_path, header=True, orig_coords_only=False)
-        except Exception:
-            anns = None
-
+        anns = Annotations(anns_path, header=True, orig_coords_only=True)
+        anns.apply_transform(init.world_transform)
+        print(f"Number of annotations: {len(anns)}")
     # Optional subset by camera group name
     cams_for_video = init.cams
     if getattr(args, "cams_group", None):
         try:
             cams_for_video = init.cams.subset_by_group(args.cams_group)
-        except Exception:
-            pass
+            print(f"Filtered cameras by group '{args.cams_group}': {len(cams_for_video)} cameras")
+        except Exception as e:
+            print(f"Warning: Failed to filter cameras by group '{args.cams_group}': {e}")
+            print(f"Available camera groups: {init.cams.group_names}")
+            print("Using all cameras instead")
+    
+    # Validate that we have cameras to work with
+    if not cams_for_video or len(cams_for_video) == 0:
+        print("Error: No cameras available for video creation")
+        return
+    
+    print(f"Using {len(cams_for_video)} cameras for video creation")
 
     # Compute output path and ensure directory
     output_mp4 = args.output_mp4 or _get_output_filepath(init, "cams.mp4")
@@ -348,6 +359,11 @@ def main():
         "--auto-orient", dest="auto_orient", action="store_true",
         help="Initialize and orient the project before saving.",
     )
+    p_views.add_argument(
+        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        help="Save computed scale_factor into a YAML config for this project.",
+    )
+
 
     # firefish
     p_ff = subparsers.add_parser(

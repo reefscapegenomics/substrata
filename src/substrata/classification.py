@@ -88,6 +88,7 @@ def classify_image_match(
     image_match,
     classifier: Union[str, Any],
     crop_size: Optional[Union[int, Tuple[int, int]]] = None,
+    show: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Run an image classifier on an ImageMatch and attach the result to the instance.
@@ -101,6 +102,7 @@ def classify_image_match(
         image_match: An instance of `cameras.ImageMatch`.
         classifier: Loaded FastAI learner or path to a .pkl learner.
         crop_size: Optional int (square) or (width, height) tuple for center crop.
+        show: If True, display the image crop and classification result (Jupyter notebook).
 
     Returns:
         A dict with keys: 'label', 'confidence', 'probs', 'pred_idx'.
@@ -152,6 +154,20 @@ def classify_image_match(
             "probs": probs_map,
             "pred_idx": int(pred_idx) if hasattr(pred_idx, "__int__") else pred_idx,
         }
+
+        # --- Show the exact image crop and classification output if requested ---
+        if show:
+            try:
+                import matplotlib.pyplot as plt
+
+                plt.figure(figsize=(4, 4))
+                plt.imshow(img)
+                plt.axis('off')
+                plt.title(f"Classification: {result.get('label', '')}\nConfidence: {result.get('confidence', ''):.3f}")
+                plt.show()
+            except Exception as e:
+                logger.warning(f"Could not display classification input crop: {e}")
+        # --------------------------------------------------------------------------
 
         # Attach to the ImageMatch instance
         setattr(image_match, "classification", result)

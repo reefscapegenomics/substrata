@@ -19,7 +19,7 @@ from substrata import (
     measurements,
     cameras,
     visualizations,
-    geometry,
+    geom,
     pointclouds,
 )
 from substrata.logging import logger
@@ -815,9 +815,9 @@ class Annotation:
         Args:
             transform (np.ndarray): Transformation matrix.
         """
-        self.coords = geometry.transform_coords(self.coords, transform)
+        self.coords = geom.transform_coords(self.coords, transform)
         for full_id in self.extra_coords:
-            self.extra_coords[full_id] = geometry.transform_coords(
+            self.extra_coords[full_id] = geom.transform_coords(
                 self.extra_coords[full_id], transform
             )
 
@@ -828,7 +828,7 @@ class Annotation:
             transform (np.ndarray): Transformation matrix.
         """
         inverse_transform = np.linalg.inv(transform)
-        self.orig_coords = geometry.transform_coords(self.coords, inverse_transform)
+        self.orig_coords = geom.transform_coords(self.coords, inverse_transform)
 
     def get_image_matches(
         self,
@@ -849,8 +849,12 @@ class Annotation:
                 continue
                 
             # Get pixel coordinates for each camera
+            if use_orig_coords:
+                coords = self.orig_coords
+            else:
+                coords = self.coords
             x, y, depth, relevance = cam.get_pixel_coords(
-                self.orig_coords, use_orig_coords=use_orig_coords
+                coords, use_orig_coords=use_orig_coords
             )
             if x is not None:
                 # If pixel coordinates are within the camera bounds

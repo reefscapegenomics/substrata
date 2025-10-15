@@ -27,7 +27,7 @@ except ImportError:
     pass
 
 # Local Modules
-from substrata import cameras, pointclouds, visualizations, settings, geometry
+from substrata import cameras, pointclouds, visualizations, settings, geom
 
 
 def conduct_PCA(pcd, sort=True):
@@ -46,10 +46,10 @@ def conduct_PCA(pcd, sort=True):
     return eigenvalues, eigenvectors
 
 
-def best_fit_plane_normal(pcd) -> geometry.Vector:
+def best_fit_plane_normal(pcd) -> geom.Vector:
     """Return a unit normal (Vector) of the PCA best-fit plane."""
     a, b, c, _ = conduct_PCA(pcd)[:4]
-    return geometry.Vector([a, b, c, 0])  # promote to 4-vector
+    return geom.Vector([a, b, c, 0])  # promote to 4-vector
 
 
 def conduct_xy_PCA(pcd, sort=True, visualize=False):

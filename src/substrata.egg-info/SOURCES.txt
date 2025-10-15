@@ -7,7 +7,7 @@ src/substrata/cameras.py
 src/substrata/classification.py
 src/substrata/cli.py
 src/substrata/firefish.py
-src/substrata/geometry.py
+src/substrata/geom.py
 src/substrata/logging.py
 src/substrata/measurements.py
 src/substrata/pointclouds.py

@@ -10,7 +10,7 @@ from substrata import (
     annotations,
     cameras,
     pointclouds,
-    geometry,
+    geom,
     settings,
 )
 
@@ -157,7 +157,7 @@ class ProjectInitializer:
         # Optional orientation-related fields
         up = yaml_config.get("up_vector")
         if up is not None:
-            from substrata.geometry import Vector
+            from substrata.geom import Vector
             self.up_vector = Vector(up)
         d_off = yaml_config.get("depth_offset")
         if d_off is not None:

@@ -321,33 +321,83 @@ def sift_match_batched(
 
 
 def visualize_sift_matches(
-    query_frame,
+    query,
     target_cam,
     max_dim=800,
     downscale_interpolation=cv2.INTER_AREA,
     use_gpu=False,
     save_path=None,
     show_plot=True,
+    query_crop=None,
+    target_crop=None,
 ):
     """
-    Visualize SIFT matches between a query frame and target camera side by side.
+    Visualize SIFT matches between a query frame/camera and target camera side by side.
 
     Args:
-        query_frame: Frame object for the query image
+        query: Frame object or Camera object for the query image
         target_cam: Camera object for the target image
         max_dim: Maximum dimension for resizing images
         downscale_interpolation: Interpolation method for resizing
         use_gpu: Whether to use GPU acceleration
         save_path: Optional path to save the visualization
         show_plot: Whether to display the plot
+        query_crop: Optional array [x, y, width, height] defining crop area for query image
+        target_crop: Optional array [x, y, width, height] defining crop area for target image
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
 
-    def load_and_resize_gray(filepath, max_dim):
+    def load_and_resize_gray_from_array(img_array, max_dim, crop_area=None):
+        h, w = img_array.shape[:2]
+        
+        # Apply crop if specified
+        if crop_area is not None:
+            x, y, crop_w, crop_h = crop_area
+            # Ensure crop coordinates are within image bounds
+            x = max(0, int(x))
+            y = max(0, int(y))
+            crop_w = min(int(crop_w), w - x)
+            crop_h = min(int(crop_h), h - y)
+            
+            if crop_w > 0 and crop_h > 0:
+                img_array = img_array[y:y+crop_h, x:x+crop_w]
+            else:
+                print(f"Warning: Invalid crop area {crop_area}, using full image")
+        
+        h, w = img_array.shape[:2]
+        scale = min(1.0, float(max_dim) / max(h, w))
+        if scale < 1.0:
+            img_array = cv2.resize(
+                img_array,
+                (int(w * scale), int(h * scale)),
+                interpolation=downscale_interpolation,
+            )
+        img_gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        img_rgb = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        return img_gray, img_rgb
+
+    def load_and_resize_gray_from_file(filepath, max_dim, crop_area=None):
         img = cv2.imread(filepath)
         if img is None:
             return None, None
+        
+        h, w = img.shape[:2]
+        
+        # Apply crop if specified
+        if crop_area is not None:
+            x, y, crop_w, crop_h = crop_area
+            # Ensure crop coordinates are within image bounds
+            x = max(0, int(x))
+            y = max(0, int(y))
+            crop_w = min(int(crop_w), w - x)
+            crop_h = min(int(crop_h), h - y)
+            
+            if crop_w > 0 and crop_h > 0:
+                img = img[y:y+crop_h, x:x+crop_w]
+            else:
+                print(f"Warning: Invalid crop area {crop_area}, using full image")
+        
         h, w = img.shape[:2]
         scale = min(1.0, float(max_dim) / max(h, w))
         if scale < 1.0:
@@ -360,24 +410,41 @@ def visualize_sift_matches(
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img_gray, img_rgb
 
-    # Load and resize images
-    query_img_gray = cv2.cvtColor(query_frame.image_array, cv2.COLOR_BGR2GRAY)
-    query_img_rgb = cv2.cvtColor(query_frame.image_array, cv2.COLOR_BGR2RGB)
-    h, w = query_img_gray.shape[:2]
-    scale = min(1.0, float(max_dim) / max(h, w))
-    if scale < 1.0:
-        query_img_gray = cv2.resize(
-            query_img_gray,
-            (int(w * scale), int(h * scale)),
-            interpolation=downscale_interpolation,
-        )
-        query_img_rgb = cv2.resize(
-            query_img_rgb,
-            (int(w * scale), int(h * scale)),
-            interpolation=downscale_interpolation,
-        )
+    # --- Handle query input: Frame or Camera ---
+    # Try to get image array and label info
+    if hasattr(query, "image_array") and query.image_array is not None:
+        # Frame object or Camera with loaded image
+        query_img_gray, query_img_rgb = load_and_resize_gray_from_array(query.image_array, max_dim, query_crop)
+        # Try to get frame_number and timestamp_seconds if present
+        query_frame_number = getattr(query, "frame_number", None)
+        query_timestamp = getattr(query, "timestamp_seconds", None)
+        query_filepath = getattr(query, "filepath", None)
+        query_cam_id = getattr(query, "cam_id", None)
+        query_label = None
+        if query_frame_number is not None and query_timestamp is not None:
+            query_label = f"Frame {query_frame_number} at {query_timestamp:.2f}s"
+        elif query_cam_id is not None:
+            query_label = f"Camera {query_cam_id}"
+        else:
+            query_label = "Query"
+    elif hasattr(query, "filepath"):
+        # Camera object with only filepath
+        query_img_gray, query_img_rgb = load_and_resize_gray_from_file(query.filepath, max_dim, query_crop)
+        query_filepath = query.filepath
+        query_cam_id = getattr(query, "cam_id", None)
+        query_label = f"Camera {query_cam_id}" if query_cam_id is not None else "Query"
+        query_frame_number = None
+        query_timestamp = None
+    else:
+        print("Query input must be a Frame or Camera object with image_array or filepath.")
+        return
 
-    target_img_gray, target_img_rgb = load_and_resize_gray(target_cam.filepath, max_dim)
+    if query_img_gray is None:
+        print(f"Could not load image for query: {getattr(query, 'filepath', 'unknown')}")
+        return
+
+    # --- Target image ---
+    target_img_gray, target_img_rgb = load_and_resize_gray_from_file(target_cam.filepath, max_dim, target_crop)
 
     if target_img_gray is None:
         print(f"Could not load image for target camera: {target_cam.filepath}")
@@ -388,7 +455,7 @@ def visualize_sift_matches(
         try:
             sift = cv2.cuda.SIFT_create()
             gpu_available = True
-        except:
+        except Exception:
             print("GPU SIFT not available, falling back to CPU")
             gpu_available = False
             sift = cv2.SIFT_create()
@@ -406,12 +473,12 @@ def visualize_sift_matches(
         kp_query, des_query = sift.detectAndCompute(query_img_gray, None)
 
     if des_query is None or len(kp_query) == 0:
-        print(f"No SIFT features found in query camera image: {query_frame.filepath}")
+        print(f"No SIFT features found in query image: {query_filepath}")
         return
 
     # Detect SIFT features for target image
     if gpu_available:
-        gpu_target_img = cv2.cuda_GpuMat()
+        gpu_target_img = cv2.cuda.GpuMat()
         gpu_target_img.upload(target_img_gray)
         kp_target, des_target = sift.detectAndCompute(gpu_target_img, None)
         des_target = des_target.download()
@@ -437,12 +504,12 @@ def visualize_sift_matches(
         if m.distance < 0.75 * n.distance:
             good_matches.append(m)
 
+    # Print match info
     print(
-        f"Found {len(good_matches)} good matches between query frame at {query_frame.timestamp_seconds:.2f}s and camera {target_cam.cam_id}"
+        f"Found {len(good_matches)} good matches between {query_label} and camera {target_cam.cam_id}"
     )
 
     # Create visualization with proper line drawing
-    # Create a single figure with both images side by side
     fig, ax = plt.subplots(1, 1, figsize=(20, 10))
 
     # Create combined image
@@ -450,7 +517,6 @@ def visualize_sift_matches(
     h2, w2 = target_img_rgb.shape[:2]
     max_h = max(h1, h2)
 
-    # Create combined image
     combined_img = np.zeros((max_h, w1 + w2, 3), dtype=np.uint8)
     combined_img[:h1, :w1] = query_img_rgb
     combined_img[:h2, w1 : w1 + w2] = target_img_rgb
@@ -458,7 +524,7 @@ def visualize_sift_matches(
     # Display combined image
     ax.imshow(combined_img)
     ax.set_title(
-        f"SIFT Feature Matching: Query Frame at {query_frame.timestamp_seconds:.2f}s ↔ Target Camera {target_cam.cam_id}\n"
+        f"SIFT Feature Matching: {query_label} ↔ Target Camera {target_cam.cam_id}\n"
         f"Matches: {len(good_matches)}/{len(matches)}",
         fontsize=14,
         fontweight="bold",
@@ -467,7 +533,6 @@ def visualize_sift_matches(
 
     # Draw matching lines
     if len(good_matches) > 0:
-        # Get matched keypoints
         src_pts = np.float32([kp_query[m.queryIdx].pt for m in good_matches]).reshape(
             -1, 1, 2
         )
@@ -475,22 +540,17 @@ def visualize_sift_matches(
             -1, 1, 2
         )
 
-        # Draw lines connecting matched points
         for i in range(len(src_pts)):
-            # Get coordinates
             x1, y1 = src_pts[i][0]
             x2, y2 = dst_pts[i][0]
-            # Adjust x2 coordinate for target image
             x2 += w1
-
-            # Draw connecting line between matched points
             ax.plot([x1, x2], [y1, y2], "b-", linewidth=2, alpha=0.7)
 
     # Add labels for the two images
     ax.text(
         w1 // 2,
         -20,
-        f"Query Frame at {query_frame.timestamp_seconds:.2f}s",
+        query_label,
         ha="center",
         va="top",
         fontsize=12,
@@ -509,13 +569,30 @@ def visualize_sift_matches(
     )
 
     # Add filepath information
-    ax.text(
-        10,
-        max_h + 20,
-        f"Query: Frame {query_frame.frame_number} at {query_frame.timestamp_seconds:.2f}s",
-        fontsize=8,
-        wrap=True,
-    )
+    if query_frame_number is not None and query_timestamp is not None:
+        ax.text(
+            10,
+            max_h + 20,
+            f"Query: Frame {query_frame_number} at {query_timestamp:.2f}s",
+            fontsize=8,
+            wrap=True,
+        )
+    elif query_cam_id is not None:
+        ax.text(
+            10,
+            max_h + 20,
+            f"Query: Camera {query_cam_id} ({query_filepath})",
+            fontsize=8,
+            wrap=True,
+        )
+    else:
+        ax.text(
+            10,
+            max_h + 20,
+            f"Query: {query_filepath}",
+            fontsize=8,
+            wrap=True,
+        )
     ax.text(
         w1 + 10, max_h + 20, f"Target: {target_cam.filepath}", fontsize=8, wrap=True
     )
@@ -537,6 +614,449 @@ def visualize_sift_matches(
         "total_matches": len(matches),
         "good_matches": len(good_matches),
         "match_ratio": len(good_matches) / len(matches) if len(matches) > 0 else 0,
+    }
+
+
+def estimate_macro_camera_pose_from_gopro(
+    gopro_camera,
+    macro_camera,
+    point_cloud,
+    max_dim=800,
+    downscale_interpolation=cv2.INTER_AREA,
+    use_gpu=False,
+    min_matches=10,
+    reprojection_threshold=2.0,
+    confidence=0.99,
+    query_crop=None,
+    target_crop=None,
+    save_visualization=None,
+    show_plot=False,
+):
+    """
+    Estimate macro camera pose using SIFT matches with a GoPro camera through PnP solving.
+    
+    This method matches SIFT features between a GoPro camera (with known pose) and a macro camera
+    (with unknown pose), then uses the 3D-2D correspondences to solve for the macro camera's
+    position and orientation using PnP (Perspective-n-Point) algorithm.
+    
+    Args:
+        gopro_camera: Camera object with known coords and transform (GoPro frame)
+        macro_camera: Camera object with unknown pose (macro camera) - must have filepath
+        point_cloud: PointCloud object for 3D point correspondences
+        max_dim: Maximum dimension for resizing images during SIFT matching
+        downscale_interpolation: Interpolation method for resizing
+        use_gpu: Whether to use GPU acceleration for SIFT
+        min_matches: Minimum number of good matches required for PnP solving
+        reprojection_threshold: Threshold for RANSAC reprojection error in pixels
+        confidence: Confidence level for RANSAC
+        query_crop: Optional array [x, y, width, height] for cropping GoPro image
+        target_crop: Optional array [x, y, width, height] for cropping macro image
+        save_visualization: Optional path to save SIFT matching visualization
+        show_plot: Whether to display the SIFT matching visualization
+        
+    Returns:
+        dict: Results containing:
+            - success (bool): Whether pose estimation was successful
+            - coords (np.ndarray): Estimated camera coordinates [x, y, z]
+            - transform (np.ndarray): Estimated 4x4 camera transform matrix
+            - rvec (np.ndarray): Rotation vector from PnP
+            - tvec (np.ndarray): Translation vector from PnP
+            - inliers (int): Number of inlier matches used
+            - reprojection_error (float): Mean reprojection error
+            - match_stats (dict): SIFT matching statistics
+    """
+    import cv2
+    import numpy as np
+    from substrata.logging import logger
+    
+    # Validate inputs
+    if not hasattr(gopro_camera, 'coords') or gopro_camera.coords is None:
+        raise ValueError("GoPro camera must have known coordinates")
+    if not hasattr(gopro_camera, 'camera_transform') or gopro_camera.camera_transform is None:
+        raise ValueError("GoPro camera must have known transform")
+    if not hasattr(macro_camera, 'filepath') or macro_camera.filepath is None:
+        raise ValueError("Macro camera must have a valid filepath")
+    
+    logger.info(f"Estimating macro camera pose using GoPro {gopro_camera.cam_id}")
+    
+    # Step 1: Perform SIFT matching between GoPro and macro camera
+    match_results = visualize_sift_matches(
+        query=gopro_camera,
+        target_cam=macro_camera,
+        max_dim=max_dim,
+        downscale_interpolation=downscale_interpolation,
+        use_gpu=use_gpu,
+        save_path=save_visualization,
+        show_plot=show_plot,
+        query_crop=query_crop,
+        target_crop=target_crop,
+    )
+    
+    if match_results is None:
+        return {
+            "success": False,
+            "error": "SIFT matching failed",
+            "match_stats": {}
+        }
+    
+    # Step 2: Get detailed SIFT matching results for 3D-2D correspondences
+    sift_results = _perform_detailed_sift_matching(
+        gopro_camera, macro_camera, point_cloud, max_dim, 
+        downscale_interpolation, use_gpu, query_crop, target_crop
+    )
+    
+    if sift_results is None or len(sift_results['good_matches']) < min_matches:
+        return {
+            "success": False,
+            "error": f"Insufficient matches: {len(sift_results['good_matches']) if sift_results else 0} < {min_matches}",
+            "match_stats": match_results
+        }
+    
+    # Step 3: Extract 3D-2D correspondences
+    object_points = sift_results['object_points']  # 3D points in world coordinates
+    image_points = sift_results['image_points']    # 2D points in macro camera image
+    
+    logger.info(f"Using {len(object_points)} 3D-2D correspondences for PnP solving")
+    
+    # Step 4: Get macro camera intrinsic parameters
+    if not hasattr(macro_camera, 'sensor') or macro_camera.sensor is None:
+        raise ValueError("Macro camera must have sensor calibration parameters")
+    
+    sensor = macro_camera.sensor
+    camera_matrix = np.array([
+        [sensor.fx, 0, sensor.cx],
+        [0, sensor.fy, sensor.cy],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    
+    dist_coeffs = np.array([
+        sensor.k1, sensor.k2, sensor.p1, sensor.p2, sensor.k3
+    ], dtype=np.float32)
+    
+    # Step 5: Solve PnP problem
+    try:
+        # Validate input data
+        logger.info(f"Object points shape: {object_points.shape}")
+        logger.info(f"Image points shape: {image_points.shape}")
+        logger.info(f"Camera matrix:\n{camera_matrix}")
+        logger.info(f"Distortion coefficients: {dist_coeffs}")
+        
+        # Check for valid data
+        if len(object_points) < 4:
+            return {
+                "success": False,
+                "error": f"Insufficient object points: {len(object_points)} < 4",
+                "match_stats": match_results
+            }
+        
+        if len(image_points) < 4:
+            return {
+                "success": False,
+                "error": f"Insufficient image points: {len(image_points)} < 4",
+                "match_stats": match_results
+            }
+        
+        # Check for NaN or infinite values
+        if np.any(np.isnan(object_points)) or np.any(np.isinf(object_points)):
+            return {
+                "success": False,
+                "error": "Object points contain NaN or infinite values",
+                "match_stats": match_results
+            }
+        
+        if np.any(np.isnan(image_points)) or np.any(np.isinf(image_points)):
+            return {
+                "success": False,
+                "error": "Image points contain NaN or infinite values",
+                "match_stats": match_results
+            }
+        
+        # Try different PnP methods
+        pnp_methods = [
+            (cv2.SOLVEPNP_ITERATIVE, "ITERATIVE"),
+            (cv2.SOLVEPNP_EPNP, "EPNP"),
+            (cv2.SOLVEPNP_P3P, "P3P"),
+            (cv2.SOLVEPNP_DLS, "DLS"),
+            (cv2.SOLVEPNP_UPNP, "UPNP")
+        ]
+        
+        success = False
+        rvec, tvec, inliers = None, None, None
+        used_method = None
+        
+        for method_flag, method_name in pnp_methods:
+            try:
+                logger.info(f"Trying PnP method: {method_name}")
+                success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=camera_matrix,
+                    distCoeffs=dist_coeffs,
+                    reprojectionError=reprojection_threshold,
+                    confidence=confidence,
+                    flags=method_flag
+                )
+                
+                if success:
+                    used_method = method_name
+                    logger.info(f"PnP succeeded with method: {method_name}")
+                    break
+                else:
+                    logger.info(f"PnP failed with method: {method_name}")
+                    
+            except Exception as e:
+                logger.warning(f"PnP method {method_name} failed with exception: {str(e)}")
+                continue
+        
+        if not success:
+            # Try without RANSAC as fallback
+            logger.info("Trying PnP without RANSAC as fallback")
+            try:
+                success, rvec, tvec = cv2.solvePnP(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=camera_matrix,
+                    distCoeffs=dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                inliers = np.arange(len(object_points))  # All points are inliers
+                used_method = "ITERATIVE (no RANSAC)"
+                logger.info("PnP succeeded without RANSAC")
+            except Exception as e:
+                logger.error(f"PnP without RANSAC also failed: {str(e)}")
+                return {
+                    "success": False,
+                    "error": f"All PnP methods failed. Last error: {str(e)}",
+                    "match_stats": match_results
+                }
+        
+        if not success:
+            return {
+                "success": False,
+                "error": "PnP solving failed with all methods",
+                "match_stats": match_results
+            }
+        
+        # Step 6: Convert rotation vector to rotation matrix and create transform
+        rmat, _ = cv2.Rodrigues(rvec)
+        
+        # Create 4x4 transform matrix
+        transform = np.eye(4)
+        transform[:3, :3] = rmat
+        transform[:3, 3] = tvec.flatten()
+        
+        # Step 7: Calculate reprojection error
+        projected_points, _ = cv2.projectPoints(
+            object_points[inliers], rvec, tvec, camera_matrix, dist_coeffs
+        )
+        projected_points = projected_points.reshape(-1, 2)
+        actual_points = image_points[inliers]
+        
+        reprojection_error = np.mean(np.linalg.norm(projected_points - actual_points, axis=1))
+        
+        # Step 8: Extract camera coordinates (position)
+        coords = tvec.flatten()
+        
+        logger.info(f"Successfully estimated macro camera pose:")
+        logger.info(f"  Method used: {used_method}")
+        logger.info(f"  Coordinates: [{coords[0]:.3f}, {coords[1]:.3f}, {coords[2]:.3f}]")
+        logger.info(f"  Inliers: {len(inliers)}/{len(object_points)}")
+        logger.info(f"  Reprojection error: {reprojection_error:.2f} pixels")
+        
+        return {
+            "success": True,
+            "coords": coords,
+            "transform": transform,
+            "rvec": rvec.flatten(),
+            "tvec": tvec.flatten(),
+            "inliers": len(inliers),
+            "reprojection_error": reprojection_error,
+            "match_stats": match_results,
+            "camera_matrix": camera_matrix,
+            "dist_coeffs": dist_coeffs
+        }
+        
+    except Exception as e:
+        logger.error(f"PnP solving failed with error: {str(e)}")
+        return {
+            "success": False,
+            "error": f"PnP solving failed: {str(e)}",
+            "match_stats": match_results
+        }
+
+
+def _perform_detailed_sift_matching(
+    gopro_camera, macro_camera, point_cloud, max_dim, 
+    downscale_interpolation, use_gpu, query_crop, target_crop
+):
+    """
+    Perform detailed SIFT matching to get 3D-2D correspondences for PnP solving.
+    
+    Returns:
+        dict: Contains 'good_matches', 'object_points', 'image_points', and keypoint info
+    """
+    import cv2
+    import numpy as np
+    
+    def load_and_resize_gray_from_array(img_array, max_dim, crop_area=None):
+        h, w = img_array.shape[:2]
+        
+        # Apply crop if specified
+        if crop_area is not None:
+            x, y, crop_w, crop_h = crop_area
+            x = max(0, int(x))
+            y = max(0, int(y))
+            crop_w = min(int(crop_w), w - x)
+            crop_h = min(int(crop_h), h - y)
+            
+            if crop_w > 0 and crop_h > 0:
+                img_array = img_array[y:y+crop_h, x:x+crop_w]
+        
+        h, w = img_array.shape[:2]
+        scale = min(1.0, float(max_dim) / max(h, w))
+        if scale < 1.0:
+            img_array = cv2.resize(
+                img_array,
+                (int(w * scale), int(h * scale)),
+                interpolation=downscale_interpolation,
+            )
+        return cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY), scale
+    
+    def load_and_resize_gray_from_file(filepath, max_dim, crop_area=None):
+        img = cv2.imread(filepath)
+        if img is None:
+            return None, None
+        
+        h, w = img.shape[:2]
+        
+        # Apply crop if specified
+        if crop_area is not None:
+            x, y, crop_w, crop_h = crop_area
+            x = max(0, int(x))
+            y = max(0, int(y))
+            crop_w = min(int(crop_w), w - x)
+            crop_h = min(int(crop_h), h - y)
+            
+            if crop_w > 0 and crop_h > 0:
+                img = img[y:y+crop_h, x:x+crop_w]
+        
+        h, w = img.shape[:2]
+        scale = min(1.0, float(max_dim) / max(h, w))
+        if scale < 1.0:
+            img = cv2.resize(
+                img,
+                (int(w * scale), int(h * scale)),
+                interpolation=downscale_interpolation,
+            )
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), scale
+    
+    # Load and resize images
+    if hasattr(gopro_camera, "image_array") and gopro_camera.image_array is not None:
+        gopro_gray, gopro_scale = load_and_resize_gray_from_array(
+            gopro_camera.image_array, max_dim, query_crop
+        )
+    elif hasattr(gopro_camera, "filepath"):
+        gopro_gray, gopro_scale = load_and_resize_gray_from_file(
+            gopro_camera.filepath, max_dim, query_crop
+        )
+    else:
+        return None
+    
+    macro_gray, macro_scale = load_and_resize_gray_from_file(
+        macro_camera.filepath, max_dim, target_crop
+    )
+    
+    if gopro_gray is None or macro_gray is None:
+        return None
+    
+    # Initialize SIFT
+    if use_gpu:
+        try:
+            sift = cv2.cuda.SIFT_create()
+            gpu_available = True
+        except Exception:
+            gpu_available = False
+            sift = cv2.SIFT_create()
+    else:
+        sift = cv2.SIFT_create()
+        gpu_available = False
+    
+    # Detect SIFT features
+    if gpu_available:
+        gpu_gopro = cv2.cuda_GpuMat()
+        gpu_gopro.upload(gopro_gray)
+        kp_gopro, des_gopro = sift.detectAndCompute(gpu_gopro, None)
+        des_gopro = des_gopro.download()
+        
+        gpu_macro = cv2.cuda.GpuMat()
+        gpu_macro.upload(macro_gray)
+        kp_macro, des_macro = sift.detectAndCompute(gpu_macro, None)
+        des_macro = des_macro.download()
+    else:
+        kp_gopro, des_gopro = sift.detectAndCompute(gopro_gray, None)
+        kp_macro, des_macro = sift.detectAndCompute(macro_gray, None)
+    
+    if des_gopro is None or des_macro is None:
+        return None
+    
+    # Match features
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    
+    matches = flann.knnMatch(des_gopro, des_macro, k=2)
+    
+    # Apply Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good_matches.append(m)
+    
+    if len(good_matches) < 4:
+        return None
+    
+    # Get matched keypoints
+    gopro_pts = np.float32([kp_gopro[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
+    macro_pts = np.float32([kp_macro[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
+    
+    # Scale keypoints back to original image coordinates
+    gopro_pts /= gopro_scale
+    macro_pts /= macro_scale
+    
+    # Apply crop offset if specified
+    if query_crop is not None:
+        gopro_pts[:, 0] += query_crop[0]
+        gopro_pts[:, 1] += query_crop[1]
+    if target_crop is not None:
+        macro_pts[:, 0] += target_crop[0]
+        macro_pts[:, 1] += target_crop[1]
+    
+    # Get 3D points corresponding to GoPro keypoints
+    object_points = []
+    image_points = []
+    
+    for i, (gopro_pt, macro_pt) in enumerate(zip(gopro_pts, macro_pts)):
+        # Project GoPro keypoint to 3D world coordinates
+        try:
+            world_coords, _, _ = gopro_camera.pixel_to_point(
+                int(gopro_pt[0]), int(gopro_pt[1]), point_cloud
+            )
+            if world_coords is not None:
+                object_points.append(world_coords)
+                image_points.append(macro_pt)
+        except Exception:
+            continue
+    
+    if len(object_points) < 4:
+        return None
+    
+    return {
+        'good_matches': good_matches,
+        'object_points': np.array(object_points, dtype=np.float32),
+        'image_points': np.array(image_points, dtype=np.float32),
+        'gopro_keypoints': kp_gopro,
+        'macro_keypoints': kp_macro
     }
 
 
@@ -966,3 +1486,4 @@ def _require_sam2():
             "or follow the project’s installation instructions."
         ) from e
     return build_sam2, SAM2ImagePredictor
+
