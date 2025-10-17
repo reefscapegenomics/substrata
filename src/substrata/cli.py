@@ -2,6 +2,7 @@
 import argparse
 import os
 import re
+import sys
 
 # Third-Party Libraries
 import yaml
@@ -280,6 +281,49 @@ def handle_cams2video(args):
     )
 
 
+def handle_intercepts(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+    from substrata import measurements, visualizations
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # Allow explicit override of PLY path
+    if getattr(args, "input", None):
+        init.pcd_filepath = args.input
+
+    # Initialize project (loads PCD, cameras if available)
+    init.initialize()
+
+    # Require a non-identity world transform
+    if init.pcd.world_transform_is_identity:
+        sys.exit("World transform is not set")
+
+    # Create bounding box, subdivide to grid, and visualize
+    optimal_bbox = measurements.find_optimal_box_position(
+        init.pcd, box_length=args.box_length, box_width=args.box_width, step_size=0.1
+    )
+    try:
+        bboxes = measurements.subdivide_boxes(optimal_bbox, args.box_size)
+    except ValueError as e:
+        sys.exit(f"Failed to subdivide boxes: {e}")
+
+    fig = visualizations.show_grid_cells(init.pcd, bboxes)
+    fig.savefig(_get_output_filepath(init, "bbox.png"))
+
+    # Sample random XY points inside cells and compute intercepts
+    random_points = measurements.generate_random_xy_points_within_cells(bboxes, 1, 0)
+    intercepts = init.pcd.get_z_intercepts(
+        random_points, args.search_radius, always_return=True
+    )
+
+    # Back-compute original coords and get first image matches if cameras are available
+    intercepts.get_original_coords(init.world_transform)
+
+    # Save intercepts to CSV
+    intercepts.save(_get_output_filepath(init, "intercepts.csv"))
+
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -478,6 +522,34 @@ def main():
         help="Optional output MP4 filepath (default: <id>_cams.mp4).",
     )
 
+    # intercepts
+    p_intercepts = subparsers.add_parser(
+        "intercepts",
+        help=(
+            "Find optimal box, subdivide to grid, sample random points, compute Z-intercepts."
+        ),
+    )
+    p_intercepts.add_argument(
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_intercepts.add_argument(
+        "--box-length", dest="box_length", type=float, default=25.0,
+        help="Rectangle length in meters for optimal box search (default: 25).",
+    )
+    p_intercepts.add_argument(
+        "--box-width", dest="box_width", type=float, default=4.0,
+        help="Rectangle width in meters for optimal box search (default: 4).",
+    )
+    p_intercepts.add_argument(
+        "--box-size", dest="box_size", type=float, default=0.2,
+        help="Grid cell size in meters for subdividing the optimal box (default: 0.2).",
+    )
+    p_intercepts.add_argument(
+        "--search-radius", dest="search_radius", type=float, default=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
+        help="Search radius in meters for Z-intercept lookup (default: 0.005).",
+    )
+
     args = parser.parse_args()
 
     handlers = {
@@ -487,6 +559,7 @@ def main():
         "views": handle_views,
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
+        "intercepts": handle_intercepts,
     }
     handlers[args.command](args)
 
