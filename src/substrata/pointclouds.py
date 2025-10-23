@@ -405,6 +405,83 @@ class PointCloud:
         finally:
             matplotlib.use(backend_original, force=True)
 
+    def crop(
+        self,
+        bounding_box: Union[
+            Tuple[Union[List[float], np.ndarray], Union[List[float], np.ndarray]],
+            np.ndarray,
+        ],
+    ) -> None:
+        """Reduce the point cloud to only the points inside a bounding box.
+
+        The bounding box can be specified in XY or XYZ:
+        - XY box: [[x_min, y_min], [x_max, y_max]]
+        - XYZ box: [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+
+        This method updates the internal Open3D point cloud in-place.
+
+        Args:
+            bounding_box: Pair of (min_corner, max_corner). Each corner is a list/
+                array of length 2 (XY) or 3 (XYZ).
+        """
+        try:
+            min_corner, max_corner = bounding_box  # type: ignore[misc]
+        except Exception as exc:
+            raise ValueError(
+                "bounding_box must be a pair: (min_corner, max_corner)"
+            ) from exc
+
+        min_corner = np.asarray(min_corner, dtype=float)
+        max_corner = np.asarray(max_corner, dtype=float)
+        if min_corner.shape != max_corner.shape or min_corner.ndim != 1:
+            raise ValueError("Bounding box corners must have same 1-D shape (2 or 3).")
+        if min_corner.shape[0] not in (2, 3):
+            raise ValueError("Bounding box corners must be length 2 (XY) or 3 (XYZ).")
+
+        pts = np.asarray(self.points)
+        if min_corner.shape[0] == 2:
+            x_min, y_min = min_corner
+            x_max, y_max = max_corner
+            mask = (
+                (pts[:, 0] >= x_min)
+                & (pts[:, 0] <= x_max)
+                & (pts[:, 1] >= y_min)
+                & (pts[:, 1] <= y_max)
+            )
+        else:
+            x_min, y_min, z_min = min_corner
+            x_max, y_max, z_max = max_corner
+            mask = (
+                (pts[:, 0] >= x_min)
+                & (pts[:, 0] <= x_max)
+                & (pts[:, 1] >= y_min)
+                & (pts[:, 1] <= y_max)
+                & (pts[:, 2] >= z_min)
+                & (pts[:, 2] <= z_max)
+            )
+
+        filtered_points = pts[mask]
+
+        # Colors and normals may be absent; only filter them if present and aligned
+        colors_np = np.asarray(self.o3d_pcd.colors)
+        normals_np = np.asarray(self.o3d_pcd.normals)
+        use_colors = colors_np.shape[0] == pts.shape[0] and colors_np.shape[0] > 0
+        use_normals = normals_np.shape[0] == pts.shape[0] and normals_np.shape[0] > 0
+
+        new_pcd = o3d.geometry.PointCloud()
+        new_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+        if use_colors:
+            new_pcd.colors = o3d.utility.Vector3dVector(colors_np[mask])
+        if use_normals:
+            new_pcd.normals = o3d.utility.Vector3dVector(normals_np[mask])
+
+        self.o3d_pcd = new_pcd
+
+        # Invalidate any cached kd-trees as indices changed
+        for attr in ("o3d_pcd_tree", "o3d_pcd_tree_xy"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
     def reduce_pcd_to_points_in_mesh(self, mesh) -> None:
         """Reduce the number of points by sampling points from a target mesh.
 
@@ -747,7 +824,7 @@ class PointCloud:
 
         The method:
 
-        1.  Runs a 2-D PCA on the cloud’s X/Y coordinates
+        1.  Runs a 2-D PCA on the cloud's X/Y coordinates
             (`measurements.conduct_xy_PCA`, which should return
             ``eigenvalues, eigenvectors`` like the 3-D version).
         2.  Takes the first eigen-vector *(v_x, v_y)*, normalises it, and
@@ -769,6 +846,93 @@ class PointCloud:
 
         return geom.Vector(vec)
 
+    def apply_along_slope_transform(
+        self,
+        inlier_range: float = 0.01,
+        visualize: bool = False,
+        inlier_method: str = "pca",
+    ) -> None:
+        """Apply a transform to align the point cloud along its slope.
+
+        1. Plane inlier detection to find the best-fit plane (using either RANSAC or PCA)
+        2. Normal estimation on inliers (using either RANSAC or PCA)
+        3. Rotation transforms around inlier centroid to align with slope
+        4. Align x-axis to eigenvector
+        """
+        from substrata import measurements, visualizations
+
+        # 1) Inlier selection (RANSAC or PCA) for initial plane
+        method = inlier_method.lower()
+        if method == "ransac":
+            a, b, c, d, inliers = measurements.get_best_fit_plane_ransac(
+                self, inlier_range=inlier_range, align_normals=True
+            )
+            print("Inlier method: RANSAC")
+        elif method == "pca":
+            a, b, c, d, inliers = measurements.get_best_fit_plane_PCA(
+                self, inlier_range=inlier_range, align_normals=True
+            )
+            print("Inlier method: PCA (deterministic)")
+        else:
+            raise ValueError("inlier_method must be 'ransac' or 'pca'")
+
+        # 2) Normal estimation on inliers
+        #    - If method == 'pca': use the plane normal from step 1 (deterministic)
+        #    - If method == 'ransac': refit PCA on inliers for a robust, deterministic normal
+        P = np.asarray(self.points)
+        Pi = P[inliers]
+        if method == "pca":
+            n = np.array([a, b, c], dtype=float)
+            n = n / np.linalg.norm(n)
+            if n[2] < 0:
+                n = -n
+        else:
+            eig_vals, eig_vecs = measurements.conduct_PCA(SimplePointCloud(Pi))
+            n = eig_vecs[:, np.argmin(eig_vals)]
+            n = n / np.linalg.norm(n)
+            if n[2] < 0:
+                n = -n
+        
+        print(f"Original PCA/SVD normal vector: [{n[0]:.6f}, {n[1]:.6f}, {n[2]:.6f}]")
+        elev_deg = measurements.get_elevation_angle(n)
+        print(f"Original PCA/SVD normal elevation: {elev_deg:.3f}°")
+
+        # Visualize original plane regression from PCA/SVD on inliers (before transformation)
+        if visualize:
+            d_original = -np.dot(n, Pi.mean(axis=0))
+            visualizations.visualize_elevation_angle(
+                self, [n[0], n[1], n[2], d_original], point_size=1
+            )
+
+        # Rotate about inlier centroid
+        ci = Pi.mean(axis=0)
+        T = Transform.from_translation((-ci[0], -ci[1], -ci[2]))
+        R = Transform.from_up_vector(n)
+        Tinv = Transform.from_translation((ci[0], ci[1], ci[2]))
+
+        self.apply_transform(T)
+        self.apply_transform(R)
+        self.apply_transform(Tinv)
+
+        self.apply_transform(Transform.align_x_to_vector(self.principal_axis_xy_2D()))
+
+        # Visualize final plane  if requested
+        if visualize:
+            P2 = np.asarray(self.points)
+            Pi2 = P2[inliers]
+            eig_vals2, eig_vecs2 = measurements.conduct_PCA(SimplePointCloud(Pi2))
+            n2 = eig_vecs2[:, np.argmin(eig_vals2)]
+            n2 = n2 / np.linalg.norm(n2)
+            if n2[2] < 0: 
+                n2 = -n2
+            d2 = -np.dot(n2, Pi2.mean(axis=0))
+            visualizations.visualize_elevation_angle(
+                self, [n2[0], n2[1], n2[2], d2], point_size=1
+            )
+        
+        # Print final world transform
+        print(f"Final world_transform after along slope transform:\n{self.world_transform}")
+        return n[0:3], elev_deg
 
 class SimplePointCloud:
     """Simple point cloud class for storing points, colors and normals."""
@@ -1218,3 +1382,57 @@ def decimate_ply_file(
             fout.write(out_header)
             for vertex_data in selected_vertices:
                 fout.write(vertex_data)
+
+def get_decimated_pcd(
+    pcd: Union["PointCloud", "SimplePointCloud", o3d.geometry.PointCloud],
+    target_points: int,
+    rng: Optional[np.random.Generator] = None,
+) -> "PointCloud":
+    """Return a decimated copy of an input point cloud as a decorated PointCloud.
+
+    The input ``pcd`` can be one of:
+      - substrata.pointclouds.PointCloud
+      - substrata.pointclouds.SimplePointCloud
+      - open3d.geometry.PointCloud
+
+    Sampling is uniform without replacement. Colors and normals are preserved
+    when present and aligned with the point array.
+
+    Args:
+        pcd: Source point cloud.
+        target_points: Desired number of points in the output (clamped to [0, N]).
+        rng: Optional NumPy Generator for reproducibility.
+
+    Returns:
+        PointCloud: A new decorated point cloud containing the sampled points.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    normals = np.asarray(pcd.normals)
+
+    if len(points) <= target_points and isinstance(pcd, PointCloud):
+        return pcd
+    elif len(points) <= target_points and not isinstance(pcd, PointCloud):
+        pcd_undecimated = PointCloud()
+        pcd_undecimated.o3d_pcd.points = o3d.utility.Vector3dVector(points[idx])
+        if len(colors) > 0:
+            pcd_undecimated.o3d_pcd.colors = o3d.utility.Vector3dVector(colors[idx])
+        if len(normals) > 0:
+            pcd_undecimated.o3d_pcd.normals = o3d.utility.Vector3dVector(normals[idx])
+        return pcd_undecimated 
+    else:
+        # Sample indices without replacement
+        idx = rng.choice(len(points), size=target_points, replace=False)
+
+        pcd_decimated = PointCloud()
+        pcd_decimated.o3d_pcd.points = o3d.utility.Vector3dVector(points[idx])
+        if len(colors) > 0:
+            pcd_decimated.o3d_pcd.colors = o3d.utility.Vector3dVector(colors[idx])
+        if len(normals) > 0:
+            pcd_decimated.o3d_pcd.normals = o3d.utility.Vector3dVector(normals[idx])
+        pcd_decimated.world_transform = pcd.world_transform
+        pcd_decimated.transforms = pcd.transforms
+
+        return pcd_decimated

@@ -300,6 +300,10 @@ def handle_intercepts(args):
     if init.pcd.world_transform_is_identity:
         sys.exit("World transform is not set")
 
+    # Optionally align along slope before proceeding
+    if getattr(args, "slope", False):
+        slope_normal, slope_elev = init.pcd.apply_along_slope_transform()
+
     # Create bounding box, subdivide to grid, and visualize
     optimal_bbox = measurements.find_optimal_box_position(
         init.pcd, box_length=args.box_length, box_width=args.box_width, step_size=0.1
@@ -310,7 +314,6 @@ def handle_intercepts(args):
         sys.exit(f"Failed to subdivide boxes: {e}")
 
     fig = visualizations.show_grid_cells(init.pcd, bboxes)
-    fig.savefig(_get_output_filepath(init, "bbox.png"))
 
     # Sample random XY points inside cells and compute intercepts
     random_points = measurements.generate_random_xy_points_within_cells(bboxes, 1, 0)
@@ -321,8 +324,27 @@ def handle_intercepts(args):
     # Back-compute original coords and get first image matches if cameras are available
     intercepts.get_original_coords(init.world_transform)
 
-    # Save intercepts to CSV
-    intercepts.save(_get_output_filepath(init, "intercepts.csv"))
+    # Save intercepts to CSV (and YAML only for --slope)
+    if getattr(args, "slope", False):
+        fig.savefig(_get_output_filepath(init, "slope_bbox.png"))
+        csv_path = _get_output_filepath(init, "slope_intercepts.csv")
+        intercepts.save(csv_path)
+        yaml_path = os.path.splitext(csv_path)[0] + ".yaml"
+        payload = {
+            "world_transform": init.pcd.world_transform.tolist(),
+            "slope_normal": [float(x) for x in slope_normal],
+            "slope_elevation_deg": float(slope_elev), 
+        }
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(payload, f)
+        # additional visualization for sanity check
+        a,b,c,d,inliers_idx = measurements.get_best_fit_plane_PCA(init.pcd)
+        visualizations.visualize_elevation_angle(init.pcd, [a,b,c,d], point_size=1,
+                                                 output_filename=_get_output_filepath(init, "slope_pca.png"))
+    else:
+        fig.savefig(_get_output_filepath(init, "topdown_bbox.png"))
+        csv_path = _get_output_filepath(init, "topdown_intercepts.csv")
+        intercepts.save(csv_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
@@ -548,6 +570,10 @@ def main():
     p_intercepts.add_argument(
         "--search-radius", dest="search_radius", type=float, default=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
         help="Search radius in meters for Z-intercept lookup (default: 0.005).",
+    )
+    p_intercepts.add_argument(
+        "--slope", dest="slope", action="store_true",
+        help="Apply along-slope transform to pointcloud before processing.",
     )
 
     args = parser.parse_args()

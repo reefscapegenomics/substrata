@@ -461,7 +461,12 @@ f
                         "depth_res": getattr(cam, "depth_residual", None),
                     }
                 )
-    
+    def get_average_vector(self):
+        """Get the average vector of the cameras.
+        """
+        vectors = np.array([cam.vector for cam in self.data.values()])
+        return vectors.mean(axis=0)
+
     def get_timematches(self, other_cams):
         """Get the timematches between the cameras.
 

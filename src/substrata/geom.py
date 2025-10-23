@@ -505,3 +505,25 @@ def sample_points_along_line(start_coord, target_coord, step_size):
     if dists.size == 0 or dists[-1] < dist:
         dists = np.append(dists, dist)
     return start_coord + dists[:, None] * unit_vector
+
+
+def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
+    """
+    Spherical linear interpolation between unit vectors u and v 
+    at fraction t in [0,1].
+    """
+    dot_uv = np.dot(u, v)
+    dot_uv = np.clip(dot_uv, -1.0, 1.0)
+    angle = np.arccos(dot_uv)
+
+    # If angle ~ 0, vectors are almost identical → no arc.
+    if angle < 1e-8:
+        return u
+    # If angle ~ pi, vectors are nearly opposite → fallback to linear 
+    # to avoid singularities.
+    elif abs(angle - np.pi) < 1e-8:
+        return (1.0 - t) * u + t * v
+
+    # Normal slerp
+    return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u \
+            + (np.sin(t * angle) / np.sin(angle)) * v

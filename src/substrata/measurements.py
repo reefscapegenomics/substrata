@@ -167,69 +167,87 @@ def get_best_fit_plane_ransac(
     return a, b, c, d, inliers_idx
 
 
-def get_plane_angles(pcd, vis=False) -> tuple[float, float, float, list, float | None]:
+def get_plane_angles(pcd, vis=False):
     """
-    Calculate the orientation angles of a best-fit plane from a point cloud
-    using PCA.
-
-    The plane is assumed to have an equation: a*x + b*y + c*z + d = 0.
-    Angles:
-      - theta: angle between the x-z projection of the plane normal
-               and the z-axis (rotation about y-axis),
-      - psi: angle between the y-z projection of the plane normal
-             and the z-axis (rotation about x-axis),
-      - elevation: angle between the plane normal and [0, 0, 1].
-
-    author: KP / PB
+    Returns:
+      theta_deg: rotation about +Y to bring n's xz-projection to +Z
+      psi_deg:   rotation about +X to then bring n to +Z
+      elev_deg:  tilt of plane from horizontal (0..90)
+      plane:     [a, b, c, d]
+      az_deg:    azimuth of normal in XY from +X CCW (None if vertical)
     """
-
     if len(pcd.points) <= 1:
         return 0.0, 0.0, 0.0, [], None
 
-    a, b, c, d, inliers_idx = get_best_fit_plane_PCA(
-        pcd
-    )  # get_best_fit_plane_ransac(pcd)
+    a, b, c, d, inliers_idx = get_best_fit_plane_PCA(pcd)
 
-    if abs(c) < 1e-8:
-        raise ValueError(
-            "Coefficient c is too close to zero; cannot compute slopes reliably."
-        )
+    n = np.array([a, b, c], dtype=float)
+    n_norm = np.linalg.norm(n)
+    if n_norm == 0:
+        raise ValueError("Degenerate plane normal.")
+    n = n / n_norm
 
-    slope_xz = a / c
-    slope_yz = b / c
-    theta = np.arctan(slope_xz)  # rotation about y-axis
-    psi = np.arctan(slope_yz)  # rotation about x-axis
+    # Stabilize sign so elevation/azimuth are consistent
+    if n[2] < 0:
+        n = -n
+    nx, ny, nz = n
 
-    plane_normal = np.array([a, b, c])
-    mag_plane = np.linalg.norm(plane_normal)
-    plane_normal_unit = plane_normal / mag_plane
+    # Elevation: angle between normal and +Z (tilt of plane from horizontal)
+    elev = np.arccos(np.clip(nz, -1.0, 1.0))
+    elev_deg = float(np.degrees(elev))
 
-    proj_xy = plane_normal_unit[:2]
-    norm_xy = np.linalg.norm(proj_xy)
-    if norm_xy < 1e-8:
-        azimuth_deg = None  # the surface is horizontal
+    # Y-then-X rotations to align n -> +Z
+    # theta: rotate about +Y to null x component in xz-plane
+    # psi:   rotate about +X to null y component
+    theta = np.arctan2(nx, nz)                 # about Y
+    # after Y rotation by -theta, residual "up" length in xz is sqrt(nx^2+nz^2)
+    psi = np.arctan2(-ny, np.hypot(nx, nz))    # about X
+
+    theta_deg = float(np.degrees(theta))
+    psi_deg = float(np.degrees(psi))
+
+    # Azimuth of normal in XY (from +X, CCW). None if normal ~ vertical.
+    r_xy = np.hypot(nx, ny)
+    if r_xy < 1e-8:
+        az_deg = None
     else:
-        proj_xy_unit = proj_xy / norm_xy
-        # Azimuth: angle from (positive y axis) in clockwise direction
-        azimuth_rad = np.arctan2(proj_xy_unit[0], proj_xy_unit[1])
-        azimuth_deg = (np.degrees(azimuth_rad) + 360) % 360  # Normalise to [0, 360]
-
-    vertical_normal = np.array([0, 0, 1])
-    dot_val = np.dot(plane_normal_unit, vertical_normal)
-    dot_val = np.clip(dot_val, -1.0, 1.0)
-    elevation = np.arccos(dot_val)
-    elev_deg = np.degrees(elevation)
+        az = np.arctan2(ny, nx)                # +X→0°, CCW
+        az_deg = float((np.degrees(az) + 360.0) % 360.0)
 
     if vis:
         visualizations.visualize_elevation_angle(pcd, [a, b, c, d], elev_deg)
 
-    return (
-        float(np.degrees(theta)),
-        float(np.degrees(psi)),
-        float(elev_deg),
-        [a, b, c, d],
-        float(azimuth_deg) if azimuth_deg is not None else None,
-    )
+    return theta_deg, psi_deg, elev_deg, [float(a), float(b), float(c), float(d)], az_deg
+
+
+def get_elevation_angle(normal) -> float:
+    """
+    Return the elevation angle (degrees) of a plane given its normal vector.
+
+    Elevation is defined as the tilt of the plane from horizontal:
+    0° for a horizontal plane, 90° for a vertical plane.
+
+    The input can be any 3-element array-like; it is normalized internally.
+
+    Raises:
+        ValueError: If the provided normal is not a length-3 non-zero vector.
+    """
+    n = np.asarray(normal, dtype=float)
+    # Accept (3,) or any 1-D length-3
+    if n.ndim != 1 or n.size != 3:
+        raise ValueError("normal must be a length-3 vector")
+
+    norm = np.linalg.norm(n)
+    if norm == 0:
+        raise ValueError("normal vector must be non-zero")
+
+    n = n / norm
+    # Stabilize sign so elevation is always in [0, 90]
+    if n[2] < 0:
+        n = -n
+
+    elev_rad = np.arccos(np.clip(n[2], -1.0, 1.0))
+    return float(np.degrees(elev_rad))
 
 
 def get_dev_rugosity(pcd):
@@ -1368,3 +1386,24 @@ def get_intercept_points_using_cams(xy_coords, search_radius, pcd, cams, vis=Fal
     )
 
     return intercept_points, non_intercept_points
+
+def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
+    """
+    Spherical linear interpolation between unit vectors u and v 
+    at fraction t in [0,1].
+    """
+    dot_uv = np.dot(u, v)
+    dot_uv = np.clip(dot_uv, -1.0, 1.0)
+    angle = np.arccos(dot_uv)
+
+    # If angle ~ 0, vectors are almost identical → no arc.
+    if angle < 1e-8:
+        return u
+    # If angle ~ pi, vectors are nearly opposite → fallback to linear 
+    # to avoid singularities.
+    elif abs(angle - np.pi) < 1e-8:
+        return (1.0 - t) * u + t * v
+
+    # Normal slerp
+    return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u \
+            + (np.sin(t * angle) / np.sin(angle)) * v

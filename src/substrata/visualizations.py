@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 # Local Modules
-from substrata import settings, segmentation, pointclouds
+from substrata import settings, segmentation, pointclouds, geom
 from substrata.logging import logger
 
 # from open3d.web_visualizer import draw
@@ -76,26 +76,8 @@ def plot(
     Returns:
         matplotlib.figure.Figure | None: New figure if created, otherwise None.
     """
-    # Convert to Open3D point cloud if necessary.
-    if isinstance(pcd, pointclouds.SimplePointCloud):
-        o3d_pcd = pcd.get_o3d_pcd()
-    else:
-        o3d_pcd = pcd.o3d_pcd
-
-    points = np.asarray(o3d_pcd.points)
-    colors = np.asarray(o3d_pcd.colors)
-
-    # Decimate the point cloud
-    if len(points) > max_output_points:
-        logger.info(
-            f"Decimating point cloud from {len(points)} to {max_output_points} points"
-        )
-        decimation_factor = len(points) // max_output_points
-        indices = np.random.choice(
-            len(points), size=len(points) // decimation_factor, replace=False
-        )
-        points = points[indices]
-        colors = colors[indices]
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
     created_fig = False
     if ax is None:
@@ -106,16 +88,16 @@ def plot(
         fig = ax.figure
     ax.set_box_aspect((width, height, height))
     ax.scatter(
-        points[:, 0],
-        points[:, 1],
-        points[:, 2],
-        c=colors,
+        pcd.points[:, 0],
+        pcd.points[:, 1],
+        pcd.points[:, 2],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
     # Weighted equal scaling: x : y : z = width : height : height
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
+    mins = pcd.points.min(axis=0)
+    maxs = pcd.points.max(axis=0)
     center = (mins + maxs) / 2.0
     ranges = maxs - mins
 
@@ -144,34 +126,16 @@ def plot_2d(
     title=None,
     max_output_points=50000,
 ):
-    # Convert to Open3D point cloud if necessary.
-    if isinstance(pcd, pointclouds.SimplePointCloud):
-        o3d_pcd = pcd.get_o3d_pcd()
-    else:
-        o3d_pcd = pcd.o3d_pcd
-
-    points = np.asarray(o3d_pcd.points)
-    colors = np.asarray(o3d_pcd.colors)
-
-    # Decimate the point cloud
-    if len(points) > max_output_points:
-        logger.info(
-            f"Decimating point cloud from {len(points)} to {max_output_points} points"
-        )
-        decimation_factor = len(points) // max_output_points
-        indices = np.random.choice(
-            len(points), size=len(points) // decimation_factor, replace=False
-        )
-        points = points[indices]
-        colors = colors[indices]
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
     fig = plt.figure(figsize=(width, height))
     ax = fig.add_subplot(111)
     ax.set_aspect("equal")
     ax.scatter(
-        points[:, 0],
-        points[:, 1],
-        c=colors,
+        pcd.points[:, 0],
+        pcd.points[:, 1],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
@@ -236,32 +200,14 @@ def multiplot_2d(
 
     # Process each point cloud
     for pcd in pcds:
-        # Convert to Open3D point cloud if necessary
-        if isinstance(pcd, pointclouds.SimplePointCloud):
-            o3d_pcd = pcd.get_o3d_pcd()
-        else:
-            o3d_pcd = pcd.o3d_pcd
-
-        points = np.asarray(o3d_pcd.points)
-        colors = np.asarray(o3d_pcd.colors)
-
-        # Decimate the point cloud
-        if len(points) > max_output_points:
-            logger.info(
-                f"Decimating point cloud from {len(points)} to {max_output_points} points"
-            )
-            decimation_factor = len(points) // max_output_points
-            indices = np.random.choice(
-                len(points), size=len(points) // decimation_factor, replace=False
-            )
-            points = points[indices]
-            colors = colors[indices]
+        # Decimate if required (and ensure PointCloud format)
+        pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
         # Plot base point cloud
         ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            c=colors,
+            pcd.points[:, 0],
+            pcd.points[:, 1],
+            c=pcd.colors,
             s=point_size,
             edgecolor="none",
         )
@@ -1016,7 +962,35 @@ def show_grid_cells(
         ax_left.plot(x_vals, y_vals, "r-", linewidth=1)
     ax_left.set_xlabel("X")
     ax_left.set_ylabel("Y")
-    ax_left.set_title("Overall plot with grid cell boundaries")
+    # Title: include overall box as bottom-left and top-right [[x,y],[x,y]]
+    try:
+        if bboxes and len(bboxes) > 0:
+            # Normalize potential single-box input
+            if (
+                isinstance(bboxes, (list, tuple))
+                and len(bboxes) == 2
+                and isinstance(bboxes[0], (list, tuple))
+                and isinstance(bboxes[1], (list, tuple))
+                and len(bboxes[0]) == 2
+                and len(bboxes[1]) == 2
+                and not (
+                    isinstance(bboxes[0][0], (list, tuple))
+                    or isinstance(bboxes[1][0], (list, tuple))
+                )
+            ):
+                boxes_iter = [bboxes]
+            else:
+                boxes_iter = bboxes
+
+            min_x = min(box[0][0] for box in boxes_iter)
+            min_y = min(box[0][1] for box in boxes_iter)
+            max_x = max(box[1][0] for box in boxes_iter)
+            max_y = max(box[1][1] for box in boxes_iter)
+            ax_left.set_title(f"Box coordinates: [[{min_x:.1f},{min_y:.1f}],[{max_x:.1f},{max_y:.1f}]]")
+        else:
+            ax_left.set_title("Overall plot with grid cell boundaries")
+    except Exception:
+        ax_left.set_title("Overall plot with grid cell boundaries")
     ax_left.axis("equal")
 
     # Right panel: For one cell, show internal subdivisions.
@@ -1132,37 +1106,8 @@ def show_classified_grid_cells(
     ):
         bboxes = [bboxes]
 
-    # Extract points (for optional background) and decimate for speed
-    if hasattr(pcd, "o3d_pcd"):
-        pts = np.asarray(pcd.o3d_pcd.points)
-        cols = (
-            np.asarray(pcd.o3d_pcd.colors)
-            if hasattr(pcd.o3d_pcd, "colors")
-            and np.asarray(pcd.o3d_pcd.colors).size > 0
-            else None
-        )
-    else:
-        pts = np.asarray(pcd.points)
-        cols = (
-            np.asarray(pcd.colors)
-            if hasattr(pcd, "colors") and np.asarray(pcd.colors).size > 0
-            else None
-        )
-
-    # Decimate like plot()
-    if len(pts) > max_output_points:
-        logger.info(
-            f"Decimating point cloud from {len(pts)} to {max_output_points} points"
-        )
-        decimation_factor = len(pts) // max_output_points
-        indices = np.random.choice(
-            len(pts), size=len(pts) // decimation_factor, replace=False
-        )
-        pts = pts[indices]
-        if cols is not None and len(cols) == len(indices) * decimation_factor:
-            cols = cols[indices]
-
-    points = pts
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
     fig = plt.figure(figsize=(12, 5))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
@@ -1171,11 +1116,11 @@ def show_classified_grid_cells(
     ax_right = fig.add_subplot(gs[0, 1])
 
     # Optional background points in grayscale
-    if show_points and points.size > 0:
-        plot_cols = np.full((points.shape[0], 3), 0.6, dtype=float)  # Default to grayscale
+    if show_points and len(pcd.points) > 0:
+        plot_cols = np.full((pcd.points.shape[0], 3), 0.6, dtype=float)  # Default to grayscale
         ax_left.scatter(
-            points[:, 0],
-            points[:, 1],
+            pcd.points[:, 0],
+            pcd.points[:, 1],
             s=point_size,
             c=plot_cols,
             alpha=0.5,
@@ -1540,14 +1485,12 @@ def plot_2d_ortho(
 
     # Fetch colors or default to white
     if hasattr(pcd, color_attr):
-        cols = np.asarray(getattr(pcd, color_attr))
-        if cols.ndim == 1:
-            cols = np.vstack((cols, cols, cols)).T
+        colors = pcd.colors
     else:
-        cols = np.ones((pts.shape[0], 3), dtype=np.float64)
+        colors = np.ones((len(points), 3), dtype=np.float64)
 
     # Rasterize
-    for pt, col in zip(pts, cols):
+    for pt, col in zip(pcd.points, pcd.colors):
         ix = int((pt[0] - min_x) / resolution)
         iy = int((pt[1] - min_y) / resolution)
         if 0 <= ix < width and 0 <= iy < height:
@@ -2101,7 +2044,15 @@ def create_annotated_video(
         shutil.rmtree(temp_image_matches_output, ignore_errors=True)
 
 
-def visualize_elevation_angle(pcd, plane_coeffs, elevation_angle, output_filename=None):
+def visualize_elevation_angle(
+    pcd,
+    plane_coeffs,
+    output_filename=None,
+    max_output_points=50000,
+    width=10,
+    height=5,
+    point_size=4,
+):
     """
     Visualize the fitted plane and the point cloud.
 
@@ -2109,33 +2060,39 @@ def visualize_elevation_angle(pcd, plane_coeffs, elevation_angle, output_filenam
         pcd: The point cloud object.
         a, b, c, d: Plane coefficients.
         output_filename: Optional filename to save the visualization.
+        max_output_points: Maximum number of points to plot.
+        width: Figure width in inches.
+        height: Figure height in inches.
+        point_size: Scatter marker size for the point cloud.
     """
-    # Convert the Open3D point cloud to NumPy
-    points = np.asarray(pcd.points)
-    if np.asarray(pcd.colors).size > 0:
-        colors = np.asarray(pcd.colors)
-    else:
-        # If no colors are present, default to gray
-        colors = np.tile([0.5, 0.5, 0.5], (points.shape[0], 1))
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
     a, b, c, d = plane_coeffs
 
     # ------------------------- 3D Visualization --------------------------
-    fig = plt.figure()
+    fig = plt.figure(figsize=(width, height))
     ax = fig.add_subplot(111, projection="3d")
 
     # 1) Plot the fitted plane FIRST (with a low alpha)
-    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
-    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    x_min, x_max = np.min(pcd.points[:, 0]), np.max(pcd.points[:, 0])
+    y_min, y_max = np.min(pcd.points[:, 1]), np.max(pcd.points[:, 1])
     xx, yy = np.meshgrid(np.linspace(x_min, x_max, 10), np.linspace(y_min, y_max, 10))
     zz = (-a * xx - b * yy - d) / c
     ax.plot_surface(xx, yy, zz, color="red", alpha=0.1)
 
     # 2) Plot the point cloud next (slightly higher alpha)
-    ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=4, alpha=0.4)
+    ax.scatter(
+        pcd.points[:, 0],
+        pcd.points[:, 1],
+        pcd.points[:, 2],
+        c=pcd.colors,
+        s=point_size,
+        alpha=0.4,
+    )
 
     # Determine bounding box and origin for arrows
-    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+    z_min, z_max = np.min(pcd.points[:, 2]), np.max(pcd.points[:, 2])
     mid_x = 0.5 * (x_min + x_max)
     mid_y = 0.5 * (y_min + y_max)
     mid_z = 0.5 * (z_min + z_max)
@@ -2176,7 +2133,7 @@ def visualize_elevation_angle(pcd, plane_coeffs, elevation_angle, output_filenam
     arc_points = []
     for i in range(num_arc_points):
         t = i / (num_arc_points - 1)
-        direction = utils.slerp(np.array([0, 0, 1]), plane_normal_unit, t)
+        direction = geom.slerp(np.array([0, 0, 1]), plane_normal_unit, t)
         arc_points.append(origin + arrow_length * direction)
     arc_points = np.array(arc_points)
 
@@ -2190,12 +2147,15 @@ def visualize_elevation_angle(pcd, plane_coeffs, elevation_angle, output_filenam
     )
 
     # Annotate near the midpoint of the arc
+    elevation_angle = np.degrees(np.arccos(np.clip(np.dot(plane_normal_unit, [0, 0, 1]), -1.0, 1.0)))
     mid_idx = num_arc_points // 2
     ax.text(
         arc_points[mid_idx, 0],
         arc_points[mid_idx, 1],
         arc_points[mid_idx, 2],
-        f"{np.degrees(np.arccos(np.clip(np.dot(plane_normal_unit, [0, 0, 1]), -1.0, 1.0))):.1f}°",
+        # This calculates the elevation angle between the plane normal (plane_normal_unit)
+        # and the vertical direction [0, 0, 1] in degrees, formatted as a string with 1 decimal and a ° symbol.
+        f"{elevation_angle:.1f}°",
         color="orange",
         fontsize=10,
     )
@@ -2318,33 +2278,9 @@ def plot_views(
       - Row 3 (two columns): top-down (XY) and front (XZ) views
       - Row 4 (two columns): side (Y–Z) and side (−Y–Z) views
     """
-    # Convert to Open3D point cloud if necessary
-    if isinstance(pcd, pointclouds.SimplePointCloud):
-        o3d_pcd = pcd.get_o3d_pcd()
-        filepath = getattr(pcd, "filepath", None)
-        n_points = len(pcd.points)
-    else:
-        o3d_pcd = pcd.o3d_pcd
-        filepath = getattr(pcd, "filepath", None)
-        n_points = len(np.asarray(o3d_pcd.points))
-
-    points = np.asarray(o3d_pcd.points)
-    colors = np.asarray(o3d_pcd.colors)
-
-    # Decimate once for the 2D scatter views
-    if len(points) > max_output_points:
-        logger.info(
-            f"Decimating point cloud from {len(points)} to {max_output_points} points"
-        )
-        decimation_factor = len(points) // max_output_points
-        indices = np.random.choice(
-            len(points), size=len(points) // decimation_factor, replace=False
-        )
-        points_scatter = points[indices]
-        colors_scatter = colors[indices]
-    else:
-        points_scatter = points
-        colors_scatter = colors
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
+    filepath = getattr(pcd, "filepath", None)
 
     def set_equal_2d(ax, x, y):
         # Keep the same units on X and Y by enforcing equal aspect and
@@ -2366,7 +2302,7 @@ def plot_views(
         os.path.basename(filepath) if filepath is not None else "Orthoprojection"
     )
     plot_2d_ortho(
-        pcd if hasattr(pcd, "points") else o3d_pcd,
+        pcd,
         resolution=ortho_resolution,
         ax=ax_ortho,
         title=ortho_title,
@@ -2375,9 +2311,9 @@ def plot_views(
 
     # Row 2: 3D plot (full width)
     ax_3d = fig.add_subplot(gs[1, :], projection="3d")
-    plot_title = f"3D view ({n_points:,} points)"
-    data_mins = points.min(axis=0)
-    data_maxs = points.max(axis=0)
+    plot_title = f"3D view ({len(pcd.points):,} points)"
+    data_mins = pcd.points.min(axis=0)
+    data_maxs = pcd.points.max(axis=0)
     data_ranges = np.maximum(data_maxs - data_mins, 1e-9)
     plot(pcd, point_size=point_size, ax=ax_3d, title=plot_title)
     ax_3d.set_box_aspect(tuple(data_ranges))
@@ -2390,47 +2326,47 @@ def plot_views(
     ax_xy = fig.add_subplot(gs[2, 0])
     ax_xz = fig.add_subplot(gs[2, 1])
     ax_xy.scatter(
-        points_scatter[:, 0],
-        points_scatter[:, 1],
-        c=colors_scatter,
+        pcd.points[:, 0],
+        pcd.points[:, 1],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
     ax_xy.set_title("Top-down (X–Y)", pad=6)
-    set_equal_2d(ax_xy, points_scatter[:, 0], points_scatter[:, 1])
+    set_equal_2d(ax_xy, pcd.points[:, 0], pcd.points[:, 1])
 
     ax_xz.scatter(
-        points_scatter[:, 0],
-        points_scatter[:, 2],
-        c=colors_scatter,
+        pcd.points[:, 0],
+        pcd.points[:, 2],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
     ax_xz.set_title("Front (X–Z)", pad=6)
-    set_equal_2d(ax_xz, points_scatter[:, 0], points_scatter[:, 2])
+    set_equal_2d(ax_xz, pcd.points[:, 0], pcd.points[:, 2])
 
     # Row 4: Side (Y–Z) and Side (−Y–Z)
     ax_yz = fig.add_subplot(gs[3, 0])
     ax_nyz = fig.add_subplot(gs[3, 1])
     ax_yz.scatter(
-        points_scatter[:, 1],
-        points_scatter[:, 2],
-        c=colors_scatter,
+        pcd.points[:, 1],
+        pcd.points[:, 2],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
     ax_yz.set_title("Side (Y–Z)", pad=6)
-    set_equal_2d(ax_yz, points_scatter[:, 1], points_scatter[:, 2])
+    set_equal_2d(ax_yz, pcd.points[:, 1], pcd.points[:, 2])
 
     ax_nyz.scatter(
-        -points_scatter[:, 1],
-        points_scatter[:, 2],
-        c=colors_scatter,
+        -pcd.points[:, 1],
+        pcd.points[:, 2],
+        c=pcd.colors,
         s=point_size,
         edgecolor="none",
     )
     ax_nyz.set_title("Side (−Y–Z)", pad=6)
-    set_equal_2d(ax_nyz, -points_scatter[:, 1], points_scatter[:, 2])
+    set_equal_2d(ax_nyz, -pcd.points[:, 1], pcd.points[:, 2])
 
     if title is not None:
         fig.suptitle(title, y=0.995)
