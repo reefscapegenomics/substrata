@@ -840,6 +840,7 @@ class Annotation:
         reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
         reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
         enabled_cameras_only=True,
+        debug=False,
     ):
         """Get all cameras where the annotation is in view."""
         image_matches = []
@@ -856,8 +857,12 @@ class Annotation:
             x, y, depth, relevance = cam.get_pixel_coords(
                 coords, use_orig_coords=use_orig_coords
             )
+
+            # If pixel coordinates are within the camera bounds
             if x is not None:
-                # If pixel coordinates are within the camera bounds
+                if debug:
+                    print(f"Pixel coordinates for camera {cam.cam_id}: {x}, {y}, {depth}, {relevance}")
+
                 image_match = cameras.ImageMatch(
                     cam, x, y, depth, relevance, annotation=self
                 )
