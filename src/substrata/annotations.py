@@ -843,6 +843,11 @@ class Annotation:
         debug=False,
     ):
         """Get all cameras where the annotation is in view."""
+        # If pcd is given, check that the annotations transform matches the pcd transform
+        if pcd is not None and self.parent is not None:
+            if not np.allclose(self.parent.world_transform, pcd.world_transform):
+                raise ValueError("The annotations transform does not match the pcd transform")
+        # Iterate over all cams to find matches
         image_matches = []
         for cam in cams:
             # Skip disabled cameras if enabled_cameras_only is True
@@ -861,7 +866,7 @@ class Annotation:
             # If pixel coordinates are within the camera bounds
             if x is not None:
                 if debug:
-                    print(f"Pixel coordinates for camera {cam.cam_id}: {x}, {y}, {depth}, {relevance}")
+                    print(f"Cam {cam.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}")
 
                 image_match = cameras.ImageMatch(
                     cam, x, y, depth, relevance, annotation=self
@@ -869,6 +874,8 @@ class Annotation:
                 # Classify according to reprojection error if pcd is provided
                 if pcd is not None:
                     image_match.get_reprojection_error(pcd, intercept_radius)
+                    if debug:
+                        print(f'Reprojection error: {image_match.reprojection_error}')
                     if image_match.reprojection_error is None:
                         continue  # do not store if no intercept found
                     elif (

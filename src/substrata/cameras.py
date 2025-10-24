@@ -1102,7 +1102,6 @@ class Camera:
         intercept_radius=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
         reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
         reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
-        debug=False,
     ):
         """
         Obtain image matches for annotation points that are in view.
@@ -1114,15 +1113,11 @@ class Camera:
             )
             # If pixel coordinates are within the camera bounds
             if x is not None:
-                if debug:
-                    print(f"Cam {self.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}")
-                
+            
                 image_match = ImageMatch(self, x, y, depth, relevance, annotation=ann)
                 # Classify according to reprojection error if pcd is provided
                 if pcd is not None:
                     image_match.get_reprojection_error(pcd, intercept_radius)
-                    if debug:
-                        print(f'Reprojection error: {image_match.reprojection_error}')
                     if image_match.reprojection_error is None:
                         continue  # do not store if no intercept found
                     elif (
@@ -1336,7 +1331,7 @@ class ImageMatch:
         )
         # Calculate reprojection error if intercept found
         if reprojection_intercept is None:
-            print("Warning: no neighboring point found")
+            #print("Warning: no neighboring point found")
             self.reprojection_error = None
             self.reprojection_coords = None
             return None

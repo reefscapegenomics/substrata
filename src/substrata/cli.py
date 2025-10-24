@@ -346,6 +346,23 @@ def handle_intercepts(args):
         csv_path = _get_output_filepath(init, "topdown_intercepts.csv")
         intercepts.save(csv_path)
 
+def handle_align(args):
+    from substrata.pointclouds import PointCloud
+
+    if not args.source or not args.target:
+        raise SystemExit("align requires --source and --target PLY paths")
+
+    # Load with optional stream decimation
+    src = PointCloud(args.source, max_points=args.points)
+    tgt = PointCloud(args.target, max_points=args.points)
+
+    # Compute transform that maps source → target space
+    T, metrics = tgt.get_auto_align_transform(src)
+
+    # Print and optionally show
+    print("Metrics:", metrics)
+    print("Alignment transform (source → target):\n", T)
+    
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -357,6 +374,8 @@ def main():
             "Decimate a PLY. With no args, uses initializer on CWD, output to <id>_dec50M.ply, target=50,000,000."
         ),
     )
+
+    # No file output or visualization in this simplified command
     p_dec.add_argument(
         "--input", "--ply", dest="input", type=str, default=None,
         help="Optional explicit input PLY path (overrides initializer).",
@@ -555,6 +574,18 @@ def main():
         "--input", "--ply", dest="input", type=str, default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
+
+    # align
+    p_align = subparsers.add_parser(
+        "align",
+        help=(
+            "Register a source PLY to a target PLY and print transform (optionally save aligned source)."
+        ),
+    )
+    p_align.add_argument("--source", dest="source", type=str, required=True, help="Source PLY path")
+    p_align.add_argument("--target", dest="target", type=str, required=True, help="Target PLY path")
+    p_align.add_argument("--points", dest="points", type=int, default=5_000_000, help="Max points to stream-load")
+    # No output or visualization flags
     p_intercepts.add_argument(
         "--box-length", dest="box_length", type=float, default=25.0,
         help="Rectangle length in meters for optimal box search (default: 25).",
@@ -586,6 +617,7 @@ def main():
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,
+        "align": handle_align,
     }
     handlers[args.command](args)
 

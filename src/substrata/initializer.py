@@ -325,13 +325,13 @@ class ProjectInitializer:
        
         if self.markers_filepath:
             print(f"Loading markers from {self.markers_filepath}")
-            self.markers = annotations.Annotations(self.markers_filepath)
+            self.markers = annotations.Annotations(self.markers_filepath, orig_coords_only=True)
             if apply_transform and not self.world_transform_is_identity:
                 self.markers.transform_coords(self.world_transform)
 
         if self.annotations_filepath:
             print(f"Loading annotations from {self.annotations_filepath}")
-            self.annotations = annotations.Annotations(self.annotations_filepath)
+            self.annotations = annotations.Annotations(self.annotations_filepath, orig_coords_only=True)
             if apply_transform and not self.world_transform_is_identity:
                 self.annotations.transform_coords(self.world_transform)
     

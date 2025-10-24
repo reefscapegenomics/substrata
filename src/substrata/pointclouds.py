@@ -605,7 +605,7 @@ class PointCloud:
 
         # Provide a short output summary
         print(
-            "Intercept points found: {}/{}".format(
+            "Intercept points returned: {}/{}".format(
                 len(intercept_points), len(xy_coords)
             )
         )
@@ -613,7 +613,7 @@ class PointCloud:
             extrapolated_count = sum(
                 1 for point in intercept_points if point.is_extrapolated
             )
-            print("Extrapolated points with no match: {}".format(extrapolated_count))
+            print(f"Extrapolated intercepts (no point found): {extrapolated_count}/{len(intercept_points)}")
         return intercept_points
 
     def get_z_intercept(
@@ -934,6 +934,131 @@ class PointCloud:
         print(f"Final world_transform after along slope transform:\n{self.world_transform}")
         return n[0:3], elev_deg
 
+    def get_auto_align_transform(
+        self,
+        target: "PointCloud",
+        voxel_size: float | None = None,
+        remove_outliers: bool = True,
+        outlier_std_ratio: float = 2.0,
+        allow_scaling: bool = True,
+        visualize: bool = False,
+    ) -> tuple[np.ndarray, dict]:
+        """Automatically register this point cloud to ``target`` using Open3D.
+
+        The routine is robust to differing orientation/scale and noisy borders:
+        - optional statistical outlier removal
+        - voxel downsampling + FPFH features
+        - global RANSAC feature matching for an initial transform (rigid)
+        - ICP refinement (optionally estimating a global scale)
+
+        Args:
+            target: Destination cloud to align to (remains fixed).
+            voxel_size: Downsample size for features; if None, derives from scene size.
+            remove_outliers: Apply statistical outlier removal before registration.
+            outlier_std_ratio: Std-dev multiplier for outlier removal.
+            allow_scaling: If True, refinement can estimate uniform scale.
+            apply: If True, applies the resulting transform to ``self``.
+            visualize: If True, prints metrics and sizes.
+
+        Returns:
+            (T, metrics): 4x4 transform matrix and a metrics dictionary
+                         with keys: fitness, inlier_rmse, stage ("icp"), and
+                         sizes of the downsampled inputs.
+        """
+        import copy as _copy
+
+        def _statistical_filter(p: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+            if not remove_outliers:
+                return p
+            try:
+                _, idx = p.remove_statistical_outlier(nb_neighbors=20, std_ratio=float(outlier_std_ratio))
+                return p.select_by_index(idx)
+            except Exception:
+                return p
+
+        def _prepare(p: o3d.geometry.PointCloud, vs: float):
+            q = p.voxel_down_sample(vs)
+            q.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 2.0, max_nn=30))
+            f = o3d.pipelines.registration.compute_fpfh_feature(
+                q, o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 5.0, max_nn=100)
+            )
+            return q, f
+
+        # Clone inputs and optionally denoise borders
+        src = _copy.deepcopy(self.o3d_pcd)
+        dst = _copy.deepcopy(target.o3d_pcd)
+        src = _statistical_filter(src)
+        dst = _statistical_filter(dst)
+
+        # Derive a reasonable voxel size from the scene if not provided
+        if voxel_size is None:
+            bb = dst.get_axis_aligned_bounding_box()
+            diag = np.linalg.norm(bb.get_extent())
+            voxel_size = max(diag * 0.02, 1e-3)  # 2% of scene extent, with a small floor
+
+        if visualize:
+            print(f"auto_align: voxel_size={voxel_size:.4f}, allow_scaling={allow_scaling}")
+
+        src_down, src_fpfh = _prepare(src, voxel_size)
+        dst_down, dst_fpfh = _prepare(dst, voxel_size)
+
+        if visualize:
+            print(f"Downsampled sizes: src={len(src_down.points)}, dst={len(dst_down.points)}")
+
+        # Global registration via RANSAC over FPFH matches (rigid init)
+        distance_threshold = voxel_size * 1.5
+        ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            src_down,
+            dst_down,
+            src_fpfh,
+            dst_fpfh,
+            mutual_filter=True,
+            max_correspondence_distance=distance_threshold,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=4,
+            checkers=[
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 1000),
+        )
+
+        T_init = ransac_result.transformation
+
+        # ICP refinement (with optional global scale estimation)
+        # Build normals on (slightly) denser versions for refinement
+        src_ref = src.voxel_down_sample(voxel_size * 0.5)
+        dst_ref = dst.voxel_down_sample(voxel_size * 0.5)
+        src_ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50))
+        dst_ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50))
+
+        max_corr_icp = voxel_size * 1.0
+        if allow_scaling:
+            est = o3d.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=True)
+        else:
+            est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+
+        icp = o3d.pipelines.registration.registration_icp(
+            src_ref, dst_ref, max_corr_icp, T_init, estimation_method=est,
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
+        )
+
+        T = icp.transformation
+        metrics = {
+            "stage": "icp",
+            "fitness": float(icp.fitness),
+            "inlier_rmse": float(icp.inlier_rmse),
+            "src_down": int(len(src_down.points)),
+            "dst_down": int(len(dst_down.points)),
+        }
+
+        if visualize:
+            print(f"ICP fitness={metrics['fitness']:.4f}, rmse={metrics['inlier_rmse']:.4f}")
+            from substrata import visualizations
+            visualizations.plot_compare(src_ref, dst_ref, point_size=1)
+
+        return T, metrics
+
 class SimplePointCloud:
     """Simple point cloud class for storing points, colors and normals."""
 
@@ -960,7 +1085,7 @@ class SimplePointCloud:
         if labels is not None:
             self.labels = np.asarray(labels)
 
-    def get_o3d_pcd(self) -> o3d.geometry.PointCloud:
+    def geto3d_pcd(self) -> o3d.geometry.PointCloud:
         """Convert to Open3D PointCloud object.
 
         Returns:

@@ -271,7 +271,7 @@ def plot_text(text, width=10, height=5):
     return fig
 
 
-def plot_compare(pcd1, pcd2, point_size=1):
+def plot_compare(pcd1, pcd2, point_size=1, max_output_points=50000):
     """
     Plots two 3D point clouds with pcd1 in a blue color scale and pcd2 in a red color scale.
 
@@ -283,11 +283,12 @@ def plot_compare(pcd1, pcd2, point_size=1):
     Returns:
         matplotlib.figure.Figure: The generated figure.
     """
-    points1 = np.asarray(pcd1.o3d_pcd.points)
-    colors1 = np.full((points1.shape[0], 3), [0.0, 0.0, 1.0])  # Blue scale
+    # Decimate if required (and ensure PointCloud format)
+    pcd1 = pointclouds.get_decimated_pcd(pcd1, max_output_points)
+    pcd2 = pointclouds.get_decimated_pcd(pcd2, max_output_points)
 
-    points2 = np.asarray(pcd2.o3d_pcd.points)
-    colors2 = np.full((points2.shape[0], 3), [1.0, 0.0, 0.0])  # Red scale
+    colors1 = np.full((pcd1.points.shape[0], 3), [0.0, 0.0, 1.0])  # Blue scale
+    colors2 = np.full((pcd2.points.shape[0], 3), [1.0, 0.0, 0.0])  # Red scale
 
     # Create figure and axis
     fig = plt.figure()
@@ -296,9 +297,9 @@ def plot_compare(pcd1, pcd2, point_size=1):
 
     # Plot the first point cloud
     ax.scatter(
-        points1[:, 0],
-        points1[:, 1],
-        points1[:, 2],
+        pcd1.points[:, 0],
+        pcd1.points[:, 1],
+        pcd1.points[:, 2],
         c=colors1,
         s=point_size,
         edgecolor="none",
@@ -306,9 +307,9 @@ def plot_compare(pcd1, pcd2, point_size=1):
 
     # Plot the second point cloud
     ax.scatter(
-        points2[:, 0],
-        points2[:, 1],
-        points2[:, 2],
+        pcd2.points[:, 0],
+        pcd2.points[:, 1],
+        pcd2.points[:, 2],
         c=colors2,
         s=point_size,
         edgecolor="none",
