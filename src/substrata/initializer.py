@@ -14,6 +14,7 @@ from substrata import (
     settings,
 )
 
+
 class ProjectInitializer:
     """
     Factory class that spawns a PointCloud, Cameras, and Annotations instance.
@@ -41,15 +42,19 @@ class ProjectInitializer:
         self.cropped_path = None
         self.thumbnail_path = None
         self.classes_filepath = None
-        self.world_transform =  np.eye(4)
+        self.world_transform = np.eye(4)
         self.scale_factor = None
         self.up_vector = None
         self.depth_offset = None
         self.depth_per_unit = None
 
+        # If YAML file is provided, read the YAML file to establish configuration,
+        # and overwrite any values set by the path.
+        if yaml is not None:
+            self.init_with_yaml(yaml)
         # If project_path is given, search for files with default naming conventions
         # in the directory to establish configuration.
-        if path is not None:
+        else:
             current_folder_name = os.path.basename(os.path.abspath(path))
             yaml_path = os.path.join(path, f"{current_folder_name}.yaml")
             if os.path.isfile(yaml_path):
@@ -57,17 +62,12 @@ class ProjectInitializer:
             else:
                 self.init_with_path(path)
 
-        # If YAML file is provided, read the YAML file to establish configuration,
-        # and overwrite any values set by the path.
-        if yaml is not None:
-            self.init_with_yaml(yaml)
-    
     def __str__(self) -> str:
-        """ 
+        """
         Returns a summary of all the variables set by the initializer.
         """
         lines = ["ProjectInitializer("]
-        
+
         # Only show attributes that are set (not None)
         if self.path is not None:
             lines.append(f"  path={self.path},")
@@ -84,7 +84,9 @@ class ProjectInitializer:
         if self.annotations_filepath is not None:
             lines.append(f"  annotations_filepath={self.annotations_filepath},")
         if self.annotations_last_highest_id is not None:
-            lines.append(f"  annotations_last_highest_id={self.annotations_last_highest_id},")
+            lines.append(
+                f"  annotations_last_highest_id={self.annotations_last_highest_id},"
+            )
         if self.photos_path is not None:
             lines.append(f"  photos_path={self.photos_path},")
         if self.cropped_path is not None:
@@ -96,11 +98,11 @@ class ProjectInitializer:
         if self.world_transform is not None:
             lines.append(f"  world_transform={self.world_transform},")
         lines.append(f"  scale_factor={self.scale_factor}")
-        
+
         # Remove trailing comma from last line if present
-        if len(lines) > 1 and lines[-1].endswith(','):
+        if len(lines) > 1 and lines[-1].endswith(","):
             lines[-1] = lines[-1][:-1]
-        
+
         lines.append(")")
         return "\n".join(lines)
 
@@ -143,7 +145,9 @@ class ProjectInitializer:
         self.annotations_filepath = self.__add_path_if_needed(
             yaml_config.get("annotations")
         )
-        self.annotations_last_highest_id = yaml_config.get("annotations_last_highest_id")
+        self.annotations_last_highest_id = yaml_config.get(
+            "annotations_last_highest_id"
+        )
         self.classes_filepath = self.__add_path_if_needed(yaml_config.get("classes"))
         self.scale_factor = yaml_config.get("scale_factor", None)
         wt = yaml_config.get("world_transform")
@@ -158,6 +162,7 @@ class ProjectInitializer:
         up = yaml_config.get("up_vector")
         if up is not None:
             from substrata.geom import Vector
+
             self.up_vector = Vector(up)
         d_off = yaml_config.get("depth_offset")
         if d_off is not None:
@@ -175,16 +180,16 @@ class ProjectInitializer:
     def world_transform_is_identity(self) -> bool:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
-    
+
     @pcd_filepath.setter
     def pcd_filepath(self, value):
         """Backwards compatibility setter for ply_filepath."""
         self.ply_filepath = value
 
-    def save_config_to_yaml(self, filepath = None):
+    def save_config_to_yaml(self, filepath=None):
         """
         Save the current configuration to a YAML file
-        
+
         Args:
             filepath (str): Path where the YAML file should be saved
         """
@@ -204,7 +209,9 @@ class ProjectInitializer:
         if self.annotations_filepath is not None:
             config["annotations"] = os.path.basename(self.annotations_filepath)
         if self.annotations_last_highest_id is not None:
-            config["annotations_last_highest_id"] = int(self.annotations_last_highest_id)
+            config["annotations_last_highest_id"] = int(
+                self.annotations_last_highest_id
+            )
         if self.photos_path is not None:
             config["photos_path"] = os.path.basename(self.photos_path)
         if self.cropped_path is not None:
@@ -229,7 +236,7 @@ class ProjectInitializer:
             config["depth_offset"] = float(self.depth_offset)
         if self.depth_per_unit is not None:
             config["depth_per_unit"] = float(self.depth_per_unit)
-        
+
         if filepath is None:
             filepath = self.yaml_path
         with open(filepath, "w") as f:
@@ -237,7 +244,7 @@ class ProjectInitializer:
 
     def init_with_path(self, filepath):
         """
-        Establish configuration by searching for files with default naming conventions 
+        Establish configuration by searching for files with default naming conventions
         in the given folder. The default naming conventions are as below, variables are
         only declared if files/paths are found in the folder.
         - ply: <id>_dec50M.ply or <id>.ply
@@ -249,12 +256,12 @@ class ProjectInitializer:
         - cropped_path: <id>.cropped/
         - thumbnails_path: <id>.thumbnails/
         - classes: classes.csv
-        
+
         Note: scale_factor defaults to 1.0 and world_transform is not set when using path-based initialization.
         """
         self.path = filepath
         self.id = os.path.basename(os.path.normpath(filepath))
-        
+
         # Follow specific naming conventions from docstring
         # PLY: <id>_dec50M.ply or <id>.ply
         ply_dec_path = os.path.join(filepath, f"{self.id}_dec50M.ply")
@@ -262,42 +269,60 @@ class ProjectInitializer:
 
         ply_full_path = os.path.join(filepath, f"{self.id}.ply")
         self.ply_full_path = ply_full_path if os.path.exists(ply_full_path) else None
-        
-        if  self.ply_dec_path:
+
+        if self.ply_dec_path:
             self.ply_filepath = self.ply_dec_path
         elif self.ply_full_path:
             self.ply_filepath = self.ply_full_path
         else:
             self.ply_filepath = None
-            
+
         # Cameras XML: <id>.cams.xml
         cams_xml_path = os.path.join(filepath, f"{self.id}.cams.xml")
-        self.cams_xml_filepath = cams_xml_path if os.path.exists(cams_xml_path) else None
-        
+        self.cams_xml_filepath = (
+            cams_xml_path if os.path.exists(cams_xml_path) else None
+        )
+
         # Cameras metadata: <id>.meta.json
         cams_meta_path = os.path.join(filepath, f"{self.id}.meta.json")
-        self.cams_meta_json_filepath = cams_meta_path if os.path.exists(cams_meta_path) else None
-        
+        self.cams_meta_json_filepath = (
+            cams_meta_path if os.path.exists(cams_meta_path) else None
+        )
+
         # Markers: <id>_markers.csv
         markers_path = os.path.join(filepath, f"{self.id}_markers.csv")
         self.markers_filepath = markers_path if os.path.exists(markers_path) else None
-        
+
         # Annotations: <id>_annotations.csv
         annotations_path = os.path.join(filepath, f"{self.id}_annotations.csv")
-        self.annotations_filepath = annotations_path if os.path.exists(annotations_path) else None
-        
+        self.annotations_filepath = (
+            annotations_path if os.path.exists(annotations_path) else None
+        )
+
         # Photos path: <id>.photos/
         photos_dir = os.path.join(filepath, f"{self.id}.photos")
-        self.photos_path = photos_dir if os.path.exists(photos_dir) and os.path.isdir(photos_dir) else None
-        
+        self.photos_path = (
+            photos_dir
+            if os.path.exists(photos_dir) and os.path.isdir(photos_dir)
+            else None
+        )
+
         # Cropped path: <id>.cropped/
         cropped_dir = os.path.join(filepath, f"{self.id}.cropped")
-        self.cropped_path = cropped_dir if os.path.exists(cropped_dir) and os.path.isdir(cropped_dir) else None
-        
+        self.cropped_path = (
+            cropped_dir
+            if os.path.exists(cropped_dir) and os.path.isdir(cropped_dir)
+            else None
+        )
+
         # Thumbnails path: <id>.thumbnails/
         thumbnails_dir = os.path.join(filepath, f"{self.id}.thumbnails")
-        self.thumbnail_path = thumbnails_dir if os.path.exists(thumbnails_dir) and os.path.isdir(thumbnails_dir) else None
-        
+        self.thumbnail_path = (
+            thumbnails_dir
+            if os.path.exists(thumbnails_dir) and os.path.isdir(thumbnails_dir)
+            else None
+        )
+
         # Classes: classes.csv
         classes_path = os.path.join(filepath, "classes.csv")
         self.classes_filepath = classes_path if os.path.exists(classes_path) else None
@@ -314,28 +339,33 @@ class ProjectInitializer:
             self.pcd = pointclouds.PointCloud(self.ply_filepath)
             if apply_transform and not self.world_transform_is_identity:
                 self.pcd.apply_transform(self.world_transform)
-        
+
         if self.cams_meta_json_filepath and self.cams_xml_filepath:
             print(
                 f"Loading cameras from {self.cams_meta_json_filepath} and {self.cams_xml_filepath}"
             )
-            self.cams = cameras.Cameras(self.cams_meta_json_filepath, self.cams_xml_filepath)
+            self.cams = cameras.Cameras(
+                self.cams_meta_json_filepath, self.cams_xml_filepath
+            )
             if apply_transform and not self.world_transform_is_identity:
                 self.cams.transform_coords(self.world_transform)
-       
+
         if self.markers_filepath:
             print(f"Loading markers from {self.markers_filepath}")
-            self.markers = annotations.Annotations(self.markers_filepath, orig_coords_only=True)
+            self.markers = annotations.Annotations(
+                self.markers_filepath, orig_coords_only=True
+            )
             if apply_transform and not self.world_transform_is_identity:
                 self.markers.transform_coords(self.world_transform)
 
         if self.annotations_filepath:
             print(f"Loading annotations from {self.annotations_filepath}")
-            self.annotations = annotations.Annotations(self.annotations_filepath, orig_coords_only=True)
+            self.annotations = annotations.Annotations(
+                self.annotations_filepath, orig_coords_only=True
+            )
             if apply_transform and not self.world_transform_is_identity:
                 self.annotations.transform_coords(self.world_transform)
-    
-    
+
     def scale(self):
         """
         Compute project scale factor if missing. Does not apply any transforms.
@@ -351,39 +381,54 @@ class ProjectInitializer:
         Computes missing orientation values if absent.
         """
         if self.pcd is None:
-            raise ValueError('Pointcloud is not initialized')
+            raise ValueError("Pointcloud is not initialized")
 
         # Ensure required parameters are present
-        if (self.up_vector is None) or (self.depth_offset is None) or (self.depth_per_unit is None):
-            self.up_vector, self.depth_offset, self.depth_per_unit, *_ = self.cams.get_up_vector_from_camera_depths()
+        if (
+            (self.up_vector is None)
+            or (self.depth_offset is None)
+            or (self.depth_per_unit is None)
+        ):
+            self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
+                self.cams.get_up_vector_from_camera_depths()
+            )
         if self.scale_factor is None:
             # If scale not computed, do it now
             self.scale()
 
         # Apply to pointcloud
         if not self.pcd.world_transform_is_identity:
-            print(f'Warning: Pointcloud already has a world_transform , this will add to it: {self.pcd.world_transform}')
-        self.pcd.apply_orientation_transforms(self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit)
+            print(
+                f"Warning: Pointcloud already has a world_transform , this will add to it: {self.pcd.world_transform}"
+            )
+        self.pcd.apply_orientation_transforms(
+            self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit
+        )
         self.world_transform = self.pcd.world_transform
 
         # Propagate to cameras/markers/annotations
-        if hasattr(self, 'cams') and self.cams is not None:
+        if hasattr(self, "cams") and self.cams is not None:
             if not self.cams.world_transform_is_identity:
-                print(f'Warning: Camera already has a world_transform, this will add to it: {self.cams.world_transform}')
+                print(
+                    f"Warning: Camera already has a world_transform, this will add to it: {self.cams.world_transform}"
+                )
             self.cams.transform_coords(self.world_transform)
             self.cams.scale_factor = self.scale_factor
             self.cams.depth_offset = self.depth_offset
             self.cams.depth_per_unit = self.depth_per_unit
 
-        if hasattr(self, 'markers') and self.markers is not None:
+        if hasattr(self, "markers") and self.markers is not None:
             if not self.markers.world_transform_is_identity:
-                print(f'Warning: Markers already have a world_transform, this will add to it: {self.markers.world_transform}')
+                print(
+                    f"Warning: Markers already have a world_transform, this will add to it: {self.markers.world_transform}"
+                )
             self.markers.transform_coords(self.world_transform)
-        if hasattr(self, 'annotations') and self.annotations is not None:
+        if hasattr(self, "annotations") and self.annotations is not None:
             if not self.annotations.world_transform_is_identity:
-                print(f'Warning: Annotations already have a world_transform, this will add to it: {self.annotations.world_transform}')
+                print(
+                    f"Warning: Annotations already have a world_transform, this will add to it: {self.annotations.world_transform}"
+                )
             self.annotations.transform_coords(self.world_transform)
-
 
     def __add_path_if_needed(self, filename):
         # If filename is an absolute path or contains directories, use it as is.
@@ -393,7 +438,6 @@ class ProjectInitializer:
             return filename
         else:
             return os.path.join(self.path.rstrip("/"), filename)
-
 
     @staticmethod
     def __is_yaml_file_or_folder_containing_yaml_file(filepath):

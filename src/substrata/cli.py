@@ -19,7 +19,6 @@ from substrata import settings
 ## Removed cameras parent; firefish/cams2video now rely on initializer
 
 
-
 def _cwd_base():
     cwd = os.getcwd()
     base = os.path.basename(cwd.rstrip(os.sep))
@@ -37,11 +36,14 @@ def _infer_target_depth(base: str, explicit_depth):
             return None
     return None
 
+
 def _get_output_filepath(init: ProjectInitializer, postfix: str):
     """Get the output filepath from the initializer and the postfix."""
     return os.path.join(init.path or os.getcwd(), f"{init.id}_{postfix}")
 
+
 # -------------------------------------- handlers -------------------------------------
+
 
 def handle_decimate(args):
     # Use initializer to infer defaults from CWD when not provided
@@ -52,10 +54,14 @@ def handle_decimate(args):
 
     input_path = args.input or init.ply_full_path
     if not input_path:
-        raise SystemExit("No input PLY found. Provide --input or ensure initializer finds a PLY in CWD.")
+        raise SystemExit(
+            "No input PLY found. Provide --input or ensure initializer finds a PLY in CWD."
+        )
 
     # Default output: initializer's decimated path or <id>_dec50M.ply beside the source
-    default_output = init.ply_dec_path or os.path.join(init.path or cwd, f"{init.id}_dec50M.ply")
+    default_output = init.ply_dec_path or os.path.join(
+        init.path or cwd, f"{init.id}_dec50M.ply"
+    )
     output_path = args.output or default_output
 
     decimate_ply_file(
@@ -64,6 +70,7 @@ def handle_decimate(args):
         target_points=args.points,
         show_progress=True,
     )
+
 
 def handle_head(args):
     # Use initializer to infer defaults from CWD when not provided
@@ -74,7 +81,9 @@ def handle_head(args):
 
     input_path = args.input or init.ply_full_path
     if not input_path:
-        raise SystemExit("No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD.")
+        raise SystemExit(
+            "No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD."
+        )
 
     ply_head(input_path, n=args.num, print_output=True)
 
@@ -89,11 +98,15 @@ def handle_scalebars(args):
     # 1) resolve inputs
     pcd_path = args.input or init.ply_full_path
     if not pcd_path:
-        raise SystemExit("No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD.")
+        raise SystemExit(
+            "No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD."
+        )
 
     markers_path = args.markers or init.markers_filepath
     if not markers_path:
-        raise SystemExit("No markers file found. Provide --markers or ensure initializer finds a markers CSV in CWD.")
+        raise SystemExit(
+            "No markers file found. Provide --markers or ensure initializer finds a markers CSV in CWD."
+        )
 
     # 2) load PCD (optionally streaming-decimate on load)
     pcd = PointCloud(pcd_path, max_points=args.points)
@@ -114,7 +127,9 @@ def handle_scalebars(args):
         try:
             scale_factor = sb.calc_scalefactor()
             init.scale_factor = float(scale_factor)
-            yaml_path = init.yaml_path or os.path.join(init.path or os.getcwd(), f"{init.id}.yaml")
+            yaml_path = init.yaml_path or os.path.join(
+                init.path or os.getcwd(), f"{init.id}.yaml"
+            )
             init.save_config_to_yaml(yaml_path)
             print(f"Saved scale_factor to YAML: {yaml_path}")
         except Exception as e:
@@ -151,6 +166,7 @@ def handle_views(args):
         yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
         init.save_config_to_yaml(yaml_path)
 
+
 def handle_firefish(args):
     # Build defaults from current directory name
     base, cwd = _cwd_base()
@@ -162,6 +178,7 @@ def handle_firefish(args):
 
     # Initialize FireFish file
     from substrata.firefish import FireFish
+
     ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
 
     # depth_outlier_thresh is passed through only if provided; otherwise rely on default
@@ -181,6 +198,7 @@ def handle_firefish(args):
     if init.scale_factor is not None or getattr(args, "save_yaml", False):
         init.scale()
         from substrata.geom import Transform
+
         init.world_transform = Transform.from_scale(init.scale_factor)
 
     init.initialize(apply_transform=True)
@@ -189,11 +207,14 @@ def handle_firefish(args):
 
     # Optional subset by camera group name
     if getattr(args, "cams_group", None):
-        try:
-            cams = cams.subset_by_group(args.cams_group)
-            print(f"Subsetting cameras to group '{args.cams_group}' → {len(cams.items())} cameras")
-        except Exception:
-            pass
+        cams = cams.subset_by_group(args.cams_group)
+        if len(cams) == 0:
+            print(f"Available camera groups: {init.cams.group_names}")
+            raise ValueError(f"No cameras found in group '{args.cams_group}'")
+        else:
+            print(
+                f"Subsetted cameras to group '{args.cams_group}' → {len(cams.items())} cameras"
+            )
 
     # Run up-vector determination
     up_vector, depth_offset, depth_per_unit, _ = ff.determine_up_vector(
@@ -218,7 +239,9 @@ def handle_firefish(args):
 
             init.scale_and_orient()
             # Save values to YAML
-            yaml_path = init.yaml_path or os.path.join(init.path or os.getcwd(), f"{init.id}.yaml")
+            yaml_path = init.yaml_path or os.path.join(
+                init.path or os.getcwd(), f"{init.id}.yaml"
+            )
             init.save_config_to_yaml(yaml_path)
             print(f"Saved orientation to YAML: {yaml_path}")
         except Exception as e:
@@ -255,17 +278,21 @@ def handle_cams2video(args):
     if getattr(args, "cams_group", None):
         try:
             cams_for_video = init.cams.subset_by_group(args.cams_group)
-            print(f"Filtered cameras by group '{args.cams_group}': {len(cams_for_video)} cameras")
+            print(
+                f"Filtered cameras by group '{args.cams_group}': {len(cams_for_video)} cameras"
+            )
         except Exception as e:
-            print(f"Warning: Failed to filter cameras by group '{args.cams_group}': {e}")
+            print(
+                f"Warning: Failed to filter cameras by group '{args.cams_group}': {e}"
+            )
             print(f"Available camera groups: {init.cams.group_names}")
             print("Using all cameras instead")
-    
+
     # Validate that we have cameras to work with
     if not cams_for_video or len(cams_for_video) == 0:
         print("Error: No cameras available for video creation")
         return
-    
+
     print(f"Using {len(cams_for_video)} cameras for video creation")
 
     # Compute output path and ensure directory
@@ -333,18 +360,23 @@ def handle_intercepts(args):
         payload = {
             "world_transform": init.pcd.world_transform.tolist(),
             "slope_normal": [float(x) for x in slope_normal],
-            "slope_elevation_deg": float(slope_elev), 
+            "slope_elevation_deg": float(slope_elev),
         }
         with open(yaml_path, "w") as f:
             yaml.safe_dump(payload, f)
         # additional visualization for sanity check
-        a,b,c,d,inliers_idx = measurements.get_best_fit_plane_PCA(init.pcd)
-        visualizations.visualize_elevation_angle(init.pcd, [a,b,c,d], point_size=1,
-                                                 output_filename=_get_output_filepath(init, "slope_pca.png"))
+        a, b, c, d, inliers_idx = measurements.get_best_fit_plane_PCA(init.pcd)
+        visualizations.visualize_elevation_angle(
+            init.pcd,
+            [a, b, c, d],
+            point_size=1,
+            output_filename=_get_output_filepath(init, "slope_pca.png"),
+        )
     else:
         fig.savefig(_get_output_filepath(init, "topdown_bbox.png"))
         csv_path = _get_output_filepath(init, "topdown_intercepts.csv")
         intercepts.save(csv_path)
+
 
 def handle_align(args):
     from substrata.pointclouds import PointCloud
@@ -362,7 +394,8 @@ def handle_align(args):
     # Print and optionally show
     print("Metrics:", metrics)
     print("Alignment transform (source → target):\n", T)
-    
+
+
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -377,28 +410,46 @@ def main():
 
     # No file output or visualization in this simplified command
     p_dec.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_dec.add_argument(
-        "--output", dest="output", type=str, default=None,
+        "--output",
+        dest="output",
+        type=str,
+        default=None,
         help="Optional explicit output PLY path (defaults to <id>_dec50M.ply).",
     )
     p_dec.add_argument(
-            "-n", "--points", dest="points", type=int, default=50_000_000,
-            help="Number of points to keep (default: 50,000,000).",
-    ) 
+        "-n",
+        "--points",
+        dest="points",
+        type=int,
+        default=50_000_000,
+        help="Number of points to keep (default: 50,000,000).",
+    )
 
     # head (PLY preview)
     p_head = subparsers.add_parser(
         "head", help="Show first N vertex rows from a PLY file."
     )
     p_head.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_head.add_argument(
-        "-n", dest="num", type=int, default=5,
+        "-n",
+        dest="num",
+        type=int,
+        default=5,
         help="Number of vertex rows to display (default: 5).",
     )
 
@@ -408,23 +459,40 @@ def main():
         help="Generate scalebar PDF from a point cloud and marker annotations.",
     )
     p_sb.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_sb.add_argument(
-        "--markers", dest="markers", type=str, default=None,
+        "--markers",
+        dest="markers",
+        type=str,
+        default=None,
         help="Optional explicit markers CSV path (overrides initializer).",
     )
     p_sb.add_argument(
-        "--output_pdf", dest="output_pdf", type=str, default=None,
+        "--output_pdf",
+        dest="output_pdf",
+        type=str,
+        default=None,
         help="Optional output PDF filepath.",
     )
     p_sb.add_argument(
-        "-n", "--points", dest="points", type=int, default=50000000,
+        "-n",
+        "--points",
+        dest="points",
+        type=int,
+        default=50000000,
         help="Optional max points to stream-load PLY (decimation on load).",
     )
     p_sb.add_argument(
-        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        "-s",
+        "--save_yaml",
+        dest="save_yaml",
+        action="store_true",
         help="Save computed scale_factor into a YAML config for this project.",
     )
 
@@ -433,22 +501,33 @@ def main():
         "views", help="Save composite views PDF for a point cloud."
     )
     p_views.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_views.add_argument(
-        "--output_pdf", dest="output_pdf", type=str, default=None, 
+        "--output_pdf",
+        dest="output_pdf",
+        type=str,
+        default=None,
         help="Output PDF filepath.",
     )
     p_views.add_argument(
-        "--auto-orient", dest="auto_orient", action="store_true",
+        "--auto-orient",
+        dest="auto_orient",
+        action="store_true",
         help="Initialize and orient the project before saving.",
     )
     p_views.add_argument(
-        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        "-s",
+        "--save_yaml",
+        dest="save_yaml",
+        action="store_true",
         help="Save computed scale_factor into a YAML config for this project.",
     )
-
 
     # firefish
     p_ff = subparsers.add_parser(
@@ -459,8 +538,13 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--firefish-file", dest="firefish_file", type=str, default=None,
-        help=("Path to FireFish file. Default: <cwd_basename>_firefish.txt in current folder."),
+        "--firefish-file",
+        dest="firefish_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to FireFish file. Default: <cwd_basename>_firefish.txt in current folder."
+        ),
     )
     p_ff.add_argument(
         "--target-depth",
@@ -503,9 +587,7 @@ def main():
         dest="cams_group",
         type=str,
         default=None,
-        help=(
-            "Optional camera group name to subset (uses Cameras.subset_by_group)."
-        ),
+        help=("Optional camera group name to subset (uses Cameras.subset_by_group)."),
     )
     p_ff.add_argument(
         "--offset",
@@ -517,12 +599,19 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     # removed --camspath-postfix (use --cams-group instead)
     p_ff.add_argument(
-        "-s", "--save_yaml", dest="save_yaml", action="store_true",
+        "-s",
+        "--save_yaml",
+        dest="save_yaml",
+        action="store_true",
         help="Save computed up_vector, depth_offset, depth_per_unit into YAML.",
     )
 
@@ -534,19 +623,33 @@ def main():
         ),
     )
     p_c2v.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_c2v.add_argument(
-        "--annotations", dest="annotations_file", type=str, default=None,
+        "--annotations",
+        dest="annotations_file",
+        type=str,
+        default=None,
         help=("Path to annotations CSV. Uses initializer if omitted."),
     )
     p_c2v.add_argument(
-        "-l", "--label", dest="use_label_column", action="store_true",
+        "-l",
+        "--label",
+        dest="use_label_column",
+        action="store_true",
         help=("Use label column from annotations when drawing matches (default: off)."),
     )
     p_c2v.add_argument(
-        "-r", "--resolution", dest="resolution", type=int, default=None,
+        "-r",
+        "--resolution",
+        dest="resolution",
+        type=int,
+        default=None,
         help=("Optional width to resize images when creating frames (pixels)."),
     )
     p_c2v.add_argument(
@@ -554,12 +657,13 @@ def main():
         dest="cams_group",
         type=str,
         default=None,
-        help=(
-            "Optional camera group name to subset (uses Cameras.subset_by_group)."
-        ),
+        help=("Optional camera group name to subset (uses Cameras.subset_by_group)."),
     )
     p_c2v.add_argument(
-        "--output_mp4", dest="output_mp4", type=str, default=None,
+        "--output_mp4",
+        dest="output_mp4",
+        type=str,
+        default=None,
         help="Optional output MP4 filepath (default: <id>_cams.mp4).",
     )
 
@@ -571,7 +675,11 @@ def main():
         ),
     )
     p_intercepts.add_argument(
-        "--input", "--ply", dest="input", type=str, default=None,
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
 
@@ -582,28 +690,52 @@ def main():
             "Register a source PLY to a target PLY and print transform (optionally save aligned source)."
         ),
     )
-    p_align.add_argument("--source", dest="source", type=str, required=True, help="Source PLY path")
-    p_align.add_argument("--target", dest="target", type=str, required=True, help="Target PLY path")
-    p_align.add_argument("--points", dest="points", type=int, default=5_000_000, help="Max points to stream-load")
+    p_align.add_argument(
+        "--source", dest="source", type=str, required=True, help="Source PLY path"
+    )
+    p_align.add_argument(
+        "--target", dest="target", type=str, required=True, help="Target PLY path"
+    )
+    p_align.add_argument(
+        "--points",
+        dest="points",
+        type=int,
+        default=5_000_000,
+        help="Max points to stream-load",
+    )
     # No output or visualization flags
     p_intercepts.add_argument(
-        "--box-length", dest="box_length", type=float, default=25.0,
+        "--box-length",
+        dest="box_length",
+        type=float,
+        default=25.0,
         help="Rectangle length in meters for optimal box search (default: 25).",
     )
     p_intercepts.add_argument(
-        "--box-width", dest="box_width", type=float, default=4.0,
+        "--box-width",
+        dest="box_width",
+        type=float,
+        default=4.0,
         help="Rectangle width in meters for optimal box search (default: 4).",
     )
     p_intercepts.add_argument(
-        "--box-size", dest="box_size", type=float, default=0.2,
+        "--box-size",
+        dest="box_size",
+        type=float,
+        default=0.2,
         help="Grid cell size in meters for subdividing the optimal box (default: 0.2).",
     )
     p_intercepts.add_argument(
-        "--search-radius", dest="search_radius", type=float, default=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
+        "--search-radius",
+        dest="search_radius",
+        type=float,
+        default=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
         help="Search radius in meters for Z-intercept lookup (default: 0.005).",
     )
     p_intercepts.add_argument(
-        "--slope", dest="slope", action="store_true",
+        "--slope",
+        dest="slope",
+        action="store_true",
         help="Apply along-slope transform to pointcloud before processing.",
     )
 
