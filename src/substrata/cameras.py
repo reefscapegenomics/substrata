@@ -876,9 +876,7 @@ class Camera:
         - If that folder name contains a '.', use the text after the first '.'
           as the group name (e.g., "20241008.auv→ "auv")
         - Further split the group by prefixing with the first part of the filename
-          before the first underscore (e.g., "PR_20250608.jpg" → "PR").
-        - Final group is "<folder_group>_<filename_prefix>" (e.g., "auv_PR").
-        - BUT: Only use the "<folder_group>_<filename_prefix>" form if there are multiple unique filename prefixes among all cameras in the parent container. If all are the same, just use "<folder_group>".
+          if there is an underscore in the filename (e.g., "PR_20250608.jpg" → "PR").
         """
         try:
             folder = os.path.basename(os.path.dirname(self.filepath))
@@ -913,7 +911,7 @@ class Camera:
                 # If no parent, fallback to just this camera's prefix
                 unique_prefixes.add(filename_prefix)
 
-            if len(unique_prefixes) > 1:
+            if len(unique_prefixes) > 1 and "_" in filename:
                 group = f"{folder_group}_{filename_prefix}"
             else:
                 group = folder_group
