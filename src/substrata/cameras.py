@@ -44,21 +44,21 @@ class Sensor:
         """
         self.sensor_id = sensor_id
         self.label = label
-        self.width = resolution['width']
-        self.height = resolution['height']
-        
+        self.width = resolution["width"]
+        self.height = resolution["height"]
+
         # Calibration parameters
-        self.f = calibration_params['f']
-        self.cx_metashape = calibration_params['cx']
-        self.cy_metashape = calibration_params['cy']
-        self.b1 = calibration_params.get('b1', 0.0)
-        self.b2 = calibration_params.get('b2', 0.0)
-        self.k1 = calibration_params['k1']
-        self.k2 = calibration_params['k2']
-        self.k3 = calibration_params['k3']
-        self.p1 = calibration_params['p1']
-        self.p2 = calibration_params['p2']
-        
+        self.f = calibration_params["f"]
+        self.cx_metashape = calibration_params["cx"]
+        self.cy_metashape = calibration_params["cy"]
+        self.b1 = calibration_params.get("b1", 0.0)
+        self.b2 = calibration_params.get("b2", 0.0)
+        self.k1 = calibration_params["k1"]
+        self.k2 = calibration_params["k2"]
+        self.k3 = calibration_params["k3"]
+        self.p1 = calibration_params["p1"]
+        self.p2 = calibration_params["p2"]
+
         # Derived parameters
         self.fx = self.f + self.b1
         self.fy = self.f
@@ -130,7 +130,9 @@ class Cameras:
 
     @property
     def group_names(self):
-        return sorted({cam.group for cam in self.data.values() if hasattr(cam, "group")})
+        return sorted(
+            {cam.group for cam in self.data.values() if hasattr(cam, "group")}
+        )
 
     def append(self, cam):
         if cam.cam_id in self.data:
@@ -163,9 +165,9 @@ class Cameras:
 
     def apply_transform(self, transform_matrix):
         """Alias for transform_coords for compatibility.
-f
-        Args:
-            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+        f
+                Args:
+                    transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
         self.transform_coords(transform_matrix)
 
@@ -263,7 +265,7 @@ f
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
         for cam_id, cam_data in data["cameras"].items():
-            #if cam_data["center"] is not None:
+            # if cam_data["center"] is not None:
             self.data[cam_id] = Camera(
                 self,
                 cam_id,
@@ -290,29 +292,33 @@ f
         """
         tree = ET.parse(cams_xml_filepath)
         root = tree.getroot()
-        
+
         # 1. Parse all sensors and create Sensor objects
-        sensors_section = root.find('.//sensors')
+        sensors_section = root.find(".//sensors")
         if sensors_section is None:
             sys.exit("No sensors section found in XML file!")
-            
-        for sensor_elem in sensors_section.findall('sensor'):
-            sensor_id = int(sensor_elem.get('id'))
-            label = sensor_elem.get('label', 'unknown')
-            
+
+        for sensor_elem in sensors_section.findall("sensor"):
+            sensor_id = int(sensor_elem.get("id"))
+            label = sensor_elem.get("label", "unknown")
+
             # Parse resolution
-            resolution_elem = sensor_elem.find('resolution')
+            resolution_elem = sensor_elem.find("resolution")
             if resolution_elem is None:
-                logger.warning(f"No resolution found for sensor {sensor_id}, skipping...")
+                logger.warning(
+                    f"No resolution found for sensor {sensor_id}, skipping..."
+                )
                 continue
-                
+
             resolution = {
-                'width': int(resolution_elem.get('width')),
-                'height': int(resolution_elem.get('height'))
+                "width": int(resolution_elem.get("width")),
+                "height": int(resolution_elem.get("height")),
             }
-            
+
             # Parse calibration
-            calibration = sensor_elem.find('.//calibration[@type="frame"][@class="adjusted"]')
+            calibration = sensor_elem.find(
+                './/calibration[@type="frame"][@class="adjusted"]'
+            )
             if calibration is not None:
                 # Helper function to safely get float values
                 def get_float_or_zero(elem, name, default=0.0):
@@ -321,77 +327,93 @@ f
                         try:
                             return float(found_elem.text)
                         except (ValueError, TypeError):
-                            logger.warning(f"Invalid {name} value for sensor {sensor_id}, using default {default}")
+                            logger.warning(
+                                f"Invalid {name} value for sensor {sensor_id}, using default {default}"
+                            )
                             return default
                     else:
-                        logger.warning(f"Missing {name} for sensor {sensor_id}, using default {default}")
+                        logger.warning(
+                            f"Missing {name} for sensor {sensor_id}, using default {default}"
+                        )
                         return default
-                
+
                 calib_params = {
-                    'f': get_float_or_zero(calibration, 'f'),
-                    'cx': get_float_or_zero(calibration, 'cx'),
-                    'cy': get_float_or_zero(calibration, 'cy'),
-                    'k1': get_float_or_zero(calibration, 'k1'),
-                    'k2': get_float_or_zero(calibration, 'k2'),
-                    'k3': get_float_or_zero(calibration, 'k3'),
-                    'p1': get_float_or_zero(calibration, 'p1'),
-                    'p2': get_float_or_zero(calibration, 'p2'),
+                    "f": get_float_or_zero(calibration, "f"),
+                    "cx": get_float_or_zero(calibration, "cx"),
+                    "cy": get_float_or_zero(calibration, "cy"),
+                    "k1": get_float_or_zero(calibration, "k1"),
+                    "k2": get_float_or_zero(calibration, "k2"),
+                    "k3": get_float_or_zero(calibration, "k3"),
+                    "p1": get_float_or_zero(calibration, "p1"),
+                    "p2": get_float_or_zero(calibration, "p2"),
                 }
-                
+
                 # Handle optional b1, b2 parameters
-                b1_elem = calibration.find('b1')
+                b1_elem = calibration.find("b1")
                 if b1_elem is not None and b1_elem.text is not None:
                     try:
-                        calib_params['b1'] = float(b1_elem.text)
+                        calib_params["b1"] = float(b1_elem.text)
                     except (ValueError, TypeError):
-                        logger.warning(f"Invalid b1 value for sensor {sensor_id}, using default 0.0")
-                        calib_params['b1'] = 0.0
+                        logger.warning(
+                            f"Invalid b1 value for sensor {sensor_id}, using default 0.0"
+                        )
+                        calib_params["b1"] = 0.0
                 else:
-                    calib_params['b1'] = 0.0
-                    
-                b2_elem = calibration.find('b2')
+                    calib_params["b1"] = 0.0
+
+                b2_elem = calibration.find("b2")
                 if b2_elem is not None and b2_elem.text is not None:
                     try:
-                        calib_params['b2'] = float(b2_elem.text)
+                        calib_params["b2"] = float(b2_elem.text)
                     except (ValueError, TypeError):
-                        logger.warning(f"Invalid b2 value for sensor {sensor_id}, using default 0.0")
-                        calib_params['b2'] = 0.0
+                        logger.warning(
+                            f"Invalid b2 value for sensor {sensor_id}, using default 0.0"
+                        )
+                        calib_params["b2"] = 0.0
                 else:
-                    calib_params['b2'] = 0.0
-                
+                    calib_params["b2"] = 0.0
+
                 # Create Sensor instance
                 sensor = Sensor(sensor_id, label, resolution, calib_params)
                 self.sensors[sensor_id] = sensor
             else:
-                logger.warning(f"No calibration found for sensor {sensor_id}, skipping...")
-        
+                logger.warning(
+                    f"No calibration found for sensor {sensor_id}, skipping..."
+                )
+
         # 2. Parse cameras and assign sensor references
-        cameras_section = root.find('.//cameras')
+        cameras_section = root.find(".//cameras")
         if cameras_section is None:
             logger.warning("No cameras section found in XML file!")
             return
-            
+
         assigned_count = 0
         xml_cam_ids = []
         json_cam_ids = list(self.data.keys())
-        
-        for camera_elem in cameras_section.findall('.//camera'):
-            cam_id = camera_elem.get('id')
-            sensor_id = int(camera_elem.get('sensor_id'))
+
+        for camera_elem in cameras_section.findall(".//camera"):
+            cam_id = camera_elem.get("id")
+            sensor_id = int(camera_elem.get("sensor_id"))
             xml_cam_ids.append(cam_id)
-            
+
             # Find matching camera in our data and assign sensor
+            static_no_sensor_message_printed = getattr(
+                self, "_no_sensor_message_printed", False
+            )
             if cam_id in self.data:
                 self.data[cam_id].sensor_id = sensor_id
                 self.data[cam_id].sensor = self.sensors.get(sensor_id)
                 if self.data[cam_id].sensor is not None:
                     assigned_count += 1
                 else:
-                    logger.warning(f"No sensor found for camera {cam_id} with sensor_id {sensor_id}")
+                    if not getattr(self, "_no_sensor_message_printed", False):
+                        logger.warning(
+                            f"No sensor found for at least one camera (e.g. {cam_id} {sensor_id})"
+                        )
+                        self._no_sensor_message_printed = True
             else:
                 logger.warning(f"Camera {cam_id} from XML not found in loaded cameras")
-    
-        
+
         if not self.sensors:
             sys.exit("No valid sensors found in XML file!")
 
@@ -461,9 +483,9 @@ f
                         "depth_res": getattr(cam, "depth_residual", None),
                     }
                 )
+
     def get_average_vector(self):
-        """Get the average vector of the cameras.
-        """
+        """Get the average vector of the cameras."""
         vectors = np.array([cam.vector for cam in self.data.values()])
         return vectors.mean(axis=0)
 
@@ -479,12 +501,16 @@ f
             if other_cam is not None:
                 timematches.append((cam, other_cam))
             else:
-                raise ValueError(f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}")
+                raise ValueError(
+                    f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}"
+                )
         return timematches
-    
-    def get_centers_and_transforms_based_on_timematch(self, other_cams, offset_xyz=None):
+
+    def get_centers_and_transforms_based_on_timematch(
+        self, other_cams, offset_xyz=None
+    ):
         """
-        Adopt the centers and transform from other cameras based on a timesync. 
+        Adopt the centers and transform from other cameras based on a timesync.
         Provide an offset_xyz in the camera's local coordinate system to apply to the camera positions.
 
         Args:
@@ -497,7 +523,9 @@ f
                 if offset_xyz is not None:
                     # Transform offset_xyz from camera coordinate system to world coordinates
                     # Extract rotation matrix from camera transform and orthonormalize it
-                    rotation_matrix = np.array(other_cam.camera_transform, dtype=float)[:3, :3]
+                    rotation_matrix = np.array(other_cam.camera_transform, dtype=float)[
+                        :3, :3
+                    ]
                     # Use SVD to obtain the nearest rotation (handles potential scaling/shear)
                     U, _, Vt = np.linalg.svd(rotation_matrix)
                     R = U @ Vt
@@ -511,7 +539,10 @@ f
                     cam.coords = other_cam.coords + world_offset
                     # Also apply the offset to the camera_transform translation
                     cam.camera_transform = other_cam.camera_transform.copy()
-                    cam.camera_transform[:3, 3] = np.array(cam.camera_transform[:3, 3], dtype=float) + world_offset
+                    cam.camera_transform[:3, 3] = (
+                        np.array(cam.camera_transform[:3, 3], dtype=float)
+                        + world_offset
+                    )
                     cam.reverse_transform_coords(other_cam.parent.world_transform)
                 else:
                     cam.coords = other_cam.coords
@@ -519,7 +550,9 @@ f
                     cam.orig_coords = other_cam.orig_coords
                     cam.orig_camera_transform = other_cam.orig_camera_transform
             else:
-                raise ValueError(f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}")
+                raise ValueError(
+                    f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}"
+                )
 
     def set_filepath_replace(self, find_str, replace_str):
         """Set a find/replace pair for adjusting filepaths.
@@ -617,7 +650,11 @@ f
             - firefish.get_unix_time(first_cam.datetime)
         )
 
-    def get_up_vector_from_camera_depths(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD, plot=False):
+    def get_up_vector_from_camera_depths(
+        self,
+        depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
+        plot=False,
+    ):
         """Compute the up vector using least-squares regression on camera depths.
 
         Fits a linear regression between the camera 3D points and their depths to
@@ -632,12 +669,14 @@ f
         cams_filtered = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth") 
-            and hasattr(cam, "coords") 
-            and (not hasattr(cam, "depth_acc") 
-                 or cam.depth_acc <= depth_accuracy_threshold)
+            if hasattr(cam, "depth")
+            and hasattr(cam, "coords")
+            and (
+                not hasattr(cam, "depth_acc")
+                or cam.depth_acc <= depth_accuracy_threshold
+            )
         ]
-    
+
         num_matches = len(cams_filtered)
         if num_matches < 2:
             # Not enough points to fit a regression
@@ -688,17 +727,34 @@ f
         # 4) Plot the regression fit if requested
         if plot:
             from substrata import visualizations
+
             visualizations.plot_depth_regression(depths, depths_predicted)
 
         # Print summary statistics
-        print(f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]")
+        print(
+            f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]"
+        )
         print(f"  Depth offset: {depth_offset:.4f} m")
 
         # 5) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
-        return coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches
-    
-    def get_depths_and_preds(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD, recalculate = True):
-        
+        return (
+            coef,
+            depth_offset,
+            depth_per_unit,
+            mse,
+            rmse,
+            mae,
+            r2,
+            cam_depth_residuals,
+            num_matches,
+        )
+
+    def get_depths_and_preds(
+        self,
+        depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
+        recalculate=True,
+    ):
+
         if recalculate:
             for cam in self.data.values():
                 if hasattr(cam, "depth"):
@@ -708,23 +764,29 @@ f
         cams_filtered = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth") 
-            and hasattr(cam, "depth_pred") 
-            and (not hasattr(cam, "depth_acc") 
-                 or cam.depth_acc <= depth_accuracy_threshold)
+            if hasattr(cam, "depth")
+            and hasattr(cam, "depth_pred")
+            and (
+                not hasattr(cam, "depth_acc")
+                or cam.depth_acc <= depth_accuracy_threshold
+            )
         ]
-        depths = [camera.depth for camera in cams_filtered] 
+        depths = [camera.depth for camera in cams_filtered]
         depths_pred = [camera.depth_pred for camera in cams_filtered]
         return depths, depths_pred
-    
-    def get_depths_and_z_coords(self, depth_accuracy_threshold = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD):
+
+    def get_depths_and_z_coords(
+        self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
+    ):
         cams_filtered = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth") 
-            and hasattr(cam, "coords") 
-            and (not hasattr(cam, "depth_acc") 
-                 or cam.depth_acc <= depth_accuracy_threshold)
+            if hasattr(cam, "depth")
+            and hasattr(cam, "coords")
+            and (
+                not hasattr(cam, "depth_acc")
+                or cam.depth_acc <= depth_accuracy_threshold
+            )
         ]
         depths = [camera.depth for camera in cams_filtered]
         z_coords = [camera.coords[2] for camera in cams_filtered]
@@ -732,16 +794,19 @@ f
 
     def show_depth_residuals(self, width=15, height=5, recalculate=True):
         """Show camera residuals using cam.depth_residual for each camera.
-        
+
         Args:
             width (float): Figure width in inches (default: 10)
             height (float): Figure height in inches (default: 5)
             recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
         depths, z_coords = self.get_depths_and_preds(recalculate=recalculate)
-        fig = visualizations.plot_depth_regression(depths, z_coords, width=width, height=height)
+        fig = visualizations.plot_depth_regression(
+            depths, z_coords, width=width, height=height
+        )
         fig2 = visualizations.plot_cam_residuals(self, width=width, height=height)
         return fig, fig2
+
 
 class Camera:
     """Class that holds information about a single camera."""
@@ -766,7 +831,7 @@ class Camera:
         self.orig_filepath = path
         self.filename = os.path.basename(path)
         self.sensor_id = None  # Will be set during XML parsing
-        self.sensor = None     # Will reference the Sensor instance
+        self.sensor = None  # Will reference the Sensor instance
 
     @property
     def vector(self):
@@ -855,11 +920,12 @@ class Camera:
             return group
         except Exception:
             return None
-    
+
     @property
     def depth_in_m(self):
-        return (self.parent.depth_per_unit / self.parent.scale_factor) * (self.coords[2] - self.parent.depth_offset) + self.parent.depth_offset
-
+        return (self.parent.depth_per_unit / self.parent.scale_factor) * (
+            self.coords[2] - self.parent.depth_offset
+        ) + self.parent.depth_offset
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.
@@ -880,9 +946,13 @@ class Camera:
         """
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = self.__transform_coords(self.coords, inverse_transform)
-        self.orig_camera_transform = np.dot(inverse_transform, self.camera_transform) ### CHECK: changed this from camera_transform to orig_camera_transform
+        self.orig_camera_transform = np.dot(
+            inverse_transform, self.camera_transform
+        )  ### CHECK: changed this from camera_transform to orig_camera_transform
 
-    def get_pixel_coords(self, coords, use_orig_coords=False, required_to_be_in_view=True):
+    def get_pixel_coords(
+        self, coords, use_orig_coords=False, required_to_be_in_view=True
+    ):
         """Compute the image pixel coordinates from original 3D coordinates.
 
         Projects a 3D point and applies lens distortion correction.
@@ -905,7 +975,6 @@ class Camera:
 
         # Ensure array type and shape for inversion
         cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
-
 
         proj_point = np.dot(np.linalg.inv(cam_transform), np.append(coords, 1))
         x_norm = proj_point[0] / proj_point[2]
@@ -1005,15 +1074,17 @@ class Camera:
         # Create a direction vector in camera space. Here, we assume the
         # image plane is at unit distance (z = 1).
         vec_cam = np.array([x_norm, y_norm, 1.0])
-        
+
         # Check for invalid values
         if np.any(np.isnan(vec_cam)) or np.any(np.isinf(vec_cam)):
-            raise ValueError(f"Invalid camera vector computed for pixel ({x_img}, {y_img}): {vec_cam}")
-        
+            raise ValueError(
+                f"Invalid camera vector computed for pixel ({x_img}, {y_img}): {vec_cam}"
+            )
+
         vec_cam_norm = np.linalg.norm(vec_cam)
         if vec_cam_norm == 0:
             raise ValueError(f"Zero-length camera vector for pixel ({x_img}, {y_img})")
-        
+
         vec_cam /= vec_cam_norm
 
         # Transform the direction vector from camera to world coordinates.
@@ -1021,11 +1092,11 @@ class Camera:
         transform_matrix = np.array(self.camera_transform, dtype=float).reshape((4, 4))
         R = transform_matrix[:3, :3]
         vec_world = R.dot(vec_cam)
-        
+
         vec_world_norm = np.linalg.norm(vec_world)
         if vec_world_norm == 0:
             raise ValueError(f"Zero-length world vector for pixel ({x_img}, {y_img})")
-        
+
         vec_world /= vec_world_norm
 
         return vec_world
@@ -1113,7 +1184,7 @@ class Camera:
             )
             # If pixel coordinates are within the camera bounds
             if x is not None:
-            
+
                 image_match = ImageMatch(self, x, y, depth, relevance, annotation=ann)
                 # Classify according to reprojection error if pcd is provided
                 if pcd is not None:
@@ -1166,22 +1237,22 @@ class Camera:
         if not os.path.isfile(self.filepath):
             logger.error(f"Image file not found: {self.filepath}")
             return None
-        
+
         # Try using exifread first (more comprehensive)
         try:
-            with open(self.filepath, 'rb') as f:
+            with open(self.filepath, "rb") as f:
                 tags = exifread.process_file(f, details=False)
-                
-                if 'EXIF DateTimeOriginal' in tags:
-                    dt_orig = str(tags['EXIF DateTimeOriginal'])
+
+                if "EXIF DateTimeOriginal" in tags:
+                    dt_orig = str(tags["EXIF DateTimeOriginal"])
                     if offset_secs is not None:
                         dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
                         dt_offset = dt + datetime.timedelta(seconds=offset_secs)
                         return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
                     else:
                         return dt_orig
-                elif 'Image DateTime' in tags:
-                    dt_orig = str(tags['Image DateTime'])
+                elif "Image DateTime" in tags:
+                    dt_orig = str(tags["Image DateTime"])
                     if offset_secs is not None:
                         dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
                         dt_offset = dt + datetime.timedelta(seconds=offset_secs)
@@ -1192,7 +1263,7 @@ class Camera:
             pass
         except Exception as e:
             pass
-        
+
         # Fallback to PIL
         image = Image.open(self.filepath)
         exif_data = image.getexif()
@@ -1331,7 +1402,7 @@ class ImageMatch:
         )
         # Calculate reprojection error if intercept found
         if reprojection_intercept is None:
-            #print("Warning: no neighboring point found")
+            # print("Warning: no neighboring point found")
             self.reprojection_error = None
             self.reprojection_coords = None
             return None
@@ -1541,20 +1612,20 @@ class ImageMatch:
         # cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
         # plt.imshow(cropped_img)
         # plt.show()
-        
+
         # Expecting PIL image, display directly
         plt.imshow(cropped_img)
-        
+
         # Highlight the center pixel in red
-        if hasattr(cropped_img, 'size'):  # PIL image
+        if hasattr(cropped_img, "size"):  # PIL image
             center_x = cropped_img.size[0] // 2
             center_y = cropped_img.size[1] // 2
         else:  # numpy array
             center_y, center_x = cropped_img.shape[:2]
             center_x = center_x // 2
             center_y = center_y // 2
-        
-        plt.plot(center_x, center_y, 'ro', markersize=8)
+
+        plt.plot(center_x, center_y, "ro", markersize=8)
         plt.show()
 
 
