@@ -146,7 +146,7 @@ class PointCloud:
         """
         bounding_box = self.o3d_pcd.get_axis_aligned_bounding_box()
         return [bounding_box.get_min_bound(), bounding_box.get_max_bound()]
-    
+
     @property
     def world_transform_is_identity(self) -> bool:
         """Check if the world_transform is the identity matrix."""
@@ -613,7 +613,9 @@ class PointCloud:
             extrapolated_count = sum(
                 1 for point in intercept_points if point.is_extrapolated
             )
-            print(f"Extrapolated intercepts (no point found): {extrapolated_count}/{len(intercept_points)}")
+            print(
+                f"Extrapolated intercepts (no point found): {extrapolated_count}/{len(intercept_points)}"
+            )
         return intercept_points
 
     def get_z_intercept(
@@ -892,7 +894,7 @@ class PointCloud:
             n = n / np.linalg.norm(n)
             if n[2] < 0:
                 n = -n
-        
+
         print(f"Original PCA/SVD normal vector: [{n[0]:.6f}, {n[1]:.6f}, {n[2]:.6f}]")
         elev_deg = measurements.get_elevation_angle(n)
         print(f"Original PCA/SVD normal elevation: {elev_deg:.3f}°")
@@ -923,15 +925,17 @@ class PointCloud:
             eig_vals2, eig_vecs2 = measurements.conduct_PCA(SimplePointCloud(Pi2))
             n2 = eig_vecs2[:, np.argmin(eig_vals2)]
             n2 = n2 / np.linalg.norm(n2)
-            if n2[2] < 0: 
+            if n2[2] < 0:
                 n2 = -n2
             d2 = -np.dot(n2, Pi2.mean(axis=0))
             visualizations.visualize_elevation_angle(
                 self, [n2[0], n2[1], n2[2], d2], point_size=1
             )
-        
+
         # Print final world transform
-        print(f"Final world_transform after along slope transform:\n{self.world_transform}")
+        print(
+            f"Final world_transform after along slope transform:\n{self.world_transform}"
+        )
         return n[0:3], elev_deg
 
     def get_auto_align_transform(
@@ -971,14 +975,18 @@ class PointCloud:
             if not remove_outliers:
                 return p
             try:
-                _, idx = p.remove_statistical_outlier(nb_neighbors=20, std_ratio=float(outlier_std_ratio))
+                _, idx = p.remove_statistical_outlier(
+                    nb_neighbors=20, std_ratio=float(outlier_std_ratio)
+                )
                 return p.select_by_index(idx)
             except Exception:
                 return p
 
         def _prepare(p: o3d.geometry.PointCloud, vs: float):
             q = p.voxel_down_sample(vs)
-            q.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 2.0, max_nn=30))
+            q.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 2.0, max_nn=30)
+            )
             f = o3d.pipelines.registration.compute_fpfh_feature(
                 q, o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 5.0, max_nn=100)
             )
@@ -994,16 +1002,22 @@ class PointCloud:
         if voxel_size is None:
             bb = dst.get_axis_aligned_bounding_box()
             diag = np.linalg.norm(bb.get_extent())
-            voxel_size = max(diag * 0.02, 1e-3)  # 2% of scene extent, with a small floor
+            voxel_size = max(
+                diag * 0.02, 1e-3
+            )  # 2% of scene extent, with a small floor
 
         if visualize:
-            print(f"auto_align: voxel_size={voxel_size:.4f}, allow_scaling={allow_scaling}")
+            print(
+                f"auto_align: voxel_size={voxel_size:.4f}, allow_scaling={allow_scaling}"
+            )
 
         src_down, src_fpfh = _prepare(src, voxel_size)
         dst_down, dst_fpfh = _prepare(dst, voxel_size)
 
         if visualize:
-            print(f"Downsampled sizes: src={len(src_down.points)}, dst={len(dst_down.points)}")
+            print(
+                f"Downsampled sizes: src={len(src_down.points)}, dst={len(dst_down.points)}"
+            )
 
         # Global registration via RANSAC over FPFH matches (rigid init)
         distance_threshold = voxel_size * 1.5
@@ -1014,11 +1028,15 @@ class PointCloud:
             dst_fpfh,
             mutual_filter=True,
             max_correspondence_distance=distance_threshold,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(
+                False
+            ),
             ransac_n=4,
             checkers=[
                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
+                    distance_threshold
+                ),
             ],
             criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 1000),
         )
@@ -1029,18 +1047,30 @@ class PointCloud:
         # Build normals on (slightly) denser versions for refinement
         src_ref = src.voxel_down_sample(voxel_size * 0.5)
         dst_ref = dst.voxel_down_sample(voxel_size * 0.5)
-        src_ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50))
-        dst_ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50))
+        src_ref.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50)
+        )
+        dst_ref.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size, max_nn=50)
+        )
 
         max_corr_icp = voxel_size * 1.0
         if allow_scaling:
-            est = o3d.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=True)
+            est = o3d.pipelines.registration.TransformationEstimationPointToPoint(
+                with_scaling=True
+            )
         else:
             est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
 
         icp = o3d.pipelines.registration.registration_icp(
-            src_ref, dst_ref, max_corr_icp, T_init, estimation_method=est,
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
+            src_ref,
+            dst_ref,
+            max_corr_icp,
+            T_init,
+            estimation_method=est,
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=100
+            ),
         )
 
         T = icp.transformation
@@ -1053,11 +1083,15 @@ class PointCloud:
         }
 
         if visualize:
-            print(f"ICP fitness={metrics['fitness']:.4f}, rmse={metrics['inlier_rmse']:.4f}")
+            print(
+                f"ICP fitness={metrics['fitness']:.4f}, rmse={metrics['inlier_rmse']:.4f}"
+            )
             from substrata import visualizations
+
             visualizations.plot_compare(src_ref, dst_ref, point_size=1)
 
         return T, metrics
+
 
 class SimplePointCloud:
     """Simple point cloud class for storing points, colors and normals."""
@@ -1440,7 +1474,7 @@ def decimate_ply_file(
             with open(output_path, "wb") as fout:
                 fout.write(out_header)
             return
-            
+
         if k >= n_vertices:
             # fast stream copy - no decimation needed
             out_header = _make_output_header(fmt, vprops, n_vertices)
@@ -1466,7 +1500,7 @@ def decimate_ply_file(
         remaining = n_vertices
         rec_dtype = np.dtype(f"V{rec_size}")  # "opaque" record view
         chunk_recs = max(1, chunk_bytes // rec_size)
-        
+
         # Collect all selected vertex data first
         selected_vertices = []
 
@@ -1499,7 +1533,7 @@ def decimate_ply_file(
                 seen += to_read
                 remaining = n_vertices - seen
                 pbar.update(to_read)
-        
+
         # Now write the file with the correct vertex count
         actual_count = taken
         out_header = _make_output_header(fmt, vprops, actual_count)
@@ -1507,6 +1541,7 @@ def decimate_ply_file(
             fout.write(out_header)
             for vertex_data in selected_vertices:
                 fout.write(vertex_data)
+
 
 def get_decimated_pcd(
     pcd: Union["PointCloud", "SimplePointCloud", o3d.geometry.PointCloud],
@@ -1546,7 +1581,7 @@ def get_decimated_pcd(
             pcd_undecimated.o3d_pcd.colors = o3d.utility.Vector3dVector(colors[idx])
         if len(normals) > 0:
             pcd_undecimated.o3d_pcd.normals = o3d.utility.Vector3dVector(normals[idx])
-        return pcd_undecimated 
+        return pcd_undecimated
     else:
         # Sample indices without replacement
         idx = rng.choice(len(points), size=target_points, replace=False)
@@ -1557,7 +1592,7 @@ def get_decimated_pcd(
             pcd_decimated.o3d_pcd.colors = o3d.utility.Vector3dVector(colors[idx])
         if len(normals) > 0:
             pcd_decimated.o3d_pcd.normals = o3d.utility.Vector3dVector(normals[idx])
-        pcd_decimated.world_transform = pcd.world_transform
-        pcd_decimated.transforms = pcd.transforms
-
+        if hasattr(pcd, "world_transform"):
+            pcd_decimated.world_transform = pcd.world_transform
+            pcd_decimated.transforms = pcd.transforms
         return pcd_decimated
