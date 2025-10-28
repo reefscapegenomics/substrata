@@ -307,7 +307,9 @@ class Annotations:
                     image_matches[ann.id] = match
                     # ann.image_matches.append(match) TODO: INCORRECT
             except Exception as e:
-                print(f"Warning: Failed to get image match for annotation {ann.id}: {e}")
+                print(
+                    f"Warning: Failed to get image match for annotation {ann.id}: {e}"
+                )
                 continue
         return image_matches
 
@@ -341,10 +343,9 @@ class Annotations:
             self._print_classification_summary(results)
 
         return results
-    
+
     def assign_image_match_classification_to_label(self):
-        """ Iterate over all annotations and assign the classification to the label.
-        """
+        """Iterate over all annotations and assign the classification to the label."""
         for ann in self.data.values():
             if ann.image_match is not None:
                 ann.label = ann.image_match.classification["label"]
@@ -846,14 +847,20 @@ class Annotation:
         # If pcd is given, check that the annotations transform matches the pcd transform
         if pcd is not None and self.parent is not None:
             if not np.allclose(self.parent.world_transform, pcd.world_transform):
-                raise ValueError("The annotations transform does not match the pcd transform")
+                raise ValueError(
+                    "The annotations transform does not match the pcd transform"
+                )
         # Iterate over all cams to find matches
         image_matches = []
         for cam in cams:
             # Skip disabled cameras if enabled_cameras_only is True
-            if enabled_cameras_only and hasattr(cam, 'enabled') and cam.enabled is False:
+            if (
+                enabled_cameras_only
+                and hasattr(cam, "enabled")
+                and cam.enabled is False
+            ):
                 continue
-                
+
             # Get pixel coordinates for each camera
             if use_orig_coords:
                 coords = self.orig_coords
@@ -866,7 +873,9 @@ class Annotation:
             # If pixel coordinates are within the camera bounds
             if x is not None:
                 if debug:
-                    print(f"Cam {cam.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}")
+                    print(
+                        f"Cam {cam.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}"
+                    )
 
                 image_match = cameras.ImageMatch(
                     cam, x, y, depth, relevance, annotation=self
@@ -875,7 +884,7 @@ class Annotation:
                 if pcd is not None:
                     image_match.get_reprojection_error(pcd, intercept_radius)
                     if debug:
-                        print(f'Reprojection error: {image_match.reprojection_error}')
+                        print(f"Reprojection error: {image_match.reprojection_error}")
                     if image_match.reprojection_error is None:
                         continue  # do not store if no intercept found
                     elif (
@@ -1061,7 +1070,7 @@ class Scalebars:
         self.scalefactor = None
         self.var = None
         self.sterr = None
-        
+
         if target_data is not None:
             # If target_data is an Annotations instance, convert to dict of coords
             if hasattr(target_data, "data") and isinstance(target_data.data, dict):
@@ -1073,16 +1082,16 @@ class Scalebars:
                 self.store_target_coords(target_data_dict)
             else:
                 self.store_target_coords(target_data)
-    
+
     def __str__(self) -> str:
         """
         Returns a summary of the scalebars and their calculated metrics.
         """
         lines = ["Scalebars("]
-        
+
         # Basic information
         lines.append(f"  num_scalebars={len(self.data)},")
-        
+
         # Show individual scalebar details
         for i, scalebar in enumerate(self.data):
             target1_set = scalebar.target1_coords is not None
@@ -1090,10 +1099,12 @@ class Scalebars:
             scalebar_summary = f"  scalebar_{i+1}='{scalebar.target1_label}'-'{scalebar.target2_label}' ({scalebar.length}m)"
             if target1_set and target2_set:
                 # Calculate scaled distance using raw_dist and overall scalefactor
-                if hasattr(scalebar, 'raw_dist') and self.scalefactor is not None:
+                if hasattr(scalebar, "raw_dist") and self.scalefactor is not None:
                     scaled_distance = scalebar.raw_dist * self.scalefactor
                     residual = scaled_distance - scalebar.length
-                    scalebar_summary += f" [dist={scaled_distance:.4f}, residual={residual:+.4f}]"
+                    scalebar_summary += (
+                        f" [dist={scaled_distance:.4f}, residual={residual:+.4f}]"
+                    )
                 else:
                     scalebar_summary += f" [coords_set]"
             elif target1_set or target2_set:
@@ -1101,7 +1112,7 @@ class Scalebars:
             else:
                 scalebar_summary += f" [no_coords]"
             lines.append(scalebar_summary + ",")
-        
+
         # Summary statistics (if calculated)
         if self.scalefactor is not None:
             lines.append(f"  calculated_scalefactor={self.scalefactor:.6f},")
@@ -1111,11 +1122,11 @@ class Scalebars:
             lines.append(f"  std_error={self.sterr:.10f},")
         if self.scalebars is not None:
             lines.append(f"  valid_scalebars={self.scalebars}")
-        
+
         # Remove trailing comma from last line if present
-        if len(lines) > 1 and lines[-1].endswith(','):
+        if len(lines) > 1 and lines[-1].endswith(","):
             lines[-1] = lines[-1][:-1]
-        
+
         lines.append(")")
         return "\n".join(lines)
 
