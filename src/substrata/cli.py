@@ -349,7 +349,7 @@ def handle_intercepts(args):
     )
 
     # Back-compute original coords and get first image matches if cameras are available
-    intercepts.get_original_coords(init.world_transform)
+    intercepts.get_original_coords(init.pcd.world_transform)
 
     # Save intercepts to CSV (and YAML only for --slope)
     if getattr(args, "slope", False):

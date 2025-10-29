@@ -502,18 +502,26 @@ def plot_cam_residuals(cams, width=10, height=5):
         • Best (lowest bin): filled markers
         • Mid bin: hollow markers (facecolor='none')
         • Worst bin: 'x' markers
-    
+
     Args:
         cams: Camera collection with data attribute containing cameras
         width (float): Base width per panel (final fig is ~2×width)
         height (float): Figure height in inches
     """
-    cams_all = [cam for cam in cams.data.values() if hasattr(cam, "coords") and cam.coords is not None]
+    cams_all = [
+        cam
+        for cam in cams.data.values()
+        if hasattr(cam, "coords") and cam.coords is not None
+    ]
     if not cams_all:
         raise ValueError("No cameras with coords found.")
 
     # Split by residual availability
-    cams_res = [cam for cam in cams_all if hasattr(cam, "depth_residual") and cam.depth_residual is not None]
+    cams_res = [
+        cam
+        for cam in cams_all
+        if hasattr(cam, "depth_residual") and cam.depth_residual is not None
+    ]
     cams_nores = [cam for cam in cams_all if cam not in cams_res]
 
     # Color mapping by residuals (symmetric around 0)
@@ -529,27 +537,37 @@ def plot_cam_residuals(cams, width=10, height=5):
 
     # Determine camera groups (for fill style)
     try:
-        group_names = cams.group_names if hasattr(cams, "group_names") else sorted({getattr(cam, "group", None) for cam in cams_all})
+        group_names = (
+            cams.group_names
+            if hasattr(cams, "group_names")
+            else sorted({getattr(cam, "group", None) for cam in cams_all})
+        )
         group_names = [g for g in group_names if g is not None]
     except Exception:
         group_names = []
-    group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(sorted(group_names))}  # True → filled, False → hollow
+    group_to_fill = {
+        g: (i % 2 == 0) for i, g in enumerate(sorted(group_names))
+    }  # True → filled, False → hollow
 
     # Build numerical accuracy groups (rounded) for cams with residuals
     def _round_acc(val: float) -> float | None:
         return float(np.round(val, 6)) if np.isfinite(val) else None
 
-    acc_values_res = sorted({
-        _round_acc(getattr(cam, "depth_acc", np.nan))
-        for cam in cams_res
-        if np.isfinite(getattr(cam, "depth_acc", np.nan))
-    })
+    acc_values_res = sorted(
+        {
+            _round_acc(getattr(cam, "depth_acc", np.nan))
+            for cam in cams_res
+            if np.isfinite(getattr(cam, "depth_acc", np.nan))
+        }
+    )
     acc_present = len(acc_values_res) > 0
     best_acc_value = acc_values_res[0] if acc_present else None
 
     # Marker shapes per accuracy value
     marker_cycle = ["o", "s", "^", "v", "D", "P", "X", "<", ">", "*", "h"]
-    acc_to_marker = {acc: marker_cycle[i % len(marker_cycle)] for i, acc in enumerate(acc_values_res)}
+    acc_to_marker = {
+        acc: marker_cycle[i % len(marker_cycle)] for i, acc in enumerate(acc_values_res)
+    }
     default_marker = "o"
 
     # Helper to plot into an axis given x and y indices (0=x,1=y,2=z)
@@ -574,21 +592,46 @@ def plot_cam_residuals(cams, width=10, height=5):
                 ys = np.array(data["y"], dtype=float)
                 cs = np.array(data["c"], dtype=float)
                 if filled:
-                    ax.scatter(xs, ys, c=cs, cmap=cmap, norm=norm, marker=marker, edgecolor="black", linewidths=0.7)
+                    ax.scatter(
+                        xs,
+                        ys,
+                        c=cs,
+                        cmap=cmap,
+                        norm=norm,
+                        marker=marker,
+                        edgecolor="black",
+                        linewidths=0.7,
+                    )
                 else:
-                    ax.scatter(xs, ys, facecolors='none', edgecolors=cmap(norm(cs)), marker=marker, linewidths=1.0)
+                    ax.scatter(
+                        xs,
+                        ys,
+                        facecolors="none",
+                        edgecolors=cmap(norm(cs)),
+                        marker=marker,
+                        linewidths=1.0,
+                    )
 
         # Cameras without residuals shown in gray
         if cams_nores:
             xs = np.array([cam.coords[x_idx] for cam in cams_nores], dtype=float)
             ys = np.array([cam.coords[y_idx] for cam in cams_nores], dtype=float)
             # Use default marker but gray color; filled to distinguish "no residuals"
-            ax.scatter(xs, ys, c="gray", marker=default_marker, edgecolor="black", linewidths=0.5)
+            ax.scatter(
+                xs,
+                ys,
+                c="gray",
+                marker=default_marker,
+                edgecolor="black",
+                linewidths=0.5,
+            )
 
         ax.grid(True, alpha=0.3)
 
     # Build the side-by-side figure
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(width, height), constrained_layout=True)
+    fig, (ax_left, ax_right) = plt.subplots(
+        1, 2, figsize=(width, height), constrained_layout=True
+    )
 
     # Left: X–Y
     plot_axis(ax_left, 0, 1)
@@ -616,26 +659,81 @@ def plot_cam_residuals(cams, width=10, height=5):
     group_handles = []
     for g in sorted(group_to_fill.keys()):
         if group_to_fill[g]:
-            group_handles.append(Line2D([0], [0], marker='o', color='w', label=str(g), markerfacecolor='black', markeredgecolor='black', markersize=8, linewidth=0))
+            group_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="black",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
+                )
+            )
         else:
-            group_handles.append(Line2D([0], [0], marker='o', color='w', label=str(g), markerfacecolor='none', markeredgecolor='black', markersize=8, linewidth=0))
+            group_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="none",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
+                )
+            )
 
     # Accuracy legend (numerical groups) + no-residuals group
     acc_handles = []
     acc_labels = []
     if acc_present:
         for acc_val in acc_values_res:
-            acc_handles.append(Line2D([0], [0], marker=acc_to_marker.get(acc_val, default_marker), color='w', label=f"{acc_val}", markerfacecolor='black', markeredgecolor='black', markersize=8, linewidth=0))
+            acc_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker=acc_to_marker.get(acc_val, default_marker),
+                    color="w",
+                    label=f"{acc_val}",
+                    markerfacecolor="black",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
+                )
+            )
             acc_labels.append(str(acc_val))
     # Add "no residuals" group
     if cams_nores:
-        acc_handles.append(Line2D([0], [0], marker='o', color='w', label='no residuals', markerfacecolor='gray', markeredgecolor='black', markersize=8, linewidth=0))
+        acc_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                label="no residuals",
+                markerfacecolor="gray",
+                markeredgecolor="black",
+                markersize=8,
+                linewidth=0,
+            )
+        )
 
     # Place legends
     if group_handles:
-        ax_left.legend(handles=group_handles, title="Groups", loc="upper right", frameon=False)
+        ax_left.legend(
+            handles=group_handles, title="Groups", loc="upper right", frameon=False
+        )
     if acc_handles:
-        ax_right.legend(handles=acc_handles, title="Accuracy (numeric)", loc="upper right", frameon=False)
+        ax_right.legend(
+            handles=acc_handles,
+            title="Accuracy (numeric)",
+            loc="upper right",
+            frameon=False,
+        )
 
     plt.show()
     return fig
@@ -671,9 +769,9 @@ def get_crop_img_cv2(img_path, crop_x, crop_y, crop_w, crop_h):
 def get_crop_img(img_path, crop_x, crop_y, crop_w, crop_h):
     """Get cropped image using PIL"""
     from PIL import Image
-    
+
     img = Image.open(img_path)
-    
+
     left = int(crop_x - crop_w / 2)
     top = int(crop_y - crop_h / 2)
     right = left + int(crop_w)
@@ -705,12 +803,12 @@ def save_to_tmp_file(image):
 def encode_to_png_buffer(image):
     """Encode image to JPG buffer"""
     # Convert PIL image to numpy array if needed
-    if hasattr(image, 'size'):  # PIL image
+    if hasattr(image, "size"):  # PIL image
         image = np.array(image)
         # Convert RGB to BGR for OpenCV
         if len(image.shape) == 3 and image.shape[2] == 3:
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    
+
     success, buffer = cv2.imencode(".jpg", image)
     if not success:
         raise IOError("Could not encode image to JPG.")
@@ -787,7 +885,7 @@ def save_cropped_image_matches_to_pdf(
     print(f"PDF created: {output_filepath}")
 
 
-def get_crop_img_from_masks( #TODO: needs PIL version
+def get_crop_img_from_masks(  # TODO: needs PIL version
     image_match,
     output_img_w=1000,
     output_img_h=1000,
@@ -987,7 +1085,9 @@ def show_grid_cells(
             min_y = min(box[0][1] for box in boxes_iter)
             max_x = max(box[1][0] for box in boxes_iter)
             max_y = max(box[1][1] for box in boxes_iter)
-            ax_left.set_title(f"Box coordinates: [[{min_x:.1f},{min_y:.1f}],[{max_x:.1f},{max_y:.1f}]]")
+            ax_left.set_title(
+                f"Box coordinates: [[{min_x:.1f},{min_y:.1f}],[{max_x:.1f},{max_y:.1f}]]"
+            )
         else:
             ax_left.set_title("Overall plot with grid cell boundaries")
     except Exception:
@@ -1118,7 +1218,9 @@ def show_classified_grid_cells(
 
     # Optional background points in grayscale
     if show_points and len(pcd.points) > 0:
-        plot_cols = np.full((pcd.points.shape[0], 3), 0.6, dtype=float)  # Default to grayscale
+        plot_cols = np.full(
+            (pcd.points.shape[0], 3), 0.6, dtype=float
+        )  # Default to grayscale
         ax_left.scatter(
             pcd.points[:, 0],
             pcd.points[:, 1],
@@ -1204,11 +1306,13 @@ def show_classified_grid_cells(
             min_corner, max_corner = bbox
             all_x_coords.extend([min_corner[0], max_corner[0]])
             all_y_coords.extend([min_corner[1], max_corner[1]])
-        
+
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
-            print(f"Setting axis limits: X=[{x_min:.2f}, {x_max:.2f}], Y=[{y_min:.2f}, {y_max:.2f}]")
+            print(
+                f"Setting axis limits: X=[{x_min:.2f}, {x_max:.2f}], Y=[{y_min:.2f}, {y_max:.2f}]"
+            )
             ax_left.set_xlim(x_min, x_max)
             ax_left.set_ylim(y_min, y_max)
 
@@ -1519,7 +1623,7 @@ def plot_2d_ortho(
     else:
         fig = ax.figure
 
-    ax.imshow(img, origin='lower')
+    ax.imshow(img, origin="lower")
     ax.axis("off")
     if title is not None:
         ax.set_title(title)
@@ -1911,7 +2015,6 @@ def save_image_matches_within_camera(
     image.save(os.path.join(output_path, cam.filename))
 
 
-
 def create_annotated_video(
     cams,
     annotations,
@@ -1936,13 +2039,21 @@ def create_annotated_video(
         # Generate image matches for each camera and save them to disk.
         if annotations is not None:
             print(f"Processing {len(cams)} cameras with annotations...")
-            for cam in tqdm(cams, total=len(cams), desc="Generating annotated frames for video"):
+            for cam in tqdm(
+                cams, total=len(cams), desc="Generating annotated frames for video"
+            ):
                 try:
                     # Check if camera has valid filepath
-                    if not hasattr(cam, 'filepath') or not cam.filepath or not os.path.exists(cam.filepath):
-                        print(f"Warning: Camera {cam.cam_id} has invalid filepath: {getattr(cam, 'filepath', 'None')}")
+                    if (
+                        not hasattr(cam, "filepath")
+                        or not cam.filepath
+                        or not os.path.exists(cam.filepath)
+                    ):
+                        print(
+                            f"Warning: Camera {cam.cam_id} has invalid filepath: {getattr(cam, 'filepath', 'None')}"
+                        )
                         continue
-                    
+
                     image_matches = cam.get_image_matches(annotations, pcd=pcd)
                     if sam_predictor:
                         for match in image_matches:
@@ -1974,7 +2085,9 @@ def create_annotated_video(
             cams_list = list(cams)
             Parallel(n_jobs=-1)(
                 delayed(save_cam_image)(cam)
-                for cam in tqdm(cams_list, desc="Generating frames for video (without annotations)")
+                for cam in tqdm(
+                    cams_list, desc="Generating frames for video (without annotations)"
+                )
             )
         # Create a video from the saved images.
         print("Creating video from frames...")
@@ -1983,7 +2096,9 @@ def create_annotated_video(
         file_list_path = None
         target_width = resize_width
         try:
-            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".txt"
+            ) as f:
                 file_list_path = f.name
                 # Determine ordered list of cams used
                 ordered_cams = list(cams) if annotations is None else list(cams)
@@ -1997,13 +2112,17 @@ def create_annotated_video(
                         last_img = out_path
                         frames_found += 1
                     else:
-                        print(f"Warning: Frame not found for camera {cam.cam_id}: {out_path}")
-                
+                        print(
+                            f"Warning: Frame not found for camera {cam.cam_id}: {out_path}"
+                        )
+
                 if frames_found == 0:
                     print("Error: No frames were generated for the video")
-                    print(f"Temporary directory contents: {os.listdir(temp_image_matches_output)}")
+                    print(
+                        f"Temporary directory contents: {os.listdir(temp_image_matches_output)}"
+                    )
                     return
-                
+
                 print(f"Found {frames_found} frames for video creation")
                 if last_img is not None:
                     f.write(f"file '{last_img}'\n")
@@ -2019,18 +2138,26 @@ def create_annotated_video(
                     target_width = None
 
             cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", file_list_path,
-                "-r", "2",  # Set output framerate to 2 fps
-                "-vsync", "cfr",  # Use constant frame rate with -r
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                file_list_path,
+                "-r",
+                "2",  # Set output framerate to 2 fps
+                "-vsync",
+                "cfr",  # Use constant frame rate with -r
             ]
             if target_width is not None:
                 cmd += ["-vf", f"scale={int(target_width)}:-2"]
             cmd += [
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
                 output_filename,
             ]
             subprocess.run(cmd, check=True)
@@ -2148,7 +2275,9 @@ def visualize_elevation_angle(
     )
 
     # Annotate near the midpoint of the arc
-    elevation_angle = np.degrees(np.arccos(np.clip(np.dot(plane_normal_unit, [0, 0, 1]), -1.0, 1.0)))
+    elevation_angle = np.degrees(
+        np.arccos(np.clip(np.dot(plane_normal_unit, [0, 0, 1]), -1.0, 1.0))
+    )
     mid_idx = num_arc_points // 2
     ax.text(
         arc_points[mid_idx, 0],
@@ -2268,7 +2397,7 @@ def plot_views(
     point_size=2,
     width=8,
     height=12,
-    max_output_points=50000,
+    max_output_points=5000000,  # higher default for ortho plot
     title=None,
     ortho_resolution=None,
 ):
