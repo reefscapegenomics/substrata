@@ -2397,7 +2397,7 @@ def plot_views(
     point_size=2,
     width=8,
     height=12,
-    max_output_points=5000000,  # higher default for ortho plot
+    max_output_points=50000,
     title=None,
     ortho_resolution=None,
 ):
@@ -2409,6 +2409,7 @@ def plot_views(
       - Row 4 (two columns): side (Y–Z) and side (−Y–Z) views
     """
     # Decimate if required (and ensure PointCloud format)
+    ortho_pcd = pcd.copy()
     pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
     filepath = getattr(pcd, "filepath", None)
 
@@ -2432,7 +2433,7 @@ def plot_views(
         os.path.basename(filepath) if filepath is not None else "Orthoprojection"
     )
     plot_2d_ortho(
-        pcd,
+        ortho_pcd,
         resolution=ortho_resolution,
         ax=ax_ortho,
         title=ortho_title,
