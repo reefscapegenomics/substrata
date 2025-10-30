@@ -671,6 +671,8 @@ class Cameras:
             for cam in self.data.values()
             if hasattr(cam, "depth")
             and hasattr(cam, "coords")
+            and cam.depth is not None
+            and cam.coords is not None
             and (
                 not hasattr(cam, "depth_acc")
                 or cam.depth_acc <= depth_accuracy_threshold
