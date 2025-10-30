@@ -1,9 +1,16 @@
 # Standard Library
+from __future__ import annotations
+
 import csv
 import logging
 import os
 import random
 import re
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    import numpy.typing as npt
+    from substrata import cameras, pointclouds
 
 # Third-Party Libraries
 import numpy as np
@@ -32,11 +39,13 @@ class Annotations:
 
     def __init__(
         self,
-        filepath=None,
-        coords=None,
-        header=True,
-        orig_coords_only=False,
-    ):
+        filepath: Optional[str] = None,
+        coords: Optional[
+            Union[Dict[str, np.ndarray], List[np.ndarray], np.ndarray]
+        ] = None,
+        header: bool = True,
+        orig_coords_only: bool = False,
+    ) -> None:
         self.data = {}
         self.measurements = {}
         self.world_transform = np.eye(4)
@@ -48,41 +57,41 @@ class Annotations:
         elif coords is not None:
             self.get_annotations_from_coords(coords)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str) -> "Annotation":
         return self.data[key]
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: "Annotation") -> None:
         self.data[key] = value
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: str) -> None:
         del self.data[key]
 
-    def __contains__(self, key):
+    def __contains__(self, key: str) -> bool:
         return key in self.data
 
-    def __iter__(self):
+    def __iter__(self) -> "Annotations":
         self._iter = iter(self.data.values())
         return self
 
-    def __next__(self):
+    def __next__(self) -> "Annotation":
         return next(self._iter)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def items(self):
+    def items(self) -> Any:
         return self.data.items()
 
     @property
-    def coords(self):
+    def coords(self) -> List[np.ndarray]:
         return [annotation.coords for annotation in self.data.values()]
 
     @property
-    def classifications(self):
+    def classifications(self) -> List[Optional[str]]:
         return [annotation.classification for annotation in self.data.values()]
 
     @property
-    def image_matches(self):
+    def image_matches(self) -> Dict[str, Any]:
         return {
             annotation.id: annotation.image_match
             for annotation in self.data.values()
@@ -94,7 +103,7 @@ class Annotations:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
-    def append(self, annotation):
+    def append(self, annotation: "Annotation") -> None:
         if annotation.id in self.data:
             raise ValueError(f"Annotation with id {annotation.id} already exists.")
         else:
@@ -103,12 +112,17 @@ class Annotations:
             # TO DO: any other changes (eg transforms) to be implemented on append?
 
     def get_annotations_from_file(
-        self, annotations_filepath, header=True, orig_coords_only=False
-    ):
+        self,
+        annotations_filepath: str,
+        header: bool = True,
+        orig_coords_only: bool = False,
+    ) -> None:
         """Read in annotations from a file and store in dict.
 
         Args:
-            annotations_filepath (str): Path to the file.
+            annotations_filepath: Path to the file.
+            header: Whether the file has a header row.
+            orig_coords_only: Whether to only use original coordinates.
         """
         annotations_file = open(annotations_filepath, "r")
 
@@ -148,11 +162,14 @@ class Annotations:
                 self.data[ann_id].add_extra_coords(line.rstrip())
         annotations_file.close()
 
-    def get_annotations_from_coords(self, annotations_coords):
+    def get_annotations_from_coords(
+        self,
+        annotations_coords: Union[Dict[str, np.ndarray], List[np.ndarray], np.ndarray],
+    ) -> None:
         """Use a dict or list of coordinates to fill the annotations class.
 
         Args:
-            annotations_coords (dict, list, or np.ndarray): Coordinate data.
+            annotations_coords: Coordinate data as dict, list, or np.ndarray.
         """
         if isinstance(annotations_coords, dict):
             for i, (key, coords) in enumerate(annotations_coords.items()):
@@ -163,16 +180,19 @@ class Annotations:
                 if coords is not None:
                     self.data[i] = Annotation(coords, id=i, parent=self)
 
-    def get_annotations_from_google_worksheet(self, worksheet, header=True):
+    def get_annotations_from_google_worksheet(
+        self, worksheet: Any, header: bool = True
+    ) -> None:
         """Use a Google worksheet to fill the annotations class.
 
         Args:
             worksheet: Google worksheet object.
+            header: Whether the worksheet has a header row.
         """
         worksheet_data = worksheet.get_all_values()
         for row_number, row_cols in enumerate(worksheet_data, start=1):
-            if row_number == 0 and header:
-                self.col_order = self.__determine_col_order(row)
+            if row_number == 1 and header:
+                self.col_order = self.__determine_col_order(",".join(row_cols))
                 continue  # skip to next line
             elif row_number == 0 and not header:
                 self.col_order = settings.ANN_DEFAULT_COL_ORDER
@@ -189,48 +209,61 @@ class Annotations:
                 world_z,
                 other_cols,
             ) = self.__get_annotation_fields(row_cols)
-            if ann_id not in self.data:
+            if id not in self.data:
                 # New annotation
                 self.data[id] = Annotation([orig_x, orig_y, orig_z], id=id, parent=self)
                 self.data[id].line_no = row_number
                 self.data[id].label = self.data[id].classification = label
                 self.data[id].label_conf = label_conf
-                if world_x is not None and orig_coords_only is False:
+                if world_x is not None:
                     self.data[id].coords = np.asarray(
                         [world_x, world_y, world_z], dtype=float
                     )
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
-                self.data[id].add_extra_coords(
-                    row_cols
-                )  # Updated to use row_cols instead of line.rstrip()
+                self.data[id].add_extra_coords(",".join(row_cols))
 
-    def add_meta_data(self, data_filepath):
+    def add_meta_data(self, data_filepath: str) -> None:
         """Add metadata to annotations from a CSV file (requires header).
 
         Args:
-            data_filepath (str): Path to the CSV file.
+            data_filepath: Path to the CSV file.
         """
         data_file = open(data_filepath, "r")
+        col_headers = None
         for line_no, line in enumerate(data_file):
             if line_no == 0:
                 self.col_order = self.__determine_col_order(line)
+                cols = line.rstrip().split(",")
+                col_headers = [col.strip('"') for col in cols]
                 continue  # skip to next line
 
             cols = line.rstrip().split(",")
             ann_id = cols[self.col_order["id"]]
             if ann_id in self.data.keys():
                 self.data[ann_id].meta_data = {}
-                for i in range(0, len(col_headers)):
-                    self.data[ann_id].meta_data[col_headers[i]] = cols[i + 1]
+                if col_headers is not None:
+                    for i in range(0, len(col_headers)):
+                        if i + 1 < len(cols):
+                            self.data[ann_id].meta_data[col_headers[i]] = cols[i + 1]
             else:
                 print(f"No annotation with ID {ann_id} found.")
         data_file.close()
 
-    def get_new_id(self, last_highest_id=None, default_prefix=None):
-        """
-        Return a identified based on the next available integer
+    def get_new_id(
+        self,
+        last_highest_id: Optional[int] = None,
+        default_prefix: Optional[str] = None,
+    ) -> str:
+        """Return an identifier based on the next available integer.
+
+        Args:
+            last_highest_id: Optional last highest ID to check against.
+            default_prefix: Optional prefix to use if no existing IDs found.
+
+        Returns:
+            New annotation ID string.
         """
         # Find the highest integer used in existing IDs
         highest_int = 0
@@ -274,21 +307,21 @@ class Annotations:
 
         return new_id
 
-    def get_bounding_box(self):
+    def get_bounding_box(self) -> List[np.ndarray]:
         """Return the min and max values of x, y, z for all points in annotations.
 
         Returns:
-            list: [min_coords, max_coords] for x, y, z.
+            List containing [min_coords, max_coords] for x, y, z.
         """
         xyz_min = np.min(self.coords, axis=0)
         xyz_max = np.max(self.coords, axis=0)
         return [xyz_min, xyz_max]
 
-    def get_eucl_distance_matrix(self):
+    def get_eucl_distance_matrix(self) -> pd.DataFrame:
         """Calculates pairwise Euclidean distances and returns a DataFrame.
 
         Returns:
-            pd.DataFrame: Distance matrix with annotation keys as rows and columns.
+            Distance matrix with annotation keys as rows and columns.
         """
         keys = list(self.data.keys())
         coords = np.array([annotation.coords for annotation in self.data.values()])
@@ -297,8 +330,18 @@ class Annotations:
         )
         return pd.DataFrame(distmat, index=keys, columns=keys)
 
-    def get_first_image_matches(self, cams, pcd=None):
-        """Get the first image match for each annotation."""
+    def get_first_image_matches(
+        self, cams: List[Any], pcd: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """Get the first image match for each annotation.
+
+        Args:
+            cams: List of camera objects.
+            pcd: Optional point cloud for filtering.
+
+        Returns:
+            Dictionary mapping annotation IDs to image matches.
+        """
         image_matches = {}
         for ann in tqdm(self.data.values(), desc="Getting first image matches"):
             try:
@@ -313,16 +356,21 @@ class Annotations:
                 continue
         return image_matches
 
-    def classify_image_matches(self, classifier, crop_size=None, print_summary=False):
+    def classify_image_matches(
+        self,
+        classifier: Any,
+        crop_size: Optional[Union[int, Tuple[int, int]]] = None,
+        print_summary: bool = False,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Classify all image matches for annotations that have them.
 
         Args:
             classifier: Loaded FastAI learner or path to a .pkl learner.
             crop_size: Optional int (square) or (width, height) tuple for center crop.
-            print_summary (bool): Whether to print classification category counts.
+            print_summary: Whether to print classification category counts.
 
         Returns:
-            dict: Mapping of annotation IDs to classification results.
+            Mapping of annotation IDs to classification results.
         """
         results = {}
         for ann in tqdm(self.data.values(), desc="Classifying image matches"):
@@ -344,7 +392,7 @@ class Annotations:
 
         return results
 
-    def assign_image_match_classification_to_label(self):
+    def assign_image_match_classification_to_label(self) -> None:
         """Iterate over all annotations and assign the classification to the label."""
         for ann in self.data.values():
             if ann.image_match is not None:
@@ -354,11 +402,13 @@ class Annotations:
                 ann.label = None
                 ann.label_conf = None
 
-    def _print_classification_summary(self, results):
+    def _print_classification_summary(
+        self, results: Dict[str, Optional[Dict[str, Any]]]
+    ) -> None:
         """Print a summary of classification results.
 
         Args:
-            results (dict): Classification results from classify_image_matches.
+            results: Classification results from classify_image_matches.
         """
         # Count classifications
         label_counts = {}
@@ -392,11 +442,11 @@ class Annotations:
     #     pcd.points = utility.Vector3dVector(self.get_all_coords())
     #     return pcd
 
-    def transform_coords(self, transform):
+    def transform_coords(self, transform: Union[np.ndarray, Any]) -> None:
         """Apply a transformation to all annotation coordinates.
 
         Args:
-            transform (np.ndarray or Transform): A 4x4 transformation matrix or a Transform instance.
+            transform: A 4x4 transformation matrix or a Transform instance.
         """
         # Accept either a 4x4 matrix or a Transform instance
         if hasattr(transform, "matrix"):
@@ -410,11 +460,11 @@ class Annotations:
     # Alias for compatibility
     apply_transform = transform_coords
 
-    def get_original_coords(self, transform_matrix):
+    def get_original_coords(self, transform_matrix: np.ndarray) -> None:
         """Revert transformed coordinates using the given transformation.
 
         Args:
-            transform_matrix (np.ndarray): The transformation matrix to invert.
+            transform_matrix: The transformation matrix to invert.
         """
         for ann_id in self.data:
             self.data[ann_id].reverse_transform_coords(transform_matrix)
@@ -422,14 +472,14 @@ class Annotations:
             np.array(transform_matrix), self.world_transform
         )  # TODO: CHECK!
 
-    def random_subset(self, length):
+    def random_subset(self, length: int) -> "Annotations":
         """Return a random subset of annotations.
 
         Args:
-            length (int): Number of annotations to include.
+            length: Number of annotations to include.
 
         Returns:
-            Annotations: New container with the selected annotations.
+            New container with the selected annotations.
         """
         annotations_subset = Annotations()
         random_keys = random.sample(list(self.data.keys()), length)
@@ -437,28 +487,28 @@ class Annotations:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
 
-    def subset(self, length):
+    def subset(self, length: int) -> "Annotations":
         """Return a subset of annotations.
 
         Args:
-            length (int): Number of annotations to include.
+            length: Number of annotations to include.
 
         Returns:
-            Annotations: New container with the selected annotations.
+            New container with the selected annotations.
         """
         annotations_subset = Annotations()
         for ann_id in list(self.data.keys())[:length]:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
 
-    def subset_by_prefix(self, prefix):
+    def subset_by_prefix(self, prefix: str) -> "Annotations":
         """Return a subset of annotations with IDs starting with a prefix.
 
         Args:
-            prefix (str): Prefix to filter annotation IDs.
+            prefix: Prefix to filter annotation IDs.
 
         Returns:
-            Annotations: New container with matching annotations.
+            New container with matching annotations.
         """
         annotations_subset = Annotations()
         for ann in self.data.values():
@@ -466,14 +516,16 @@ class Annotations:
                 annotations_subset.data[ann.id] = ann
         return annotations_subset
 
-    def subset_by_label(self, label_string_or_list):
+    def subset_by_label(
+        self, label_string_or_list: Union[str, List[str]]
+    ) -> "Annotations":
         """Return a subset of annotations with the given label or labels.
 
         Args:
-            label_string_or_list (str or list of str): Label value(s) to filter annotations.
+            label_string_or_list: Label value(s) to filter annotations.
 
         Returns:
-            Annotations: New container with annotations that match the label(s).
+            New container with annotations that match the label(s).
         """
         if isinstance(label_string_or_list, str):
             label_set = {label_string_or_list}
@@ -485,14 +537,14 @@ class Annotations:
                 annotations_subset.data[ann.id] = ann
         return annotations_subset
 
-    def subset_by_label_prefix(self, prefix):
+    def subset_by_label_prefix(self, prefix: str) -> "Annotations":
         """Return a subset of annotations where the label contains the given prefix.
 
         Args:
-            prefix (str): Prefix to search for in annotation labels.
+            prefix: Prefix to search for in annotation labels.
 
         Returns:
-            Annotations: New container with annotations whose label contains the prefix.
+            New container with annotations whose label contains the prefix.
         """
         annotations_subset = Annotations()
         for ann in self.data.values():
@@ -500,27 +552,27 @@ class Annotations:
                 annotations_subset.data[ann.id] = ann
         return annotations_subset
 
-    def subset_by_range(self, start_idx, end_idx):
+    def subset_by_range(self, start_idx: int, end_idx: int) -> "Annotations":
         """Return a subset of annotations based on index range.
 
         Args:
-            start_idx (int): Starting index.
-            end_idx (int): Ending index.
+            start_idx: Starting index.
+            end_idx: Ending index.
 
         Returns:
-            Annotations: New container with annotations in the range.
+            New container with annotations in the range.
         """
         annotations_subset = Annotations()
         for ann_id in list(self.data.keys())[start_idx:end_idx]:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
 
-    def get_point_cloud_by_radius(self, source_pcd, radius):
+    def get_point_cloud_by_radius(self, source_pcd: Any, radius: float) -> None:
         """Get a point cloud around each annotation within a radius.
 
         Args:
             source_pcd: Source point cloud.
-            radius (float): Radius for subsampling.
+            radius: Radius for subsampling.
         """
         for ann in tqdm(
             self.data.values(), desc="Subsampling pointcloud for each annotation"
@@ -529,11 +581,13 @@ class Annotations:
                 ann.coords, radius
             )
 
-    def measure_all(self, measurement_func, *args, **kwargs):
+    def measure_all(
+        self, measurement_func: Callable, *args: Any, **kwargs: Any
+    ) -> None:
         """Conduct measurements for all annotations.
 
         Args:
-            measurement_func (callable): Function to measure an annotation.
+            measurement_func: Function to measure an annotation.
             *args: Additional arguments.
             **kwargs: Additional keyword arguments.
         """
@@ -583,11 +637,11 @@ class Annotations:
                 self.data[id].measurements["psi"] = output[1]
                 self.data[id].measurements["elevation"] = output[2]
 
-    def save(self, filepath):
+    def save(self, filepath: str) -> None:
         """Save the annotations to a CSV file.
 
         Args:
-            filepath (str): Output file path.
+            filepath: Output file path.
         """
         output_lines = []
         # Header - core columns
@@ -663,10 +717,19 @@ class Annotations:
         with open(filepath, "w", newline="") as f:
             csv.writer(f).writerows(output_lines)
 
-    def __determine_col_order(self, line):
-        """Determine column order from either header or a line of data"""
+    def __determine_col_order(self, line: str) -> Dict[str, Optional[int]]:
+        """Determine column order from either header or a line of data.
 
-        def get_col_index(columns, names, mandatory=True):
+        Args:
+            line: Header line or data line to parse.
+
+        Returns:
+            Dictionary mapping column names to indices.
+        """
+
+        def get_col_index(
+            columns: List[str], names: List[str], mandatory: bool = True
+        ) -> Optional[int]:
             # Strip quotation marks from each column value directly
             columns = [col.strip('"') for col in columns]
             for name in names:
@@ -695,15 +758,34 @@ class Annotations:
             "world_z": get_col_index(cols, ["world_z"], mandatory=False),
         }
 
-    def __get_annotation_fields(self, cols):
-        """Get annotation values"""
+    def __get_annotation_fields(self, cols: List[str]) -> Tuple[
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        List[str],
+    ]:
+        """Get annotation values.
+
+        Args:
+            cols: List of column values.
+
+        Returns:
+            Tuple containing id, orig_x, orig_y, orig_z, label, label_conf,
+            world_x, world_y, world_z, and other_fields.
+        """
 
         primary_field_indices = set(self.col_order.values())
         other_fields = [
             value for idx, value in enumerate(cols) if idx not in primary_field_indices
         ]
 
-        def get_value(key):
+        def get_value(key: str) -> Optional[str]:
             idx = self.col_order.get(key)
             return cols[idx] if idx is not None and idx < len(cols) else None
 
@@ -721,8 +803,15 @@ class Annotations:
         )
 
     @staticmethod
-    def __strip_post_fixes(ann_id):
-        """Remove postfixes from annotation id."""
+    def __strip_post_fixes(ann_id: str) -> str:
+        """Remove postfixes from annotation id.
+
+        Args:
+            ann_id: Annotation ID string.
+
+        Returns:
+            Annotation ID with postfixes removed.
+        """
         for substring in settings.ANN_ID_POST_FIXES:
             ann_id = ann_id.replace(substring, "")
         return ann_id
@@ -731,7 +820,12 @@ class Annotations:
 class Annotation:
     """Class that holds information about an annotation."""
 
-    def __init__(self, coords, id=None, parent=None):
+    def __init__(
+        self,
+        coords: Union[List[float], np.ndarray],
+        id: Optional[str] = None,
+        parent: Optional["Annotations"] = None,
+    ) -> None:
         self.coords = self.orig_coords = np.asarray(coords, dtype=float)
         self.id = id
         self.parent = parent
@@ -744,11 +838,11 @@ class Annotation:
         self.extra_coords = {}
         self.orig_extra_coords = {}
 
-    def add_extra_coords(self, line):
+    def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.
 
         Args:
-            line (str): A line with extra coordinate data.
+            line: A line with extra coordinate data.
         """
         cols = line.split(",")
         full_id = cols[self.parent.col_order["id"]]
@@ -762,11 +856,11 @@ class Annotation:
         )
         self.orig_extra_coords[full_id] = self.extra_coords[full_id]
 
-    def get_radius_from_extra_coords(self):
+    def get_radius_from_extra_coords(self) -> float:
         """Calculate the radius of the annotation using extra coordinates.
 
         Returns:
-            float: Radius value.
+            Radius value.
         """
         coords = [value for value in self.extra_coords.values()]
         distmat = np.sqrt(
@@ -781,40 +875,40 @@ class Annotation:
         )
         return np.nanmax(distmat) / 2
 
-    def get_radius_from_2D_surface_area(self):
+    def get_radius_from_2D_surface_area(self) -> float:
         """Calculate the radius in meters using the 2D surface area in cm².
 
         Returns:
-            float: Radius in meters.
+            Radius in meters.
         """
         # Calculate radius in centimeters then convert to meters.
         radius_cm = np.sqrt(self.measurements["SA_in_cm2"] / np.pi)
         return radius_cm / 100
 
-    def get_point_cloud_by_radius(self, source_pcd, radius):
+    def get_point_cloud_by_radius(self, source_pcd: Any, radius: float) -> None:
         """Get a point cloud for annotation by sampling a point cloud within a radius.
 
         Args:
             source_pcd: Source point cloud.
-            radius (float): Radius for subsampling.
+            radius: Radius for subsampling.
         """
         self.simple_pcd = source_pcd.subsample_pointcloud_by_radius(self.coords, radius)
 
-    def get_hom_coords(self):
+    def get_hom_coords(self) -> np.ndarray:
         """Return the annotation coordinates in homogeneous format.
 
         Returns:
-            np.ndarray: [x, y, z, 1]
+            Array with [x, y, z, 1].
         """
         return np.array(
             [self.coords[0], self.coords[1], self.coords[2], 1], dtype=float
         )
 
-    def transform_coords(self, transform):
+    def transform_coords(self, transform: np.ndarray) -> None:
         """Apply a transformation to the annotation coordinates.
 
         Args:
-            transform (np.ndarray): Transformation matrix.
+            transform: Transformation matrix.
         """
         self.coords = geom.transform_coords(self.coords, transform)
         for full_id in self.extra_coords:
@@ -822,28 +916,43 @@ class Annotation:
                 self.extra_coords[full_id], transform
             )
 
-    def reverse_transform_coords(self, transform):
+    def reverse_transform_coords(self, transform: np.ndarray) -> None:
         """Revert the transformation of annotation coordinates.
 
         Args:
-            transform (np.ndarray): Transformation matrix.
+            transform: Transformation matrix.
         """
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = geom.transform_coords(self.coords, inverse_transform)
 
     def get_image_matches(
         self,
-        cams,
-        max_cams=None,
-        pcd=None,
-        use_orig_coords=True,
-        intercept_radius=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
-        reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
-        reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
-        enabled_cameras_only=True,
-        debug=False,
-    ):
-        """Get all cameras where the annotation is in view."""
+        cams: List[Any],
+        max_cams: Optional[int] = None,
+        pcd: Optional[Any] = None,
+        use_orig_coords: bool = True,
+        intercept_radius: float = settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
+        reprojection_threshold_uncertain: float = settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
+        reprojection_threshold_discard: float = settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
+        enabled_cameras_only: bool = True,
+        debug: bool = False,
+    ) -> List[Any]:
+        """Get all cameras where the annotation is in view.
+
+        Args:
+            cams: List of camera objects.
+            max_cams: Maximum number of matches to return.
+            pcd: Optional point cloud for filtering.
+            use_orig_coords: Whether to use original coordinates.
+            intercept_radius: Search radius for intercepts.
+            reprojection_threshold_uncertain: Threshold for uncertain matches.
+            reprojection_threshold_discard: Threshold for discarding matches.
+            enabled_cameras_only: Whether to only use enabled cameras.
+            debug: Whether to print debug information.
+
+        Returns:
+            List of image match objects.
+        """
         # If pcd is given, check that the annotations transform matches the pcd transform
         if pcd is not None and self.parent is not None:
             if not np.allclose(self.parent.world_transform, pcd.world_transform):
@@ -925,21 +1034,25 @@ class Annotation:
 
     def get_first_image_match(
         self,
-        cams,
-        pcd=None,
-        use_orig_coords=True,
-        intercept_radius=settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
-        reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
-        reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
-    ):
+        cams: List[Any],
+        pcd: Optional[Any] = None,
+        use_orig_coords: bool = True,
+        intercept_radius: float = settings.DEFAULT_INTERCEPT_SEARCH_RADIUS,
+        reprojection_threshold_uncertain: float = settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
+        reprojection_threshold_discard: float = settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
+    ) -> Optional[Any]:
         """Get the most relevant image match.
 
         Args:
-            cams (list): List of camera objects.
+            cams: List of camera objects.
             pcd: Optional point cloud for occlusion filtering.
+            use_orig_coords: Whether to use original coordinates.
+            intercept_radius: Search radius for intercepts.
+            reprojection_threshold_uncertain: Threshold for uncertain matches.
+            reprojection_threshold_discard: Threshold for discarding matches.
 
         Returns:
-            ImageMatch or None: Top image match if available.
+            Top image match if available, None otherwise.
         """
         image_matches = self.get_image_matches(
             cams,
@@ -955,16 +1068,18 @@ class Annotation:
         else:
             return None
 
-    def measure(self, measurement_func, *args, **kwargs):
+    def measure(
+        self, measurement_func: Callable, *args: Any, **kwargs: Any
+    ) -> Tuple[Optional[str], Optional[Any]]:
         """Execute a measurement function for this annotation.
 
         Args:
-            measurement_func (callable): Measurement function.
+            measurement_func: Measurement function.
             *args: Additional arguments.
             **kwargs: Additional keyword arguments.
 
         Returns:
-            tuple: (annotation id, result)
+            Tuple containing (annotation id, result).
         """
         if measurement_func.__name__ == "calc_gap_fraction":
             gapF_raw, gapF_fill, _ = measurement_func(self, *args)
@@ -1001,16 +1116,17 @@ class Annotation:
             logger.error("Measurement not recognized!")
         return self.id, None
 
-    def get_crosshair_points(self, plane_normal, offset_m=0.01):
-        """
-        Compute four offset 3D points in a plane defined by the normal.
+    def get_crosshair_points(
+        self, plane_normal: np.ndarray, offset_m: float = 0.01
+    ) -> "Annotations":
+        """Compute four offset 3D points in a plane defined by the normal.
 
         Args:
-            plane_normal (np.ndarray): Normal vector for the plane.
-            offset_m (float, optional): Offset in meters.
+            plane_normal: Normal vector for the plane.
+            offset_m: Offset in meters.
 
         Returns:
-            Annotations: New annotation container with four offset points.
+            New annotation container with four offset points.
         """
         n = plane_normal / np.linalg.norm(plane_normal)
         if abs(n[0]) < 0.9:
@@ -1030,21 +1146,26 @@ class Annotation:
             ]
         )
 
-    def set_image_mask_id(self, mask_id):
+    def set_image_mask_id(self, mask_id: int) -> None:
+        """Set the image mask by ID.
+
+        Args:
+            mask_id: Index of the mask to use.
+        """
         self.image_match.mask = self.image_match.masks[mask_id]
 
 
 class InterceptAnnotation(Annotation):
     def __init__(
         self,
-        coords,
-        search_radius,
-        is_extrapolated=False,
-        estimated_intercept_coords=None,
-        parent=None,
-        id=None,
-        neighboring_coords=None,
-    ):
+        coords: Union[List[float], np.ndarray],
+        search_radius: float,
+        is_extrapolated: bool = False,
+        estimated_intercept_coords: Optional[np.ndarray] = None,
+        parent: Optional["Annotations"] = None,
+        id: Optional[str] = None,
+        neighboring_coords: Optional[np.ndarray] = None,
+    ) -> None:
         # Use intercept_point.coords as the main coordinates.
         super().__init__(coords, id=id, parent=parent)
 
@@ -1060,7 +1181,11 @@ class Scalebars:
     Container class that holds a collection of Scalebar objects
     """
 
-    def __init__(self, scalebar_data, target_data=None):
+    def __init__(
+        self,
+        scalebar_data: List[Tuple[str, str, float]],
+        target_data: Optional[Dict] = None,
+    ) -> None:
         self.data = [
             Scalebar(pred_scalebar[0], pred_scalebar[1], pred_scalebar[2])
             for pred_scalebar in scalebar_data
@@ -1096,7 +1221,10 @@ class Scalebars:
         for i, scalebar in enumerate(self.data):
             target1_set = scalebar.target1_coords is not None
             target2_set = scalebar.target2_coords is not None
-            scalebar_summary = f"  scalebar_{i+1}='{scalebar.target1_label}'-'{scalebar.target2_label}' ({scalebar.length}m)"
+            scalebar_summary = (
+                f"  scalebar_{i+1}='{scalebar.target1_label}'"
+                f"-'{scalebar.target2_label}' ({scalebar.length}m)"
+            )
             if target1_set and target2_set:
                 # Calculate scaled distance using raw_dist and overall scalefactor
                 if hasattr(scalebar, "raw_dist") and self.scalefactor is not None:
@@ -1130,7 +1258,7 @@ class Scalebars:
         lines.append(")")
         return "\n".join(lines)
 
-    def store_target_coords(self, target_data):
+    def store_target_coords(self, target_data: Dict) -> None:
         for target_label, target_coords in target_data.items():
             for scalebar in self.data:
                 if target_label == scalebar.target1_label:
@@ -1139,7 +1267,7 @@ class Scalebars:
                     scalebar.target2_coords = np.asarray(target_coords[0], dtype=float)
         self.calc_scalefactor()
 
-    def calc_scalefactor(self, max_var=0.005):
+    def calc_scalefactor(self, max_var: float = 0.005) -> Optional[float]:
         scalefactors = []
         for scalebar in self.data:
             scalefactor = scalebar.calc_scalefactor()
@@ -1163,7 +1291,7 @@ class Scalebars:
         else:
             return None
 
-    def _generate_scalebar_figs(self, pcd):
+    def _generate_scalebar_figs(self, pcd: Any) -> List[Any]:
         """Generate matplotlib figures for each scalebar target."""
         figs = []
         for scalebar in self.data:
@@ -1196,10 +1324,13 @@ class Scalebars:
                 figs.append(fig2)
         return figs
 
-    def show(self, pcd):
+    def show(self, pcd: Any) -> List[Any]:
         """Visualize the scale bar targets"""
         print(
-            f"Number of scalebars: {self.scalebars}\nScale factor: {self.scalefactor:.5f}\nVariance: {self.var:.10f}\nStd Error: {self.sterr:.10f}"
+            f"Number of scalebars: {self.scalebars}\n"
+            f"Scale factor: {self.scalefactor:.5f}\n"
+            f"Variance: {self.var:.10f}\n"
+            f"Std Error: {self.sterr:.10f}"
         )
         figs = self._generate_scalebar_figs(pcd)
         # Show the figures interactively
@@ -1207,7 +1338,7 @@ class Scalebars:
             fig.show()
         return figs
 
-    def save_pdf(self, pcd, filepath=None):
+    def save_pdf(self, pcd: Any, filepath: Optional[str] = None) -> None:
         """Save the scalebar visualization as a PDF (does not display figures)."""
         import matplotlib
 
@@ -1239,18 +1370,16 @@ class Scalebars:
 
 
 class Scalebar(object):
-    """
-    Scalebar
-    """
+    """Scalebar class for storing scale bar information."""
 
-    def __init__(self, target1_label, target2_label, length):
+    def __init__(self, target1_label: str, target2_label: str, length: float) -> None:
         self.target1_label = target1_label
         self.target2_label = target2_label
         self.length = length
         self.target1_coords = None
         self.target2_coords = None
 
-    def calc_scalefactor(self):
+    def calc_scalefactor(self) -> Optional[float]:
         if self.target1_coords is not None and self.target2_coords is not None:
             x1 = float(self.target1_coords[0])
             y1 = float(self.target1_coords[1])
