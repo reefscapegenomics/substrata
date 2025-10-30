@@ -2409,7 +2409,7 @@ def plot_views(
       - Row 4 (two columns): side (Y–Z) and side (−Y–Z) views
     """
     # Decimate if required (and ensure PointCloud format)
-    ortho_pcd = pcd.copy()
+    ortho_pcd = pcd
     pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
     filepath = getattr(pcd, "filepath", None)
 
