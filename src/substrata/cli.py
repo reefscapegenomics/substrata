@@ -1,5 +1,6 @@
 # Standard Library
 import argparse
+import ast
 import os
 import re
 import sys
@@ -396,6 +397,152 @@ def handle_align(args):
     print("Alignment transform (source → target):\n", T)
 
 
+def _parse_transform_from_input(transform_str: str) -> np.ndarray:
+    """Parse a 4x4 transform matrix from user input (YAML or array format).
+
+    Supports:
+    - YAML format with world_transform key (3x4 or 4x4)
+    - Array format (3x4 or 4x4)
+    - Promotes 3x4 matrices to 4x4 by adding [0, 0, 0, 1] bottom row
+    - Promotes 3x3 matrices to 4x4 by adding bottom row and right column
+
+    Args:
+        transform_str: String containing transform in YAML or array format.
+
+    Returns:
+        4x4 numpy array representing the transform matrix.
+    """
+    transform_str = transform_str.strip()
+
+    # Try to parse as YAML first (check for YAML-like structure)
+    if ":" in transform_str or "world_transform" in transform_str.lower():
+        try:
+            yaml_data = yaml.safe_load(transform_str)
+            if isinstance(yaml_data, dict) and "world_transform" in yaml_data:
+                transform = np.array(yaml_data["world_transform"], dtype=float)
+            elif isinstance(yaml_data, list):
+                transform = np.array(yaml_data, dtype=float)
+            else:
+                raise ValueError("YAML format not recognized")
+        except Exception as e:
+            raise ValueError(f"Failed to parse YAML format: {e}")
+    else:
+        # Try to parse as array/list format
+        try:
+            parsed = ast.literal_eval(transform_str)
+            transform = np.array(parsed, dtype=float)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse array format: {e}. "
+                "Expected format: [[...], [...], [...], [...]] or YAML format"
+            )
+
+    return transform
+
+
+def handle_images(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+    from substrata import visualizations
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # Allow explicit override of PLY path
+    if args.input:
+        init.pcd_filepath = args.input
+    # Allow explicit override of annotations path
+    if args.annotations:
+        init.annotations_filepath = args.annotations
+
+    # Initialize (loads PCD and cameras if available)
+    init.initialize()
+
+    # Resolve annotations
+    if not init.annotations_filepath:
+        raise SystemExit(
+            "No annotations file found. Provide --annotations or ensure "
+            "initializer finds an annotations CSV in CWD."
+        )
+
+    anns = Annotations(init.annotations_filepath, header=True, orig_coords_only=True)
+
+    # Handle optional transform
+    if getattr(args, "transform", False):
+        print("Please paste the transform matrix (YAML or array format):")
+        print("  - YAML format: world_transform")
+        print("  - Array format: [[...], [...], [...]] or [[...], [...], [...], [...]]")
+        transform_str = ""
+        while True:
+            try:
+                line = input()
+                if line.strip() == "":
+                    break
+                transform_str += line + "\n"
+            except EOFError:
+                break
+
+        if not transform_str.strip():
+            raise SystemExit("No transform provided")
+
+        try:
+            transform = _parse_transform_from_input(transform_str)
+            print(f"Parsed transform:\n{transform}")
+
+            # Transform orig_coords and use as new orig_coords
+            from substrata import geom
+
+            for ann_id in anns.data:
+                ann = anns.data[ann_id]
+                # Transform current orig_coords
+                new_orig_coords = geom.transform_coords(ann.orig_coords, transform)
+                # Set as new orig_coords and reset coords
+                ann.orig_coords = new_orig_coords
+                ann.coords = new_orig_coords.copy()
+                # Also transform extra_coords if present
+                for full_id in ann.extra_coords:
+                    ann.extra_coords[full_id] = geom.transform_coords(
+                        ann.extra_coords[full_id], transform
+                    )
+                    ann.orig_extra_coords[full_id] = ann.extra_coords[full_id].copy()
+
+            # Reset world_transform to identity since we've updated orig_coords
+            anns.world_transform = np.eye(4)
+            print(
+                "Applied transform to orig_coords and reset "
+                "world_transform to identity"
+            )
+
+        except Exception as e:
+            raise SystemExit(f"Failed to parse or apply transform: {e}")
+
+    # Apply world_transform from initializer if available
+    if not init.world_transform_is_identity:
+        anns.apply_transform(init.world_transform)
+
+    # Validate that we have cameras and annotations
+    if not init.cams or len(init.cams) == 0:
+        raise SystemExit("No cameras available for image matching")
+
+    if len(anns) == 0:
+        raise SystemExit("No annotations found")
+
+    print(f"Number of annotations: {len(anns)}")
+    print(f"Number of cameras: {len(init.cams)}")
+
+    # Get first image matches for each annotation
+    image_matches = anns.get_first_image_matches(init.cams, pcd=init.pcd)
+
+    if len(image_matches) == 0:
+        raise SystemExit("No image matches found for any annotations")
+
+    print(f"Found {len(image_matches)} image matches")
+
+    # Save to PDF
+    pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_imagematches.pdf")
+    visualizations.save_cropped_image_matches_to_pdf(image_matches, pdf_output)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -739,6 +886,46 @@ def main():
         help="Apply along-slope transform to pointcloud before processing.",
     )
 
+    # images
+    p_images = subparsers.add_parser(
+        "images",
+        help=("Find image matches of annotations and output cropped images to PDF."),
+    )
+    p_images.add_argument(
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_images.add_argument(
+        "--annotations",
+        dest="annotations",
+        type=str,
+        default=None,
+        help="Optional explicit annotations CSV path (overrides initializer).",
+    )
+    p_images.add_argument(
+        "--transform",
+        dest="transform",
+        action="store_true",
+        help=(
+            "Prompt for 4x4 transform matrix to apply to orig_coords "
+            "(accepts YAML or array format)."
+        ),
+    )
+    p_images.add_argument(
+        "--pdf-output",
+        dest="pdf_output",
+        type=str,
+        default=None,
+        help=(
+            "Optional output PDF filepath. "
+            "Default: <cwd_basename>_imagematches.pdf in current folder."
+        ),
+    )
+
     args = parser.parse_args()
 
     handlers = {
@@ -750,6 +937,7 @@ def main():
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,
         "align": handle_align,
+        "images": handle_images,
     }
     handlers[args.command](args)
 
