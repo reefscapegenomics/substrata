@@ -730,8 +730,8 @@ class Annotations:
         def get_col_index(
             columns: List[str], names: List[str], mandatory: bool = True
         ) -> Optional[int]:
-            # Strip quotation marks from each column value directly
-            columns = [col.strip('"') for col in columns]
+            # Strip quotation marks and whitespace from each column value
+            columns = [col.strip('"').strip() for col in columns]
             for name in names:
                 if name in columns:
                     return columns.index(name)
