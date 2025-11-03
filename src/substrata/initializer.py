@@ -340,7 +340,7 @@ class ProjectInitializer:
             and self.world_transform_is_identity
             and self.scale_factor is not None
         ):
-            self.world_transform = Transform.from_scale(self.scale_factor)
+            self.world_transform = geom.Transform.from_scale(self.scale_factor)
 
         if self.ply_filepath:
             print(f"Loading pointcloud from {self.ply_filepath}")
