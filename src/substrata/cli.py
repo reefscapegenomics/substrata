@@ -135,7 +135,6 @@ def handle_scalebars(args):
         )
         init.save_config_to_yaml(yaml_path)
         print(f"Saved to YAML: {yaml_path}")
-        except Exception as e:
 
 
 def handle_views(args):
