@@ -499,7 +499,7 @@ def handle_images(args):
                 # Set as new orig_coords and reset coords
                 ann.orig_coords = new_orig_coords
                 ann.coords = new_orig_coords.copy()
-                print(f'{ann_id} orig_coords: {ann.orig_coords}' coords: {ann.coords}')
+                print(f"{ann_id} orig_coords: {ann.orig_coords}, coords: {ann.coords}")
                 # Also transform extra_coords if present
                 for full_id in ann.extra_coords:
                     ann.extra_coords[full_id] = geom.transform_coords(
