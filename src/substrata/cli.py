@@ -477,7 +477,7 @@ def handle_images(args):
             try:
                 line = input()
                 if line.strip() == "":
-                    breakg
+                    break
                 transform_str += line + "\n"
             except EOFError:
                 break
@@ -520,7 +520,7 @@ def handle_images(args):
     if not init.world_transform_is_identity:
         anns.apply_transform(init.world_transform)
     elif init.scale_factor is not None:
-        anns.apply_transform(Transform.from_scale(init.scale_factor))
+        anns.apply_transform(geom.Transform.from_scale(init.scale_factor))
 
     # Validate that we have cameras and annotations
     if not init.cams or len(init.cams) == 0:
