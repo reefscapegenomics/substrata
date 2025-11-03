@@ -335,6 +335,7 @@ class ProjectInitializer:
             no_transform (bool): If True, do not apply world_transform to loaded objects.
         """
         # Create world_transform from scale_factor if it is not set
+        # TODO: some inconsistency here, as it then ignores the world_transform from the YAML file
         if (
             apply_transform
             and self.world_transform_is_identity

@@ -18,6 +18,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from tqdm_joblib import tqdm_joblib
+import matplotlib
 from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
@@ -1326,22 +1327,40 @@ class Scalebars:
         return figs
 
     def show(self, pcd: Any) -> List[Any]:
-        """Visualize the scale bar targets"""
-        print(
-            f"Number of scalebars: {self.scalebars}\n"
-            f"Scale factor: {self.scalefactor:.5f}\n"
-            f"Variance: {self.var:.10f}\n"
-            f"Std Error: {self.sterr:.10f}"
-        )
-        figs = self._generate_scalebar_figs(pcd)
-        # Show the figures interactively
-        for fig in figs:
-            fig.show()
-        return figs
+        """Visualize the scale bar targets.
+
+        Args:
+            pcd: The point cloud object.
+
+        Returns:
+            List of matplotlib figure objects.
+        """
+        if self.scalebars is not None:
+            print(
+                f"Number of scalebars: {self.scalebars}\n"
+                f"Scale factor: {self.scalefactor:.5f}\n"
+                f"Variance: {self.var:.10f}\n"
+                f"Std Error: {self.sterr:.10f}"
+            )
+            figs = self._generate_scalebar_figs(pcd)
+            # Show the figures interactively
+            for fig in figs:
+                fig.show()
+            return figs
+        return []
 
     def save_pdf(self, pcd: Any, filepath: Optional[str] = None) -> None:
-        """Save the scalebar visualization as a PDF (does not display figures)."""
-        import matplotlib
+        """Save the scalebar visualization as a PDF (does not display figures).
+
+        Args:
+            pcd: The point cloud object.
+            filepath: Optional path to save the PDF file.
+
+        Returns:
+            None
+        """
+        if self.scalebars is None:
+            return
 
         backend_original = matplotlib.get_backend()
         # Use a non-interactive backend to prevent showing figures
