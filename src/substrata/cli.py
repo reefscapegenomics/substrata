@@ -477,7 +477,7 @@ def handle_images(args):
             try:
                 line = input()
                 if line.strip() == "":
-                    break
+                    breakg
                 transform_str += line + "\n"
             except EOFError:
                 break
@@ -519,6 +519,8 @@ def handle_images(args):
     # Apply world_transform from initializer if available
     if not init.world_transform_is_identity:
         anns.apply_transform(init.world_transform)
+    elif init.scale_factor is not None:
+        anns.apply_transform(Transform.from_scale(init.scale_factor))
 
     # Validate that we have cameras and annotations
     if not init.cams or len(init.cams) == 0:

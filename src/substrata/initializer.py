@@ -334,6 +334,14 @@ class ProjectInitializer:
         Args:
             no_transform (bool): If True, do not apply world_transform to loaded objects.
         """
+        # Create world_transform from scale_factor if it is not set
+        if (
+            apply_transform
+            and self.world_transform_is_identity
+            and self.scale_factor is not None
+        ):
+            self.world_transform = Transform.from_scale(self.scale_factor)
+
         if self.ply_filepath:
             print(f"Loading pointcloud from {self.ply_filepath}")
             self.pcd = pointclouds.PointCloud(self.ply_filepath)

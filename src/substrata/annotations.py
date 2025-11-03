@@ -144,7 +144,7 @@ class Annotations:
                 world_y,
                 world_z,
                 other_cols,
-            ) = self.__get_annotation_fields(line.rstrip().split(","))
+            ) = self.__get_annotation_fields(line.rstrip("\r\n").split(","))
             ann_id = self.__strip_post_fixes(id)
             if ann_id not in self.data:
                 # New annotation
@@ -159,7 +159,7 @@ class Annotations:
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
-                self.data[ann_id].add_extra_coords(line.rstrip())
+                self.data[ann_id].add_extra_coords(line.rstrip("\r\n"))
         annotations_file.close()
 
     def get_annotations_from_coords(
@@ -235,11 +235,11 @@ class Annotations:
         for line_no, line in enumerate(data_file):
             if line_no == 0:
                 self.col_order = self.__determine_col_order(line)
-                cols = line.rstrip().split(",")
+                cols = line.rstrip("\r\n").split(",")
                 col_headers = [col.strip('"') for col in cols]
                 continue  # skip to next line
 
-            cols = line.rstrip().split(",")
+            cols = line.rstrip("\r\n").split(",")
             ann_id = cols[self.col_order["id"]]
             if ann_id in self.data.keys():
                 self.data[ann_id].meta_data = {}
@@ -745,7 +745,8 @@ class Annotations:
                 return None
 
         # Try to establish column indexes by assuming header
-        cols = line.rstrip().split(",")
+        # Strip line endings (handle both Unix LF and Windows CRLF)
+        cols = line.rstrip("\r\n").split(",")
         return {
             "id": get_col_index(cols, ["id"]),
             "orig_x": get_col_index(cols, ["x", "orig_x"]),
