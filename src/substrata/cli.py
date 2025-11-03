@@ -499,6 +499,7 @@ def handle_images(args):
                 # Set as new orig_coords and reset coords
                 ann.orig_coords = new_orig_coords
                 ann.coords = new_orig_coords.copy()
+                print(f'{ann_id} orig_coords: {ann.orig_coords}' coords: {ann.coords}')
                 # Also transform extra_coords if present
                 for full_id in ann.extra_coords:
                     ann.extra_coords[full_id] = geom.transform_coords(
@@ -516,11 +517,11 @@ def handle_images(args):
         except Exception as e:
             raise SystemExit(f"Failed to parse or apply transform: {e}")
 
-    # Apply world_transform from initializer if available
-    if not init.world_transform_is_identity:
-        anns.apply_transform(init.world_transform)
-    elif init.scale_factor is not None:
-        anns.apply_transform(geom.Transform.from_scale(init.scale_factor))
+    # # Apply world_transform from initializer if available
+    # if not init.world_transform_is_identity:
+    #     anns.apply_transform(init.world_transform)
+    # elif init.scale_factor is not None:
+    #     anns.apply_transform(geom.Transform.from_scale(init.scale_factor))
 
     # Validate that we have cameras and annotations
     if not init.cams or len(init.cams) == 0:
