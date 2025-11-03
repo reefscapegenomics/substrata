@@ -97,7 +97,14 @@ class ProjectInitializer:
             lines.append(f"  classes_filepath={self.classes_filepath},")
         if self.world_transform is not None:
             lines.append(f"  world_transform={self.world_transform},")
-        lines.append(f"  scale_factor={self.scale_factor}")
+        if self.scale_factor is not None:
+            lines.append(f"  scale_factor={self.scale_factor},")
+        if self.up_vector is not None:
+            lines.append(f"  up_vector={self.up_vector.xyz},")
+        if self.depth_offset is not None:
+            lines.append(f"  depth_offset={self.depth_offset},")
+        if self.depth_per_unit is not None:
+            lines.append(f"  depth_per_unit={self.depth_per_unit},")
 
         # Remove trailing comma from last line if present
         if len(lines) > 1 and lines[-1].endswith(","):

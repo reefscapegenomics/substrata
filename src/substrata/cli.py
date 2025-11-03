@@ -125,16 +125,17 @@ def handle_scalebars(args):
 
     # 6) optionally persist scale factor to YAML
     if getattr(args, "save_yaml", False):
-        try:
-            scale_factor = sb.calc_scalefactor()
+        scale_factor = sb.calc_scalefactor()
+        if scale_factor is not None:
             init.scale_factor = float(scale_factor)
-            yaml_path = init.yaml_path or os.path.join(
-                init.path or os.getcwd(), f"{init.id}.yaml"
-            )
-            init.save_config_to_yaml(yaml_path)
-            print(f"Saved scale_factor to YAML: {yaml_path}")
+        else:
+            print("Warning: failed to compute scale_factor")
+        yaml_path = init.yaml_path or os.path.join(
+            init.path or os.getcwd(), f"{init.id}.yaml"
+        )
+        init.save_config_to_yaml(yaml_path)
+        print(f"Saved to YAML: {yaml_path}")
         except Exception as e:
-            print(f"Warning: failed to save scale_factor to YAML: {e}")
 
 
 def handle_views(args):
