@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 # Standard Library
 import os
-from __future__ import annotations
 
 # Third-Party Libraries
 import yaml
