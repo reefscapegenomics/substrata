@@ -777,7 +777,7 @@ class Cameras:
         """
         if recalculate:
             for cam in self.data.values():
-                if hasattr(cam, "depth"):
+                if hasattr(cam, "depth") and cam.depth is not None:
                     cam.depth_pred = cam.depth_in_m
                     cam.depth_residual = cam.depth - cam.depth_pred
 
