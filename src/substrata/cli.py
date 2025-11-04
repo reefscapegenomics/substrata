@@ -259,6 +259,7 @@ def handle_firefish(args):
 
         # Save camera depth residuals PDF
         output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
+        init.cams.load_camera_attributes(cam_depths_file)
         init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
