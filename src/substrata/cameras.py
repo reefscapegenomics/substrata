@@ -275,7 +275,8 @@ class Cameras:
             )
             if "reference" in cam_data:
                 self.data[cam_id].reference = cam_data["reference"]
-                self.data[cam_id].depth = cam_data["reference"][2]
+                # Ensure depth is negative (in meters)
+                self.data[cam_id].depth = -abs(cam_data["reference"][2])
             if "reference_accuracy" in cam_data:
                 self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
                 self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
