@@ -343,6 +343,8 @@ class ProjectInitializer:
             self.cams = cameras.Cameras(
                 self.cams_meta_json_filepath, self.cams_xml_filepath
             )
+            self.cams.offset = self.depth_offset
+            self.cams.per_unit = self.depth_per_unit
 
         if self.markers_filepath:
             print(f"Loading markers from {self.markers_filepath}")
@@ -431,6 +433,9 @@ class ProjectInitializer:
         self.pcd.apply_orientation_transforms(
             self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit
         )
+
+        self.cams.depth_offset = self.depth_offset
+        self.cams.depth_per_unit = self.depth_per_unit
 
         # Propagate pointcloud world_transform to cameras/markers/annotations
         self.world_transform = self.pcd.world_transform
