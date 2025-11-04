@@ -65,10 +65,13 @@ class ProjectInitializer:
                     self.init_with_yaml(yaml_path)
                 else:
                     raise ValueError(f"YAML file not found: {yaml_path}")
-        # If project_path is given, search for files with default naming conventions
-        # in the directory to establish configuration.
-        else:
-            self.init_with_path(path)
+        elif path is not None:
+            current_folder_name = os.path.basename(os.path.abspath(path))
+            yaml_path = os.path.join(path, f"{current_folder_name}.yaml")
+            if os.path.isfile(yaml_path):
+                self.init_with_yaml(yaml_path)
+            else:
+                self.init_with_path(path)
 
     def __str__(self) -> str:
         """
