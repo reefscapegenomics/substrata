@@ -151,21 +151,44 @@ def handle_views(args):
     # Initialize project (loads PCD, cameras/markers if available)
     init.initialize()
 
-    # Optional orientation via initializer workflow - ignore if world_transform is already set
-    if getattr(args, "auto_orient", False):
-        if init.world_transform_is_identity:
-            init.scale_and_orient()
-        else:
-            print(f"Warning: world_transform is already set, skipping auto-orientation")
+    # Apply world_transform if it's not identity (already set from YAML or previous runs)
+    if not init.world_transform_is_identity:
+        init.apply_world_transform()
 
     # Save composite views PDF from initialized point cloud
     output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
     init.pcd.save_pdf(filepath=output_pdf)
 
-    if getattr(args, "save_yaml", False):
-        # Save values to YAML
-        yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
-        init.save_config_to_yaml(yaml_path)
+
+def handle_orient(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd)
+
+    # Allow explicit override of PLY path
+    if args.input:
+        init.pcd_filepath = args.input
+
+    # Initialize project (loads PCD, cameras/markers if available)
+    init.initialize()
+
+    # Run scale_and_orient workflow
+    init.scale_and_orient()
+
+    # Always save values to YAML
+    yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
+    init.save_config_to_yaml(yaml_path)
+    print(f"Saved orientation to YAML: {yaml_path}")
+
+    # Also output composite views as done for the "views" command
+    output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
+    init.pcd.save_pdf(filepath=output_pdf)
+
+    # Save camera depth residuals PDF
+    output_pdf = args.output_pdf or _get_output_filepath(init, "depth_residuals.pdf")
+    init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_firefish(args):
@@ -173,55 +196,39 @@ def handle_firefish(args):
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd)
 
+    # Arguments
     target_depth = _infer_target_depth(base, args.target_depth)
     pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_firefish.pdf")
     cam_depths_file = args.cam_depths_file or os.path.join(cwd, f"{base}_camdepths.csv")
-
-    # Initialize FireFish file
-    from substrata.firefish import FireFish
-
-    ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
-
-    # depth_outlier_thresh is passed through only if provided; otherwise rely on default
     kwargs = {
         "camdepths_filepath": cam_depths_file,
         "pdf_output_filepath": pdf_output,
     }
     if args.depth_outlier_thresh is not None:
         kwargs["depth_and_outlier_threshold"] = args.depth_outlier_thresh
-
     if args.input:
         init.pcd_filepath = args.input
 
+    # Initialize FireFish file
+    from substrata.firefish import FireFish
+
+    ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
+
+    # Initialize project (loads PCD, cameras/markers if available) without transforms
     init.initialize(apply_transform=False)
 
-    # Only apply scale_factor (if specified or needed for save_yaml)
-    if init.scale_factor is not None or getattr(args, "save_yaml", False):
-        init.scale()
-        from substrata.geom import Transform
+    # Calculate scale factor to get accurate camera distances only
+    if init.scale_factor is None:
+        init.calc_scale_factor()
+    if init.scale_factor is None:
+        raise ValueError("Scale factor is not set")
 
-        init.world_transform = Transform.from_scale(init.scale_factor)
-
-    init.initialize(apply_transform=True)
-    pcd = init.pcd
-    cams = init.cams
-
-    # Optional subset by camera group name
-    if getattr(args, "cams_group", None):
-        cams = cams.subset_by_group(args.cams_group)
-        if len(cams) == 0:
-            print(f"Available camera groups: {init.cams.group_names}")
-            raise ValueError(f"No cameras found in group '{args.cams_group}'")
-        else:
-            print(
-                f"Subsetted cameras to group '{args.cams_group}' → {len(cams.items())} cameras"
-            )
-
-    # Run up-vector determination
+    # Run up-vector determination (on unscaled/unoriented pointcloud)
     up_vector, depth_offset, depth_per_unit, _ = ff.determine_up_vector(
-        cams,
+        init.cams,
         target_depth,
-        pcd,
+        init.pcd,
+        distance_scale_factor=init.scale_factor,  # for camdists only
         offset=args.offset,
         **kwargs,
     )
@@ -229,22 +236,30 @@ def handle_firefish(args):
     # Optionally persist orientation results to YAML
     if getattr(args, "save_yaml", False):
         try:
-            # Re-initialize the pointcloud with no transform
-            init.world_transform = np.eye(4)
-            init.initialize()
-
-            # Set scaling/orientation values
+            # Set scaling/orientation values and run apply_orientation_transforms()
+            # via the scale_and_orient() method
             init.up_vector = up_vector
             init.depth_offset = float(depth_offset)
             init.depth_per_unit = float(depth_per_unit)
-
             init.scale_and_orient()
+
             # Save values to YAML
             yaml_path = init.yaml_path or os.path.join(
                 init.path or os.getcwd(), f"{init.id}.yaml"
             )
             init.save_config_to_yaml(yaml_path)
             print(f"Saved orientation to YAML: {yaml_path}")
+
+            # Save composite views PDF from initialized point cloud
+            output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
+            init.pcd.save_pdf(filepath=output_pdf)
+
+            # Save camera depth residuals PDF
+            output_pdf = args.output_pdf or _get_output_filepath(
+                init, "depth_residuals.pdf"
+            )
+            init.cams.save_depth_residuals_pdf(filepath=output_pdf)
+
         except Exception as e:
             print(f"Warning: failed to save orientation to YAML: {e}")
 
@@ -665,18 +680,19 @@ def main():
         default=None,
         help="Output PDF filepath.",
     )
-    p_views.add_argument(
-        "--auto-orient",
-        dest="auto_orient",
-        action="store_true",
-        help="Initialize and orient the project before saving.",
+
+    # orient
+    p_orient = subparsers.add_parser(
+        "orient",
+        help="Calculate and apply scale and orientation transforms, save to YAML.",
     )
-    p_views.add_argument(
-        "-s",
-        "--save_yaml",
-        dest="save_yaml",
-        action="store_true",
-        help="Save computed scale_factor into a YAML config for this project.",
+    p_orient.add_argument(
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
     )
 
     # firefish
@@ -936,6 +952,7 @@ def main():
         "head": handle_head,
         "scalebars": handle_scalebars,
         "views": handle_views,
+        "orient": handle_orient,
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,

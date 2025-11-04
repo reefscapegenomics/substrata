@@ -571,7 +571,14 @@ class Cameras:
         """
         self.filepath_replace = ["", base_path]
 
-    def get_cam_dists(self, pcd, beam_angle, n_jobs=-1, backend="threading"):
+    def get_cam_dists(
+        self,
+        pcd,
+        beam_angle: float,
+        n_jobs: int = -1,
+        backend: str = "threading",
+        scale_factor: float = 1.0,
+    ):
         """Calculate camera distances to a point cloud.
 
         For each camera, compute the distance to the given point cloud based on
@@ -584,11 +591,12 @@ class Cameras:
             beam_angle (float): The beam angle for distance calculation.
             n_jobs (int): Number of parallel workers. Use 1 for sequential; -1 for all CPUs.
             backend (str): joblib backend. Use "threading" to avoid pickling ``pcd``.
+            scale_factor (float, optional): Value to scale the result distance by. Default is 1.0.
         """
         cams_list = list(self.data.values())
         if n_jobs in (None, 1):
             for cam in tqdm(cams_list, desc="Calculating camera distances..."):
-                cam.camdist = pcd.get_cam_dist(cam, beam_angle)
+                cam.camdist = pcd.get_cam_dist(cam, beam_angle) * scale_factor
         else:
             with tqdm_joblib(
                 tqdm(total=len(cams_list), desc="Calculating camera distances...")
@@ -597,7 +605,7 @@ class Cameras:
                     delayed(pcd.get_cam_dist)(cam, beam_angle) for cam in cams_list
                 )
             for cam, dist in zip(cams_list, dists):
-                cam.camdist = dist
+                cam.camdist = dist * scale_factor
 
     def get_datetime_originals(self, offset_secs=None):
         """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""
@@ -680,6 +688,7 @@ class Cameras:
         ]
 
         num_matches = len(cams_filtered)
+        print(f"Found {num_matches} matching cameras/depths for regression")
         if num_matches < 2:
             # Not enough points to fit a regression
             raise ValueError(
@@ -756,7 +765,16 @@ class Cameras:
         depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
         recalculate=True,
     ):
+        """
+        Get the depths and predicted depths for the cameras. If recalculate is True, recalculate the depths and predicted depths.
 
+        Args:
+            depth_accuracy_threshold (float): The depth accuracy threshold.
+            recalculate (bool): If True, recalculate the depths and predicted depths.
+
+        Returns:
+            tuple: A tuple containing the depths and predicted depths.
+        """
         if recalculate:
             for cam in self.data.values():
                 if hasattr(cam, "depth"):
@@ -780,6 +798,15 @@ class Cameras:
     def get_depths_and_z_coords(
         self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
     ):
+        """
+        Get the depths and z-coordinates for the cameras.
+
+        Args:
+            depth_accuracy_threshold (float): The depth accuracy threshold.
+
+        Returns:
+            tuple: A tuple containing the depths and z-coordinates.
+        """
         cams_filtered = [
             cam
             for cam in self.data.values()
@@ -808,6 +835,56 @@ class Cameras:
         )
         fig2 = visualizations.plot_cam_residuals(self, width=width, height=height)
         return fig, fig2
+
+    def save_depth_residuals_pdf(
+        self, filepath=None, width=15, height=5, recalculate=True
+    ):
+        """Save camera depth residuals visualization as a PDF.
+
+        Args:
+            filepath (str, optional): Path to save the PDF file. If None, generates
+                a default filename based on the cameras metadata filepath.
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+            recalculate (bool): If True, recalculate the depth residuals (default: True)
+
+        Returns:
+            str: The filepath where the PDF was saved.
+        """
+        import matplotlib
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        backend_original = matplotlib.get_backend()
+        # Use a non-interactive backend to prevent showing figures
+        matplotlib.use("Agg", force=True)
+        try:
+            if filepath is None:
+                # Generate default filename from cameras metadata filepath if available
+                if hasattr(self, "cams_meta_filepath") and self.cams_meta_filepath:
+                    base, _ = os.path.splitext(self.cams_meta_filepath)
+                    filepath = f"{base}_depth_residuals.pdf"
+                else:
+                    filepath = "depth_residuals.pdf"
+
+            # Get the figures from show_depth_residuals
+            fig1, fig2 = self.show_depth_residuals(
+                width=width, height=height, recalculate=recalculate
+            )
+
+            # Save both figures to PDF
+            pdf = PdfPages(filepath)
+            pdf.savefig(fig1)
+            pdf.savefig(fig2)
+            pdf.close()
+
+            # Close figures to free memory
+            plt.close(fig1)
+            plt.close(fig2)
+
+            return filepath
+        finally:
+            # Restore the original backend
+            matplotlib.use(backend_original, force=True)
 
 
 class Camera:
@@ -922,10 +999,16 @@ class Camera:
             return None
 
     @property
-    def depth_in_m(self):
-        return (self.parent.depth_per_unit / self.parent.scale_factor) * (
-            self.coords[2] - self.parent.depth_offset
-        ) + self.parent.depth_offset
+    def depth_in_m(self) -> float:
+        """Calculate the depth in meters for the camera using original Z-coordinate.
+
+        Returns:
+            float: The depth in meters based on orig_coords[2], parent's depth_per_unit, and
+                parent's depth_offset.
+        """
+        return (
+            self.parent.depth_offset + self.parent.depth_per_unit * self.orig_coords[2]
+        )
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.

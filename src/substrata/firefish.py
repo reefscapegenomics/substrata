@@ -177,7 +177,7 @@ class FireFish:
             #     logger.warning(f"Skipping offset {offset} due to error: {e}")
             #     return None
             except Exception as e:
-                #logger.error(f"Unexpected error at offset {offset}: {e}")
+                # logger.error(f"Unexpected error at offset {offset}: {e}")
                 return None
 
         error_stats = Parallel(n_jobs=-1)(
@@ -277,13 +277,24 @@ class FireFish:
         cam_depth_residuals = dict(zip(cam_ids, depths_residuals))
 
         # 4) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
-        return coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches
+        return (
+            coef,
+            depth_offset,
+            depth_per_unit,
+            mse,
+            rmse,
+            mae,
+            r2,
+            cam_depth_residuals,
+            num_matches,
+        )
 
     def determine_up_vector(
         self,
         cams,
         target_depth,
         pcd,
+        distance_scale_factor=1.0,
         cams_filepath_postfix_filter=None,
         cams_filename_prefix_filter=None,
         camdepths_filepath=None,
@@ -296,6 +307,9 @@ class FireFish:
         visualizations for manual review.
 
         Optionally filter cameras by filepath postfix or prefix.
+
+        Distance scale factor is used only for camera distances and plot visualizations.
+        It is not used for the up vector determination.
         """
         # Optionally filter cameras by filepath postfix
         if cams_filepath_postfix_filter is not None:
@@ -310,12 +324,7 @@ class FireFish:
                 f"Filtered cameras to {len(cams.items())} cameras using prefix {cams_filename_prefix_filter}"
             )
 
-        # Check if pcd has undergone a transformation (scaling)
-        if len(pcd.transforms) == 0:
-            logger.warning(
-                "The pointcloud has not undergone any transformation and is perhaps not yet scaled (needed for determine_up_vector)"
-            )
-
+        # Create PDF output file
         if not pdf_output_filepath:
             pdf_output_filepath = "{0}_upvector.pdf".format(pcd.name)
         pdf = PdfPages(pdf_output_filepath)
@@ -327,10 +336,11 @@ class FireFish:
             cams.load_camera_attributes(camdepths_filepath)
         else:
             cams.get_datetime_originals()
-            cams.get_cam_dists(pcd, 15)
+            cams.get_cam_dists(pcd, 15, scale_factor=distance_scale_factor)
             cams.save_camera_attributes(camdepths_filepath)
 
         # Determine camera time offset unless provided manually
+        self.remove_outlier_altitudes(depth_and_outlier_threshold)
         if offset is None:
             offset, fig = self.determine_camera_time_offset(
                 cams,
@@ -342,7 +352,6 @@ class FireFish:
             )
             pdf.savefig(fig)
         else:
-            self.remove_outlier_altitudes(depth_and_outlier_threshold)
             print(f"Using manually provided time offset: {offset}s")
 
         # Determine up vector
@@ -365,30 +374,8 @@ class FireFish:
         fig = self.plot_cams_vs_firefish(cams, offset, show_overlap_range=True)
         pdf.savefig(fig)
 
-        # Apply transformations to pointcloud
-        pcd.apply_orientation_transforms(1, up_vector, depth_offset, depth_per_unit)
-
-        # # Convert cameras to annotations for visualization
-        # cams_reload = cameras.Cameras(cams.cams_meta_filepath, cams.cams_xml_filepath)
-        # fig = visualizations.show_cam_residuals(cams_reload, cam_depth_residuals, pcd.world_transform)
-        # pdf.savefig(fig)
-
-        # Visualize oriented pointcloud
-        fig = visualizations.plot(pcd, width=30, height=8, title=pcd.name)
-        pdf.savefig(fig)
-
-        # Output text summary including actual time offset
-        text = [
-            "Timepoint: {0}\nUp vector: {1}\nDepth offset: {2}\nDepth per unit: {3}\nTime offset: {4}s\n\nWorld Transform:\n{5}\n".format(
-                pcd.name, up_vector, depth_offset, depth_per_unit, offset, pcd.world_transform
-            )
-        ]
-        fig = visualizations.plot_text("\n".join(text))
-        pdf.savefig(fig)
-        print(text)
-
         pdf.close()
-        return up_vector, depth_offset, depth_per_unit, pcd.world_transform
+        return up_vector, depth_offset, depth_per_unit
 
     @staticmethod
     def __plot_matches(x_values, series1, series2):
@@ -410,10 +397,13 @@ class FireFish:
 
 def get_unix_time(unknown_datetime):
     if isinstance(unknown_datetime, str):
-        return datetime.strptime(
-            unknown_datetime, settings.CAM_DATETIME_FORMAT
-        ).replace(tzinfo=timezone.utc).timestamp()
+        return (
+            datetime.strptime(unknown_datetime, settings.CAM_DATETIME_FORMAT)
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
     return unknown_datetime
+
 
 def get_time_diff_in_secs(datetime1, datetime2):
     """Calculates the time difference in seconds between two datetime values.

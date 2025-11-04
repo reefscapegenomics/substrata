@@ -269,14 +269,22 @@ class PointCloud:
             )
             self.up_vector = up_vector
         if depth_offset is not None:
+            # Correct depth_offset for differences between depth_per_unit and
+            # scale_factor. Convert depth_offset from depth units to coordinate units,
+            # then scale for the scaled coordinate system:
+            # coord = (depth_offset / depth_per_unit) * scale_factor
+            if depth_scale_factor is not None and scale_factor is not None:
+                depth_offset_corr = depth_offset * (scale_factor / depth_scale_factor)
+                self.depth_scale_factor = depth_scale_factor
+            else:
+                depth_offset_corr = depth_offset
+
             self.apply_transform(
-                Transform.from_depth_offset(depth_offset),
+                Transform.from_depth_offset(depth_offset_corr),
                 plot=plot,
                 plot_title="Transform.from_depth_offset" if plot else None,
             )
             self.depth_offset = depth_offset
-        if depth_scale_factor is not None:
-            self.depth_scale_factor = depth_scale_factor
         self.apply_transform(
             Transform.align_x_to_vector(self.principal_axis_xy_2D()),
             plot=plot,
