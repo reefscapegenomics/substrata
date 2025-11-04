@@ -151,10 +151,6 @@ def handle_views(args):
     # Initialize project (loads PCD, cameras/markers if available)
     init.initialize()
 
-    # Apply world_transform if it's not identity (already set from YAML or previous runs)
-    if not init.world_transform_is_identity:
-        init.apply_world_transform()
-
     # Save composite views PDF from initialized point cloud
     output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
     init.pcd.save_pdf(filepath=output_pdf)
