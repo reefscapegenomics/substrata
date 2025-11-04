@@ -217,6 +217,12 @@ def handle_firefish(args):
     # Initialize project (loads PCD, cameras/markers if available) without transforms
     init.initialize(apply_transform=False)
 
+    # Optionally filter cameras by group name
+    if args.cams_group:
+        cams = init.cams.group(args.cams_group)
+    else:
+        cams = init.cams
+
     # Calculate scale factor to get accurate camera distances only
     if init.scale_factor is None:
         init.calc_scale_factor()
@@ -225,7 +231,7 @@ def handle_firefish(args):
 
     # Run up-vector determination (on unscaled/unoriented pointcloud)
     up_vector, depth_offset, depth_per_unit, _ = ff.determine_up_vector(
-        init.cams,
+        cams,
         target_depth,
         init.pcd,
         distance_scale_factor=init.scale_factor,  # for camdists only
@@ -749,7 +755,7 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--cams-group",
+        "--cams_group",
         dest="cams_group",
         type=str,
         default=None,
@@ -772,7 +778,6 @@ def main():
         default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
-    # removed --camspath-postfix (use --cams-group instead)
     p_ff.add_argument(
         "-s",
         "--save_yaml",
@@ -819,7 +824,7 @@ def main():
         help=("Optional width to resize images when creating frames (pixels)."),
     )
     p_c2v.add_argument(
-        "--cams-group",
+        "--cams_group",
         dest="cams_group",
         type=str,
         default=None,
