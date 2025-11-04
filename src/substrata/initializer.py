@@ -55,22 +55,21 @@ class ProjectInitializer:
 
         # If YAML file or path to YAML file is provided, use it to initialize the project
         if yaml is not None:
-            if ".yaml" in yaml or ".yml" in yaml:
-                # YAML file is provided directly
-                self.init_with_yaml(yaml)
-            else:
-                # Look for YAML file in the same directory as the provided path
-                yaml_path = os.path.join(path, f"{yaml}.yaml")
-                if os.path.isfile(yaml_path):
-                    self.init_with_yaml(yaml_path)
-                else:
-                    raise ValueError(f"YAML file not found: {yaml_path}")
+            # YAML file is provided directly
+            print(f"Loading project from YAML file: {yaml}")
+            self.init_with_yaml(yaml)
+        # If path is provided - assess whether a YAML file exists in the same directory
+        # otherwise use default naming conventions
         elif path is not None:
             current_folder_name = os.path.basename(os.path.abspath(path))
             yaml_path = os.path.join(path, f"{current_folder_name}.yaml")
             if os.path.isfile(yaml_path):
+                print(f"Loading project from YAML file: {yaml_path}")
                 self.init_with_yaml(yaml_path)
             else:
+                print(
+                    f"Loading project using default naming conventions from path: {path}"
+                )
                 self.init_with_path(path)
 
     def __str__(self) -> str:

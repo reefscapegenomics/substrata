@@ -239,33 +239,27 @@ def handle_firefish(args):
 
     # Optionally persist orientation results to YAML
     if getattr(args, "save_yaml", False):
-        try:
-            # Set scaling/orientation values and run apply_orientation_transforms()
-            # via the scale_and_orient() method
-            init.up_vector = up_vector
-            init.depth_offset = float(depth_offset)
-            init.depth_per_unit = float(depth_per_unit)
-            init.scale_and_orient()
+        # Set scaling/orientation values and run apply_orientation_transforms()
+        # via the scale_and_orient() method
+        init.up_vector = up_vector
+        init.depth_offset = float(depth_offset)
+        init.depth_per_unit = float(depth_per_unit)
+        init.scale_and_orient()
 
-            # Save values to YAML
-            yaml_path = init.yaml_path or os.path.join(
-                init.path or os.getcwd(), f"{init.id}.yaml"
-            )
-            init.save_config_to_yaml(yaml_path)
-            print(f"Saved orientation to YAML: {yaml_path}")
+        # Save values to YAML
+        yaml_path = init.yaml_path or os.path.join(
+            init.path or os.getcwd(), f"{init.id}.yaml"
+        )
+        init.save_config_to_yaml(yaml_path)
+        print(f"Saved orientation to YAML: {yaml_path}")
 
-            # Save composite views PDF from initialized point cloud
-            output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
-            init.pcd.save_pdf(filepath=output_pdf)
+        # Save composite views PDF from initialized point cloud
+        output_pdf = _get_output_filepath(init, "views.pdf")
+        init.pcd.save_pdf(filepath=output_pdf)
 
-            # Save camera depth residuals PDF
-            output_pdf = args.output_pdf or _get_output_filepath(
-                init, "depth_residuals.pdf"
-            )
-            init.cams.save_depth_residuals_pdf(filepath=output_pdf)
-
-        except Exception as e:
-            print(f"Warning: failed to save orientation to YAML: {e}")
+        # Save camera depth residuals PDF
+        output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
+        init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_cams2video(args):
