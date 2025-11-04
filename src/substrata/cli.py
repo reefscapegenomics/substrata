@@ -228,6 +228,8 @@ def handle_firefish(args):
         init.calc_scale_factor()
     if init.scale_factor is None:
         raise ValueError("Scale factor is not set")
+    else:
+        print("Scale factor: {init.scale_factor}")
 
     # Run up-vector determination (on unscaled/unoriented pointcloud)
     up_vector, depth_offset, depth_per_unit = ff.determine_up_vector(
