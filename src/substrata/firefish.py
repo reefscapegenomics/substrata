@@ -272,6 +272,7 @@ class FireFish:
         for idx, cam_id in enumerate(cam_ids):
             cams.data[cam_id].depth_pred = depths_predicted[idx]
             cams.data[cam_id].depth_residual = depths_residuals[idx]
+            cams.data[cam_id].depth_acc = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
 
         # Build a dict of residuals if you need them downstream
         cam_depth_residuals = dict(zip(cam_ids, depths_residuals))

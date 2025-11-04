@@ -39,7 +39,6 @@ DEFAULT_PIXEL_REPROJECTION_THRESHOLD = 2
 
 DEFAULT_DEPTH_ACCURACY_THRESHOLD = 0.3
 
-
 RGL_SCALEBARS = [
     ["target 3", "target 4", 0.500],
     ["target 5", "target 6", 0.500],  # w/ yellow ruler
