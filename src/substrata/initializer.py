@@ -8,10 +8,8 @@ import yaml
 import numpy as np
 
 # Local Modules
-from substrata import (
-    geom,
-    settings,
-)
+from substrata import geom, settings
+import substrata.annotations as annotations
 
 
 class ProjectInitializer:
@@ -328,7 +326,6 @@ class ProjectInitializer:
             apply_transform (bool): If True, apply world_transform to loaded objects.
         """
         from substrata import (
-            annotations,
             cameras,
             pointclouds,
         )
@@ -391,8 +388,6 @@ class ProjectInitializer:
         """
         Compute project scale factor. Does not apply any transforms.
         """
-        from substrata import annotations
-
         self.scalebars = annotations.Scalebars(settings.RGL_SCALEBARS, self.markers)
         self.scale_factor = self.scalebars.calc_scalefactor()
         return self.scale_factor
@@ -403,8 +398,6 @@ class ProjectInitializer:
         Pointcloud.apply_orientation_transforms() method.
 
         """
-        from substrata import annotations, pointclouds, cameras
-
         # Ensure at least the poincloud is initialized
         if self.pcd is None:
             raise ValueError("Pointcloud is not initialized")
