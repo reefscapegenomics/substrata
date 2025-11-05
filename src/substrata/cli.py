@@ -693,6 +693,13 @@ def main():
         default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
+    p_orient.add_argument(
+        "--output_pdf",
+        dest="output_pdf",
+        type=str,
+        default=None,
+        help="Output PDF filepath.",
+    )
 
     # firefish
     p_ff = subparsers.add_parser(
