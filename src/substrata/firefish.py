@@ -25,12 +25,21 @@ class FireFish:
     """Class that holds FireFish sensor"""
 
     def __init__(self, data_filepath):
+        """Initialize the FireFish class by loading sensor data from CSV.
+
+        Args:
+            data_filepath (str): Path to the FireFish sensor CSV file.
+        """
         self.data = pd.read_csv(
             data_filepath,
             skiprows=2,
             usecols=range(len(settings.FIREFISH_DEFAULT_COLS)),
         )
         self.data.columns = settings.FIREFISH_DEFAULT_COLS
+
+        # Ensure the 'depth' column values are always negative
+        if "depth" in self.data.columns:
+            self.data["depth"] = -self.data["depth"].abs()
 
     def remove_outlier_altitudes(self, threshold):
         """Remove altitudes that are above a certain threshold or below 0"""
