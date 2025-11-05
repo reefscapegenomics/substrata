@@ -142,7 +142,7 @@ class FireFish:
         target_depth=None,
         time_range=None,
         time_step=1,
-        depth_and_outlier_threshold=3,
+        depth_and_outlier_threshold=settings.FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD,
     ):
         """Determine the time offset for each camera by finding the depth"""
         # Filter the data for a particular depth range (e.g. 35-45 m)
@@ -244,7 +244,7 @@ class FireFish:
 
         if num_matches < 50:
             # Not enough points to fit a regression
-            raise ValueError()
+            raise ValueError("Not enough points to fit a regression: {num_matches}")
 
         points = np.array(cam_points)
         depths = np.array(cam_depths)
@@ -350,7 +350,6 @@ class FireFish:
             cams.save_camera_attributes(camdepths_filepath)
 
         # Determine camera time offset unless provided manually
-        self.remove_outlier_altitudes(depth_and_outlier_threshold)
         if offset is None:
             offset, fig = self.determine_camera_time_offset(
                 cams,
@@ -362,6 +361,8 @@ class FireFish:
             )
             pdf.savefig(fig)
         else:
+            # Remove outliers (as otherwise done in determine_camera_time_offset)
+            self.remove_outlier_altitudes(depth_and_outlier_threshold)
             print(f"Using manually provided time offset: {offset}s")
 
         # Determine up vector

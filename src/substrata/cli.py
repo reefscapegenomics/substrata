@@ -215,9 +215,9 @@ def handle_firefish(args):
 
     # Optionally filter cameras by group name
     if args.cams_group:
-        cams = init.cams.group(args.cams_group)
+        filtered_cams = init.cams.group(args.cams_group)
     else:
-        cams = init.cams
+        filtered_cams = init.cams
 
     # Calculate scale factor to get accurate camera distances only
     if init.scale_factor is None:
@@ -229,7 +229,7 @@ def handle_firefish(args):
 
     # Run up-vector determination (on unscaled/unoriented pointcloud)
     up_vector, depth_offset, depth_per_unit = ff.determine_up_vector(
-        cams,
+        filtered_cams,
         target_depth,
         init.pcd,
         distance_scale_factor=init.scale_factor,  # for camdists only
@@ -260,7 +260,7 @@ def handle_firefish(args):
         # Save camera depth residuals PDF
         output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
         # init.cams.load_camera_attributes(cam_depths_file)
-        init.cams.save_depth_residuals_pdf(filepath=output_pdf)
+        filtered_cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_cams2video(args):
