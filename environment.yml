@@ -23,3 +23,4 @@ dependencies:
       - fpdf2
       - gspread
       - net-tools
+      - exifread
