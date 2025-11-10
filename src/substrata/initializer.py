@@ -396,36 +396,27 @@ class ProjectInitializer:
         self.scale_factor = self.scalebars.calc_scalefactor()
         return self.scale_factor
 
-    def scale_and_orient(self):
+    def scale_and_orient(self, plot=True, recalculate=True):
         """
         Calculates scale and orientation transforms and applies them using the
         Pointcloud.apply_orientation_transforms() method.
 
+        Note that depth_offset is based on depth_per_unit (vertical scaling factor),
+        and so z-values are only very rough approximations of depth
         """
         # Ensure at least the poincloud is initialized
         if self.pcd is None:
             raise ValueError("Pointcloud is not initialized")
 
-        # If orientation-related fields are not computed, compute them now
-        # these units are relative to orig_coords (unscaled / unoriented)
-        if (
-            (self.up_vector is None)
-            or (self.depth_offset is None)
-            or (self.depth_per_unit is None)
-        ):
+        if recalculate:
+            # Determine up vector, depth offset and depth per unit
             self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
-                self.cams.get_up_vector_from_camera_depths()
+                self.cams.get_up_vector_from_camera_depths(plot=plot)
             )
-
-        # If scale_factor is not computed, compute it now
-        if self.scale_factor is None:
+            # Determine scale factor
             self.calc_scale_factor()
 
-        # Apply scale and orientation transforms to pointcloud (using its properties
-        # for additional centering and orientation)
-        #
-        # Note that depth_offset is based on depth_per_unit (vertical scaling factor),
-        # and so z-values are only very rough approximations of depth
+        # Apply scale and orientation transforms to pointcloud
         if not self.pcd.world_transform_is_identity:
             print(
                 f"Warning: Pointcloud already has a world_transform , this will add to it: {self.pcd.world_transform}"
@@ -433,13 +424,17 @@ class ProjectInitializer:
         self.pcd.apply_orientation_transforms(
             self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit
         )
-
+    
+        # Set camera attributes
+        self.cams.up_vector = self.up_vector
         self.cams.depth_offset = self.depth_offset
         self.cams.depth_per_unit = self.depth_per_unit
 
         # Propagate pointcloud world_transform to cameras/markers/annotations
         self.world_transform = self.pcd.world_transform
         self.apply_world_transform(skip_pcd=True)
+
+        return self.up_vector, self.depth_offset, self.depth_per_unit
 
     def __add_path_if_needed(self, filename):
         # If filename is an absolute path or contains directories, use it as is.

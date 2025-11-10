@@ -15,6 +15,9 @@ from joblib import Parallel, delayed
 from open3d import geometry, utility, cpu
 import open3d as o3d
 from scipy.signal import convolve2d
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from dataclasses import dataclass
 
 try:  # TO DO
     import alphashape
@@ -1407,3 +1410,66 @@ def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
     # Normal slerp
     return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u \
             + (np.sin(t * angle) / np.sin(angle)) * v
+
+
+@dataclass
+class DepthRegressionResult:
+    up_vector: np.ndarray
+    depth_offset: float
+    depth_per_unit: float
+    mse: float
+    rmse: float
+    mae: float
+    r2: float
+    depths_pred: np.ndarray
+    depths_res: np.ndarray
+
+
+def fit_depth_regression(
+    points: np.ndarray, depths: np.ndarray
+) -> DepthRegressionResult:
+    """
+    Fit linear regression: depth ≈ intercept + coef · (x, y, z).
+    Returns up-vector (coef; sign adjusted so stepping along it decreases depth),
+    offset, per-unit depth change, and error metrics with predictions/residuals.
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must be shape (N, 3)")
+    if depths.ndim != 1 or depths.shape[0] != points.shape[0]:
+        raise ValueError("depths must be shape (N,) and align with points")
+    if len(points) < 2:
+        raise ValueError("Need at least 2 points for regression")
+
+    model = LinearRegression()
+    model.fit(points, depths)
+    coef = model.coef_.astype(float)
+    depth_offset = float(model.intercept_)
+    depth_per_unit = float(np.linalg.norm(coef))
+
+    # Evaluate sign: flip so that stepping along coef decreases depth
+    centroid = points.mean(axis=0)
+    depth_centroid = float(model.predict([centroid])[0])
+    p_step = centroid + 1.0 * coef
+    depth_step = float(model.predict([p_step])[0])
+    if depth_step < depth_centroid:
+        coef = -coef
+
+    depths_pred = model.predict(points).astype(float)
+    depths_res = depths.astype(float) - depths_pred
+
+    mse = float(mean_squared_error(depths, depths_pred))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(depths, depths_pred))
+    r2 = float(r2_score(depths, depths_pred))
+
+    return DepthRegressionResult(
+        up_vector=coef,
+        depth_offset=depth_offset,
+        depth_per_unit=depth_per_unit,
+        mse=mse,
+        rmse=rmse,
+        mae=mae,
+        r2=r2,
+        depths_pred=depths_pred,
+        depths_res=depths_res,
+    )

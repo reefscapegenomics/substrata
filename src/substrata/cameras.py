@@ -17,14 +17,12 @@ import pandas as pd
 from PIL import Image
 from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import exifread
 
 # Local Modules
-from substrata import visualizations, settings, geom
+from substrata import visualizations, settings, geom, measurements
 from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
@@ -184,9 +182,10 @@ class Cameras:
         )  # TODO: CHECK!
 
     def subset(self, length):
-        cameras_subset = Cameras()
+        cameras_subset = self._empty_like()
         for cam_id in list(self.data.keys())[:length]:
             cameras_subset.data[cam_id] = self.data[cam_id]
+            cameras_subset.data[cam_id].parent = cameras_subset
         return cameras_subset
 
     def subset_by_filename_prefix(self, prefix):
@@ -198,10 +197,11 @@ class Cameras:
         Returns:
             Cameras: New container with matching cameras.
         """
-        cameras_subset = Cameras()
+        cameras_subset = self._empty_like()
         for cam in self.data.values():
             if cam.filename.startswith(prefix):
                 cameras_subset.data[cam.cam_id] = cam
+                cam.parent = cameras_subset
         return cameras_subset
 
     def subset_by_filepath_postfix(self, postfix):
@@ -213,11 +213,12 @@ class Cameras:
         Returns:
             Cameras: New container with matching cameras.
         """
-        cameras_subset = Cameras()
+        cameras_subset = self._empty_like()
         for cam in self.data.values():
             folder = os.path.dirname(cam.filepath)
             if folder.endswith(postfix) or folder.endswith(postfix + os.sep):
                 cameras_subset.data[cam.cam_id] = cam
+                cam.parent = cameras_subset
         return cameras_subset
 
     def subset_by_group(self, group_name):
@@ -229,10 +230,11 @@ class Cameras:
         Returns:
             Cameras: New container with cameras from the requested group.
         """
-        cameras_subset = Cameras()
+        cameras_subset = self._empty_like()
         for cam in self.data.values():
             if getattr(cam, "group", None) == group_name:
                 cameras_subset.data[cam.cam_id] = cam
+                cam.parent = cameras_subset
         return cameras_subset
 
     def subset_by_sensor(self, sensor_id):
@@ -244,10 +246,11 @@ class Cameras:
         Returns:
             Cameras: New container with cameras using the specified sensor.
         """
-        cameras_subset = Cameras()
+        cameras_subset = self._empty_like()
         for cam in self.data.values():
             if getattr(cam, "sensor_id", None) == sensor_id:
                 cameras_subset.data[cam.cam_id] = cam
+                cam.parent = cameras_subset
         if len(cameras_subset.data) == 0:
             print(f"No cameras found with sensor_id={sensor_id}")
         return cameras_subset
@@ -255,6 +258,54 @@ class Cameras:
     # Convenience alias to match the requested call-site: Cameras.group("name")
     def group(self, group_name):
         return self.subset_by_group(group_name)
+
+    def _empty_like(self) -> "Cameras":
+        """Return an empty Cameras container inheriting this instance's metadata."""
+        subset = Cameras()
+        for attr, val in self.__dict__.items():
+            if attr == "data":
+                continue
+            try:
+                setattr(subset, attr, val)
+            except Exception:
+                pass
+        subset.data = {}
+        return subset
+
+    def filter_by_ids(self, cam_ids):
+        """Return a new Cameras container containing only the specified camera ids.
+
+        Copies container metadata (shallow) and re-parents included Camera objects
+        so downstream code can rely on attributes like world_transform, up_vector, etc.
+        """
+        subset = self._empty_like()
+        for cid in cam_ids:
+            cam = self.data.get(cid)
+            if cam is not None:
+                subset.data[cid] = cam
+                cam.parent = subset
+        return subset
+
+    def filter_by_cams(self, cams_list):
+        """Return a new Cameras container containing only the specified Camera objects.
+
+        Equivalent to calling filter_by_ids([cam.cam_id for cam in cams_list]).
+        """
+        ids = [getattr(cam, "cam_id", None) for cam in cams_list]
+        ids = [cid for cid in ids if cid is not None]
+        return self.filter_by_ids(ids)
+
+    def reset_depth_sensor_m(self):
+        """Reset the depth_sensor_m attribute for all cameras to None."""
+        for cam in self.data.values():
+            cam.depth_sensor_m = None
+
+    def set_depth_sensor_m(self, depth_by_cam_id):
+        """Set depth_sensor_m for cameras from a mapping of cam_id -> depth (meters)."""
+        for cam_id, depth in depth_by_cam_id.items():
+            cam = self.data.get(cam_id)
+            if cam is not None:
+                cam.depth_sensor_m = float(depth)
 
     def get_cams_from_file(self, cams_meta_filepath):
         """Load cameras from a JSON file and store them in the container.
@@ -276,7 +327,7 @@ class Cameras:
             if "reference" in cam_data:
                 self.data[cam_id].reference = cam_data["reference"]
                 # Ensure depth is negative (in meters)
-                self.data[cam_id].depth = -abs(cam_data["reference"][2])
+                self.data[cam_id].depth_sensor_m = -abs(cam_data["reference"][2])
             if "reference_accuracy" in cam_data:
                 self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
                 self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
@@ -422,11 +473,12 @@ class Cameras:
         """Load camera attributes from a CSV file.
 
         Updates each camera in the container with attributes such as path,
-        datetime, distance, and depth information.
+        datetime, distance, and depth information (stored in depth_sensor_m).
 
         Args:
             input_filepath (str): Path to the CSV file with camera attributes.
         """
+        cam_counter = 0
         not_found_counter = 0
         with open(input_filepath, "r") as csvfile:
             reader = csv.DictReader(csvfile)
@@ -437,18 +489,17 @@ class Cameras:
                     cam.orig_filepath = row["path"]
                     cam.datetime = row["datetime"] if row["datetime"] else None
                     cam.camdist = row["camdist"] if row["camdist"] else None
-                    cam.depth = float(row["depth"]) if row["depth"] else None
-                    cam.depth_pred = (
-                        float(row["depth_pred"]) if row["depth_pred"] else None
-                    )
-                    cam.depth_residual = (
-                        float(row["depth_res"]) if row["depth_res"] else None
-                    )
+                    cam.depth_sensor_m = float(row["depth"]) if row["depth"] else None
+                    cam_counter += 1
                 else:
                     not_found_counter += 1
         if not_found_counter > 0:
             logger.warning(
                 f"File had {not_found_counter} cameras that were not found..."
+            )
+        if cam_counter == 0:
+            logger.warning(
+                f"No cameras found in file {input_filepath}"
             )
 
     def save_camera_attributes(self, output_filepath):
@@ -479,7 +530,9 @@ class Cameras:
                         "path": cam.orig_filepath,
                         "datetime": getattr(cam, "datetime", None),
                         "camdist": getattr(cam, "camdist", None),
-                        "depth": getattr(cam, "depth", None),
+                        # Keep CSV column name 'depth' for compatibility,
+                        # but read from Camera.depth_sensor_m
+                        "depth": getattr(cam, "depth_sensor_m", None),
                         "depth_pred": getattr(cam, "depth_pred", None),
                         "depth_res": getattr(cam, "depth_residual", None),
                     }
@@ -666,7 +719,7 @@ class Cameras:
     ):
         """Compute the up vector using least-squares regression on camera depths.
 
-        Fits a linear regression between the camera 3D points and their depths to
+        Fits a linear regression between the camera 3D points and their sensor depths to
         find the dominant depth direction. Also stores predicted depths and errors.
 
         Args:
@@ -675,132 +728,94 @@ class Cameras:
         Returns:
             np.ndarray: The coefficient vector representing the up vector.
         """
+        # Filter cameras to those with depth_sensor_m and coords, and if they have a depth accuracy threshold
+        # ensure that it is below the threshold
         cams_filtered = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth")
+            if hasattr(cam, "depth_sensor_m")
             and hasattr(cam, "coords")
-            and cam.depth is not None
+            and cam.depth_sensor_m is not None
             and cam.coords is not None
             and (
                 not hasattr(cam, "depth_acc")
                 or cam.depth_acc <= depth_accuracy_threshold
             )
         ]
+        print(f"Found {len(cams_filtered)} matching cameras/depths for regression")
 
-        num_matches = len(cams_filtered)
-        print(f"Found {num_matches} matching cameras/depths for regression")
-        if num_matches < 2:
-            # Not enough points to fit a regression
-            raise ValueError(
-                f"Not enough matching cameras/depths for regression (found {num_matches})"
-            )
-
+        # Conduct regression on the filtered cameras
         cam_ids = [cam.cam_id for cam in cams_filtered]
         points = np.array([cam.coords for cam in cams_filtered])
-        depths = np.array([cam.depth for cam in cams_filtered])
+        depths = np.array([cam.depth_sensor_m for cam in cams_filtered])
 
-        # 1) Fit a linear regression model:  depth ≈ intercept + coef·(x,y,z)
-        model = LinearRegression()
-        model.fit(points, depths)
-        coef = model.coef_  # shape (3,)
-        depth_offset = model.intercept_
-        depth_per_unit = np.linalg.norm(coef)
+        res = measurements.fit_depth_regression(points, depths)
 
-        # 2) Evaluate sign so that stepping along 'coef' decreases depth:
-        centroid = np.mean(points, axis=0)  # single 3D point
-        depth_centroid = model.predict([centroid])[0]
-
-        # Take a small step in the direction of 'coef' and predict depth
-        step_size = 1.0
-        p_step = centroid + step_size * coef
-        depth_step = model.predict([p_step])[0]
-
-        # If stepping along coef yields a more negative depth, flip it
-        if depth_step < depth_centroid:
-            coef = -coef
-
-        # 3) Store predicted depths and residuals from the (original) linear model
-        depths_predicted = model.predict(points)
-        depths_residuals = depths - depths_predicted
-
-        mse = mean_squared_error(depths, depths_predicted)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(depths, depths_predicted)
-        r2 = r2_score(depths, depths_predicted)
-
-        for idx, cam_id in enumerate(cam_ids):
-            self.data[cam_id].depth_pred = depths_predicted[idx]
-            self.data[cam_id].depth_residual = depths_residuals[idx]
-
-        # Build a dict of residuals if you need them downstream
-        cam_depth_residuals = dict(zip(cam_ids, depths_residuals))
 
         # 4) Plot the regression fit if requested
         if plot:
             from substrata import visualizations
-
-            visualizations.plot_depth_regression(depths, depths_predicted)
+            visualizations.plot_depth_regression(depths, res.depths_pred)
 
         # Print summary statistics
         print(
-            f"  Up vector (normalized): [{coef[0]:.4f}, {coef[1]:.4f}, {coef[2]:.4f}]"
+            f"  Up vector: [{res.up_vector[0]}, {res.up_vector[1]}, {res.up_vector[2]}]"
         )
-        print(f"  Depth offset: {depth_offset:.4f} m")
+        print(f"  Depth offset: {res.depth_offset:.4f} m")
+        print(f"  Depth per unit: {res.depth_per_unit:.4f} m")
+        print(f"  Mean squared error: {res.mse:.4f} m²")
+        print(f"  Root mean squared error: {res.rmse:.4f} m")
+        print(f"  Mean absolute error: {res.mae:.4f} m")
+        print(f"  R²: {res.r2:.4f}")
+        print(f"  Number of matches: {len(cams_filtered)}")
 
         # 5) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
         return (
-            coef,
-            depth_offset,
-            depth_per_unit,
-            mse,
-            rmse,
-            mae,
-            r2,
-            cam_depth_residuals,
-            num_matches,
+            res.up_vector,
+            res.depth_offset,
+            res.depth_per_unit,
+            res.mse,
+            res.rmse,
+            res.mae,
+            res.r2,
+            len(cams_filtered),
         )
 
-    def get_depths_and_preds(
+    def get_depths_and_estimated_depths(
         self,
-        depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
-        recalculate=True,
+        depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
     ):
         """
-        Get the depths and predicted depths for the cameras. If recalculate is True, recalculate the depths and predicted depths.
+        Get the sensor depths (.depth_sensor_m) and predicted depths (.depth_in_m)
+        for the cameras.
 
         Args:
             depth_accuracy_threshold (float): The depth accuracy threshold.
-            recalculate (bool): If True, recalculate the depths and predicted depths.
 
         Returns:
             tuple: A tuple containing the depths and predicted depths.
         """
-        if recalculate:
-            for cam in self.data.values():
-                if hasattr(cam, "depth") and cam.depth is not None:
-                    cam.depth_pred = cam.depth_in_m
-                    cam.depth_residual = cam.depth - cam.depth_pred
-
-        cams_filtered = [
+        cams_list = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth")
-            and hasattr(cam, "depth_pred")
+            if cam.depth_sensor_m is not None
+            and cam.coords is not None
             and (
                 not hasattr(cam, "depth_acc")
                 or cam.depth_acc <= depth_accuracy_threshold
             )
         ]
-        depths = [camera.depth for camera in cams_filtered]
-        depths_pred = [camera.depth_pred for camera in cams_filtered]
-        return depths, depths_pred
+        cams_filtered = self.filter_by_cams(cams_list)
+        depths = [cam.depth_sensor_m for cam in cams_filtered.data.values()]
+        est_depths = [cam.depth_in_m for cam in cams_filtered.data.values()]
+        return depths, est_depths, cams_filtered
 
     def get_depths_and_z_coords(
         self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
     ):
         """
-        Get the depths and z-coordinates for the cameras.
+        Get the recorded camera depths (.depth_sensor_m) and current z-coordinates
+        (.coords[2]) for the cameras.
 
         Args:
             depth_accuracy_threshold (float): The depth accuracy threshold.
@@ -808,39 +823,57 @@ class Cameras:
         Returns:
             tuple: A tuple containing the depths and z-coordinates.
         """
-        cams_filtered = [
+        cams_list = [
             cam
             for cam in self.data.values()
-            if hasattr(cam, "depth")
-            and hasattr(cam, "coords")
+            if hasattr(cam, "depth_sensor_m")
+            and cam.depth_sensor_m is not None
+            and cam.coords is not None
             and (
                 not hasattr(cam, "depth_acc")
                 or cam.depth_acc <= depth_accuracy_threshold
             )
         ]
-        depths = [camera.depth for camera in cams_filtered]
-        z_coords = [camera.coords[2] for camera in cams_filtered]
-        return depths, z_coords
+        cams_filtered = self.filter_by_cams(cams_list)
+        depths = [cam.depth_sensor_m for cam in cams_filtered.data.values()]
+        z_coords = [cam.coords[2] for cam in cams_filtered.data.values()]
+        return depths, z_coords, cams_filtered
+    
 
-    def show_depth_residuals(self, width=15, height=5, recalculate=True):
-        """Show camera residuals using cam.depth_residual for each camera.
+    def show_depth_vs_est_depth_residuals(self, width=15, height=5):
+        """Show residuals between predicted depth_in_m and the original recorded camera depths.
+        
+        These residuals are calculated based on recorded camera depths and the predicted depths from the regression model.
 
         Args:
-            width (float): Figure width in inches (default: 10)
+            width (float): Figure width in inches (default: 15)
             height (float): Figure height in inches (default: 5)
             recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
-        depths, z_coords = self.get_depths_and_preds(recalculate=recalculate)
-        fig = visualizations.plot_depth_regression(
-            depths, z_coords, width=width, height=height
-        )
-        fig2 = visualizations.plot_cam_residuals(self, width=width, height=height)
-        return fig, fig2
+        depths, est_depths, cams_filtered = self.get_depths_and_estimated_depths()
+        fig1 = visualizations.plot_depth_regression(depths, est_depths, width=width, height=height, title="Depth vs Estimated Depth")
+        fig2 = visualizations.plot_cam_residuals(cams_filtered, depths, est_depths, width=width, height=height)
+        return fig1, fig2
+
+    def show_z_vs_depth_residuals(self, width=15, height=5):
+        """Show residuals between camera z-coordinates and the original recorded camera depths.
+
+        Args:
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+            recalculate (bool): If True, recalculate the depth residuals (default: True)
+        """
+        depths, z_coords, cams_filtered = self.get_depths_and_z_coords()
+        fig1 = visualizations.plot_depth_regression(depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate")
+        fig2 = visualizations.plot_cam_residuals(cams_filtered, depths, z_coords, width=width, height=height)
+        return fig1, fig2
 
     def save_depth_residuals_pdf(
         self, filepath=None, width=15, height=5, recalculate=True
     ):
         """Save camera depth residuals visualization as a PDF.
+
+        These residuals are calculated based on recorded camera depths and the predicted depths from the regression model.
 
         Args:
             filepath (str, optional): Path to save the PDF file. If None, generates
@@ -868,14 +901,15 @@ class Cameras:
                     filepath = "depth_residuals.pdf"
 
             # Get the figures from show_depth_residuals
-            fig1, fig2 = self.show_depth_residuals(
-                width=width, height=height, recalculate=recalculate
-            )
+            fig1, fig2 = self.show_depth_vs_est_depth_residuals(width=width, height=height)
+            fig3, fig4 = self.show_z_vs_depth_residuals(width=width, height=height)
 
             # Save both figures to PDF
             pdf = PdfPages(filepath)
             pdf.savefig(fig1)
             pdf.savefig(fig2)
+            pdf.savefig(fig3)
+            pdf.savefig(fig4)
             pdf.close()
 
             # Close figures to free memory
@@ -908,6 +942,7 @@ class Camera:
         self.cam_id = cam_id
         self.camera_transform = self.orig_camera_transform = camera_transform
         self.coords = self.orig_coords = coords
+        self.depth_sensor_m = None # Depth in meters as measured by a sensor
         self.orig_filepath = path
         self.filename = os.path.basename(path)
         self.sensor_id = None  # Will be set during XML parsing
@@ -1001,15 +1036,30 @@ class Camera:
 
     @property
     def depth_in_m(self) -> float:
-        """Calculate the depth in meters for the camera using original Z-coordinate.
+        """Depth in meters from the 3D regression (orig frame).
+
+        Uses the regression model stored on the parent:
+            depth ≈ depth_offset + up_vector · orig_coords
+
+        Where ``up_vector`` is the 3-D coefficient vector returned by the
+        regression (not necessarily unit-length), and ``orig_coords`` are the
+        camera centers in the original coordinate frame used for the fit.
 
         Returns:
-            float: The depth in meters based on orig_coords[2], parent's depth_per_unit, and
-                parent's depth_offset.
+            float: Depth value in meters, or None if inputs are missing.
         """
-        return (
-            self.parent.depth_offset + self.parent.depth_per_unit * self.orig_coords[2]
-        )
+        if self.orig_coords is None:
+            print(f"No coordinates found for camera {self.cam_id}")
+            return None
+
+        if (
+            not hasattr(self.parent, "up_vector") or self.parent.up_vector is None or
+            not hasattr(self.parent, "depth_offset") or self.parent.depth_offset is None
+        ):
+            print("Cameras 'up_vector' and/or depth_offset not set")
+            return None
+
+        return float(self.parent.depth_offset + float(np.dot(self.parent.up_vector, self.orig_coords)))
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.

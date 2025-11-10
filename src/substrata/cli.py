@@ -32,7 +32,7 @@ def _infer_target_depth(base: str, explicit_depth):
     m = re.search(r"_(\d+)m_", base)
     if m:
         try:
-            return int(m.group(1))
+            return -int(m.group(1))
         except Exception:
             return None
     return None
@@ -168,7 +168,7 @@ def handle_orient(args):
         init.pcd_filepath = args.input
 
     # Initialize project (loads PCD, cameras/markers if available)
-    init.initialize()
+    init.initialize(apply_transform=False)
 
     # Run scale_and_orient workflow
     init.scale_and_orient()
@@ -179,35 +179,32 @@ def handle_orient(args):
     print(f"Saved orientation to YAML: {yaml_path}")
 
     # Also output composite views as done for the "views" command
-    output_pdf = args.output_pdf or _get_output_filepath(init, "views.pdf")
+    output_pdf = _get_output_filepath(init, "views.pdf")
     init.pcd.save_pdf(filepath=output_pdf)
 
     # Save camera depth residuals PDF
-    output_pdf = args.output_pdf or _get_output_filepath(init, "depth_residuals.pdf")
+    output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
     init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_firefish(args):
-    # Build defaults from current directory name
+    """Handles the 'firefish' command.
+
+    Args:
+        args: Parsed command-line arguments.
+    """
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd)
 
     # Arguments
     target_depth = _infer_target_depth(base, args.target_depth)
-    pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_firefish.pdf")
+    pdf_output = os.path.join(cwd, f"{base}_firefish.pdf")
     cam_depths_file = args.cam_depths_file or os.path.join(cwd, f"{base}_camdepths.csv")
-    kwargs = {
-        "camdepths_filepath": cam_depths_file,
-        "pdf_output_filepath": pdf_output,
-    }
-    if args.depth_outlier_thresh is not None:
-        kwargs["depth_and_outlier_threshold"] = args.depth_outlier_thresh
+    depth_and_outlier_threshold = args.depth_outlier_thresh if args.depth_outlier_thresh is not None else None
     if args.input:
         init.pcd_filepath = args.input
 
-    # Initialize FireFish file
     from substrata.firefish import FireFish
-
     ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
 
     # Initialize project (loads PCD, cameras/markers if available) without transforms
@@ -216,35 +213,39 @@ def handle_firefish(args):
     # Optionally filter cameras by group name
     if args.cams_group:
         filtered_cams = init.cams.group(args.cams_group)
+        print(f"Number of cameras considered (after filter by group): {len(filtered_cams.items())}")
     else:
         filtered_cams = init.cams
+        print(f"All cameras are being considered: {len(filtered_cams.items())}")
 
-    # Calculate scale factor to get accurate camera distances only
-    if init.scale_factor is None:
-        init.calc_scale_factor()
+    if len(filtered_cams.items()) == 0:
+        raise ValueError(f"No cameras available in this group. Available camera groups: {init.cams.group_names}")
+
+    # Calculate scale factor (but do not apply yet - to get accurate camera distances only)
+    init.calc_scale_factor()
+    
     if init.scale_factor is None:
         raise ValueError("Scale factor is not set")
     else:
         print(f"Scale factor: {init.scale_factor}")
 
     # Run up-vector determination (on unscaled/unoriented pointcloud)
-    up_vector, depth_offset, depth_per_unit = ff.determine_up_vector(
+    init.up_vector, init.depth_offset, init.depth_per_unit = ff.determine_up_vector(
         filtered_cams,
         target_depth,
         init.pcd,
-        distance_scale_factor=init.scale_factor,  # for camdists only
+        distance_scale_factor=init.scale_factor,
         offset=args.offset,
-        **kwargs,
+        camdepths_filepath=cam_depths_file,
+        pdf_output_filepath=pdf_output,
+        depth_and_outlier_threshold=depth_and_outlier_threshold,
     )
 
     # Optionally persist orientation results to YAML
     if getattr(args, "save_yaml", False):
-        # Set scaling/orientation values and run apply_orientation_transforms()
-        # via the scale_and_orient() method
-        init.up_vector = up_vector
-        init.depth_offset = float(depth_offset)
-        init.depth_per_unit = float(depth_per_unit)
-        init.scale_and_orient()
+        # Apply scale and orientation transforms to pointcloud (using its properties
+        # for additional centering and orientation)
+        init.scale_and_orient(recalculate=False, plot=False)
 
         # Save values to YAML
         yaml_path = init.yaml_path or os.path.join(
@@ -259,8 +260,7 @@ def handle_firefish(args):
 
         # Save camera depth residuals PDF
         output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
-        # init.cams.load_camera_attributes(cam_depths_file)
-        filtered_cams.save_depth_residuals_pdf(filepath=output_pdf)
+        init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_cams2video(args):
@@ -693,13 +693,6 @@ def main():
         default=None,
         help="Optional explicit input PLY path (overrides initializer).",
     )
-    p_orient.add_argument(
-        "--output_pdf",
-        dest="output_pdf",
-        type=str,
-        default=None,
-        help="Output PDF filepath.",
-    )
 
     # firefish
     p_ff = subparsers.add_parser(
@@ -728,15 +721,6 @@ def main():
         ),
     )
     p_ff.add_argument(
-        "--pdf-output",
-        dest="pdf_output",
-        type=str,
-        default=None,
-        help=(
-            "Optional output PDF filepath. Default: <cwd_basename>_firefish.pdf in current folder."
-        ),
-    )
-    p_ff.add_argument(
         "--cam-depths-file",
         dest="cam_depths_file",
         type=str,
@@ -749,7 +733,7 @@ def main():
         "--depth-outlier-threshold",
         dest="depth_outlier_thresh",
         type=int,
-        default=None,
+        default=settings.FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD,
         help=(
             "Optional depth/outlier threshold (meters). Defaults to FireFish.determine_up_vector default."
         ),

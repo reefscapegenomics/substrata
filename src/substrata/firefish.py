@@ -8,15 +8,13 @@ import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import RobustScaler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
-from substrata import settings, visualizations
+from substrata import settings, visualizations, measurements
 
 logger = logging.getLogger(__name__)
 
@@ -136,16 +134,17 @@ class FireFish:
         """Get the last time in the FireFish data"""
         return int(self.data.iloc[-1]["unixtime"])
 
-    def determine_camera_time_offset(
+    def determine_camera_time_offset_based_on_lowest_depth_regression_error(
         self,
         cams,
         target_depth=None,
         time_range=None,
         time_step=1,
         depth_and_outlier_threshold=settings.FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD,
+        min_num_cam_matches=settings.FIREFISH_MIN_NUM_CAM_MATCHES,
     ):
         """Determine the time offset for each camera by finding the depth"""
-        # Filter the data for a particular depth range (e.g. 35-45 m)
+        # Filter the data for outliers and the depth range of interest(e.g. 35-45 m)
         self.remove_outlier_altitudes(depth_and_outlier_threshold)
         if target_depth:
             filtered_data = self.filter_by_depth_range(
@@ -172,25 +171,25 @@ class FireFish:
         # Calculate error statistics for offset range
         error_stats = []
 
-        def safe_get_mae(offset, n_treshold=100):
-            try:
-                result = self.get_up_vector_from_camera_depths_with_offset(cams, offset)
-                # Return tuple is: (coef, depth_offset, depth_per_unit, mse, rmse, mae, r2, cam_depth_residuals, num_matches)
-                mae = result[5]
-                num_matches = result[8]
-                # If mae is nan, inf, or result is not valid, skip
-                if np.isnan(mae) or np.isinf(mae) or num_matches < n_treshold:
-                    return None
-                return {"offset": offset, "mae": mae}
-            # except ValueError as e:
-            #     logger.warning(f"Skipping offset {offset} due to error: {e}")
-            #     return None
-            except Exception as e:
-                # logger.error(f"Unexpected error at offset {offset}: {e}")
+        def get_mae_from_depth_regression(offset):
+            # Build arrays for regression without mutating cams
+            points, depths = self.get_camera_coords_and_depths_from_firefish(cams, offset)
+            if len(points) < min_num_cam_matches:
                 return None
+            try:
+                res = measurements.fit_depth_regression(points, depths)
+            except Exception:
+                return None
+            if np.isnan(res.mae) or np.isinf(res.mae):
+                return None
+            return {
+                "offset": offset,
+                "mae": res.mae,
+                "num_matches": len(points),
+            }
 
         error_stats = Parallel(n_jobs=-1)(
-            delayed(safe_get_mae)(offset)
+            delayed(get_mae_from_depth_regression)(offset)
             for offset in tqdm(
                 range(time_range[0], time_range[1], time_step),
                 desc="Processing Offsets",
@@ -217,87 +216,36 @@ class FireFish:
         fig = self.__plot_matches(offsets, maes, maes)
         return lowest_mae_offset, fig
 
-    def get_up_vector_from_camera_depths_with_offset(self, cams, offset):
-        """Compute the up vector by doing a least-squared regression between the
-        3D points and camera depths to find the vector that is most strongly
-        associated with the camera depth measurements. Also returns depth offset
-        and the number of matching cameras/depths used in the fit.
+
+    def get_camera_depths_from_firefish(self, cams, offset):
         """
-
-        # Gather camera 3D positions (points) and corresponding depth measurements
+        Build a mapping of cam_id -> depth (meters) from FireFish data at a given offset.
+        """
+        # Get the cameras with datetime and find matches, but do not mutate cameras here
         cams_with_datetime = [cam for cam in cams if cam.has_coords_datetime()]
-        cam_points = []
-        cam_depths = []
-        cam_ids = []
-
+        cam_id_to_sensor_depth_m = {}
         for cam in cams_with_datetime:
             cam_time_adjusted = get_unix_time(cam.datetime) + offset
-            match = self.data[self.data["unixtime"] == cam_time_adjusted]
-            if not match.empty:
-                cam_ids.append(cam.cam_id)
-                cam_points.append(cam.coords)
-                cam_depths.append(match.iloc[0]["depth"])
-                # Optionally store that depth back into the camera object
-                cam.depth = match.iloc[0]["depth"]
-
-        num_matches = len(cam_points)
-
-        if num_matches < 50:
-            # Not enough points to fit a regression
-            raise ValueError("Not enough points to fit a regression: {num_matches}")
-
-        points = np.array(cam_points)
-        depths = np.array(cam_depths)
-
-        # 1) Fit a linear regression model:  depth ≈ intercept + coef·(x,y,z)
-        model = LinearRegression()
-        model.fit(points, depths)
-        coef = model.coef_  # shape (3,)
-        depth_offset = model.intercept_
-        depth_per_unit = np.linalg.norm(coef)
-
-        # 2) Evaluate sign so that stepping along 'coef' decreases depth:
-        centroid = np.mean(points, axis=0)  # single 3D point
-        depth_centroid = model.predict([centroid])[0]
-
-        # Take a small step in the direction of 'coef' and predict depth
-        step_size = 1.0
-        p_step = centroid + step_size * coef
-        depth_step = model.predict([p_step])[0]
-
-        # If stepping along coef yields a *larger* depth, flip it
-        if depth_step > depth_centroid:
-            coef = -coef
-
-        # 3) Store predicted depths and residuals from the (original) linear model
-        depths_predicted = model.predict(points)
-        depths_residuals = depths - depths_predicted
-
-        mse = mean_squared_error(depths, depths_predicted)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(depths, depths_predicted)
-        r2 = r2_score(depths, depths_predicted)
-
-        for idx, cam_id in enumerate(cam_ids):
-            cams.data[cam_id].depth_pred = depths_predicted[idx]
-            cams.data[cam_id].depth_residual = depths_residuals[idx]
-            cams.data[cam_id].depth_acc = settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
-
-        # Build a dict of residuals if you need them downstream
-        cam_depth_residuals = dict(zip(cam_ids, depths_residuals))
-
-        # 4) Return the *flipped-if-needed* up vector and error metrics, plus number of matches
-        return (
-            coef,
-            depth_offset,
-            depth_per_unit,
-            mse,
-            rmse,
-            mae,
-            r2,
-            cam_depth_residuals,
-            num_matches,
-        )
+            match_firefish = self.data[self.data["unixtime"] == cam_time_adjusted]
+            if not match_firefish.empty:
+                cam_id_to_sensor_depth_m[cam.cam_id] = float(match_firefish.iloc[0]["depth"])
+        return cam_id_to_sensor_depth_m
+    
+    def get_camera_coords_and_depths_from_firefish(self, cams, offset):
+        """
+        Build numpy arrays of (points, depths) for cameras that have FireFish depth
+        at the given offset. Does not mutate cameras.
+        """
+        mapping = self.get_camera_depths_from_firefish(cams, offset)
+        points = []
+        depths = []
+        for cam_id, depth in mapping.items():
+            cam = cams.data.get(cam_id)
+            if cam is None or cam.coords is None:
+                continue
+            points.append(cam.coords)
+            depths.append(depth)
+        return np.array(points), np.array(depths, dtype=float)
 
     def determine_up_vector(
         self,
@@ -305,35 +253,18 @@ class FireFish:
         target_depth,
         pcd,
         distance_scale_factor=1.0,
-        cams_filepath_postfix_filter=None,
-        cams_filename_prefix_filter=None,
         camdepths_filepath=None,
         pdf_output_filepath=None,
-        depth_and_outlier_threshold=3,
+        depth_and_outlier_threshold=settings.FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD,
         offset=None,
     ):
         """
         Workflow method that will determine offset, then up vector and then outputs
         visualizations for manual review.
 
-        Optionally filter cameras by filepath postfix or prefix.
-
         Distance scale factor is used only for camera distances and plot visualizations.
         It is not used for the up vector determination.
         """
-        # Optionally filter cameras by filepath postfix
-        if cams_filepath_postfix_filter is not None:
-            cams = cams.subset_by_filepath_postfix(cams_filepath_postfix_filter)
-            print(
-                f"Filtered cameras to {len(cams.items())} cameras using postfix {cams_filepath_postfix_filter}"
-            )
-        # Optionally filter cameras by filename prefix
-        if cams_filename_prefix_filter is not None:
-            cams = cams.subset_by_filename_prefix(cams_filename_prefix_filter)
-            print(
-                f"Filtered cameras to {len(cams.items())} cameras using prefix {cams_filename_prefix_filter}"
-            )
-
         # Create PDF output file
         if not pdf_output_filepath:
             pdf_output_filepath = "{0}_upvector.pdf".format(pcd.name)
@@ -351,7 +282,7 @@ class FireFish:
 
         # Determine camera time offset unless provided manually
         if offset is None:
-            offset, fig = self.determine_camera_time_offset(
+            offset, fig = self.determine_camera_time_offset_based_on_lowest_depth_regression_error(
                 cams,
                 target_depth=target_depth,
                 depth_and_outlier_threshold=depth_and_outlier_threshold,
@@ -365,19 +296,12 @@ class FireFish:
             self.remove_outlier_altitudes(depth_and_outlier_threshold)
             print(f"Using manually provided time offset: {offset}s")
 
-        # Determine up vector
-        (
-            up_vector,
-            depth_offset,
-            depth_per_unit,
-            mse,
-            rmse,
-            mae,
-            r2,
-            cam_depth_residuals,
-            num_matches,
-        ) = self.get_up_vector_from_camera_depths_with_offset(cams, offset)
-        cams.save_camera_attributes(camdepths_filepath)
+        # Map FireFish depths to cameras for the chosen offset, then apply once
+        # and determine the up vector using the applied depths
+        cams.reset_depth_sensor_m()
+        cam_id_to_sensor_depth_m = self.get_camera_depths_from_firefish(cams, offset)
+        cams.set_depth_sensor_m(cam_id_to_sensor_depth_m)
+        up_vector, depth_offset, depth_per_unit, *_ = cams.get_up_vector_from_camera_depths()
 
         # Visualize altitude matches
         fig = self.plot_cams_vs_firefish(cams, offset)

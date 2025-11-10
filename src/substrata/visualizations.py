@@ -491,7 +491,7 @@ def save_img(img_path, save_path, highlight_pixels=None):
     cv2.imwrite(save_path, image)
 
 
-def plot_cam_residuals(cams, width=10, height=5):
+def plot_cam_residuals(cams, depths, est_depths, width=10, height=5):
     """Plot camera residuals with two side-by-side views: X–Y and X–Z.
 
     - Points are colored by depth residual (blue–white–red, symmetric limits).
@@ -516,17 +516,32 @@ def plot_cam_residuals(cams, width=10, height=5):
     if not cams_all:
         raise ValueError("No cameras with coords found.")
 
-    # Split by residual availability
-    cams_res = [
-        cam
-        for cam in cams_all
-        if hasattr(cam, "depth_residual") and cam.depth_residual is not None
-    ]
-    cams_nores = [cam for cam in cams_all if cam not in cams_res]
+    depths = np.asarray(depths, dtype=float)
+    est_depths = np.asarray(est_depths, dtype=float)
+    if depths.shape != est_depths.shape:
+        raise ValueError("depths and est_depths must have the same shape")
+    if depths.ndim != 1:
+        raise ValueError("depths and est_depths must be 1-D arrays")
+    if depths.size != len(cams_all):
+        raise ValueError(
+            f"depths/est_depths length ({depths.size}) must match number of cams with coords ({len(cams_all)})"
+        )
+
+    residuals_full = depths - est_depths
+    # Finite residuals considered available; others treated as missing
+    cams_res = []
+    residuals = []
+    cams_nores = []
+    for cam, res in zip(cams_all, residuals_full):
+        if np.isfinite(res):
+            cams_res.append(cam)
+            residuals.append(float(res))
+        else:
+            cams_nores.append(cam)
+    residuals = np.asarray(residuals, dtype=float)
 
     # Color mapping by residuals (symmetric around 0)
     if cams_res:
-        residuals = np.array([cam.depth_residual for cam in cams_res], dtype=float)
         max_abs_res = float(np.max(np.abs(residuals))) if residuals.size else 1.0
         max_abs_res = max(max_abs_res, 1e-9)
         norm = plt.Normalize(vmin=-max_abs_res, vmax=max_abs_res)
@@ -735,7 +750,7 @@ def plot_cam_residuals(cams, width=10, height=5):
             frameon=False,
         )
 
-    plt.show()
+    #plt.show()
     return fig
 
 
@@ -2333,7 +2348,7 @@ def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:
     plt.show()
 
 
-def plot_depth_regression(depths, depths_predicted, width=10, height=5):
+def plot_depth_regression(depths, depths_predicted, width=10, height=5, title=None):
     """
     Plot depth regression analysis with actual vs predicted depths and residual analysis.
 
@@ -2373,7 +2388,8 @@ def plot_depth_regression(depths, depths_predicted, width=10, height=5):
     )
     ax1.set_xlabel("Actual Depth (m)")
     ax1.set_ylabel("Predicted Depth (m)")
-    ax1.set_title(f"Depth Regression Fit\nR² = {r2:.3f}, RMSE = {rmse:.3f}m")
+    base_title_1 = f"Depth Regression Fit\nR² = {r2:.3f}, RMSE = {rmse:.3f}m"
+    ax1.set_title((f"{title} - " if title else "") + base_title_1)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
@@ -2382,12 +2398,13 @@ def plot_depth_regression(depths, depths_predicted, width=10, height=5):
     ax2.axhline(y=0, color="r", linestyle="--", lw=2, label="Zero residual")
     ax2.set_xlabel("Predicted Depth (m)")
     ax2.set_ylabel("Residuals (m)")
-    ax2.set_title(f"Residual Analysis\nMAE = {mae:.3f}m, n = {num_matches}")
+    base_title_2 = f"Residual Analysis\nMAE = {mae:.3f}m, n = {num_matches}"
+    ax2.set_title((f"{title} - " if title else "") + base_title_2)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show()
+    #plt.show()
 
     return fig
 
