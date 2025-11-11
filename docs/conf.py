@@ -29,6 +29,9 @@ extensions = [
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 
+# Do not execute notebooks during doc builds (safer for RTD)
+nb_execution_mode = "off"
+
 # Napoleon settings for Google-style docstrings
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True
@@ -53,7 +56,25 @@ autodoc_default_options = {
     'undoc-members': True,
     'exclude-members': '__weakref__'
 }
-autodoc_mock_imports = []
+autodoc_mock_imports = [
+    # Heavy/optional libs not guaranteed on RTD
+    "open3d",
+    "cv2",
+    "sklearn",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "tqdm",
+    "tqdm_joblib",
+    "yaml",
+    "exifread",
+    "ffmpeg",
+    "alphashape",
+    "shapely",
+    "joblib",
+    # Submodules occasionally imported directly
+    "mpl_toolkits.mplot3d",
+]
 
 # Type hints settings
 typehints_fully_qualified = False

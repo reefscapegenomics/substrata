@@ -11,7 +11,6 @@ dependencies:
   - open3d
   - opencv
   - pytorch
-  - joblib
   - pandas
   - scikit-learn
   - tqdm
@@ -24,3 +23,4 @@ dependencies:
       - gspread
       - net-tools
       - exifread
+      - joblib

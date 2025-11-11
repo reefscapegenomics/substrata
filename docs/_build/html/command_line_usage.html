@@ -1,0 +1,312 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Command-line usage of substrata &mdash; substrata  documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="_static/mystnb.8ecb98da25f57f5357bf6f572d296f466b2cfe2517ffebfabe82451661e28f02.css?v=6644e6bb" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="API Reference" href="api.html" />
+    <link rel="prev" title="Scaling and orientation with substrata" href="notebooks/scaling_and_orientation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            substrata
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="notebooks/scaling_and_orientation.html">Scaling and orientation with <code class="docutils literal notranslate"><span class="pre">substrata</span></code></a><ul>
+<li class="toctree-l2"><a class="reference internal" href="notebooks/scaling_and_orientation.html#loading-a-point-cloud">Loading a point cloud</a></li>
+<li class="toctree-l2"><a class="reference internal" href="notebooks/scaling_and_orientation.html#scaling-the-point-cloud">Scaling the point cloud</a></li>
+<li class="toctree-l2"><a class="reference internal" href="notebooks/scaling_and_orientation.html#orientation">Orientation</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Command-line usage of <code class="docutils literal notranslate"><span class="pre">substrata</span></code></a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#decimation-of-ply-files">Decimation of PLY files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#ply-file-preview-head">PLY file preview (head)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#visual-assessment-of-scalebars">Visual assessment of scalebars</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#composite-views">Composite views</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#orientation-and-scaling">Orientation and scaling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#firefish-alignment">FireFish alignment</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#camera-video-creation">Camera video creation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#z-intercepts-calculation">Z-intercepts calculation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#point-cloud-alignment">Point cloud alignment</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#image-matches">Image matches</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api.html#core-modules">Core Modules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#analysis-and-processing">Analysis and Processing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#visualization">Visualization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#module-substrata.settings">Configuration and Utilities</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api.html#substrata.logging.setup_logging"><code class="docutils literal notranslate"><span class="pre">setup_logging()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="api.html#substrata.logging.tqdm_joblib"><code class="docutils literal notranslate"><span class="pre">tqdm_joblib()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#command-line-interface">Command Line Interface</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">substrata</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Command-line usage of <code class="docutils literal notranslate"><span class="pre">substrata</span></code></li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/command_line_usage.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="command-line-usage-of-substrata">
+<h1>Command-line usage of <code class="docutils literal notranslate"><span class="pre">substrata</span></code><a class="headerlink" href="#command-line-usage-of-substrata" title="Link to this heading"></a></h1>
+<p>This tutorial walks through the available command-line tools of the <code class="docutils literal notranslate"><span class="pre">substrata</span></code> Python package.</p>
+<p>Note: All commands look for a YAML project file or default filenames in the current working directory, unless separately specified. Most commands use the <code class="docutils literal notranslate"><span class="pre">ProjectInitializer</span></code> to auto-detect project files based on the current directory name.</p>
+<section id="decimation-of-ply-files">
+<h2>Decimation of PLY files<a class="headerlink" href="#decimation-of-ply-files" title="Link to this heading"></a></h2>
+<p>Decimate a PLY file to reduce the number of points. With no arguments, uses initializer on CWD, output to <code class="docutils literal notranslate"><span class="pre">&lt;id&gt;_dec50M.ply</span></code>, target = 50,000,000 points.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">decimate</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--output</span> <span class="pre">PLY]</span> <span class="pre">[--points</span> <span class="pre">N]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD)</span>
+substrata<span class="w"> </span>decimate
+
+<span class="c1"># With explicit arguments</span>
+substrata<span class="w"> </span>decimate<span class="w"> </span>--input<span class="w"> </span>cur_sna_20m_20200303.ply<span class="w"> </span>--output<span class="w"> </span>cur_sna_20m_20200303_dec50M.ply<span class="w"> </span>--points<span class="w"> </span><span class="m">50000000</span>
+
+<span class="c1"># Using short flags</span>
+substrata<span class="w"> </span>decimate<span class="w"> </span>--ply<span class="w"> </span>input.ply<span class="w"> </span>-n<span class="w"> </span><span class="m">10000000</span>
+</pre></div>
+</div>
+</section>
+<section id="ply-file-preview-head">
+<h2>PLY file preview (head)<a class="headerlink" href="#ply-file-preview-head" title="Link to this heading"></a></h2>
+<p>Show the first N vertex rows from a PLY file.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">head</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[-n</span> <span class="pre">N]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Show first 5 rows (default)</span>
+substrata<span class="w"> </span>head
+
+<span class="c1"># Show first 10 rows</span>
+substrata<span class="w"> </span>head<span class="w"> </span>--input<span class="w"> </span>pointcloud.ply<span class="w"> </span>-n<span class="w"> </span><span class="m">10</span>
+</pre></div>
+</div>
+</section>
+<section id="visual-assessment-of-scalebars">
+<h2>Visual assessment of scalebars<a class="headerlink" href="#visual-assessment-of-scalebars" title="Link to this heading"></a></h2>
+<p>Generate a scalebar PDF from a point cloud and marker annotations. Optionally save the computed scale factor to YAML.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">scalebars</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--markers</span> <span class="pre">CSV]</span> <span class="pre">[--output_pdf</span> <span class="pre">PDF]</span> <span class="pre">[--points</span> <span class="pre">N]</span> <span class="pre">[--save_yaml]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD)</span>
+substrata<span class="w"> </span>scalebars
+
+<span class="c1"># With explicit arguments</span>
+substrata<span class="w"> </span>scalebars<span class="w"> </span>--input<span class="w"> </span>cur_sna_20m_20200303_dec50M.ply<span class="w"> </span>--markers<span class="w"> </span>cur_sna_20m_20200303_markers.csv<span class="w"> </span>--output_pdf<span class="w"> </span>~/scalebar_check.pdf
+
+<span class="c1"># Save scale factor to YAML</span>
+substrata<span class="w"> </span>scalebars<span class="w"> </span>--save_yaml
+
+<span class="c1"># Limit points loaded (stream decimation)</span>
+substrata<span class="w"> </span>scalebars<span class="w"> </span>--points<span class="w"> </span><span class="m">10000000</span>
+</pre></div>
+</div>
+</section>
+<section id="composite-views">
+<h2>Composite views<a class="headerlink" href="#composite-views" title="Link to this heading"></a></h2>
+<p>Save composite views PDF for a point cloud showing multiple perspectives.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">views</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--output_pdf</span> <span class="pre">PDF]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior</span>
+substrata<span class="w"> </span>views
+
+<span class="c1"># With explicit output path</span>
+substrata<span class="w"> </span>views<span class="w"> </span>--input<span class="w"> </span>pointcloud.ply<span class="w"> </span>--output_pdf<span class="w"> </span>views.pdf
+</pre></div>
+</div>
+</section>
+<section id="orientation-and-scaling">
+<h2>Orientation and scaling<a class="headerlink" href="#orientation-and-scaling" title="Link to this heading"></a></h2>
+<p>Calculate and apply scale and orientation transforms, then save to YAML. Also generates composite views and camera depth residuals PDFs.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">orient</span> <span class="pre">[--input</span> <span class="pre">PLY]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD)</span>
+substrata<span class="w"> </span>orient
+
+<span class="c1"># With explicit PLY path</span>
+substrata<span class="w"> </span>orient<span class="w"> </span>--input<span class="w"> </span>pointcloud.ply
+</pre></div>
+</div>
+</section>
+<section id="firefish-alignment">
+<h2>FireFish alignment<a class="headerlink" href="#firefish-alignment" title="Link to this heading"></a></h2>
+<p>Run FireFish/Cameras alignment to determine up vector and generate output PDF. Initializes FireFish and Cameras, then determines the up vector based on camera depth data.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">firefish</span> <span class="pre">[--firefish-file</span> <span class="pre">FILE]</span> <span class="pre">[--target-depth</span> <span class="pre">M]</span> <span class="pre">[--cam-depths-file</span> <span class="pre">CSV]</span> <span class="pre">[--depth-outlier-threshold</span> <span class="pre">M]</span> <span class="pre">[--cams_group</span> <span class="pre">GROUP]</span> <span class="pre">[--offset</span> <span class="pre">SEC]</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--save_yaml]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD, infers depth from directory name)</span>
+substrata<span class="w"> </span>firefish
+
+<span class="c1"># With explicit target depth</span>
+substrata<span class="w"> </span>firefish<span class="w"> </span>--target-depth<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># Filter cameras by group</span>
+substrata<span class="w"> </span>firefish<span class="w"> </span>--cams_group<span class="w"> </span><span class="s2">&quot;group_name&quot;</span>
+
+<span class="c1"># Save results to YAML</span>
+substrata<span class="w"> </span>firefish<span class="w"> </span>--save_yaml
+
+<span class="c1"># With manual time offset</span>
+substrata<span class="w"> </span>firefish<span class="w"> </span>--offset<span class="w"> </span><span class="m">30</span>
+</pre></div>
+</div>
+</section>
+<section id="camera-video-creation">
+<h2>Camera video creation<a class="headerlink" href="#camera-video-creation" title="Link to this heading"></a></h2>
+<p>Create a video from cameras by drawing image matches. Optionally include annotations in the video.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">cams2video</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--annotations</span> <span class="pre">CSV]</span> <span class="pre">[--cams_group</span> <span class="pre">GROUP]</span> <span class="pre">[--label]</span> <span class="pre">[--resolution</span> <span class="pre">WIDTH]</span> <span class="pre">[--output_mp4</span> <span class="pre">MP4]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD)</span>
+substrata<span class="w"> </span>cams2video
+
+<span class="c1"># With annotations</span>
+substrata<span class="w"> </span>cams2video<span class="w"> </span>--annotations<span class="w"> </span>annotations.csv
+
+<span class="c1"># Filter cameras by group</span>
+substrata<span class="w"> </span>cams2video<span class="w"> </span>--cams_group<span class="w"> </span><span class="s2">&quot;group_name&quot;</span>
+
+<span class="c1"># Use label column from annotations</span>
+substrata<span class="w"> </span>cams2video<span class="w"> </span>--label
+
+<span class="c1"># Resize images to specific width</span>
+substrata<span class="w"> </span>cams2video<span class="w"> </span>--resolution<span class="w"> </span><span class="m">1920</span>
+
+<span class="c1"># Specify output file</span>
+substrata<span class="w"> </span>cams2video<span class="w"> </span>--output_mp4<span class="w"> </span>output.mp4
+</pre></div>
+</div>
+</section>
+<section id="z-intercepts-calculation">
+<h2>Z-intercepts calculation<a class="headerlink" href="#z-intercepts-calculation" title="Link to this heading"></a></h2>
+<p>Find optimal box position, subdivide to grid, sample random points, and compute Z-intercepts. Optionally apply along-slope transform before processing.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">intercepts</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--box-length</span> <span class="pre">M]</span> <span class="pre">[--box-width</span> <span class="pre">M]</span> <span class="pre">[--box-size</span> <span class="pre">M]</span> <span class="pre">[--search-radius</span> <span class="pre">M]</span> <span class="pre">[--slope]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (top-down intercepts)</span>
+substrata<span class="w"> </span>intercepts
+
+<span class="c1"># With custom box dimensions</span>
+substrata<span class="w"> </span>intercepts<span class="w"> </span>--box-length<span class="w"> </span><span class="m">30</span>.0<span class="w"> </span>--box-width<span class="w"> </span><span class="m">5</span>.0
+
+<span class="c1"># With custom grid cell size</span>
+substrata<span class="w"> </span>intercepts<span class="w"> </span>--box-size<span class="w"> </span><span class="m">0</span>.25
+
+<span class="c1"># Apply along-slope transform</span>
+substrata<span class="w"> </span>intercepts<span class="w"> </span>--slope
+
+<span class="c1"># Custom search radius</span>
+substrata<span class="w"> </span>intercepts<span class="w"> </span>--search-radius<span class="w"> </span><span class="m">0</span>.01
+</pre></div>
+</div>
+</section>
+<section id="point-cloud-alignment">
+<h2>Point cloud alignment<a class="headerlink" href="#point-cloud-alignment" title="Link to this heading"></a></h2>
+<p>Register a source PLY to a target PLY and print the alignment transform.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">align</span> <span class="pre">--source</span> <span class="pre">PLY</span> <span class="pre">--target</span> <span class="pre">PLY</span> <span class="pre">[--points</span> <span class="pre">N]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Align two point clouds</span>
+substrata<span class="w"> </span>align<span class="w"> </span>--source<span class="w"> </span>source.ply<span class="w"> </span>--target<span class="w"> </span>target.ply
+
+<span class="c1"># Limit points for faster processing</span>
+substrata<span class="w"> </span>align<span class="w"> </span>--source<span class="w"> </span>source.ply<span class="w"> </span>--target<span class="w"> </span>target.ply<span class="w"> </span>--points<span class="w"> </span><span class="m">5000000</span>
+</pre></div>
+</div>
+</section>
+<section id="image-matches">
+<h2>Image matches<a class="headerlink" href="#image-matches" title="Link to this heading"></a></h2>
+<p>Find image matches of annotations and output cropped images to PDF. Optionally apply a transform to annotation coordinates before matching.</p>
+<p>Usage: <code class="docutils literal notranslate"><span class="pre">substrata</span> <span class="pre">images</span> <span class="pre">[--input</span> <span class="pre">PLY]</span> <span class="pre">[--annotations</span> <span class="pre">CSV]</span> <span class="pre">[--transform]</span> <span class="pre">[--pdf-output</span> <span class="pre">PDF]</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default behavior (auto-detects from CWD)</span>
+substrata<span class="w"> </span>images
+
+<span class="c1"># With explicit annotations file</span>
+substrata<span class="w"> </span>images<span class="w"> </span>--annotations<span class="w"> </span>annotations.csv
+
+<span class="c1"># Apply transform to annotation coordinates (interactive)</span>
+substrata<span class="w"> </span>images<span class="w"> </span>--transform
+
+<span class="c1"># Specify output PDF</span>
+substrata<span class="w"> </span>images<span class="w"> </span>--pdf-output<span class="w"> </span>imagematches.pdf
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="notebooks/scaling_and_orientation.html" class="btn btn-neutral float-left" title="Scaling and orientation with substrata" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="api.html" class="btn btn-neutral float-right" title="API Reference" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, Reefscape Genomics Lab.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
