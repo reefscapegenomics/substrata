@@ -754,6 +754,163 @@ def plot_cam_residuals(cams, depths, est_depths, width=10, height=5):
     return fig
 
 
+def plot_cam_positions(
+    cams, pcd, max_output_points=50000, width=10, height=8, cam_point_size=40
+):
+    """Plot camera positions with two side-by-side views: X–Y and X–Z.
+    
+    - Background shows a grayscale decimated point cloud.
+    - Camera markers encode Camera.group (filled/hollow), and marker color
+      follows a blue→red heatmap by Z coordinate (bwr colormap).
+    
+    Args:
+        cams: Camera collection with data attribute containing cameras.
+        pcd: Point cloud object to show as background (decimated).
+        max_output_points (int): Max points for background decimation (default 50,000).
+        width (float): Figure width in inches.
+        height (float): Figure height in inches.
+        cam_point_size (float): Marker size for camera points.
+    
+    Returns:
+        matplotlib.figure.Figure: The generated figure.
+    """
+    # Collect cameras with coords
+    cams_all = [
+        cam
+        for cam in cams.data.values()
+        if hasattr(cam, "coords") and cam.coords is not None
+    ]
+    if not cams_all:
+        raise ValueError("No cameras with coords found.")
+
+    # Prepare group → filled mapping
+    try:
+        group_names = (
+            cams.group_names
+            if hasattr(cams, "group_names")
+            else sorted({getattr(cam, "group", None) for cam in cams_all})
+        )
+        group_names = [g for g in group_names if g is not None]
+    except Exception:
+        group_names = []
+    group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(sorted(group_names))}
+
+    # Prepare color mapping by Z coordinate (blue→red)
+    z_vals = np.array([float(cam.coords[2]) for cam in cams_all], dtype=float)
+    z_min = float(np.min(z_vals))
+    z_max = float(np.max(z_vals))
+    z_min, z_max = (z_min, z_max) if np.isfinite(z_min) and np.isfinite(z_max) else (-1.0, 1.0)
+    norm = plt.Normalize(vmin=z_min, vmax=z_max)
+    cmap = plt.cm.bwr
+
+    # Build a two-row figure (top and bottom)
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, figsize=(width, height), constrained_layout=True
+    )
+
+    # Background: decimated PCD and grayscale points for XY and XZ
+    try:
+        pcd_bg = pointclouds.get_decimated_pcd(pcd, max_output_points)
+        pts = np.asarray(pcd_bg.points)
+        if len(pts) > 0:
+            gray = np.full((pts.shape[0], 3), 0.7, dtype=float)
+            # Top: XY background
+            ax_top.scatter(pts[:, 0], pts[:, 1], s=1, c=gray, alpha=0.4, edgecolor="none")
+            # Bottom: XZ background
+            ax_bottom.scatter(
+                pts[:, 0], pts[:, 2], s=1, c=gray, alpha=0.4, edgecolor="none"
+            )
+    except Exception:
+        # If background fails, continue with cameras only
+        pass
+
+    # Helper to plot cameras into an axis given x and y indices (0=x,1=y,2=z),
+    # coloring by Z using the bwr colormap. Group determines filled/hollow.
+    def _plot_axis(ax, x_idx: int, y_idx: int, title: str, xlabel: str, ylabel: str):
+        xs = np.array([float(cam.coords[x_idx]) for cam in cams_all], dtype=float)
+        ys = np.array([float(cam.coords[y_idx]) for cam in cams_all], dtype=float)
+        colors = [cmap(norm(float(cam.coords[2]))) for cam in cams_all]
+
+        # Draw hollow vs filled by group
+        for cam, x, y, color in zip(cams_all, xs, ys, colors):
+            filled = group_to_fill.get(getattr(cam, "group", None), True)
+            if filled:
+                ax.scatter(
+                    x,
+                    y,
+                    s=cam_point_size,
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidths=0.7,
+                    alpha=0.95,
+                )
+            else:
+                ax.scatter(
+                    x,
+                    y,
+                    s=cam_point_size,
+                    facecolors="none",
+                    edgecolors=[color],
+                    linewidths=1.2,
+                    alpha=0.95,
+                )
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+
+    # Top: X–Y
+    _plot_axis(ax_top, 0, 1, "Camera positions (X–Y)", "X coordinate", "Y coordinate")
+    # Bottom: X–Z
+    _plot_axis(ax_bottom, 0, 2, "Camera positions (X–Z)", "X coordinate", "Z coordinate")
+
+    # Legends: groups only (filled vs hollow); add a shared colorbar for Z
+    from matplotlib.lines import Line2D
+
+    group_handles = []
+    for g in sorted(group_to_fill.keys()):
+        if group_to_fill[g]:
+            group_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="black",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
+                )
+            )
+        else:
+            group_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="none",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
+                )
+            )
+    if group_handles:
+        ax_top.legend(
+            handles=group_handles, title="Groups", loc="upper right", frameon=False
+        )
+
+    # Shared colorbar for Z coordinate
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=[ax_top, ax_bottom], fraction=0.046, pad=0.04)
+    cbar.set_label("Z (m)")
+
+    return fig
+
+
 def get_crop_img_cv2(img_path, crop_x, crop_y, crop_w, crop_h):
     """Get cropped image"""
     img = cv2.imread(img_path)

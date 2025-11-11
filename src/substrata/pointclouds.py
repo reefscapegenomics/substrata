@@ -100,6 +100,60 @@ class PointCloud:
         else:
             self.filepath = None
 
+    def __str__(self) -> str:
+        """Return a concise, human-readable summary of the point cloud."""
+        try:
+            num_points = int(len(self.points))
+        except Exception:
+            num_points = 0
+
+        colors_np = np.asarray(self.o3d_pcd.colors)
+        normals_np = np.asarray(self.o3d_pcd.normals)
+        has_colors = colors_np.shape[0] == num_points and num_points > 0
+        has_normals = normals_np.shape[0] == num_points and num_points > 0
+
+        # Bounding box (if points present)
+        try:
+            bb_min, bb_max = self.bounding_box
+            extent = bb_max - bb_min
+            bb_str = (
+                f"[min=({bb_min[0]:.3f}, {bb_min[1]:.3f}, {bb_min[2]:.3f}), "
+                f"max=({bb_max[0]:.3f}, {bb_max[1]:.3f}, {bb_max[2]:.3f}), "
+                f"extent=({extent[0]:.3f}, {extent[1]:.3f}, {extent[2]:.3f})]"
+            )
+        except Exception:
+            bb_str = "unavailable"
+
+        wt_is_identity = self.world_transform_is_identity
+        n_transforms = len(self.transforms)
+
+        name = self.name or "unnamed"
+        filepath = self.filepath or "in-memory"
+
+        # Format world transform matrix (4x4)
+        try:
+            wt = np.asarray(self.world_transform, dtype=float).reshape((4, 4))
+            wt_rows = [
+                "  " + " ".join(f"{wt[i, j]: .6f}" for j in range(4)) for i in range(4)
+            ]
+        except Exception:
+            wt_rows = ["  unavailable"]
+
+        lines = [
+            f"PointCloud(name='{name}', path='{filepath}')",
+            f"- points: {num_points:,}",
+            f"- colors: {'yes' if has_colors else 'no'}",
+            f"- normals: {'yes' if has_normals else 'no'}",
+            f"- bounding_box: {bb_str}",
+            (
+                f"- world_transform: {'identity' if wt_is_identity else 'non-identity'}"
+            ),
+            f"- world_transform_matrix:",
+            *wt_rows,
+            f"- transforms_applied: {n_transforms}",
+        ]
+        return "\n".join(lines)
+
     @property
     def points(self) -> np.ndarray:
         """Get point coordinates as numpy array.

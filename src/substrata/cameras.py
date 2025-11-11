@@ -87,6 +87,76 @@ class Cameras:
             self.cams_xml_filepath = cams_xml_filepath
             self.get_cam_sensor_parameters_from_file(cams_xml_filepath)
 
+    def __str__(self) -> str:
+        """Return a concise, human-readable summary of the cameras collection."""
+        total = len(self.data)
+        sensors_count = len(getattr(self, "sensors", {}) or {})
+        wt_is_identity = self.world_transform_is_identity
+        groups = self.group_names
+        # Count cameras per group
+        group_counts = {}
+        for cam in self.data.values():
+            g = getattr(cam, "group", None)
+            if g is None:
+                continue
+            group_counts[g] = group_counts.get(g, 0) + 1
+
+        # Basic availability stats
+        num_with_coords = sum(
+            1
+            for cam in self.data.values()
+            if getattr(cam, "coords", None) is not None
+        )
+        num_with_datetime = sum(
+            1
+            for cam in self.data.values()
+            if getattr(cam, "datetime", None) is not None
+        )
+        num_with_depth = sum(
+            1
+            for cam in self.data.values()
+            if getattr(cam, "depth_sensor_m", None) is not None
+        )
+        num_enabled = sum(
+            1
+            for cam in self.data.values()
+            if getattr(cam, "enabled", True) is True
+        )
+
+        # Coordinate bounds (if available)
+        try:
+            coords_list = [
+                cam.coords
+                for cam in self.data.values()
+                if getattr(cam, "coords", None) is not None
+            ]
+            if coords_list:
+                C = np.vstack(coords_list)
+                cmin = C.min(axis=0)
+                cmax = C.max(axis=0)
+                extent = cmax - cmin
+                bb_str = (
+                    f"[min=({cmin[0]:.3f}, {cmin[1]:.3f}, {cmin[2]:.3f}), "
+                    f"max=({cmax[0]:.3f}, {cmax[1]:.3f}, {cmax[2]:.3f}), "
+                    f"extent=({extent[0]:.3f}, {extent[1]:.3f}, {extent[2]:.3f})]"
+                )
+            else:
+                bb_str = "unavailable"
+        except Exception:
+            bb_str = "unavailable"
+
+        lines = [
+            "Cameras(",
+            f"  count={total}, sensors={sensors_count}, enabled={num_enabled},",
+            f"  with_coords={num_with_coords}, with_datetime={num_with_datetime}, with_depth_sensor_m={num_with_depth},",
+            f"  world_transform={'identity' if wt_is_identity else 'non-identity'},",
+            f"  groups={groups if groups else '[]'},",
+            f"  groups_counts={group_counts if group_counts else {}},",
+            f"  coords_bounds={bb_str}",
+            ")",
+        ]
+        return "\n".join(lines)
+
     @property
     def coords(self):
         return [camera.coords for camera in self.data.values()]
@@ -131,6 +201,15 @@ class Cameras:
         return sorted(
             {cam.group for cam in self.data.values() if hasattr(cam, "group")}
         )
+
+    def show(self, pcd):
+        """
+        Show the camera positions in the pointcloud.
+
+        Args:
+            pcd (PointCloud): The pointcloud to show the camera positions in.
+        """
+        visualizations.plot_cam_positions(self, pcd)
 
     def append(self, cam):
         if cam.cam_id in self.data:
@@ -1060,6 +1139,7 @@ class Camera:
             return None
 
         return float(self.parent.depth_offset + float(np.dot(self.parent.up_vector, self.orig_coords)))
+    
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.

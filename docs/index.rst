@@ -12,13 +12,13 @@ Installation
 
 Get started by installing substrata. See :doc:`installation` for detailed instructions.
 
-Getting Started
----------------
+Scaling and Orientation
+-----------------------
 
-If you're new to substrata, check out the following resources:
+If you're new to substrata or want to quickly orient and scale a point cloud, start here:
 
-* :doc:`notebooks/getting_started` - A comprehensive introduction to substrata
-* :doc:`notebooks/command_line_usage` - Learn how to use the command-line interface
+* :doc:`notebooks/scaling_and_orientation` - End-to-end scaling and orientation workflow
+* :doc:`notebooks/command_line_usage` - Command-line usage guide
 
 API Documentation
 -----------------
@@ -31,7 +31,7 @@ documentation for all modules, classes, and functions.
    :caption: Contents:
 
    installation
-   notebooks/getting_started
+   notebooks/scaling_and_orientation
    notebooks/command_line_usage
    api
 
