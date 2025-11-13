@@ -1,5 +1,4 @@
 # Standard Library
-from __future__ import annotations
 
 import csv
 import logging
@@ -104,6 +103,14 @@ class Annotations:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
+    def show(self, pcd: Any, color=False) -> None:
+        """Show annotation positions overlaid on a point cloud.
+
+        Args:
+            pcd: Point cloud to draw as background.
+        """
+        visualizations.plot_positions(self, pcd, color=color)
+
     def append(self, annotation: "Annotation") -> None:
         if annotation.id in self.data:
             raise ValueError(f"Annotation with id {annotation.id} already exists.")
@@ -144,6 +151,9 @@ class Annotations:
                 world_x,
                 world_y,
                 world_z,
+                cam_filepath,
+                cam_x,
+                cam_y,
                 other_cols,
             ) = self.__get_annotation_fields(line.rstrip("\r\n").split(","))
             ann_id = self.__strip_post_fixes(id)
@@ -157,6 +167,16 @@ class Annotations:
                     self.data[id].coords = np.asarray(
                         [world_x, world_y, world_z], dtype=float
                     )
+                # Load optional camera fields if present
+                self.data[id].cam_filepath = (
+                    cam_filepath if cam_filepath not in [None, ""] else None
+                )
+                self.data[id].cam_x = (
+                    float(cam_x) if cam_x not in [None, ""] else None
+                )
+                self.data[id].cam_y = (
+                    float(cam_y) if cam_y not in [None, ""] else None
+                )
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
@@ -208,6 +228,9 @@ class Annotations:
                 world_x,
                 world_y,
                 world_z,
+                cam_filepath,
+                cam_x,
+                cam_y,
                 other_cols,
             ) = self.__get_annotation_fields(row_cols)
             if id not in self.data:
@@ -220,6 +243,16 @@ class Annotations:
                     self.data[id].coords = np.asarray(
                         [world_x, world_y, world_z], dtype=float
                     )
+                # Load optional camera fields if present
+                self.data[id].cam_filepath = (
+                    cam_filepath if cam_filepath not in [None, ""] else None
+                )
+                self.data[id].cam_x = (
+                    float(cam_x) if cam_x not in [None, ""] else None
+                )
+                self.data[id].cam_y = (
+                    float(cam_y) if cam_y not in [None, ""] else None
+                )
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
@@ -656,6 +689,9 @@ class Annotations:
             "world_x",
             "world_y",
             "world_z",
+            "cam_filepath",
+            "cam_x",
+            "cam_y",
         ]
         # Header - specific to InterceptAnnotation instances
         first_annotation = next(iter(self.data.values()), None)
@@ -694,6 +730,24 @@ class Annotations:
             else:
                 row.append("NA")
             row += [value for value in ann.coords]
+
+            # Camera columns (from image_match if available; otherwise any loaded values)
+            cam_filepath = None
+            cam_x = None
+            cam_y = None
+            if getattr(ann, "image_match", None) is not None and getattr(
+                ann.image_match, "cam", None
+            ) is not None:
+                cam_filepath = getattr(ann.image_match.cam, "filepath", None)
+                cam_x = getattr(ann.image_match, "x", None)
+                cam_y = getattr(ann.image_match, "y", None)
+            else:
+                cam_filepath = getattr(ann, "cam_filepath", None)
+                cam_x = getattr(ann, "cam_x", None)
+                cam_y = getattr(ann, "cam_y", None)
+            row.append(cam_filepath if cam_filepath is not None else "")
+            row.append(cam_x if cam_x is not None else "")
+            row.append(cam_y if cam_y is not None else "")
 
             # Columns specific to InterceptAnnotation instances
             if isinstance(ann, InterceptAnnotation):
@@ -758,9 +812,15 @@ class Annotations:
             "world_x": get_col_index(cols, ["world_x"], mandatory=False),
             "world_y": get_col_index(cols, ["world_y"], mandatory=False),
             "world_z": get_col_index(cols, ["world_z"], mandatory=False),
+            "cam_filepath": get_col_index(cols, ["cam_filepath"], mandatory=False),
+            "cam_x": get_col_index(cols, ["cam_x"], mandatory=False),
+            "cam_y": get_col_index(cols, ["cam_y"], mandatory=False),
         }
 
     def __get_annotation_fields(self, cols: List[str]) -> Tuple[
+        Optional[str],
+        Optional[str],
+        Optional[str],
         Optional[str],
         Optional[str],
         Optional[str],
@@ -779,7 +839,7 @@ class Annotations:
 
         Returns:
             Tuple containing id, orig_x, orig_y, orig_z, label, label_conf,
-            world_x, world_y, world_z, and other_fields.
+            world_x, world_y, world_z, cam_filepath, cam_x, cam_y, and other_fields.
         """
 
         primary_field_indices = set(self.col_order.values())
@@ -801,9 +861,11 @@ class Annotations:
             get_value("world_x"),
             get_value("world_y"),
             get_value("world_z"),
+            get_value("cam_filepath"),
+            get_value("cam_x"),
+            get_value("cam_y"),
             other_fields,
         )
-
     @staticmethod
     def __strip_post_fixes(ann_id: str) -> str:
         """Remove postfixes from annotation id.
@@ -839,6 +901,10 @@ class Annotation:
         self.measurements = {}
         self.extra_coords = {}
         self.orig_extra_coords = {}
+        # Optional camera fields loaded/saved from CSV
+        self.cam_filepath: Optional[str] = None
+        self.cam_x: Optional[float] = None
+        self.cam_y: Optional[float] = None
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.

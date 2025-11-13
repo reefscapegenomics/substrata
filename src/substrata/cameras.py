@@ -202,14 +202,14 @@ class Cameras:
             {cam.group for cam in self.data.values() if hasattr(cam, "group")}
         )
 
-    def show(self, pcd):
+    def show(self, pcd, color=False):
         """
         Show the camera positions in the pointcloud.
 
         Args:
             pcd (PointCloud): The pointcloud to show the camera positions in.
         """
-        visualizations.plot_cam_positions(self, pcd)
+        visualizations.plot_positions(self, pcd, color=color)
 
     def append(self, cam):
         if cam.cam_id in self.data:
@@ -695,6 +695,14 @@ class Cameras:
             replace_str (str): The string to replace find_str with.
         """
         self.filepath_replace = [find_str, replace_str]
+    
+    def set_filename_prefix(self, filename_prefix):
+        """Set a filename prefix for adjusting filepaths.
+
+        Args:
+            filename_prefix (str): The filename prefix to use.
+        """
+        self.filename_prefix = filename_prefix
 
     def set_base_path(self, base_path):
         """Set a replacement base path for adjusting filepaths.
@@ -758,6 +766,30 @@ class Cameras:
         """
         for cam in self.data.values():
             if cam.filename == filename or cam.filename == filename + ".jpg":
+                return cam
+        return None
+    
+    def get_camera_by_filename_partial_match(self, filename):
+        """Get a camera object by a partial filename match.
+
+        Args:
+            filename (str): The filename to search for.
+        """
+        for cam in self.data.values():
+            if filename in cam.filename:
+                return cam
+        return None
+
+    def get_camera_by_filepath(self, filepath):
+        """Get a camera object by its filepath.
+
+        Args:
+            filepath (str): The filepath to search for.
+        """
+        for cam in self.data.values():
+            if cam.filepath == filepath:
+                return cam
+            elif cam.orig_filepath == filepath:
                 return cam
         return None
 
@@ -1054,8 +1086,8 @@ class Camera:
     @property
     def filepath(self):
         if (
-            not hasattr(self.parent, "filepath_replace")
-            or not self.parent.filepath_replace
+            (not hasattr(self.parent, "filepath_replace") or not self.parent.filepath_replace)
+            and (not hasattr(self.parent, "filename_prefix") or not self.parent.filename_prefix)
         ):
             return self.orig_filepath
         else:
@@ -1521,16 +1553,27 @@ class Camera:
         Returns:
             str: The updated filepath.
         """
-        if self.parent.filepath_replace[0] and self.parent.filepath_replace[1]:
-            updated = self.orig_filepath.replace(
-                self.parent.filepath_replace[0], self.parent.filepath_replace[1]
-            )
-        elif self.parent.filepath_replace[1]:
-            updated = self.__replace_base_path(
-                self.orig_filepath, self.parent.filepath_replace[1]
-            )
-        else:
-            return self.orig_filepath
+        updated = self.orig_filepath
+
+        # Apply filepath_replace if set on parent
+        if (
+            hasattr(self.parent, "filepath_replace")
+            and self.parent.filepath_replace
+            and len(self.parent.filepath_replace) >= 2
+        ):
+            find_str, replace_str = self.parent.filepath_replace[0], self.parent.filepath_replace[1]
+            if find_str and replace_str:
+                updated = updated.replace(find_str, replace_str)
+            elif replace_str:
+                updated = self.__replace_base_path(updated, replace_str)
+
+        # Apply filename_prefix if set on parent
+        filename_prefix = getattr(self.parent, "filename_prefix", None)
+        if filename_prefix:
+            dirname = os.path.dirname(updated)
+            basename = os.path.basename(updated)
+            updated = os.path.join(dirname, f"{filename_prefix}{basename}")
+
         return self.__reformat_filepath_according_to_os(updated)
 
     @staticmethod
@@ -1841,6 +1884,7 @@ class ImageMatch:
 
         plt.plot(center_x, center_y, "ro", markersize=8)
         plt.show()
+
 
 
 class Frame:

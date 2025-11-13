@@ -4,6 +4,21 @@ This package provides tools for working with point clouds, including
 loading, processing, and analyzing 3D point cloud data.
 """
 
+import warnings
+
+# Suppress noisy tqdm warning emitted by tqdm.autonotebook when ipywidgets is missing.
+# This often surfaces via third-party packages (e.g., tqdm_joblib) on import.
+try:
+    from tqdm import TqdmWarning  # type: ignore
+except Exception:  # pragma: no cover - robust fallback if tqdm is unavailable
+    TqdmWarning = Warning  # type: ignore[assignment]
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*IProgress not found.*",
+    category=TqdmWarning,
+)
+
 from .logging import logger
 
 from .annotations import *

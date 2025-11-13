@@ -754,26 +754,226 @@ def plot_cam_residuals(cams, depths, est_depths, width=10, height=5):
     return fig
 
 
-def plot_cam_positions(
-    cams, pcd, max_output_points=50000, width=10, height=8, cam_point_size=40
+def plot_positions(
+    positions,
+    pcd,
+    max_output_points=50000,
+    width=10,
+    height=8,
+    point_size=40,
+    title=None,
+    color=False,
 ):
-    """Plot camera positions with two side-by-side views: X–Y and X–Z.
+    """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and X–Z views.
     
-    - Background shows a grayscale decimated point cloud.
-    - Camera markers encode Camera.group (filled/hollow), and marker color
-      follows a blue→red heatmap by Z coordinate (bwr colormap).
+    - Background shows a grayscale decimated point cloud if provided.
+      If color=True and the point cloud has colors, use those instead.
+    - Markers are colored by Z (bwr colormap).
+    - If items have a `group` attribute, groups are encoded as filled (even index)
+      vs hollow (odd index) and a legend is shown.
     
     Args:
-        cams: Camera collection with data attribute containing cameras.
-        pcd: Point cloud object to show as background (decimated).
-        max_output_points (int): Max points for background decimation (default 50,000).
-        width (float): Figure width in inches.
-        height (float): Figure height in inches.
-        cam_point_size (float): Marker size for camera points.
+        positions: One of:
+            - collection with `.data` mapping to objects with `.coords` (e.g., Cameras, Annotations)
+            - iterable of objects each with `.coords`
+            - numpy array or list-like of shape (N, 3) with XYZ coordinates
+        pcd: Point cloud object for background (decimated).
+        max_output_points: Max points for background decimation (default 50,000).
+        width: Figure width in inches.
+        height: Figure height in inches.
+        point_size: Marker size for plotted positions.
+        title: Optional figure title.
+        color: If True, draw background point cloud with its colors when available;
+               if False (default), draw background in gray.
     
     Returns:
         matplotlib.figure.Figure: The generated figure.
     """
+    # Normalize input → coords[N,3], groups[List[Any] | None]
+    def _normalize_positions(pos):
+        # Case 1: numpy array or list-like of coordinates
+        try:
+            arr = np.asarray(pos, dtype=float)
+            if arr.ndim == 2 and arr.shape[1] >= 3:
+                coords = arr[:, :3]
+                groups = [None] * len(coords)
+                return coords, groups
+        except Exception:
+            pass
+
+        # Case 2: object with .data mapping to items with .coords
+        if hasattr(pos, "data"):
+            try:
+                items = list(pos.data.values())
+                coords = []
+                groups = []
+                for it in items:
+                    if hasattr(it, "coords") and it.coords is not None:
+                        c = np.asarray(it.coords, dtype=float)
+                        if c.shape[0] >= 3:
+                            coords.append(c[:3])
+                            groups.append(getattr(it, "group", None))
+                if coords:
+                    return np.vstack(coords), groups
+            except Exception:
+                pass
+
+        # Case 3: iterable of objects with .coords
+        try:
+            coords = []
+            groups = []
+            for it in list(pos):
+                if hasattr(it, "coords") and it.coords is not None:
+                    c = np.asarray(it.coords, dtype=float)
+                    if c.shape[0] >= 3:
+                        coords.append(c[:3])
+                        groups.append(getattr(it, "group", None))
+            if coords:
+                return np.vstack(coords), groups
+        except Exception:
+            pass
+
+        raise ValueError(
+            "positions must be Nx3 array-like, a collection with .data of items "
+            "each having .coords, or an iterable of items with .coords."
+        )
+
+    coords, groups = _normalize_positions(positions)
+    if coords.size == 0:
+        raise ValueError("No positions with coords provided.")
+
+    # Prepare group → filled mapping (if any groups are present)
+    valid_groups = [g for g in groups if g is not None]
+    unique_groups = sorted(set(valid_groups))
+    group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(unique_groups)}
+
+    # Prepare color mapping by Z coordinate (blue→red)
+    z_vals = np.array(coords[:, 2], dtype=float)
+    if z_vals.size:
+        z_min = float(np.nanmin(z_vals))
+        z_max = float(np.nanmax(z_vals))
+        if not (np.isfinite(z_min) and np.isfinite(z_max)):
+            z_min, z_max = -1.0, 1.0
+        if z_min == z_max:
+            z_min, z_max = z_min - 1e-6, z_max + 1e-6
+    else:
+        z_min, z_max = -1.0, 1.0
+    norm = plt.Normalize(vmin=z_min, vmax=z_max)
+    cmap = plt.cm.bwr
+
+    # Build a two-row figure (top and bottom)
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, figsize=(width, height), constrained_layout=True
+    )
+
+    # Background: decimated PCD and grayscale points for XY and XZ
+    try:
+        pcd_bg = pointclouds.get_decimated_pcd(pcd, max_output_points)
+        pts = np.asarray(pcd_bg.points)
+        if len(pts) > 0:
+            # Choose background colors
+            if color:
+                pcd_cols = np.asarray(pcd_bg.colors)
+                use_cols = (
+                    pcd_cols.shape[0] == pts.shape[0] and pcd_cols.shape[0] > 0
+                )
+                bg_cols = pcd_cols if use_cols else np.full((pts.shape[0], 3), 0.7, dtype=float)
+            else:
+                bg_cols = np.full((pts.shape[0], 3), 0.7, dtype=float)
+            # Top: XY background
+            ax_top.scatter(pts[:, 0], pts[:, 1], s=1, c=bg_cols, alpha=0.4, edgecolor="none")
+            # Bottom: XZ background
+            ax_bottom.scatter(
+                pts[:, 0], pts[:, 2], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
+            )
+    except Exception:
+        # If background fails, continue with positions only
+        pass
+
+    # Helper to plot (x_idx, y_idx)
+    def _plot_axis(ax, x_idx: int, y_idx: int, xlabel: str, ylabel: str, ttl: str):
+        xs = np.asarray(coords[:, x_idx], dtype=float)
+        ys = np.asarray(coords[:, y_idx], dtype=float)
+        # Draw hollow vs filled by group
+        for (x, y, g, z) in zip(xs, ys, groups, z_vals):
+            col = cmap(norm(z))
+            filled = group_to_fill.get(g, True)
+            if filled:
+                ax.scatter(
+                    x,
+                    y,
+                    s=point_size,
+                    facecolor=col,
+                    edgecolor="black",
+                    linewidths=0.7,
+                    alpha=0.95,
+                )
+            else:
+                ax.scatter(
+                    x,
+                    y,
+                    s=point_size,
+                    facecolors="none",
+                    edgecolors=[col],
+                    linewidths=1.2,
+                    alpha=0.95,
+                )
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(ttl)
+        ax.grid(True, alpha=0.3)
+
+    # Top: X–Y
+    _plot_axis(ax_top, 0, 1, "X coordinate", "Y coordinate", "Positions (X–Y)")
+    # Bottom: X–Z
+    _plot_axis(ax_bottom, 0, 2, "X coordinate", "Z coordinate", "Positions (X–Z)")
+
+    # Shared colorbar for Z coordinate
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=[ax_top, ax_bottom], fraction=0.046, pad=0.04)
+    cbar.set_label("Z (m)")
+
+    # Group legend (if groups present)
+    if unique_groups:
+        from matplotlib.lines import Line2D
+
+        handles = []
+        for g in unique_groups:
+            if group_to_fill[g]:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="w",
+                        label=str(g),
+                        markerfacecolor="black",
+                        markeredgecolor="black",
+                        markersize=8,
+                        linewidth=0,
+                    )
+                )
+            else:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="w",
+                        label=str(g),
+                        markerfacecolor="none",
+                        markeredgecolor="black",
+                        markersize=8,
+                        linewidth=0,
+                    )
+                )
+        ax_top.legend(handles=handles, title="Groups", loc="upper right", frameon=False)
+
+    if title:
+        fig.suptitle(title)
+
+    return fig
     # Collect cameras with coords
     cams_all = [
         cam
@@ -1764,7 +1964,7 @@ def plot_2d_ortho(
     if hasattr(pcd, color_attr):
         colors = pcd.colors
     else:
-        colors = np.ones((len(points), 3), dtype=np.float64)
+        colors = np.ones((len(pts), 3), dtype=np.float64)
 
     # Rasterize
     for pt, col in zip(pcd.points, pcd.colors):

@@ -19,6 +19,7 @@ If you're new to substrata or want to quickly orient and scale a point cloud, st
 
 * :doc:`notebooks/scaling_and_orientation` - End-to-end scaling and orientation workflow
 * :doc:`notebooks/command_line_usage` - Command-line usage guide
+* :doc:`notebooks/transferring_annotations` - Transfer annotations between datasets/projects
 
 API Documentation
 -----------------
@@ -32,6 +33,7 @@ documentation for all modules, classes, and functions.
 
    installation
    notebooks/scaling_and_orientation
+   notebooks/transferring_annotations
    command_line_usage
    api
 

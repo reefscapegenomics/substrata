@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # Standard Library
 import os
 
@@ -8,7 +6,7 @@ import yaml
 import numpy as np
 
 # Local Modules
-from substrata import geom, settings
+rom substrata import geom, settings, annotations
 import substrata.annotations as annotations
 
 
