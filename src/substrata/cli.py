@@ -455,7 +455,14 @@ def _parse_transform_from_input(transform_str: str) -> np.ndarray:
 
 
 def handle_images(args):
-    # Use initializer to infer defaults from CWD when not provided
+    """Handle the image matching CLI command.
+
+    Uses project initializer to load data and optionally apply a transform.
+    Generates cropped image match visualizations and saves them to PDF.
+
+    Args:
+        args: Arguments from argparse.
+    """
     from substrata.initializer import ProjectInitializer
     from substrata import visualizations
 
@@ -469,9 +476,6 @@ def handle_images(args):
     if args.annotations:
         init.annotations_filepath = args.annotations
 
-    # Initialize (loads PCD and cameras if available)
-    init.initialize()
-
     # Resolve annotations
     if not init.annotations_filepath:
         raise SystemExit(
@@ -479,7 +483,8 @@ def handle_images(args):
             "initializer finds an annotations CSV in CWD."
         )
 
-    anns = Annotations(init.annotations_filepath, header=True, orig_coords_only=True)
+    # Initialize (loads PCD and cameras if available)
+    init.initialize()
 
     # Handle optional transform
     if getattr(args, "transform", False):
@@ -506,8 +511,8 @@ def handle_images(args):
             # Transform orig_coords and use as new orig_coords
             from substrata import geom
 
-            for ann_id in anns.data:
-                ann = anns.data[ann_id]
+            for ann_id in init.annotations.data:
+                ann = init.annotations.data[ann_id]
                 # Transform current orig_coords
                 new_orig_coords = geom.transform_coords(ann.orig_coords, transform)
                 # Set as new orig_coords and reset coords
@@ -522,7 +527,7 @@ def handle_images(args):
                     ann.orig_extra_coords[full_id] = ann.extra_coords[full_id].copy()
 
             # Reset world_transform to identity since we've updated orig_coords
-            anns.world_transform = np.eye(4)
+            init.annotations.world_transform = np.eye(4)
             print(
                 "Applied transform to orig_coords and reset "
                 "world_transform to identity"
@@ -533,22 +538,22 @@ def handle_images(args):
 
     # # Apply world_transform from initializer if available
     # if not init.world_transform_is_identity:
-    #     anns.apply_transform(init.world_transform)
+    #     init.annotations.apply_transform(init.world_transform)
     # elif init.scale_factor is not None:
-    #     anns.apply_transform(geom.Transform.from_scale(init.scale_factor))
+    #     init.annotations.apply_transform(geom.Transform.from_scale(init.scale_factor))
 
     # Validate that we have cameras and annotations
     if not init.cams or len(init.cams) == 0:
         raise SystemExit("No cameras available for image matching")
 
-    if len(anns) == 0:
+    if len(init.annotations) == 0:
         raise SystemExit("No annotations found")
 
-    print(f"Number of annotations: {len(anns)}")
+    print(f"Number of annotations: {len(init.annotations)}")
     print(f"Number of cameras: {len(init.cams)}")
 
     # Get first image matches for each annotation
-    image_matches = anns.get_first_image_matches(init.cams, pcd=init.pcd)
+    image_matches = init.annotations.get_first_image_matches(init.cams, pcd=init.pcd)
 
     if len(image_matches) == 0:
         raise SystemExit("No image matches found for any annotations")
