@@ -356,7 +356,7 @@ class Cameras:
 
         Copies container metadata (shallow) and re-parents included Camera objects
         so downstream code can rely on attributes like world_transform, up_vector, etc.
-        """
+        """okay
         subset = self._empty_like()
         for cid in cam_ids:
             cam = self.data.get(cid)

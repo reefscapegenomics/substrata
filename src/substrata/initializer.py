@@ -180,12 +180,12 @@ class ProjectInitializer:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
-    def save_config_to_yaml(self, filepath=None):
+    def save_config_to_yaml(self, filepath: str | None = None) -> None:
         """
-        Save the current configuration to a YAML file
+        Save the current configuration to a YAML file.
 
         Args:
-            filepath (str): Path where the YAML file should be saved
+            filepath (str, optional): Path where the YAML file should be saved.
         """
         config = {}
         if self.path is not None:
@@ -193,29 +193,27 @@ class ProjectInitializer:
         if self.id is not None:
             config["id"] = self.id
         if self.ply_filepath is not None:
-            config["ply"] = os.path.basename(self.ply_filepath)
+            config["ply"] = self.ply_filepath
         if self.cams_xml_filepath is not None:
-            config["cams_xml"] = os.path.basename(self.cams_xml_filepath)
+            config["cams_xml"] = self.cams_xml_filepath
         if self.cams_meta_json_filepath is not None:
-            config["cams_meta_json"] = os.path.basename(self.cams_meta_json_filepath)
+            config["cams_meta_json"] = self.cams_meta_json_filepath
         if self.markers_filepath is not None:
-            config["markers"] = os.path.basename(self.markers_filepath)
+            config["markers"] = self.markers_filepath
         if self.annotations_filepath is not None:
-            config["annotations"] = os.path.basename(self.annotations_filepath)
+            config["annotations"] = self.annotations_filepath
         if self.annotations_last_highest_id is not None:
-            config["annotations_last_highest_id"] = int(
-                self.annotations_last_highest_id
-            )
+            config["annotations_last_highest_id"] = int(self.annotations_last_highest_id)
         if self.classifier_filepath is not None:
-            config["classifier"] = os.path.basename(self.classifier_filepath)
+            config["classifier"] = self.classifier_filepath
         if self.photos_path is not None:
-            config["photos_path"] = os.path.basename(self.photos_path)
+            config["photos_path"] = self.photos_path
         if self.cropped_path is not None:
-            config["cropped_path"] = os.path.basename(self.cropped_path)
+            config["cropped_path"] = self.cropped_path
         if self.thumbnail_path is not None:
-            config["thumbnails_path"] = os.path.basename(self.thumbnail_path)
+            config["thumbnails_path"] = self.thumbnail_path
         if self.classes_filepath is not None:
-            config["classes"] = os.path.basename(self.classes_filepath)
+            config["classes"] = self.classes_filepath
         if self.scale_factor is not None:
             config["scale_factor"] = float(self.scale_factor)
         if self.world_transform is not None:
