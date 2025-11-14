@@ -511,27 +511,12 @@ def handle_images(args):
             # Transform orig_coords and use as new orig_coords
             from substrata import geom
 
-            for ann_id in init.annotations.data:
-                ann = init.annotations.data[ann_id]
-                # Transform current orig_coords
-                new_orig_coords = geom.transform_coords(ann.orig_coords, transform)
-                # Set as new orig_coords and reset coords
-                ann.orig_coords = new_orig_coords
-                ann.coords = new_orig_coords.copy()
-                print(f"{ann_id} orig_coords: {ann.orig_coords}, coords: {ann.coords}")
-                # Also transform extra_coords if present
-                for full_id in ann.extra_coords:
-                    ann.extra_coords[full_id] = geom.transform_coords(
-                        ann.extra_coords[full_id], transform
-                    )
-                    ann.orig_extra_coords[full_id] = ann.extra_coords[full_id].copy()
-
-            # Reset world_transform to identity since we've updated orig_coords
-            init.annotations.world_transform = np.eye(4)
-            print(
-                "Applied transform to orig_coords and reset "
-                "world_transform to identity"
-            )
+            for annotation in init.annotations:
+                old_coords = annotation.orig_coords
+                annotation.orig_coords = geom.transform_coords(annotation.orig_coords, transform)
+                if annotation.extra_coords:
+                    raise ValueError("Extra coords are not supported for image matching")
+                print(f"{annotation.id} orig_coords changed from {old_coords} to {annotation.orig_coords}")
 
         except Exception as e:
             raise SystemExit(f"Failed to parse or apply transform: {e}")
