@@ -18,7 +18,7 @@ Scaling and Orientation
 If you're new to substrata or want to quickly orient and scale a point cloud, start here:
 
 * :doc:`notebooks/scaling_and_orientation` - End-to-end scaling and orientation workflow
-* :doc:`notebooks/command_line_usage` - Command-line usage guide
+* :doc:`command_line_usage` - Command-line usage guide
 * :doc:`notebooks/transferring_annotations` - Transfer annotations between datasets/projects
 
 API Documentation

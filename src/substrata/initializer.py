@@ -6,7 +6,7 @@ import yaml
 import numpy as np
 
 # Local Modules
-rom substrata import geom, settings, annotations
+from substrata import geom, settings, annotations
 import substrata.annotations as annotations
 
 
@@ -39,6 +39,7 @@ class ProjectInitializer:
         self.cropped_path = None
         self.thumbnail_path = None
         self.classes_filepath = None
+        self.classifier_filepath = None
         self.world_transform = np.eye(4)
         self.scale_factor = None
         self.up_vector = None
@@ -130,6 +131,9 @@ class ProjectInitializer:
             yaml_config.get("annotations")
         )
         self.classes_filepath = self.__add_path_if_needed(yaml_config.get("classes"))
+        self.classifier_filepath = self.__add_path_if_needed(
+            yaml_config.get("classifier")
+        )
         self.photos_path = self.__add_path_if_needed(yaml_config.get("photos_path"))
         self.cropped_path = self.__add_path_if_needed(yaml_config.get("cropped_path"))
         self.thumbnail_path = self.__add_path_if_needed(
@@ -202,6 +206,8 @@ class ProjectInitializer:
             config["annotations_last_highest_id"] = int(
                 self.annotations_last_highest_id
             )
+        if self.classifier_filepath is not None:
+            config["classifier"] = os.path.basename(self.classifier_filepath)
         if self.photos_path is not None:
             config["photos_path"] = os.path.basename(self.photos_path)
         if self.cropped_path is not None:

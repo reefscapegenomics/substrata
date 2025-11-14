@@ -395,7 +395,15 @@ class Cameras:
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
         for cam_id, cam_data in data["cameras"].items():
-            # if cam_data["center"] is not None:
+            if (
+                cam_data.get("center") is None
+                or cam_data.get("center") == "null"
+                or cam_data.get("transform") is None
+                or cam_data.get("transform") == "null"
+                or cam_data.get("path") is None
+                or cam_data.get("path") == "null"
+            ):
+                continue
             self.data[cam_id] = Camera(
                 self,
                 cam_id,
