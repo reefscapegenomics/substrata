@@ -217,7 +217,8 @@ class ProjectInitializer:
         if self.scale_factor is not None:
             config["scale_factor"] = float(self.scale_factor)
         if self.world_transform is not None:
-            config["world_transform"] = self.world_transform.tolist()
+            # Save as bracketed nested arrays ([[..., ...], [..., ...], ...]) in YAML
+            config["world_transform"] = _as_flow_sequence(self.world_transform)
         # Optional orientation-related fields
         if self.up_vector is not None:
             up_val = getattr(self.up_vector, "xyz", self.up_vector)
@@ -225,7 +226,8 @@ class ProjectInitializer:
                 up_list = up_val.tolist()
             else:
                 up_list = list(up_val)
-            config["up_vector"] = [float(v) for v in up_list]
+            # Save vector in bracketed flow style: [x, y, z]
+            config["up_vector"] = _as_flow_sequence([float(v) for v in up_list])
         if self.depth_offset is not None:
             config["depth_offset"] = float(self.depth_offset)
         if self.depth_per_unit is not None:
@@ -446,3 +448,40 @@ class ProjectInitializer:
             return filename
         else:
             return os.path.join(self.path.rstrip("/"), filename)
+
+class _YamlFlowList(list):
+    """Wrapper list to force YAML flow-style (bracketed) sequences."""
+
+
+def _represent_flow_list(dumper, data):
+    """YAML representer to serialize lists in flow-style."""
+    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+
+
+def _ensure_yaml_flow_registered() -> None:
+    """Register the YAML representer for flow-style lists once."""
+    if not getattr(yaml, "_substrata_flow_registered", False):
+        yaml.add_representer(_YamlFlowList, _represent_flow_list)  # type: ignore[arg-type]
+        yaml._substrata_flow_registered = True  # type: ignore[attr-defined]
+
+
+def _as_flow_sequence(value):
+    """Convert array-like value to a flow-style YAML sequence (bracketed).
+
+    Preserves nested list structure and ensures both outer and inner lists
+    are written using bracketed syntax.
+    """
+    _ensure_yaml_flow_registered()
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        items = [
+            _as_flow_sequence(v)
+            if isinstance(v, (list, tuple, np.ndarray))
+            else v
+            for v in list(value)
+        ]
+        return _YamlFlowList(items)
+    return value
