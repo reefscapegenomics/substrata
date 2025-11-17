@@ -170,8 +170,9 @@ def handle_orient(args):
     # Initialize project (loads PCD, cameras/markers if available)
     init.initialize(apply_transform=False)
 
-    # Run scale_and_orient workflow
-    init.scale_and_orient()
+    # Run scale_and_orient workflow (skip if --manual flag is set)
+    if not getattr(args, "manual", False):
+        init.scale_and_orient()
 
     # Handle optional manual transform
     if getattr(args, "transform", False):
@@ -796,6 +797,15 @@ def main():
         help=(
             "Prompt for manual transform matrix to apply after scale_and_orient "
             "(accepts YAML or array format, supports multiple transforms)."
+        ),
+    )
+    p_orient.add_argument(
+        "--manual",
+        dest="manual",
+        action="store_true",
+        help=(
+            "Skip the automatic scale_and_orient workflow. "
+            "Use with --transform to apply only manual transforms."
         ),
     )
 
