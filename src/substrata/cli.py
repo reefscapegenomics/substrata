@@ -173,6 +173,17 @@ def handle_orient(args):
     # Run scale_and_orient workflow
     init.scale_and_orient()
 
+    # Handle optional manual transform
+    if getattr(args, "transform", False):
+        manual_transform = _get_transform_from_user()
+        # Apply manual transform to pointcloud
+        # (multiplies with existing world_transform)
+        init.pcd.apply_transform(manual_transform)
+        # Update initializer's world_transform to match pointcloud
+        init.world_transform = init.pcd.world_transform
+        # Propagate updated world_transform to cameras/markers/annotations
+        init.apply_world_transform(skip_pcd=True)
+
     # Always save values to YAML
     yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
     init.save_config_to_yaml(yaml_path)
@@ -200,11 +211,14 @@ def handle_firefish(args):
     target_depth = _infer_target_depth(base, args.target_depth)
     pdf_output = os.path.join(cwd, f"{base}_firefish.pdf")
     cam_depths_file = args.cam_depths_file or os.path.join(cwd, f"{base}_camdepths.csv")
-    depth_and_outlier_threshold = args.depth_outlier_thresh if args.depth_outlier_thresh is not None else None
+    depth_and_outlier_threshold = (
+        args.depth_outlier_thresh if args.depth_outlier_thresh is not None else None
+    )
     if args.input:
         init.pcd_filepath = args.input
 
     from substrata.firefish import FireFish
+
     ff = FireFish(args.firefish_file or os.path.join(cwd, f"{base}_firefish.txt"))
 
     # Initialize project (loads PCD, cameras/markers if available) without transforms
@@ -213,17 +227,21 @@ def handle_firefish(args):
     # Optionally filter cameras by group name
     if args.cams_group:
         filtered_cams = init.cams.group(args.cams_group)
-        print(f"Number of cameras considered (after filter by group): {len(filtered_cams.items())}")
+        print(
+            f"Number of cameras considered (after filter by group): {len(filtered_cams.items())}"
+        )
     else:
         filtered_cams = init.cams
         print(f"All cameras are being considered: {len(filtered_cams.items())}")
 
     if len(filtered_cams.items()) == 0:
-        raise ValueError(f"No cameras available in this group. Available camera groups: {init.cams.group_names}")
+        raise ValueError(
+            f"No cameras available in this group. Available camera groups: {init.cams.group_names}"
+        )
 
     # Calculate scale factor (but do not apply yet - to get accurate camera distances only)
     init.calc_scale_factor()
-    
+
     if init.scale_factor is None:
         raise ValueError("Scale factor is not set")
     else:
@@ -454,6 +472,105 @@ def _parse_transform_from_input(transform_str: str) -> np.ndarray:
     return transform
 
 
+def _read_single_transform_input() -> str:
+    """Read a single transform matrix input from stdin.
+
+    Returns:
+        String containing the transform matrix in YAML or array format.
+
+    Raises:
+        SystemExit: If no transform is provided.
+    """
+    lines = []
+    while True:
+        try:
+            line = input()
+            # If we get an empty line and we already have content, we're done
+            if line.strip() == "" and lines:
+                break
+            # If we get an empty line and no content yet, continue waiting
+            if line.strip() == "":
+                continue
+            lines.append(line)
+        except EOFError:
+            # Ctrl+D signals end of input
+            break
+
+    transform_str = "\n".join(lines)
+    if not transform_str.strip():
+        raise SystemExit("No transform provided")
+
+    return transform_str
+
+
+def _get_transform_from_user() -> np.ndarray:
+    """Prompt user for transform matrix input, read from stdin, and parse it.
+
+    Supports multiple transforms that are multiplied cumulatively.
+    After the first transform is parsed successfully, prompts for additional
+    transforms. Each new transform is multiplied with the cumulative result
+    using np.dot(new_transform, cumulative_transform).
+
+    Returns:
+        4x4 numpy array representing the cumulative transform matrix.
+
+    Raises:
+        SystemExit: If no transform is provided or parsing fails.
+    """
+    print("Please paste the transform matrix (YAML or array format):")
+    print("  - YAML format: world_transform")
+    print("  - Array format: [[...], [...], [...]] or " "[[...], [...], [...], [...]]")
+
+    # Read and parse first transform
+    transform_str = _read_single_transform_input()
+    try:
+        cumulative_transform = _parse_transform_from_input(transform_str)
+        print(f"Parsed transform:\n{cumulative_transform}")
+    except Exception as e:
+        raise SystemExit(f"Failed to parse transform: {e}")
+
+    # Loop for additional transforms
+    while True:
+        print(
+            "If you want to apply any additional transforms paste the next "
+            "one below, otherwise press ENTER"
+        )
+        try:
+            line = input().strip()
+            if line == "":
+                # Empty line means no more transforms
+                break
+        except EOFError:
+            # Ctrl+D means no more transforms
+            break
+
+        # Read the additional transform
+        additional_lines = [line]
+        while True:
+            try:
+                next_line = input()
+                if next_line.strip() == "":
+                    break
+                additional_lines.append(next_line)
+            except EOFError:
+                break
+
+        additional_transform_str = "\n".join(additional_lines)
+        if not additional_transform_str.strip():
+            break
+
+        try:
+            additional_transform = _parse_transform_from_input(additional_transform_str)
+            print(f"Parsed additional transform:\n{additional_transform}")
+            # Multiply: new_transform @ cumulative_transform
+            cumulative_transform = np.dot(additional_transform, cumulative_transform)
+            print(f"Cumulative transform:\n{cumulative_transform}")
+        except Exception as e:
+            raise SystemExit(f"Failed to parse additional transform: {e}")
+
+    return cumulative_transform
+
+
 def handle_images(args):
     """Handle the image matching CLI command.
 
@@ -488,38 +605,27 @@ def handle_images(args):
 
     # Handle optional transform
     if getattr(args, "transform", False):
-        print("Please paste the transform matrix (YAML or array format):")
-        print("  - YAML format: world_transform")
-        print("  - Array format: [[...], [...], [...]] or [[...], [...], [...], [...]]")
-        transform_str = ""
-        while True:
-            try:
-                line = input()
-                if line.strip() == "":
-                    break
-                transform_str += line + "\n"
-            except EOFError:
-                break
+        transform = _get_transform_from_user()
 
-        if not transform_str.strip():
-            raise SystemExit("No transform provided")
+        # Transform orig_coords and use as new orig_coords
+        from substrata import geom
 
         try:
-            transform = _parse_transform_from_input(transform_str)
-            print(f"Parsed transform:\n{transform}")
-
-            # Transform orig_coords and use as new orig_coords
-            from substrata import geom
-
             for annotation in init.annotations:
                 old_coords = annotation.orig_coords
-                annotation.orig_coords = geom.transform_coords(annotation.orig_coords, transform)
+                annotation.orig_coords = geom.transform_coords(
+                    annotation.orig_coords, transform
+                )
                 if annotation.extra_coords:
-                    raise ValueError("Extra coords are not supported for image matching")
-                print(f"{annotation.id} orig_coords changed from {old_coords} to {annotation.orig_coords}")
-
+                    raise ValueError(
+                        "Extra coords are not supported for image matching"
+                    )
+                print(
+                    f"{annotation.id} orig_coords changed from {old_coords} "
+                    f"to {annotation.orig_coords}"
+                )
         except Exception as e:
-            raise SystemExit(f"Failed to parse or apply transform: {e}")
+            raise SystemExit(f"Failed to apply transform: {e}")
 
     # # Apply world_transform from initializer if available
     # if not init.world_transform_is_identity:
@@ -682,6 +788,15 @@ def main():
         type=str,
         default=None,
         help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_orient.add_argument(
+        "--transform",
+        dest="transform",
+        action="store_true",
+        help=(
+            "Prompt for manual transform matrix to apply after scale_and_orient "
+            "(accepts YAML or array format, supports multiple transforms)."
+        ),
     )
 
     # firefish

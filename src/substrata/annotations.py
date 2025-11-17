@@ -171,12 +171,8 @@ class Annotations:
                 self.data[id].cam_filepath = (
                     cam_filepath if cam_filepath not in [None, ""] else None
                 )
-                self.data[id].cam_x = (
-                    float(cam_x) if cam_x not in [None, ""] else None
-                )
-                self.data[id].cam_y = (
-                    float(cam_y) if cam_y not in [None, ""] else None
-                )
+                self.data[id].cam_x = float(cam_x) if cam_x not in [None, ""] else None
+                self.data[id].cam_y = float(cam_y) if cam_y not in [None, ""] else None
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
@@ -247,12 +243,8 @@ class Annotations:
                 self.data[id].cam_filepath = (
                     cam_filepath if cam_filepath not in [None, ""] else None
                 )
-                self.data[id].cam_x = (
-                    float(cam_x) if cam_x not in [None, ""] else None
-                )
-                self.data[id].cam_y = (
-                    float(cam_y) if cam_y not in [None, ""] else None
-                )
+                self.data[id].cam_x = float(cam_x) if cam_x not in [None, ""] else None
+                self.data[id].cam_y = float(cam_y) if cam_y not in [None, ""] else None
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
@@ -474,7 +466,7 @@ class Annotations:
     #     """Get a point cloud of all annotation coordinates."""
     #     pcd = geometry.PointCloud()
     #     pcd.points = utility.Vector3dVector(self.get_all_coords())
-    #     return pcd
+    #     return pcd``
 
     def transform_coords(self, transform: Union[np.ndarray, Any]) -> None:
         """Apply a transformation to all annotation coordinates.
@@ -735,9 +727,10 @@ class Annotations:
             cam_filepath = None
             cam_x = None
             cam_y = None
-            if getattr(ann, "image_match", None) is not None and getattr(
-                ann.image_match, "cam", None
-            ) is not None:
+            if (
+                getattr(ann, "image_match", None) is not None
+                and getattr(ann.image_match, "cam", None) is not None
+            ):
                 cam_filepath = getattr(ann.image_match.cam, "filepath", None)
                 cam_x = getattr(ann.image_match, "x", None)
                 cam_y = getattr(ann.image_match, "y", None)
@@ -866,6 +859,7 @@ class Annotations:
             get_value("cam_y"),
             other_fields,
         )
+
     @staticmethod
     def __strip_post_fixes(ann_id: str) -> str:
         """Remove postfixes from annotation id.

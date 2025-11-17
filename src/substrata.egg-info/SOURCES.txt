@@ -8,6 +8,7 @@ src/substrata/classification.py
 src/substrata/cli.py
 src/substrata/firefish.py
 src/substrata/geom.py
+src/substrata/initializer.py
 src/substrata/logging.py
 src/substrata/measurements.py
 src/substrata/pointclouds.py
