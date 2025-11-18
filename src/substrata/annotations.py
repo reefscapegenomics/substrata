@@ -163,6 +163,7 @@ class Annotations:
                 cam_x,
                 cam_y,
                 other_cols,
+                depth_sensor_m,
             ) = self.__get_annotation_fields(line.rstrip("\r\n").split(","))
             ann_id = self.__strip_post_fixes(id)
             if ann_id not in self.data:
@@ -181,6 +182,9 @@ class Annotations:
                 )
                 self.data[id].cam_x = float(cam_x) if cam_x not in [None, ""] else None
                 self.data[id].cam_y = float(cam_y) if cam_y not in [None, ""] else None
+                self.data[id].depth_sensor_m = (
+                    float(depth_sensor_m) if depth_sensor_m not in [None, ""] else None
+                )
                 self.data[id].other_cols = other_cols
             else:
                 # Additional coordinates for existing annotation
@@ -815,6 +819,7 @@ class Annotations:
             "cam_filepath": get_col_index(cols, ["cam_filepath"], mandatory=False),
             "cam_x": get_col_index(cols, ["cam_x"], mandatory=False),
             "cam_y": get_col_index(cols, ["cam_y"], mandatory=False),
+            "depth_sensor_m": get_col_index(cols, ["depth"], mandatory=False),
         }
 
     def __get_annotation_fields(self, cols: List[str]) -> Tuple[
