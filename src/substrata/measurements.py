@@ -1514,10 +1514,21 @@ class DepthResidualAnalyzer:
         if not hasattr(parent, "depth_offset") or parent.depth_offset is None:
             return None
 
-        # Use orig_coords if available, otherwise coords
-        coords = getattr(item, "orig_coords", None)
-        if coords is None:
-            coords = getattr(item, "coords", None)
+        # For cameras, use orig_coords (as in Camera.depth_in_m property)
+        # For annotations, use orig_coords to match the coordinates used in regression
+        # (regression uses coords at regression time, but orig_coords preserves those values)
+        container_type = type(parent).__name__
+        if container_type == "Cameras":
+            coords = getattr(item, "orig_coords", None)
+            if coords is None:
+                coords = getattr(item, "coords", None)
+        else:
+            # For Annotations, prefer orig_coords (preserves original values used in regression)
+            # Fall back to coords if orig_coords not available
+            coords = getattr(item, "orig_coords", None)
+            if coords is None:
+                coords = getattr(item, "coords", None)
+
         if coords is None:
             return None
 

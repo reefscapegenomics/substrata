@@ -456,6 +456,12 @@ class ProjectInitializer:
         self.cams.depth_offset = self.depth_offset
         self.cams.depth_per_unit = self.depth_per_unit
 
+        # Set marker attributes if markers were used
+        if markers_filepath is not None and self.markers is not None:
+            self.markers.up_vector = self.up_vector
+            self.markers.depth_offset = self.depth_offset
+            self.markers.depth_per_unit = self.depth_per_unit
+
         # Propagate pointcloud world_transform to cameras/markers/annotations
         self.world_transform = self.pcd.world_transform
         self.apply_world_transform(skip_pcd=True)
