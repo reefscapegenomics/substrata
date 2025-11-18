@@ -175,7 +175,7 @@ def handle_orient(args):
         init.scale_and_orient()
 
     # Handle optional manual transform
-    if getattr(args, "transform", False):
+    if getattr(args, "transform", False) or getattr(args, "manual", False):
         manual_transform = _get_transform_from_user()
         # Apply manual transform to pointcloud
         # (multiplies with existing world_transform)
@@ -195,8 +195,9 @@ def handle_orient(args):
     init.pcd.save_pdf(filepath=output_pdf)
 
     # Save camera depth residuals PDF
-    output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
-    init.cams.save_depth_residuals_pdf(filepath=output_pdf)
+    if not getattr(args, "manual", False):
+        output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
+        init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_firefish(args):

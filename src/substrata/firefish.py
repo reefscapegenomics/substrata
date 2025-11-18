@@ -173,7 +173,9 @@ class FireFish:
 
         def get_mae_from_depth_regression(offset):
             # Build arrays for regression without mutating cams
-            points, depths = self.get_camera_coords_and_depths_from_firefish(cams, offset)
+            points, depths = self.get_camera_coords_and_depths_from_firefish(
+                cams, offset
+            )
             if len(points) < min_num_cam_matches:
                 return None
             try:
@@ -216,7 +218,6 @@ class FireFish:
         fig = self.__plot_matches(offsets, maes, maes)
         return lowest_mae_offset, fig
 
-
     def get_camera_depths_from_firefish(self, cams, offset):
         """
         Build a mapping of cam_id -> depth (meters) from FireFish data at a given offset.
@@ -228,9 +229,11 @@ class FireFish:
             cam_time_adjusted = get_unix_time(cam.datetime) + offset
             match_firefish = self.data[self.data["unixtime"] == cam_time_adjusted]
             if not match_firefish.empty:
-                cam_id_to_sensor_depth_m[cam.cam_id] = float(match_firefish.iloc[0]["depth"])
+                cam_id_to_sensor_depth_m[cam.cam_id] = float(
+                    match_firefish.iloc[0]["depth"]
+                )
         return cam_id_to_sensor_depth_m
-    
+
     def get_camera_coords_and_depths_from_firefish(self, cams, offset):
         """
         Build numpy arrays of (points, depths) for cameras that have FireFish depth
@@ -282,10 +285,12 @@ class FireFish:
 
         # Determine camera time offset unless provided manually
         if offset is None:
-            offset, fig = self.determine_camera_time_offset_based_on_lowest_depth_regression_error(
-                cams,
-                target_depth=target_depth,
-                depth_and_outlier_threshold=depth_and_outlier_threshold,
+            offset, fig = (
+                self.determine_camera_time_offset_based_on_lowest_depth_regression_error(
+                    cams,
+                    target_depth=target_depth,
+                    depth_and_outlier_threshold=depth_and_outlier_threshold,
+                )
             )
             print(
                 f"Determined camera time offset for target depth {target_depth}m: {offset}s"
@@ -301,7 +306,11 @@ class FireFish:
         cams.reset_depth_sensor_m()
         cam_id_to_sensor_depth_m = self.get_camera_depths_from_firefish(cams, offset)
         cams.set_depth_sensor_m(cam_id_to_sensor_depth_m)
-        up_vector, depth_offset, depth_per_unit, *_ = cams.get_up_vector_from_camera_depths()
+        up_vector, depth_offset, depth_per_unit, *_ = (
+            cams.get_up_vector_from_camera_depths()
+        )
+        # Re-save camera attributes to file (to include determined depth_sensor_m values)
+        cams.save_camera_attributes(camdepths_filepath)
 
         # Visualize altitude matches
         fig = self.plot_cams_vs_firefish(cams, offset)

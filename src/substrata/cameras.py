@@ -103,9 +103,7 @@ class Cameras:
 
         # Basic availability stats
         num_with_coords = sum(
-            1
-            for cam in self.data.values()
-            if getattr(cam, "coords", None) is not None
+            1 for cam in self.data.values() if getattr(cam, "coords", None) is not None
         )
         num_with_datetime = sum(
             1
@@ -118,9 +116,7 @@ class Cameras:
             if getattr(cam, "depth_sensor_m", None) is not None
         )
         num_enabled = sum(
-            1
-            for cam in self.data.values()
-            if getattr(cam, "enabled", True) is True
+            1 for cam in self.data.values() if getattr(cam, "enabled", True) is True
         )
 
         # Coordinate bounds (if available)
@@ -585,9 +581,7 @@ class Cameras:
                 f"File had {not_found_counter} cameras that were not found..."
             )
         if cam_counter == 0:
-            logger.warning(
-                f"No cameras found in file {input_filepath}"
-            )
+            logger.warning(f"No cameras found in file {input_filepath}")
 
     def save_camera_attributes(self, output_filepath):
         """Save camera attributes to a CSV file.
@@ -602,6 +596,9 @@ class Cameras:
             fieldnames = [
                 "cam_id",
                 "path",
+                "orig_x",
+                "orig_y",
+                "orig_z",
                 "datetime",
                 "camdist",
                 "depth",
@@ -615,6 +612,9 @@ class Cameras:
                     {
                         "cam_id": cam.cam_id,
                         "path": cam.orig_filepath,
+                        "orig_x": cam.orig_coords[0],
+                        "orig_y": cam.orig_coords[1],
+                        "orig_z": cam.orig_coords[2],
                         "datetime": getattr(cam, "datetime", None),
                         "camdist": getattr(cam, "camdist", None),
                         # Keep CSV column name 'depth' for compatibility,
@@ -703,7 +703,7 @@ class Cameras:
             replace_str (str): The string to replace find_str with.
         """
         self.filepath_replace = [find_str, replace_str]
-    
+
     def set_filename_prefix(self, filename_prefix):
         """Set a filename prefix for adjusting filepaths.
 
@@ -776,7 +776,7 @@ class Cameras:
             if cam.filename == filename or cam.filename == filename + ".jpg":
                 return cam
         return None
-    
+
     def get_camera_by_filename_partial_match(self, filename):
         """Get a camera object by a partial filename match.
 
@@ -870,10 +870,10 @@ class Cameras:
 
         res = measurements.fit_depth_regression(points, depths)
 
-
         # 4) Plot the regression fit if requested
         if plot:
             from substrata import visualizations
+
             visualizations.plot_depth_regression(depths, res.depths_pred)
 
         # Print summary statistics
@@ -901,8 +901,7 @@ class Cameras:
         )
 
     def get_depths_and_estimated_depths(
-        self,
-        depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
+        self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
     ):
         """
         Get the sensor depths (.depth_sensor_m) and predicted depths (.depth_in_m)
@@ -957,11 +956,10 @@ class Cameras:
         depths = [cam.depth_sensor_m for cam in cams_filtered.data.values()]
         z_coords = [cam.coords[2] for cam in cams_filtered.data.values()]
         return depths, z_coords, cams_filtered
-    
 
     def show_depth_vs_est_depth_residuals(self, width=15, height=5):
         """Show residuals between predicted depth_in_m and the original recorded camera depths.
-        
+
         These residuals are calculated based on recorded camera depths and the predicted depths from the regression model.
 
         Args:
@@ -970,8 +968,16 @@ class Cameras:
             recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
         depths, est_depths, cams_filtered = self.get_depths_and_estimated_depths()
-        fig1 = visualizations.plot_depth_regression(depths, est_depths, width=width, height=height, title="Depth vs Estimated Depth")
-        fig2 = visualizations.plot_cam_residuals(cams_filtered, depths, est_depths, width=width, height=height)
+        fig1 = visualizations.plot_depth_regression(
+            depths,
+            est_depths,
+            width=width,
+            height=height,
+            title="Depth vs Estimated Depth",
+        )
+        fig2 = visualizations.plot_cam_residuals(
+            cams_filtered, depths, est_depths, width=width, height=height
+        )
         return fig1, fig2
 
     def show_z_vs_depth_residuals(self, width=15, height=5):
@@ -983,8 +989,12 @@ class Cameras:
             recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
         depths, z_coords, cams_filtered = self.get_depths_and_z_coords()
-        fig1 = visualizations.plot_depth_regression(depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate")
-        fig2 = visualizations.plot_cam_residuals(cams_filtered, depths, z_coords, width=width, height=height)
+        fig1 = visualizations.plot_depth_regression(
+            depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate"
+        )
+        fig2 = visualizations.plot_cam_residuals(
+            cams_filtered, depths, z_coords, width=width, height=height
+        )
         return fig1, fig2
 
     def save_depth_residuals_pdf(
@@ -1020,7 +1030,9 @@ class Cameras:
                     filepath = "depth_residuals.pdf"
 
             # Get the figures from show_depth_residuals
-            fig1, fig2 = self.show_depth_vs_est_depth_residuals(width=width, height=height)
+            fig1, fig2 = self.show_depth_vs_est_depth_residuals(
+                width=width, height=height
+            )
             fig3, fig4 = self.show_z_vs_depth_residuals(width=width, height=height)
 
             # Save both figures to PDF
@@ -1061,7 +1073,7 @@ class Camera:
         self.cam_id = cam_id
         self.camera_transform = self.orig_camera_transform = camera_transform
         self.coords = self.orig_coords = coords
-        self.depth_sensor_m = None # Depth in meters as measured by a sensor
+        self.depth_sensor_m = None  # Depth in meters as measured by a sensor
         self.orig_filepath = path
         self.filename = os.path.basename(path)
         self.sensor_id = None  # Will be set during XML parsing
@@ -1094,8 +1106,11 @@ class Camera:
     @property
     def filepath(self):
         if (
-            (not hasattr(self.parent, "filepath_replace") or not self.parent.filepath_replace)
-            and (not hasattr(self.parent, "filename_prefix") or not self.parent.filename_prefix)
+            not hasattr(self.parent, "filepath_replace")
+            or not self.parent.filepath_replace
+        ) and (
+            not hasattr(self.parent, "filename_prefix")
+            or not self.parent.filename_prefix
         ):
             return self.orig_filepath
         else:
@@ -1172,14 +1187,18 @@ class Camera:
             return None
 
         if (
-            not hasattr(self.parent, "up_vector") or self.parent.up_vector is None or
-            not hasattr(self.parent, "depth_offset") or self.parent.depth_offset is None
+            not hasattr(self.parent, "up_vector")
+            or self.parent.up_vector is None
+            or not hasattr(self.parent, "depth_offset")
+            or self.parent.depth_offset is None
         ):
             print("Cameras 'up_vector' and/or depth_offset not set")
             return None
 
-        return float(self.parent.depth_offset + float(np.dot(self.parent.up_vector, self.orig_coords)))
-    
+        return float(
+            self.parent.depth_offset
+            + float(np.dot(self.parent.up_vector, self.orig_coords))
+        )
 
     def transform_coords(self, transform_matrix):
         """Apply a transformation to the camera coordinates and transform.
@@ -1569,7 +1588,10 @@ class Camera:
             and self.parent.filepath_replace
             and len(self.parent.filepath_replace) >= 2
         ):
-            find_str, replace_str = self.parent.filepath_replace[0], self.parent.filepath_replace[1]
+            find_str, replace_str = (
+                self.parent.filepath_replace[0],
+                self.parent.filepath_replace[1],
+            )
             if find_str and replace_str:
                 updated = updated.replace(find_str, replace_str)
             elif replace_str:
@@ -1892,7 +1914,6 @@ class ImageMatch:
 
         plt.plot(center_x, center_y, "ro", markersize=8)
         plt.show()
-
 
 
 class Frame:
