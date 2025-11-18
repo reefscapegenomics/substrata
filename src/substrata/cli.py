@@ -658,6 +658,56 @@ def handle_images(args):
     visualizations.save_cropped_image_matches_to_pdf(image_matches, pdf_output)
 
 
+def handle_transform(args):
+    """Handle the transform CLI command.
+
+    Loads annotations from a file, prompts for one or more transforms,
+    applies them to orig_coords of each annotation, and sets coords to match.
+
+    Args:
+        args: Arguments from argparse.
+    """
+    from substrata import geom
+
+    if not args.input:
+        raise SystemExit("--input is required. Provide path to annotations file.")
+
+    # Load annotations from file
+    header = not getattr(args, "no_header", False)
+    anns = Annotations(filepath=args.input, header=header)
+
+    if len(anns) == 0:
+        raise SystemExit("No annotations found in input file.")
+
+    print(f"Loaded {len(anns)} annotations from {args.input}")
+
+    # Prompt for transform(s)
+    transform = _get_transform_from_user()
+
+    # Apply transform to each annotation's orig_coords and set coords to match
+    for annotation in anns:
+        old_orig_coords = annotation.orig_coords.copy()
+        annotation.orig_coords = geom.transform_coords(
+            annotation.orig_coords, transform
+        )
+        annotation.coords = annotation.orig_coords
+        print(
+            f"{annotation.id} orig_coords transformed from {old_orig_coords} "
+            f"to {annotation.orig_coords}"
+        )
+
+    # Save transformed annotations
+    if args.output:
+        output_path = args.output
+    else:
+        # Default output: add _transformed suffix before extension
+        base_path, ext = os.path.splitext(args.input)
+        output_path = f"{base_path}_transformed{ext}"
+
+    anns.save(output_path)
+    print(f"Saved transformed annotations to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1050,6 +1100,38 @@ def main():
         ),
     )
 
+    # transform
+    p_transform = subparsers.add_parser(
+        "transform",
+        help=(
+            "Transform annotations: load from file, apply transform(s) to orig_coords, "
+            "and save result."
+        ),
+    )
+    p_transform.add_argument(
+        "--input",
+        dest="input",
+        type=str,
+        required=True,
+        help="Path to input annotations CSV file.",
+    )
+    p_transform.add_argument(
+        "--output",
+        dest="output",
+        type=str,
+        default=None,
+        help=(
+            "Optional output annotations CSV filepath. "
+            "Default: <input_basename>_transformed.csv"
+        ),
+    )
+    p_transform.add_argument(
+        "--no_header",
+        dest="no_header",
+        action="store_true",
+        help="Set header=False when loading annotations (default: header=True).",
+    )
+
     args = parser.parse_args()
 
     handlers = {
@@ -1063,6 +1145,7 @@ def main():
         "intercepts": handle_intercepts,
         "align": handle_align,
         "images": handle_images,
+        "transform": handle_transform,
     }
     handlers[args.command](args)
 
