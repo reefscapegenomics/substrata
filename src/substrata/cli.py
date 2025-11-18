@@ -173,8 +173,12 @@ def handle_orient(args):
     # Run scale_and_orient workflow (skip if --manual flag is set)
     if not getattr(args, "manual", False):
         # Use markers CSV filepath if provided, otherwise use camera depths
-        markers_filepath = getattr(args, "markers", None)
-        init.scale_and_orient(markers_filepath=markers_filepath)
+        depth_markers_filepath = getattr(args, "markers", None)
+        if depth_markers_filepath is not None:
+            depth_markers = Annotations(depth_markers_filepath, orig_coords_only=True)
+        else:
+            depth_markers = None
+        init.scale_and_orient(depth_markers=depth_markers)
 
     # Handle optional manual transform
     if getattr(args, "transform", False) or getattr(args, "manual", False):
@@ -198,11 +202,10 @@ def handle_orient(args):
 
     # Save depth residuals PDF (from markers if used, otherwise from cameras)
     if not getattr(args, "manual", False):
-        markers_filepath = getattr(args, "markers", None)
         output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
-        if markers_filepath is not None and init.markers is not None:
-            # Use annotation depth residuals if markers were used
-            init.markers.save_depth_residuals_pdf(filepath=output_pdf)
+        if depth_markers is not None:
+            # Use annotation depth residuals if depth_markers were used
+            depth_markers.save_depth_residuals_pdf(filepath=output_pdf)
         else:
             # Use camera depth residuals (default behavior)
             init.cams.save_depth_residuals_pdf(filepath=output_pdf)

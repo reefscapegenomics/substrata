@@ -51,6 +51,7 @@ class ProjectInitializer:
         self.markers = None
         self.annotations = None
         self.scalebars = None
+        self.depth_markers = None
 
         # If YAML file or path to YAML file is provided, use it to initialize the project
         if yaml is not None:
@@ -402,7 +403,7 @@ class ProjectInitializer:
         self.scale_factor = self.scalebars.calc_scalefactor()
         return self.scale_factor
 
-    def scale_and_orient(self, plot=True, recalculate=True, markers_filepath=None):
+    def scale_and_orient(self, plot=True, recalculate=True, depth_markers=None):
         """Calculate scale and orientation transforms and apply them.
 
         Calculates scale and orientation transforms and applies them using the
@@ -414,8 +415,8 @@ class ProjectInitializer:
         Args:
             plot (bool): If True, create visualizations of the regression fit.
             recalculate (bool): If True, recalculate the up vector and scale factor.
-            markers_filepath (str, optional): Path to markers CSV file. If provided,
-                uses annotation depths instead of camera depths to determine up vector.
+            depth_markers (Annotations, optional): Annotations instance with depth data.
+                If provided, uses annotation depths instead of camera depths to determine up vector.
         """
         # Ensure at least the poincloud is initialized
         if self.pcd is None:
@@ -423,16 +424,10 @@ class ProjectInitializer:
 
         if recalculate:
             # Determine up vector, depth offset and depth per unit
-            if markers_filepath is not None:
-                # Load markers if not already loaded or if different filepath
-                if self.markers is None or self.markers_filepath != markers_filepath:
-                    print(f"Loading markers from {markers_filepath}")
-                    self.markers = annotations.Annotations(
-                        markers_filepath, orig_coords_only=True
-                    )
+            if depth_markers is not None:
                 # Use annotation depths to determine up vector
                 self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
-                    self.markers.get_up_vector_from_annotation_depths(plot=plot)
+                    depth_markers.get_up_vector_from_annotation_depths(plot=plot)
                 )
             else:
                 # Use camera depths to determine up vector (default behavior)
@@ -451,20 +446,20 @@ class ProjectInitializer:
             self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit
         )
 
+        # Propagate pointcloud world_transform to cameras/markers/annotations
+        self.world_transform = self.pcd.world_transform
+        self.apply_world_transform(skip_pcd=True)
+
         # Set camera attributes
         self.cams.up_vector = self.up_vector
         self.cams.depth_offset = self.depth_offset
         self.cams.depth_per_unit = self.depth_per_unit
-
-        # Set marker attributes if markers were used
-        if markers_filepath is not None and self.markers is not None:
-            self.markers.up_vector = self.up_vector
-            self.markers.depth_offset = self.depth_offset
-            self.markers.depth_per_unit = self.depth_per_unit
-
-        # Propagate pointcloud world_transform to cameras/markers/annotations
-        self.world_transform = self.pcd.world_transform
-        self.apply_world_transform(skip_pcd=True)
+        # Set depth_markers attributes if depth_markers were used
+        if depth_markers is not None:
+            depth_markers.up_vector = self.up_vector
+            depth_markers.depth_offset = self.depth_offset
+            depth_markers.depth_per_unit = self.depth_per_unit
+            depth_markers.apply_transform(self.world_transform)
 
         return self.up_vector, self.depth_offset, self.depth_per_unit
 
