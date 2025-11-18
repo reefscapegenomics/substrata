@@ -172,7 +172,9 @@ def handle_orient(args):
 
     # Run scale_and_orient workflow (skip if --manual flag is set)
     if not getattr(args, "manual", False):
-        init.scale_and_orient()
+        # Use markers CSV filepath if provided, otherwise use camera depths
+        markers_filepath = getattr(args, "markers", None)
+        init.scale_and_orient(markers_filepath=markers_filepath)
 
     # Handle optional manual transform
     if getattr(args, "transform", False) or getattr(args, "manual", False):
@@ -194,10 +196,16 @@ def handle_orient(args):
     output_pdf = _get_output_filepath(init, "views.pdf")
     init.pcd.save_pdf(filepath=output_pdf)
 
-    # Save camera depth residuals PDF
+    # Save depth residuals PDF (from markers if used, otherwise from cameras)
     if not getattr(args, "manual", False):
+        markers_filepath = getattr(args, "markers", None)
         output_pdf = _get_output_filepath(init, "depth_residuals.pdf")
-        init.cams.save_depth_residuals_pdf(filepath=output_pdf)
+        if markers_filepath is not None and init.markers is not None:
+            # Use annotation depth residuals if markers were used
+            init.markers.save_depth_residuals_pdf(filepath=output_pdf)
+        else:
+            # Use camera depth residuals (default behavior)
+            init.cams.save_depth_residuals_pdf(filepath=output_pdf)
 
 
 def handle_firefish(args):
@@ -864,6 +872,13 @@ def main():
             "Skip the automatic scale_and_orient workflow. "
             "Use with --transform to apply only manual transforms."
         ),
+    )
+    p_orient.add_argument(
+        "--markers",
+        dest="markers",
+        type=str,
+        default=None,
+        help="Optional markers CSV filepath to use for up vector calculation.",
     )
 
     # firefish

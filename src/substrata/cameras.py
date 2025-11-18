@@ -896,6 +896,13 @@ class Cameras:
             len(cams_filtered),
         )
 
+    @property
+    def depth_residuals(self):
+        """Access depth residual analysis methods."""
+        from substrata.measurements import DepthResidualAnalyzer
+
+        return DepthResidualAnalyzer(self)
+
     def get_depths_and_estimated_depths(
         self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
     ):
@@ -909,20 +916,10 @@ class Cameras:
         Returns:
             tuple: A tuple containing the depths and predicted depths.
         """
-        cams_list = [
-            cam
-            for cam in self.data.values()
-            if cam.depth_sensor_m is not None
-            and cam.coords is not None
-            and (
-                not hasattr(cam, "depth_acc")
-                or cam.depth_acc <= depth_accuracy_threshold
-            )
-        ]
-        cams_filtered = self.filter_by_cams(cams_list)
-        depths = [cam.depth_sensor_m for cam in cams_filtered.data.values()]
-        est_depths = [cam.depth_in_m for cam in cams_filtered.data.values()]
-        return depths, est_depths, cams_filtered
+        return self.depth_residuals.get_depths_and_estimated_depths(
+            depth_accuracy_threshold=depth_accuracy_threshold,
+            use_accuracy_filter=True,
+        )
 
     def get_depths_and_z_coords(
         self, depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD
@@ -937,21 +934,10 @@ class Cameras:
         Returns:
             tuple: A tuple containing the depths and z-coordinates.
         """
-        cams_list = [
-            cam
-            for cam in self.data.values()
-            if hasattr(cam, "depth_sensor_m")
-            and cam.depth_sensor_m is not None
-            and cam.coords is not None
-            and (
-                not hasattr(cam, "depth_acc")
-                or cam.depth_acc <= depth_accuracy_threshold
-            )
-        ]
-        cams_filtered = self.filter_by_cams(cams_list)
-        depths = [cam.depth_sensor_m for cam in cams_filtered.data.values()]
-        z_coords = [cam.coords[2] for cam in cams_filtered.data.values()]
-        return depths, z_coords, cams_filtered
+        return self.depth_residuals.get_depths_and_z_coords(
+            depth_accuracy_threshold=depth_accuracy_threshold,
+            use_accuracy_filter=True,
+        )
 
     def show_depth_vs_est_depth_residuals(self, width=15, height=5):
         """Show residuals between predicted depth_in_m and the original recorded camera depths.
@@ -961,20 +947,13 @@ class Cameras:
         Args:
             width (float): Figure width in inches (default: 15)
             height (float): Figure height in inches (default: 5)
-            recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
-        depths, est_depths, cams_filtered = self.get_depths_and_estimated_depths()
-        fig1 = visualizations.plot_depth_regression(
-            depths,
-            est_depths,
+        return self.depth_residuals.show_depth_vs_est_depth_residuals(
             width=width,
             height=height,
-            title="Depth vs Estimated Depth",
+            depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
+            use_accuracy_filter=True,
         )
-        fig2 = visualizations.plot_cam_residuals(
-            cams_filtered, depths, est_depths, width=width, height=height
-        )
-        return fig1, fig2
 
     def show_z_vs_depth_residuals(self, width=15, height=5):
         """Show residuals between camera z-coordinates and the original recorded camera depths.
@@ -982,16 +961,13 @@ class Cameras:
         Args:
             width (float): Figure width in inches (default: 15)
             height (float): Figure height in inches (default: 5)
-            recalculate (bool): If True, recalculate the depth residuals (default: True)
         """
-        depths, z_coords, cams_filtered = self.get_depths_and_z_coords()
-        fig1 = visualizations.plot_depth_regression(
-            depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate"
+        return self.depth_residuals.show_z_vs_depth_residuals(
+            width=width,
+            height=height,
+            depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
+            use_accuracy_filter=True,
         )
-        fig2 = visualizations.plot_cam_residuals(
-            cams_filtered, depths, z_coords, width=width, height=height
-        )
-        return fig1, fig2
 
     def save_depth_residuals_pdf(
         self, filepath=None, width=15, height=5, recalculate=True
@@ -1010,43 +986,13 @@ class Cameras:
         Returns:
             str: The filepath where the PDF was saved.
         """
-        import matplotlib
-        from matplotlib.backends.backend_pdf import PdfPages
-
-        backend_original = matplotlib.get_backend()
-        # Use a non-interactive backend to prevent showing figures
-        matplotlib.use("Agg", force=True)
-        try:
-            if filepath is None:
-                # Generate default filename from cameras metadata filepath if available
-                if hasattr(self, "cams_meta_filepath") and self.cams_meta_filepath:
-                    base, _ = os.path.splitext(self.cams_meta_filepath)
-                    filepath = f"{base}_depth_residuals.pdf"
-                else:
-                    filepath = "depth_residuals.pdf"
-
-            # Get the figures from show_depth_residuals
-            fig1, fig2 = self.show_depth_vs_est_depth_residuals(
-                width=width, height=height
-            )
-            fig3, fig4 = self.show_z_vs_depth_residuals(width=width, height=height)
-
-            # Save both figures to PDF
-            pdf = PdfPages(filepath)
-            pdf.savefig(fig1)
-            pdf.savefig(fig2)
-            pdf.savefig(fig3)
-            pdf.savefig(fig4)
-            pdf.close()
-
-            # Close figures to free memory
-            plt.close(fig1)
-            plt.close(fig2)
-
-            return filepath
-        finally:
-            # Restore the original backend
-            matplotlib.use(backend_original, force=True)
+        return self.depth_residuals.save_depth_residuals_pdf(
+            filepath=filepath,
+            width=width,
+            height=height,
+            depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
+            use_accuracy_filter=True,
+        )
 
 
 class Camera:

@@ -203,7 +203,9 @@ class ProjectInitializer:
         if self.annotations_filepath is not None:
             config["annotations"] = self.annotations_filepath
         if self.annotations_last_highest_id is not None:
-            config["annotations_last_highest_id"] = int(self.annotations_last_highest_id)
+            config["annotations_last_highest_id"] = int(
+                self.annotations_last_highest_id
+            )
         if self.classifier_filepath is not None:
             config["classifier"] = self.classifier_filepath
         if self.photos_path is not None:
@@ -400,13 +402,20 @@ class ProjectInitializer:
         self.scale_factor = self.scalebars.calc_scalefactor()
         return self.scale_factor
 
-    def scale_and_orient(self, plot=True, recalculate=True):
-        """
+    def scale_and_orient(self, plot=True, recalculate=True, markers_filepath=None):
+        """Calculate scale and orientation transforms and apply them.
+
         Calculates scale and orientation transforms and applies them using the
         Pointcloud.apply_orientation_transforms() method.
 
         Note that depth_offset is based on depth_per_unit (vertical scaling factor),
-        and so z-values are only very rough approximations of depth
+        and so z-values are only very rough approximations of depth.
+
+        Args:
+            plot (bool): If True, create visualizations of the regression fit.
+            recalculate (bool): If True, recalculate the up vector and scale factor.
+            markers_filepath (str, optional): Path to markers CSV file. If provided,
+                uses annotation depths instead of camera depths to determine up vector.
         """
         # Ensure at least the poincloud is initialized
         if self.pcd is None:
@@ -414,9 +423,22 @@ class ProjectInitializer:
 
         if recalculate:
             # Determine up vector, depth offset and depth per unit
-            self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
-                self.cams.get_up_vector_from_camera_depths(plot=plot)
-            )
+            if markers_filepath is not None:
+                # Load markers if not already loaded or if different filepath
+                if self.markers is None or self.markers_filepath != markers_filepath:
+                    print(f"Loading markers from {markers_filepath}")
+                    self.markers = annotations.Annotations(
+                        markers_filepath, orig_coords_only=True
+                    )
+                # Use annotation depths to determine up vector
+                self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
+                    self.markers.get_up_vector_from_annotation_depths(plot=plot)
+                )
+            else:
+                # Use camera depths to determine up vector (default behavior)
+                self.up_vector, self.depth_offset, self.depth_per_unit, *_ = (
+                    self.cams.get_up_vector_from_camera_depths(plot=plot)
+                )
             # Determine scale factor
             self.calc_scale_factor()
 
@@ -428,7 +450,7 @@ class ProjectInitializer:
         self.pcd.apply_orientation_transforms(
             self.scale_factor, self.up_vector, self.depth_offset, self.depth_per_unit
         )
-    
+
         # Set camera attributes
         self.cams.up_vector = self.up_vector
         self.cams.depth_offset = self.depth_offset
@@ -448,6 +470,7 @@ class ProjectInitializer:
             return filename
         else:
             return os.path.join(self.path.rstrip("/"), filename)
+
 
 class _YamlFlowList(list):
     """Wrapper list to force YAML flow-style (bracketed) sequences."""
@@ -478,9 +501,7 @@ def _as_flow_sequence(value):
         value = value.tolist()
     if isinstance(value, (list, tuple)):
         items = [
-            _as_flow_sequence(v)
-            if isinstance(v, (list, tuple, np.ndarray))
-            else v
+            _as_flow_sequence(v) if isinstance(v, (list, tuple, np.ndarray)) else v
             for v in list(value)
         ]
         return _YamlFlowList(items)

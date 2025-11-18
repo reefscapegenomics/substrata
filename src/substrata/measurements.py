@@ -202,9 +202,9 @@ def get_plane_angles(pcd, vis=False):
     # Y-then-X rotations to align n -> +Z
     # theta: rotate about +Y to null x component in xz-plane
     # psi:   rotate about +X to null y component
-    theta = np.arctan2(nx, nz)                 # about Y
+    theta = np.arctan2(nx, nz)  # about Y
     # after Y rotation by -theta, residual "up" length in xz is sqrt(nx^2+nz^2)
-    psi = np.arctan2(-ny, np.hypot(nx, nz))    # about X
+    psi = np.arctan2(-ny, np.hypot(nx, nz))  # about X
 
     theta_deg = float(np.degrees(theta))
     psi_deg = float(np.degrees(psi))
@@ -214,13 +214,19 @@ def get_plane_angles(pcd, vis=False):
     if r_xy < 1e-8:
         az_deg = None
     else:
-        az = np.arctan2(ny, nx)                # +X→0°, CCW
+        az = np.arctan2(ny, nx)  # +X→0°, CCW
         az_deg = float((np.degrees(az) + 360.0) % 360.0)
 
     if vis:
         visualizations.visualize_elevation_angle(pcd, [a, b, c, d], elev_deg)
 
-    return theta_deg, psi_deg, elev_deg, [float(a), float(b), float(c), float(d)], az_deg
+    return (
+        theta_deg,
+        psi_deg,
+        elev_deg,
+        [float(a), float(b), float(c), float(d)],
+        az_deg,
+    )
 
 
 def get_elevation_angle(normal) -> float:
@@ -1390,9 +1396,10 @@ def get_intercept_points_using_cams(xy_coords, search_radius, pcd, cams, vis=Fal
 
     return intercept_points, non_intercept_points
 
+
 def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
     """
-    Spherical linear interpolation between unit vectors u and v 
+    Spherical linear interpolation between unit vectors u and v
     at fraction t in [0,1].
     """
     dot_uv = np.dot(u, v)
@@ -1402,14 +1409,15 @@ def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
     # If angle ~ 0, vectors are almost identical → no arc.
     if angle < 1e-8:
         return u
-    # If angle ~ pi, vectors are nearly opposite → fallback to linear 
+    # If angle ~ pi, vectors are nearly opposite → fallback to linear
     # to avoid singularities.
     elif abs(angle - np.pi) < 1e-8:
         return (1.0 - t) * u + t * v
 
     # Normal slerp
-    return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u \
-            + (np.sin(t * angle) / np.sin(angle)) * v
+    return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u + (
+        np.sin(t * angle) / np.sin(angle)
+    ) * v
 
 
 @dataclass
@@ -1473,3 +1481,282 @@ def fit_depth_regression(
         depths_pred=depths_pred,
         depths_res=depths_res,
     )
+
+
+class DepthResidualAnalyzer:
+    """Analyzes depth residuals for any container with depth data.
+
+    Works with both Cameras and Annotations containers that have:
+    - Items with depth_sensor_m and coords/orig_coords attributes
+    - Parent container with up_vector and depth_offset attributes
+    """
+
+    def __init__(self, container):
+        """Initialize the analyzer with a container.
+
+        Args:
+            container: A Cameras or Annotations container instance.
+        """
+        self.container = container
+
+    def _calculate_estimated_depth(self, item):
+        """Calculate estimated depth using parent's up_vector and depth_offset.
+
+        Args:
+            item: A Camera or Annotation instance.
+
+        Returns:
+            float: Estimated depth in meters, or None if calculation not possible.
+        """
+        parent = self.container
+        if not hasattr(parent, "up_vector") or parent.up_vector is None:
+            return None
+        if not hasattr(parent, "depth_offset") or parent.depth_offset is None:
+            return None
+
+        # Use orig_coords if available, otherwise coords
+        coords = getattr(item, "orig_coords", None)
+        if coords is None:
+            coords = getattr(item, "coords", None)
+        if coords is None:
+            return None
+
+        return float(parent.depth_offset + float(np.dot(parent.up_vector, coords)))
+
+    def _filter_items_with_depth(
+        self, depth_accuracy_threshold=None, use_accuracy_filter=False
+    ):
+        """Filter items that have depth data.
+
+        Args:
+            depth_accuracy_threshold (float, optional): Threshold for depth accuracy
+                filtering (only used for cameras with use_accuracy_filter=True).
+            use_accuracy_filter (bool): Whether to apply accuracy threshold filtering.
+
+        Returns:
+            list: Filtered list of items with depth data.
+        """
+        items = []
+        for item in self.container.data.values():
+            if not hasattr(item, "depth_sensor_m") or item.depth_sensor_m is None:
+                continue
+            if not hasattr(item, "coords") or item.coords is None:
+                continue
+
+            # Apply accuracy filter only if requested and item has depth_acc
+            if use_accuracy_filter and depth_accuracy_threshold is not None:
+                if hasattr(item, "depth_acc") and item.depth_acc is not None:
+                    if item.depth_acc > depth_accuracy_threshold:
+                        continue
+
+            items.append(item)
+        return items
+
+    def get_depths_and_estimated_depths(
+        self, depth_accuracy_threshold=None, use_accuracy_filter=False
+    ):
+        """Get sensor depths and predicted depths for items.
+
+        Args:
+            depth_accuracy_threshold (float, optional): Threshold for depth accuracy
+                filtering (only used with use_accuracy_filter=True).
+            use_accuracy_filter (bool): Whether to apply accuracy threshold filtering.
+
+        Returns:
+            tuple: (depths, est_depths, filtered_container) where:
+                - depths: List of sensor depths
+                - est_depths: List of estimated depths from regression
+                - filtered_container: Container with filtered items
+        """
+        items = self._filter_items_with_depth(
+            depth_accuracy_threshold, use_accuracy_filter
+        )
+        depths = [item.depth_sensor_m for item in items]
+        est_depths = [self._calculate_estimated_depth(item) for item in items]
+
+        # Filter out None values from est_depths
+        valid_indices = [i for i, ed in enumerate(est_depths) if ed is not None]
+        depths = [depths[i] for i in valid_indices]
+        est_depths = [est_depths[i] for i in valid_indices]
+        items = [items[i] for i in valid_indices]
+
+        # Create filtered container
+        filtered = self.container._empty_like()
+        for item in items:
+            item_id = getattr(item, "cam_id", None) or getattr(item, "id", None)
+            if item_id:
+                filtered.data[item_id] = item
+                item.parent = filtered
+
+        return depths, est_depths, filtered
+
+    def get_depths_and_z_coords(
+        self, depth_accuracy_threshold=None, use_accuracy_filter=False
+    ):
+        """Get sensor depths and z-coordinates for items.
+
+        Args:
+            depth_accuracy_threshold (float, optional): Threshold for depth accuracy
+                filtering (only used with use_accuracy_filter=True).
+            use_accuracy_filter (bool): Whether to apply accuracy threshold filtering.
+
+        Returns:
+            tuple: (depths, z_coords, filtered_container) where:
+                - depths: List of sensor depths
+                - z_coords: List of z-coordinates
+                - filtered_container: Container with filtered items
+        """
+        items = self._filter_items_with_depth(
+            depth_accuracy_threshold, use_accuracy_filter
+        )
+        depths = [item.depth_sensor_m for item in items]
+        z_coords = [item.coords[2] for item in items]
+
+        # Create filtered container
+        filtered = self.container._empty_like()
+        for item in items:
+            item_id = getattr(item, "cam_id", None) or getattr(item, "id", None)
+            if item_id:
+                filtered.data[item_id] = item
+                item.parent = filtered
+
+        return depths, z_coords, filtered
+
+    def show_depth_vs_est_depth_residuals(self, width=15, height=5, **kwargs):
+        """Show residuals between predicted and recorded depths.
+
+        Args:
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+            **kwargs: Additional arguments passed to get_depths_and_estimated_depths
+
+        Returns:
+            tuple: (fig1, fig2) matplotlib figure objects
+        """
+        from substrata import visualizations
+
+        depths, est_depths, filtered = self.get_depths_and_estimated_depths(**kwargs)
+        fig1 = visualizations.plot_depth_regression(
+            depths,
+            est_depths,
+            width=width,
+            height=height,
+            title="Depth vs Estimated Depth",
+        )
+
+        # Use appropriate visualization function based on container type
+        container_type = type(self.container).__name__
+        if container_type == "Cameras":
+            fig2 = visualizations.plot_cam_residuals(
+                filtered, depths, est_depths, width=width, height=height
+            )
+        else:
+            # For annotations, use a simpler residual plot
+            # TODO: Create plot_annotation_residuals if needed
+            fig2 = visualizations.plot_depth_regression(
+                depths,
+                est_depths,
+                width=width,
+                height=height,
+                title="Depth Residuals",
+            )
+        return fig1, fig2
+
+    def show_z_vs_depth_residuals(self, width=15, height=5, **kwargs):
+        """Show residuals between z-coordinates and recorded depths.
+
+        Args:
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+            **kwargs: Additional arguments passed to get_depths_and_z_coords
+
+        Returns:
+            tuple: (fig1, fig2) matplotlib figure objects
+        """
+        from substrata import visualizations
+
+        depths, z_coords, filtered = self.get_depths_and_z_coords(**kwargs)
+        fig1 = visualizations.plot_depth_regression(
+            depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate"
+        )
+
+        # Use appropriate visualization function based on container type
+        container_type = type(self.container).__name__
+        if container_type == "Cameras":
+            fig2 = visualizations.plot_cam_residuals(
+                filtered, depths, z_coords, width=width, height=height
+            )
+        else:
+            # For annotations, use a simpler residual plot
+            fig2 = visualizations.plot_depth_regression(
+                depths,
+                z_coords,
+                width=width,
+                height=height,
+                title="Z-Coordinate Residuals",
+            )
+        return fig1, fig2
+
+    def save_depth_residuals_pdf(self, filepath=None, width=15, height=5, **kwargs):
+        """Save depth residuals visualization as a PDF.
+
+        Args:
+            filepath (str, optional): Path to save the PDF file. If None, generates
+                a default filename.
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+            **kwargs: Additional arguments passed to residual methods
+
+        Returns:
+            str: The filepath where the PDF was saved.
+        """
+        import matplotlib
+        from matplotlib.backends.backend_pdf import PdfPages
+        import os
+
+        backend_original = matplotlib.get_backend()
+        matplotlib.use("Agg", force=True)
+        try:
+            if filepath is None:
+                # Generate default filename
+                container_type = type(self.container).__name__.lower()
+                if (
+                    hasattr(self.container, "cams_meta_filepath")
+                    and self.container.cams_meta_filepath
+                ):
+                    base, _ = os.path.splitext(self.container.cams_meta_filepath)
+                    filepath = f"{base}_depth_residuals.pdf"
+                elif (
+                    hasattr(self.container, "markers_filepath")
+                    and self.container.markers_filepath
+                ):
+                    base, _ = os.path.splitext(self.container.markers_filepath)
+                    filepath = f"{base}_depth_residuals.pdf"
+                else:
+                    filepath = f"{container_type}_depth_residuals.pdf"
+
+            # Get the figures
+            fig1, fig2 = self.show_depth_vs_est_depth_residuals(
+                width=width, height=height, **kwargs
+            )
+            fig3, fig4 = self.show_z_vs_depth_residuals(
+                width=width, height=height, **kwargs
+            )
+
+            # Save all figures to PDF
+            pdf = PdfPages(filepath)
+            pdf.savefig(fig1)
+            pdf.savefig(fig2)
+            pdf.savefig(fig3)
+            pdf.savefig(fig4)
+            pdf.close()
+
+            # Close figures to free memory
+            plt.close(fig1)
+            plt.close(fig2)
+            plt.close(fig3)
+            plt.close(fig4)
+
+            return filepath
+        finally:
+            matplotlib.use(backend_original, force=True)

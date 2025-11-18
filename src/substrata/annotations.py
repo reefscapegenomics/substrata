@@ -491,6 +491,159 @@ class Annotations:
                 print(f"  {label}: {count} ({percentage:.1f}%)")
         print()
 
+    def get_up_vector_from_annotation_depths(
+        self,
+        plot: bool = False,
+    ) -> Tuple[
+        np.ndarray,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        int,
+    ]:
+        """Compute the up vector using least-squares regression on annotation depths.
+
+        Fits a linear regression between the annotation 3D points and their sensor
+        depths to find the dominant depth direction. Also stores predicted depths
+        and errors.
+
+        Args:
+            plot (bool): If True, create a visualization of the regression fit.
+
+        Returns:
+            Tuple containing:
+                - up_vector (np.ndarray): The coefficient vector representing the
+                  up vector.
+                - depth_offset (float): Depth offset from regression.
+                - depth_per_unit (float): Depth per unit from regression.
+                - mse (float): Mean squared error.
+                - rmse (float): Root mean squared error.
+                - mae (float): Mean absolute error.
+                - r2 (float): R² value.
+                - num_matches (int): Number of annotations used.
+        """
+        # Get annotations with depth_sensor_m and coords
+        # (no filtering by accuracy threshold)
+        anns_with_depth = [
+            ann
+            for ann in self.data.values()
+            if (
+                hasattr(ann, "depth_sensor_m")
+                and hasattr(ann, "coords")
+                and ann.depth_sensor_m is not None
+                and ann.coords is not None
+            )
+        ]
+        print(
+            f"Found {len(anns_with_depth)} matching "
+            f"annotations/depths for regression"
+        )
+
+        # Conduct regression on the annotations
+        points = np.array([ann.coords for ann in anns_with_depth])
+        depths = np.array([ann.depth_sensor_m for ann in anns_with_depth])
+
+        res = measurements.fit_depth_regression(points, depths)
+
+        # Plot the regression fit if requested
+        if plot:
+            from substrata import visualizations
+
+            visualizations.plot_depth_regression(depths, res.depths_pred)
+
+        # Print summary statistics
+        print(
+            f"  Up vector: [{res.up_vector[0]}, {res.up_vector[1]}, {res.up_vector[2]}]"
+        )
+        print(f"  Depth offset: {res.depth_offset:.4f} m")
+        print(f"  Depth per unit: {res.depth_per_unit:.4f} m")
+        print(f"  Mean squared error: {res.mse:.4f} m²")
+        print(f"  Root mean squared error: {res.rmse:.4f} m")
+        print(f"  Mean absolute error: {res.mae:.4f} m")
+        print(f"  R²: {res.r2:.4f}")
+        print(f"  Number of matches: {len(anns_with_depth)}")
+
+        # Return the up vector and error metrics, plus number of matches
+        return (
+            res.up_vector,
+            res.depth_offset,
+            res.depth_per_unit,
+            res.mse,
+            res.rmse,
+            res.mae,
+            res.r2,
+            len(anns_with_depth),
+        )
+
+    @property
+    def depth_residuals(self):
+        """Access depth residual analysis methods."""
+        from substrata.measurements import DepthResidualAnalyzer
+
+        return DepthResidualAnalyzer(self)
+
+    def get_depths_and_estimated_depths(self):
+        """Get sensor depths and predicted depths for annotations.
+
+        Returns:
+            tuple: (depths, est_depths, filtered_annotations)
+        """
+        return self.depth_residuals.get_depths_and_estimated_depths()
+
+    def get_depths_and_z_coords(self):
+        """Get sensor depths and z-coordinates for annotations.
+
+        Returns:
+            tuple: (depths, z_coords, filtered_annotations)
+        """
+        return self.depth_residuals.get_depths_and_z_coords()
+
+    def show_depth_vs_est_depth_residuals(self, width=15, height=5):
+        """Show residuals between predicted and recorded depths.
+
+        Args:
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+
+        Returns:
+            tuple: (fig1, fig2) matplotlib figure objects
+        """
+        return self.depth_residuals.show_depth_vs_est_depth_residuals(
+            width=width, height=height
+        )
+
+    def show_z_vs_depth_residuals(self, width=15, height=5):
+        """Show residuals between z-coordinates and recorded depths.
+
+        Args:
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+
+        Returns:
+            tuple: (fig1, fig2) matplotlib figure objects
+        """
+        return self.depth_residuals.show_z_vs_depth_residuals(
+            width=width, height=height
+        )
+
+    def save_depth_residuals_pdf(self, filepath=None, width=15, height=5):
+        """Save depth residuals visualization as a PDF.
+
+        Args:
+            filepath (str, optional): Path to save the PDF file.
+            width (float): Figure width in inches (default: 15)
+            height (float): Figure height in inches (default: 5)
+
+        Returns:
+            str: The filepath where the PDF was saved.
+        """
+        return self.depth_residuals.save_depth_residuals_pdf(
+            filepath=filepath, width=width, height=height
+        )
+
     # def get_pcd(self):
     #     """Get a point cloud of all annotation coordinates."""
     #     pcd = geometry.PointCloud()
@@ -621,6 +774,19 @@ class Annotations:
         for ann_id in list(self.data.keys())[start_idx:end_idx]:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
+
+    def _empty_like(self) -> "Annotations":
+        """Return an empty Annotations container inheriting this instance's metadata."""
+        subset = Annotations()
+        for attr, val in self.__dict__.items():
+            if attr == "data":
+                continue
+            try:
+                setattr(subset, attr, val)
+            except Exception:
+                pass
+        subset.data = {}
+        return subset
 
     def get_point_cloud_by_radius(self, source_pcd: Any, radius: float) -> None:
         """Get a point cloud around each annotation within a radius.
