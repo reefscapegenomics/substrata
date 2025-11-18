@@ -37,6 +37,23 @@ class Annotations:
     Container class that holds a collection of Annotation objects
     """
 
+    # Field configuration: (field_name, [possible_column_names], mandatory)
+    _FIELD_CONFIG = [
+        ("id", ["id"], True),
+        ("orig_x", ["x", "orig_x"], True),
+        ("orig_y", ["y", "orig_y"], True),
+        ("orig_z", ["z", "orig_z"], True),
+        ("label", ["label"], True),
+        ("label_conf", ["label_conf"], False),
+        ("world_x", ["world_x"], False),
+        ("world_y", ["world_y"], False),
+        ("world_z", ["world_z"], False),
+        ("cam_filepath", ["cam_filepath"], False),
+        ("cam_x", ["cam_x"], False),
+        ("cam_y", ["cam_y"], False),
+        ("depth_sensor_m", ["depth"], False),
+    ]
+
     def __init__(
         self,
         filepath: Optional[str] = None,
@@ -807,19 +824,8 @@ class Annotations:
         # Strip line endings (handle both Unix LF and Windows CRLF)
         cols = line.rstrip("\r\n").split(",")
         return {
-            "id": get_col_index(cols, ["id"]),
-            "orig_x": get_col_index(cols, ["x", "orig_x"]),
-            "orig_y": get_col_index(cols, ["y", "orig_y"]),
-            "orig_z": get_col_index(cols, ["z", "orig_z"]),
-            "label": get_col_index(cols, ["label"]),
-            "label_conf": get_col_index(cols, ["label_conf"], mandatory=False),
-            "world_x": get_col_index(cols, ["world_x"], mandatory=False),
-            "world_y": get_col_index(cols, ["world_y"], mandatory=False),
-            "world_z": get_col_index(cols, ["world_z"], mandatory=False),
-            "cam_filepath": get_col_index(cols, ["cam_filepath"], mandatory=False),
-            "cam_x": get_col_index(cols, ["cam_x"], mandatory=False),
-            "cam_y": get_col_index(cols, ["cam_y"], mandatory=False),
-            "depth_sensor_m": get_col_index(cols, ["depth"], mandatory=False),
+            field_name: get_col_index(cols, possible_names, mandatory=mandatory)
+            for field_name, possible_names, mandatory in self._FIELD_CONFIG
         }
 
     def __get_annotation_fields(self, cols: List[str]) -> Tuple[
@@ -849,29 +855,37 @@ class Annotations:
         """
 
         primary_field_indices = set(self.col_order.values())
-        other_fields = [
-            value for idx, value in enumerate(cols) if idx not in primary_field_indices
-        ]
 
         def get_value(key: str) -> Optional[str]:
             idx = self.col_order.get(key)
             return cols[idx] if idx is not None and idx < len(cols) else None
 
+        # Extract all known fields using the field configuration
+        field_values = {}
+        for field_name, _, _ in self._FIELD_CONFIG:
+            field_values[field_name] = get_value(field_name)
+
+        # Compute other_fields last, after all known fields are extracted
+        other_fields = [
+            value for idx, value in enumerate(cols) if idx not in primary_field_indices
+        ]
+
+        # Return in the expected order (matching the unpacking in get_annotations_from_file)
         return (
-            get_value("id"),
-            get_value("orig_x"),
-            get_value("orig_y"),
-            get_value("orig_z"),
-            get_value("label"),
-            get_value("label_conf"),
-            get_value("world_x"),
-            get_value("world_y"),
-            get_value("world_z"),
-            get_value("cam_filepath"),
-            get_value("cam_x"),
-            get_value("cam_y"),
-            get_value("depth_sensor_m"),
+            field_values["id"],
+            field_values["orig_x"],
+            field_values["orig_y"],
+            field_values["orig_z"],
+            field_values["label"],
+            field_values["label_conf"],
+            field_values["world_x"],
+            field_values["world_y"],
+            field_values["world_z"],
+            field_values["cam_filepath"],
+            field_values["cam_x"],
+            field_values["cam_y"],
             other_fields,
+            field_values["depth_sensor_m"],
         )
 
     @staticmethod
