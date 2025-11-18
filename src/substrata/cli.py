@@ -710,7 +710,7 @@ def handle_transform(args):
         base_path, ext = os.path.splitext(args.input)
         output_path = f"{base_path}_transformed{ext}"
 
-    anns.save(output_path)
+    anns.save(output_path, orig_coords_only=True)
     print(f"Saved transformed annotations to {output_path}")
 
 

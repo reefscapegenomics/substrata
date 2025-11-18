@@ -671,11 +671,12 @@ class Annotations:
                 self.data[id].measurements["psi"] = output[1]
                 self.data[id].measurements["elevation"] = output[2]
 
-    def save(self, filepath: str) -> None:
+    def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
 
         Args:
             filepath: Output file path.
+            orig_coords_only: If True, only output orig_coords and not world coords.
         """
         output_lines = []
         # Header - core columns
@@ -686,13 +687,10 @@ class Annotations:
             "orig_z",
             "label",
             "label_conf",
-            "world_x",
-            "world_y",
-            "world_z",
-            "cam_filepath",
-            "cam_x",
-            "cam_y",
         ]
+        if not orig_coords_only:
+            col_headers.extend(["world_x", "world_y", "world_z"])
+        col_headers.extend(["cam_filepath", "cam_x", "cam_y"])
         # Header - specific to InterceptAnnotation instances
         first_annotation = next(iter(self.data.values()), None)
         if isinstance(first_annotation, InterceptAnnotation):
@@ -729,7 +727,8 @@ class Annotations:
                 row.append(ann.label_conf)
             else:
                 row.append("NA")
-            row += [value for value in ann.coords]
+            if not orig_coords_only:
+                row += [value for value in ann.coords]
 
             # Camera columns (from image_match if available; otherwise any loaded values)
             cam_filepath = None
