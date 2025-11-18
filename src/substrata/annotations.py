@@ -835,6 +835,7 @@ class Annotations:
         Optional[str],
         Optional[str],
         Optional[str],
+        Optional[float],
         List[str],
     ]:
         """Get annotation values.
@@ -869,6 +870,7 @@ class Annotations:
             get_value("cam_filepath"),
             get_value("cam_x"),
             get_value("cam_y"),
+            get_value("depth_sensor_m"),
             other_fields,
         )
 
