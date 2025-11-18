@@ -595,15 +595,13 @@ class Cameras:
         with open(output_filepath, "w", newline="") as csvfile:
             fieldnames = [
                 "cam_id",
-                "path",
                 "orig_x",
                 "orig_y",
                 "orig_z",
+                "path",
                 "datetime",
                 "camdist",
                 "depth",
-                "depth_pred",
-                "depth_res",
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -611,17 +609,15 @@ class Cameras:
                 writer.writerow(
                     {
                         "cam_id": cam.cam_id,
-                        "path": cam.orig_filepath,
                         "orig_x": cam.orig_coords[0],
                         "orig_y": cam.orig_coords[1],
                         "orig_z": cam.orig_coords[2],
+                        "path": cam.orig_filepath,
                         "datetime": getattr(cam, "datetime", None),
                         "camdist": getattr(cam, "camdist", None),
                         # Keep CSV column name 'depth' for compatibility,
                         # but read from Camera.depth_sensor_m
                         "depth": getattr(cam, "depth_sensor_m", None),
-                        "depth_pred": getattr(cam, "depth_pred", None),
-                        "depth_res": getattr(cam, "depth_residual", None),
                     }
                 )
 
