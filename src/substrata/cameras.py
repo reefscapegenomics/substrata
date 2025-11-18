@@ -566,10 +566,10 @@ class Cameras:
         with open(input_filepath, "r") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
-                cam_id = row["cam_id"]
+                cam_id = row.get("cam_id", row.get("id"))
                 if cam_id in self.data:
                     cam = self.data[cam_id]
-                    cam.orig_filepath = row["path"]
+                    cam.orig_filepath = row.get("path", row.get("label"))
                     cam.datetime = row["datetime"] if row["datetime"] else None
                     cam.camdist = row["camdist"] if row["camdist"] else None
                     cam.depth_sensor_m = float(row["depth"]) if row["depth"] else None
@@ -594,11 +594,11 @@ class Cameras:
         """
         with open(output_filepath, "w", newline="") as csvfile:
             fieldnames = [
-                "cam_id",
+                "id",
                 "orig_x",
                 "orig_y",
                 "orig_z",
-                "path",
+                "label",
                 "datetime",
                 "camdist",
                 "depth",
@@ -608,11 +608,11 @@ class Cameras:
             for cam in self.data.values():
                 writer.writerow(
                     {
-                        "cam_id": cam.cam_id,
+                        "id": cam.cam_id,
                         "orig_x": cam.orig_coords[0],
                         "orig_y": cam.orig_coords[1],
                         "orig_z": cam.orig_coords[2],
-                        "path": cam.orig_filepath,
+                        "label": cam.orig_filepath,
                         "datetime": getattr(cam, "datetime", None),
                         "camdist": getattr(cam, "camdist", None),
                         # Keep CSV column name 'depth' for compatibility,
