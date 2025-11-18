@@ -711,7 +711,7 @@ class Annotations:
         ]
         if not orig_coords_only:
             col_headers.extend(["world_x", "world_y", "world_z"])
-        col_headers.extend(["cam_filepath", "cam_x", "cam_y"])
+        col_headers.extend(["cam_filepath", "cam_x", "cam_y", "depth"])
         # Header - specific to InterceptAnnotation instances
         first_annotation = next(iter(self.data.values()), None)
         if isinstance(first_annotation, InterceptAnnotation):
@@ -769,6 +769,8 @@ class Annotations:
             row.append(cam_filepath if cam_filepath is not None else "")
             row.append(cam_x if cam_x is not None else "")
             row.append(cam_y if cam_y is not None else "")
+            depth_sensor_m = getattr(ann, "depth_sensor_m", None)
+            row.append(depth_sensor_m if depth_sensor_m is not None else "")
 
             # Columns specific to InterceptAnnotation instances
             if isinstance(ann, InterceptAnnotation):
@@ -927,6 +929,7 @@ class Annotation:
         self.cam_filepath: Optional[str] = None
         self.cam_x: Optional[float] = None
         self.cam_y: Optional[float] = None
+        self.depth_sensor_m: Optional[float] = None
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.
