@@ -669,12 +669,13 @@ def handle_transform(args):
     """
     from substrata import geom
 
-    if not args.input:
-        raise SystemExit("--input is required. Provide path to annotations file.")
-
     # Load annotations from file
     header = not getattr(args, "no_header", False)
-    anns = Annotations(filepath=args.input, header=header)
+    ignore_header = getattr(args, "ignore_header", False)
+    anns = Annotations()
+    anns.get_annotations_from_file(
+        args.input, header=header, ignore_header=ignore_header
+    )
 
     if len(anns) == 0:
         raise SystemExit("No annotations found in input file.")
@@ -683,6 +684,11 @@ def handle_transform(args):
 
     # Prompt for transform(s)
     transform = _get_transform_from_user()
+
+    # Apply inverse if requested
+    if getattr(args, "inverse", False):
+        transform = np.linalg.inv(transform)
+        print(f"Applied inverse transform:\n{transform}")
 
     # Apply transform to each annotation's orig_coords and set coords to match
     for annotation in anns:
@@ -1109,10 +1115,8 @@ def main():
         ),
     )
     p_transform.add_argument(
-        "--input",
-        dest="input",
+        "input",
         type=str,
-        required=True,
         help="Path to input annotations CSV file.",
     )
     p_transform.add_argument(
@@ -1130,6 +1134,18 @@ def main():
         dest="no_header",
         action="store_true",
         help="Set header=False when loading annotations (default: header=True).",
+    )
+    p_transform.add_argument(
+        "--ignore_header",
+        dest="ignore_header",
+        action="store_true",
+        help="Skip the first line of the file and ignore header argument (default: False).",
+    )
+    p_transform.add_argument(
+        "--inverse",
+        dest="inverse",
+        action="store_true",
+        help="Apply the inverse of the cumulative transforms (default: False).",
     )
 
     args = parser.parse_args()

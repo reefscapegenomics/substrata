@@ -45,6 +45,7 @@ class Annotations:
         ] = None,
         header: bool = True,
         orig_coords_only: bool = False,
+        ignore_header: bool = False,
     ) -> None:
         self.data = {}
         self.measurements = {}
@@ -124,6 +125,7 @@ class Annotations:
         annotations_filepath: str,
         header: bool = True,
         orig_coords_only: bool = False,
+        ignore_header: bool = False,
     ) -> None:
         """Read in annotations from a file and store in dict.
 
@@ -131,8 +133,14 @@ class Annotations:
             annotations_filepath: Path to the file.
             header: Whether the file has a header row.
             orig_coords_only: Whether to only use original coordinates.
+            ignore_header: If True, skip the first line and ignore the header argument.
         """
         annotations_file = open(annotations_filepath, "r")
+
+        # If ignore_header is True, skip first line and treat as no header
+        if ignore_header:
+            next(annotations_file, None)  # Skip first line
+            header = False
 
         for line_no, line in enumerate(annotations_file):
             if line_no == 0 and header:
