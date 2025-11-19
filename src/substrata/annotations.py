@@ -857,6 +857,8 @@ class Annotations:
                 self.data[id].measurements["theta"] = output[0]
                 self.data[id].measurements["psi"] = output[1]
                 self.data[id].measurements["elevation"] = output[2]
+                self.data[id].measurements["plane_coeffs"] = output[3]
+                self.data[id].measurements["azimuth"] = output[4]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
@@ -1096,6 +1098,12 @@ class Annotation:
         self.cam_x: Optional[float] = None
         self.cam_y: Optional[float] = None
         self.depth_sensor_m: Optional[float] = None
+
+    def show(self) -> None:
+        """Show the annotation."""
+        if self.simple_pcd is None:
+            self.get_point_cloud_by_radius(self.parent.pcd, 0.2)
+        visualizations.plot(self.simple_pcd, highlight_coords=self.coords)
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.

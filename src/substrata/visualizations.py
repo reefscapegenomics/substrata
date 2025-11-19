@@ -60,6 +60,7 @@ def plot(
     max_output_points=50000,
     title=None,
     ax=None,
+    highlight_coords=None,
 ):
     """
     Plot a 3D point cloud, with optional decimation for speed.
@@ -72,6 +73,9 @@ def plot(
         max_output_points (int): Maximum number of points to plot.
         title (str | None): Title for the plot.
         ax (matplotlib.axes.Axes | None): Optional 3D axes to draw into.
+        highlight_coords (array-like | None): Optional coordinates to highlight
+            with red dots. Can be a single [x, y, z] coordinate or an array
+            of shape (N, 3) for multiple coordinates.
 
     Returns:
         matplotlib.figure.Figure | None: New figure if created, otherwise None.
@@ -95,6 +99,23 @@ def plot(
         s=point_size,
         edgecolor="none",
     )
+
+    # Highlight the specified coordinates with red dots
+    if highlight_coords is not None:
+        # Convert single coord to array of coords if needed
+        coords = np.array(highlight_coords)
+        if coords.ndim == 1:
+            coords = coords.reshape(1, -1)
+
+        ax.scatter(
+            coords[:, 0],
+            coords[:, 1],
+            coords[:, 2],
+            c="red",
+            s=200,  # Size of the highlight dot
+            edgecolor="none",
+        )
+
     # Weighted equal scaling: x : y : z = width : height : height
     mins = pcd.points.min(axis=0)
     maxs = pcd.points.max(axis=0)
@@ -2686,7 +2707,7 @@ def visualize_elevation_angle(
     ax.set_ylim(mid_y - 0.5 * max_range, mid_y + 0.5 * max_range)
     ax.set_zlim(mid_z - 0.5 * max_range, mid_z + 0.5 * max_range)
 
-    if output_filename:
+    if output_filename is not None:
         plt.savefig(output_filename)
     else:
         plt.show()
