@@ -20,6 +20,7 @@ If you're new to substrata or want to quickly orient and scale a point cloud, st
 * :doc:`notebooks/scaling_and_orientation` - End-to-end scaling and orientation workflow
 * :doc:`command_line_usage` - Command-line usage guide
 * :doc:`notebooks/transferring_annotations` - Transfer annotations between datasets/projects
+* :doc:`notebooks/notebook_mcav_sint` - MCAV SINT analysis workflow
 
 API Documentation
 -----------------
@@ -34,6 +35,7 @@ documentation for all modules, classes, and functions.
    installation
    notebooks/scaling_and_orientation
    notebooks/transferring_annotations
+   notebooks/notebook_mcav_sint
    command_line_usage
    api
 

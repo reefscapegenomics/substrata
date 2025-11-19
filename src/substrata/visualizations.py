@@ -750,7 +750,7 @@ def plot_cam_residuals(cams, depths, est_depths, width=10, height=5):
             frameon=False,
         )
 
-    #plt.show()
+    # plt.show()
     return fig
 
 
@@ -765,13 +765,13 @@ def plot_positions(
     color=False,
 ):
     """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and X–Z views.
-    
+
     - Background shows a grayscale decimated point cloud if provided.
       If color=True and the point cloud has colors, use those instead.
     - Markers are colored by Z (bwr colormap).
     - If items have a `group` attribute, groups are encoded as filled (even index)
       vs hollow (odd index) and a legend is shown.
-    
+
     Args:
         positions: One of:
             - collection with `.data` mapping to objects with `.coords` (e.g., Cameras, Annotations)
@@ -785,10 +785,11 @@ def plot_positions(
         title: Optional figure title.
         color: If True, draw background point cloud with its colors when available;
                if False (default), draw background in gray.
-    
+
     Returns:
         matplotlib.figure.Figure: The generated figure.
     """
+
     # Normalize input → coords[N,3], groups[List[Any] | None]
     def _normalize_positions(pos):
         # Case 1: numpy array or list-like of coordinates
@@ -874,14 +875,18 @@ def plot_positions(
             # Choose background colors
             if color:
                 pcd_cols = np.asarray(pcd_bg.colors)
-                use_cols = (
-                    pcd_cols.shape[0] == pts.shape[0] and pcd_cols.shape[0] > 0
+                use_cols = pcd_cols.shape[0] == pts.shape[0] and pcd_cols.shape[0] > 0
+                bg_cols = (
+                    pcd_cols
+                    if use_cols
+                    else np.full((pts.shape[0], 3), 0.7, dtype=float)
                 )
-                bg_cols = pcd_cols if use_cols else np.full((pts.shape[0], 3), 0.7, dtype=float)
             else:
                 bg_cols = np.full((pts.shape[0], 3), 0.7, dtype=float)
             # Top: XY background
-            ax_top.scatter(pts[:, 0], pts[:, 1], s=1, c=bg_cols, alpha=0.4, edgecolor="none")
+            ax_top.scatter(
+                pts[:, 0], pts[:, 1], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
+            )
             # Bottom: XZ background
             ax_bottom.scatter(
                 pts[:, 0], pts[:, 2], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
@@ -895,7 +900,7 @@ def plot_positions(
         xs = np.asarray(coords[:, x_idx], dtype=float)
         ys = np.asarray(coords[:, y_idx], dtype=float)
         # Draw hollow vs filled by group
-        for (x, y, g, z) in zip(xs, ys, groups, z_vals):
+        for x, y, g, z in zip(xs, ys, groups, z_vals):
             col = cmap(norm(z))
             filled = group_to_fill.get(g, True)
             if filled:
@@ -921,6 +926,7 @@ def plot_positions(
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(ttl)
+        ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
 
     # Top: X–Y
@@ -999,7 +1005,9 @@ def plot_positions(
     z_vals = np.array([float(cam.coords[2]) for cam in cams_all], dtype=float)
     z_min = float(np.min(z_vals))
     z_max = float(np.max(z_vals))
-    z_min, z_max = (z_min, z_max) if np.isfinite(z_min) and np.isfinite(z_max) else (-1.0, 1.0)
+    z_min, z_max = (
+        (z_min, z_max) if np.isfinite(z_min) and np.isfinite(z_max) else (-1.0, 1.0)
+    )
     norm = plt.Normalize(vmin=z_min, vmax=z_max)
     cmap = plt.cm.bwr
 
@@ -1015,7 +1023,9 @@ def plot_positions(
         if len(pts) > 0:
             gray = np.full((pts.shape[0], 3), 0.7, dtype=float)
             # Top: XY background
-            ax_top.scatter(pts[:, 0], pts[:, 1], s=1, c=gray, alpha=0.4, edgecolor="none")
+            ax_top.scatter(
+                pts[:, 0], pts[:, 1], s=1, c=gray, alpha=0.4, edgecolor="none"
+            )
             # Bottom: XZ background
             ax_bottom.scatter(
                 pts[:, 0], pts[:, 2], s=1, c=gray, alpha=0.4, edgecolor="none"
@@ -1062,7 +1072,9 @@ def plot_positions(
     # Top: X–Y
     _plot_axis(ax_top, 0, 1, "Camera positions (X–Y)", "X coordinate", "Y coordinate")
     # Bottom: X–Z
-    _plot_axis(ax_bottom, 0, 2, "Camera positions (X–Z)", "X coordinate", "Z coordinate")
+    _plot_axis(
+        ax_bottom, 0, 2, "Camera positions (X–Z)", "X coordinate", "Z coordinate"
+    )
 
     # Legends: groups only (filled vs hollow); add a shared colorbar for Z
     from matplotlib.lines import Line2D
@@ -2761,7 +2773,7 @@ def plot_depth_regression(depths, depths_predicted, width=10, height=5, title=No
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    #plt.show()
+    # plt.show()
 
     return fig
 

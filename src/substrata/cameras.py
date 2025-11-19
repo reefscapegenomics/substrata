@@ -547,7 +547,8 @@ class Cameras:
                         )
                         self._no_sensor_message_printed = True
             else:
-                logger.warning(f"Camera {cam_id} from XML not found in loaded cameras")
+                pass  # Too many warnings for some projects - TODO
+                # logger.warning(f"Camera {cam_id} from XML not found in loaded cameras")
 
         if not self.sensors:
             sys.exit("No valid sensors found in XML file!")

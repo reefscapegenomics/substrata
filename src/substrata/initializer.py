@@ -472,6 +472,59 @@ class ProjectInitializer:
         else:
             return os.path.join(self.path.rstrip("/"), filename)
 
+    def reset_paths_to_local(self, path: str | None = None) -> None:
+        """Reset all path/filepath variables to a new base path.
+
+        Extracts the filename or directory name from each existing path and
+        updates it to be relative to the new base path. If a path is None,
+        it remains None.
+
+        Args:
+            path (str, optional): New base path. If None, uses self.path.
+        """
+        if path is None:
+            if self.path is None:
+                raise ValueError("path must be provided if self.path is None")
+            path = self.path
+
+        # Normalize the new base path
+        new_base_path = os.path.normpath(path)
+
+        # List of path attributes to reset
+        path_attributes = [
+            "ply_filepath",
+            "ply_dec_path",
+            "ply_full_path",
+            "cams_xml_filepath",
+            "cams_meta_json_filepath",
+            "markers_filepath",
+            "annotations_filepath",
+            "photos_path",
+            "cropped_path",
+            "thumbnail_path",
+            "classes_filepath",
+            "classifier_filepath",
+        ]
+
+        # Reset each path attribute
+        for attr_name in path_attributes:
+            current_path = getattr(self, attr_name, None)
+            if current_path is not None:
+                # Extract the filename or directory name
+                name = os.path.basename(current_path)
+                # Join with new base path
+                new_path = os.path.join(new_base_path, name)
+                setattr(self, attr_name, new_path)
+
+        # Update the base path itself
+        self.path = new_base_path
+
+        # Update yaml_path if it exists
+        # (keep it in the same directory as the new path)
+        if self.yaml_path is not None:
+            yaml_filename = os.path.basename(self.yaml_path)
+            self.yaml_path = os.path.join(new_base_path, yaml_filename)
+
 
 class _YamlFlowList(list):
     """Wrapper list to force YAML flow-style (bracketed) sequences."""

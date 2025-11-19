@@ -1365,12 +1365,15 @@ class Annotation:
             self.measurements["SA_in_cm2"] = SA_in_cm2
             return self.id, [SA_in_cm2]
         elif measurement_func.__name__ == "get_plane_angles":
-            theta, psi, elevation, plane_coeffs = measurement_func(self.simple_pcd)
+            theta, psi, elevation, plane_coeffs, azimuth = measurement_func(
+                self.simple_pcd
+            )
             self.measurements["theta"] = theta
             self.measurements["psi"] = psi
             self.measurements["elevation"] = elevation
             self.measurements["plane_coeffs"] = plane_coeffs
-            return self.id, [theta, psi, elevation, plane_coeffs]
+            self.measurements["azimuth"] = azimuth
+            return self.id, [theta, psi, elevation, plane_coeffs, azimuth]
         else:
             logger.error("Measurement not recognized!")
         return self.id, None
