@@ -145,9 +145,7 @@ class PointCloud:
             f"- colors: {'yes' if has_colors else 'no'}",
             f"- normals: {'yes' if has_normals else 'no'}",
             f"- bounding_box: {bb_str}",
-            (
-                f"- world_transform: {'identity' if wt_is_identity else 'non-identity'}"
-            ),
+            (f"- world_transform: {'identity' if wt_is_identity else 'non-identity'}"),
             f"- world_transform_matrix:",
             *wt_rows,
             f"- transforms_applied: {n_transforms}",

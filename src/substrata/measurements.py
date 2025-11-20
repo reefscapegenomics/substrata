@@ -218,7 +218,11 @@ def get_plane_angles(pcd, vis=False):
         az_deg = float((np.degrees(az) + 360.0) % 360.0)
 
     if vis:
-        visualizations.visualize_elevation_angle(pcd, [a, b, c, d], elev_deg)
+        visualizations.visualize_elevation_angle(pcd, [a, b, c, d])
+
+    image = visualizations.visualize_elevation_angle(
+        pcd, [a, b, c, d], interactive=False
+    )
 
     return (
         theta_deg,
@@ -226,6 +230,7 @@ def get_plane_angles(pcd, vis=False):
         elev_deg,
         [float(a), float(b), float(c), float(d)],
         az_deg,
+        image,
     )
 
 
@@ -261,7 +266,8 @@ def get_elevation_angle(normal) -> float:
 
 def get_dev_rugosity(pcd):
     """
-    Calculate deviation rugosity for a pointcloud (how much the points vary from the best fitting plane)
+    Calculate deviation rugosity for a pointcloud (how much the points vary from the best fitting plane).
+    Also called "plane-detrended roughness"
 
     author: DvH
     """
@@ -272,6 +278,68 @@ def get_dev_rugosity(pcd):
     )
     dev_rugosity = np.sum(dist) / len(pcd.points)
     return dev_rugosity
+
+
+def calc_roughness(pcd):
+    """
+    Compute plane-detrended roughness (Ra, Rq) for a point cloud.
+
+    This function fits a best-fitting plane to the point cloud and then
+    measures how much points deviate from that plane, using distances
+    perpendicular to the plane.
+
+    Definitions
+    ----------
+    Ra : arithmetical mean roughness
+        The mean of the absolute perpendicular distances from all points
+        to the best-fitting plane (mean(|d_i|)). This is the classic
+        "average height" roughness measure. Same as get_dev_rugosity.
+
+    Rq : root mean square roughness
+        The square root of the mean of squared perpendicular distances
+        (sqrt(mean(d_i^2))). This is more sensitive to larger
+        deviations than Ra and is the standard RMS roughness metric used
+        in surface metrology.
+
+    Both Ra and Rq are returned in the same absolute units as the point cloud
+    coordinates (e.g. meters).
+
+    Parameters
+    ----------
+    pcd :
+        Point cloud object with a .points attribute that can be
+        converted to an (N, 3) NumPy array. For example, an Open3D
+        PointCloud.
+
+    Returns
+    -------
+    ra : float
+        Arithmetical mean roughness (Ra).
+    rq : float
+        Root mean square roughness (Rq).
+    """
+    pts = np.asarray(pcd.points, dtype=float)
+    if pts.size == 0:
+        raise ValueError("Point cloud has no points")
+
+    # Plane: a*x + b*y + c*z + d = 0
+    a, b, c, d = get_best_fit_plane_PCA(pcd)[:4]
+
+    normal = np.array([a, b, c], dtype=float)
+    denom = np.linalg.norm(normal)
+    if denom == 0.0:
+        raise ValueError("Best-fit plane has zero-length normal")
+
+    # Perpendicular distances of all points to the plane
+    dist = np.abs(pts @ normal + d) / denom
+
+    ra = float(dist.mean())
+    rq = float(np.sqrt((dist**2).mean()))
+
+    # Pass ra and rq to avoid recalculating in visualize_roughness
+    image = visualizations.visualize_roughness(pcd, interactive=False, ra=ra, rq=rq)
+
+    return ra, rq, image
 
 
 def get_fractal_dimension(pcd, iterations=10, plot=False):
@@ -524,11 +592,26 @@ def get_3d_rugosity(area_2D, area_3D):
 
 
 def calc_gap_fraction(
-    annotation, pcd, resolution=200, color_output=True, max_radius=None
+    annotation,
+    pcd,
+    resolution=200,
+    color_output=True,
+    max_radius=None,
+    output_filename=None,
 ):
     """
     Calculate gap fraction based on hemispherical projection:
     ratio of "sky pixels" to "benthic pixels" in the resulting 2D image
+
+    Args:
+        annotation: Annotation object with coords attribute.
+        pcd: Point cloud object.
+        resolution: Image resolution (default 200).
+        color_output: Whether to use color output (default True).
+        max_radius: Optional maximum radius for filtering points.
+        output_filename: Optional filename to save the image. If None, the image
+            is not saved to file. If not provided, uses default path based on
+            annotation.id and settings.OUTPUT_FOLDER.
     """
 
     # Translate the point cloud by the negation of the center coordinates
@@ -603,12 +686,10 @@ def calc_gap_fraction(
     fill_pixel_count = cv2.countNonZero(cv2.inRange(image, fill_color, fill_color))
     gapF_fill = fill_pixel_count / img_area
 
-    # Output the image
-    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(
-        "{0}/{1}_gap_fraction.png".format(settings.OUTPUT_FOLDER, annotation.id),
-        image_bgr,
-    )
+    # Output the image only if output_filename is provided
+    if output_filename is not None:
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_filename, image_bgr)
 
     return gapF_raw, gapF_fill, image
 

@@ -35,21 +35,180 @@ def capture_geoms_to_file(geoms, output_file):
     vis.destroy_window()
 
 
-def show(geoms, Jupyter=False):
-    if Jupyter:
-        draw(geoms)
+def show(geoms, highlight_coords=None, max_output_points=500000):
+    """Show PointCloud or SimplePointCloud using plotly for interactive 3D visualization.
+
+    Works in both Jupyter notebooks and VS Code. Optionally highlights specific
+    coordinates with red markers.
+
+    Args:
+        geoms: PointCloud or SimplePointCloud object to visualize.
+        highlight_coords: Optional coordinates to highlight with red markers.
+            Can be a single [x, y, z] coordinate or an array of shape (N, 3)
+            for multiple coordinates.
+        max_output_points: Maximum number of points to display. The point cloud
+            will be decimated if it exceeds this limit. Default is at 500,000 points
+            based on plotly's performance limits.
+
+    Returns:
+        plotly.graph_objects.Figure: The interactive plotly figure.
+    """
+    import plotly.graph_objects as go
+
+    # Decimate if required (and ensure PointCloud format)
+    geoms = pointclouds.get_decimated_pcd(geoms, max_output_points)
+
+    # Check if input is a point cloud
+    if isinstance(geoms, pointclouds.SimplePointCloud):
+        points = np.asarray(geoms.points)
+        colors = getattr(geoms, "colors", None)
+        if colors is not None:
+            colors = np.asarray(colors)
+    elif isinstance(geoms, pointclouds.PointCloud):
+        points = np.asarray(geoms.points)
+        colors = getattr(geoms, "colors", None)
+        if colors is not None:
+            colors = np.asarray(geoms.colors)
+    elif hasattr(geoms, "o3d_pcd"):
+        o3d_pcd = geoms.o3d_pcd
+        points = np.asarray(o3d_pcd.points)
+        colors = np.asarray(o3d_pcd.colors) if o3d_pcd.has_colors() else None
     else:
-        vis = visualization.Visualizer()
-        vis.create_window()
+        raise ValueError("geoms must be a PointCloud or SimplePointCloud object")
 
-        for geom in geoms:
-            vis.add_geometry(geom)
-        coordinate_frame = geometry.TriangleMesh.create_coordinate_frame(
-            size=3, origin=[0, 0, 0]
+    # Ensure points are in correct format
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Points must be shape (N, 3), got {points.shape}")
+
+    # Prepare colors for plotly (expects RGB strings like 'rgb(255,0,0)')
+    if colors is not None:
+        # Normalize colors to 0-255 range if needed
+        if colors.max() <= 1.0:
+            colors_uint8 = (colors * 255).astype(np.uint8)
+        else:
+            colors_uint8 = colors.astype(np.uint8)
+        # Convert to RGB strings
+        color_strings = [
+            f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in colors_uint8
+        ]
+    else:
+        color_strings = None
+
+    # Create scatter3d trace for point cloud
+    trace = go.Scatter3d(
+        x=points[:, 0],
+        y=points[:, 1],
+        z=points[:, 2],
+        mode="markers",
+        marker=dict(
+            size=2,
+            color=color_strings if color_strings else "blue",
+            opacity=0.8,
+        ),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[trace])
+
+    # Add highlighted coordinates if provided
+    if highlight_coords is not None:
+        coords = np.asarray(highlight_coords)
+        if coords.ndim == 1:
+            coords = coords.reshape(1, -1)
+
+        if coords.shape[1] < 3:
+            raise ValueError("highlight_coords must contain 3D coordinates [x, y, z]")
+
+        # Add red markers for highlighted coordinates
+        fig.add_trace(
+            go.Scatter3d(
+                x=coords[:, 0],
+                y=coords[:, 1],
+                z=coords[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color="red",
+                    symbol="circle",
+                ),
+                showlegend=False,
+            )
         )
-        vis.add_geometry(coordinate_frame)
 
-        vis.run()
+    # Calculate ranges for equal aspect ratio (same pixels per meter for all axes)
+    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
+    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    z_range = z_max - z_min
+
+    # Use the maximum range to ensure equal scaling
+    max_range = max(x_range, y_range, z_range, 1e-9)  # Avoid division by zero
+
+    # Center each axis and use the same range
+    x_center = (x_min + x_max) / 2.0
+    y_center = (y_min + y_max) / 2.0
+    z_center = (z_min + z_max) / 2.0
+
+    half_range = max_range / 2.0
+
+    # Update layout for better viewing with equal aspect ratio
+    # Set camera view similar to matplotlib default (x on right, y going back)
+    camera_eye = {
+        "x": 1.25,
+        "y": -1.25,
+        "z": 1.25,
+    }
+    camera_center = {"x": 0, "y": 0, "z": 0}
+    camera_up = {"x": 0, "y": 0, "z": 1}
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+            aspectmode="cube",
+            xaxis=dict(range=[x_center - half_range, x_center + half_range]),
+            yaxis=dict(range=[y_center - half_range, y_center + half_range]),
+            zaxis=dict(range=[z_center - half_range, z_center + half_range]),
+            camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
+        ),
+        width=800,
+        height=600,
+        showlegend=False,
+        margin=dict(l=0, r=0, t=0, b=0),
+    )
+
+    # Show the figure (works in both Jupyter and VS Code)
+    # Try to detect environment and use appropriate renderer
+    try:
+        from IPython import get_ipython
+
+        in_jupyter = get_ipython() is not None
+    except ImportError:
+        in_jupyter = False
+
+    if in_jupyter:
+        # In Jupyter: try default renderer first, fallback to browser
+        try:
+            fig.show()
+        except (ValueError, ImportError) as e:
+            if "nbformat" in str(e):
+                # nbformat not installed - use browser renderer
+                import warnings
+
+                warnings.warn(
+                    "nbformat>=4.2.0 not installed. Using browser renderer. "
+                    "Install with: pip install nbformat>=4.2.0 for inline display."
+                )
+                fig.show(renderer="browser")
+            else:
+                raise
+    else:
+        # Command line: use browser renderer
+        fig.show(renderer="browser")
 
 
 def plot(
@@ -778,41 +937,73 @@ def plot_cam_residuals(cams, depths, est_depths, width=10, height=5):
 def plot_positions(
     positions,
     pcd,
-    max_output_points=50000,
+    max_output_points=500000,
     width=10,
     height=8,
     point_size=40,
     title=None,
     color=False,
+    show_x_z=False,
+    show_z=False,
+    zoom=None,
 ):
-    """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and X–Z views.
+    """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and optionally X–Z views.
 
     - Background shows a grayscale decimated point cloud if provided.
       If color=True and the point cloud has colors, use those instead.
-    - Markers are colored by Z (bwr colormap).
+    - Markers are colored by Z (bwr colormap) if show_z=True, otherwise in red.
     - If items have a `group` attribute, groups are encoded as filled (even index)
       vs hollow (odd index) and a legend is shown.
 
     Args:
         positions: One of:
+            - single Annotation object (will be wrapped in Annotations container)
             - collection with `.data` mapping to objects with `.coords` (e.g., Cameras, Annotations)
             - iterable of objects each with `.coords`
             - numpy array or list-like of shape (N, 3) with XYZ coordinates
         pcd: Point cloud object for background (decimated).
-        max_output_points: Max points for background decimation (default 50,000).
+        max_output_points: Max points for background decimation (default 500,000).
         width: Figure width in inches.
         height: Figure height in inches.
         point_size: Marker size for plotted positions.
         title: Optional figure title.
         color: If True, draw background point cloud with its colors when available;
                if False (default), draw background in gray.
+        show_x_z: If True, show X–Z plot in addition to X–Y (default False).
+        show_z: If True, color markers by Z coordinate with colorbar (default False).
+            If False, all markers are colored red.
+        zoom: Optional zoom level (only used for single Annotation). If provided,
+            limits the view to a zoom x zoom meter area centered on the annotation.
+            For example, zoom=1 shows a 1x1m area, zoom=2 shows a 2x2m area.
 
     Returns:
         matplotlib.figure.Figure: The generated figure.
     """
 
+    # Check if input is a single Annotation (before normalization)
+    is_single_annotation = (
+        hasattr(positions, "coords")
+        and not hasattr(positions, "data")
+        and type(positions).__name__ == "Annotation"
+    )
+    annotation_coords = None
+    if is_single_annotation and zoom is not None:
+        annotation_coords = np.asarray(positions.coords, dtype=float)
+
     # Normalize input → coords[N,3], groups[List[Any] | None]
     def _normalize_positions(pos):
+        # Case 0: single Annotation object - wrap in Annotations container
+        if (
+            hasattr(pos, "coords")
+            and not hasattr(pos, "data")
+            and type(pos).__name__ == "Annotation"
+        ):
+            from substrata import annotations
+
+            annotations_container = annotations.Annotations()
+            annotations_container.data[pos.id] = pos
+            pos = annotations_container
+
         # Case 1: numpy array or list-like of coordinates
         try:
             arr = np.asarray(pos, dtype=float)
@@ -856,8 +1047,9 @@ def plot_positions(
             pass
 
         raise ValueError(
-            "positions must be Nx3 array-like, a collection with .data of items "
-            "each having .coords, or an iterable of items with .coords."
+            "positions must be a single Annotation object, Nx3 array-like, "
+            "a collection with .data of items each having .coords, or an "
+            "iterable of items with .coords."
         )
 
     coords, groups = _normalize_positions(positions)
@@ -869,28 +1061,42 @@ def plot_positions(
     unique_groups = sorted(set(valid_groups))
     group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(unique_groups)}
 
-    # Prepare color mapping by Z coordinate (blue→red)
+    # Prepare color mapping by Z coordinate (blue→red) if show_z is True
     z_vals = np.array(coords[:, 2], dtype=float)
-    if z_vals.size:
-        z_min = float(np.nanmin(z_vals))
-        z_max = float(np.nanmax(z_vals))
-        if not (np.isfinite(z_min) and np.isfinite(z_max)):
+    if show_z:
+        if z_vals.size:
+            z_min = float(np.nanmin(z_vals))
+            z_max = float(np.nanmax(z_vals))
+            if not (np.isfinite(z_min) and np.isfinite(z_max)):
+                z_min, z_max = -1.0, 1.0
+            if z_min == z_max:
+                z_min, z_max = z_min - 1e-6, z_max + 1e-6
+        else:
             z_min, z_max = -1.0, 1.0
-        if z_min == z_max:
-            z_min, z_max = z_min - 1e-6, z_max + 1e-6
+        norm = plt.Normalize(vmin=z_min, vmax=z_max)
+        cmap = plt.cm.bwr
     else:
-        z_min, z_max = -1.0, 1.0
-    norm = plt.Normalize(vmin=z_min, vmax=z_max)
-    cmap = plt.cm.bwr
+        # Use red color for all markers when show_z is False
+        norm = None
+        cmap = None
 
-    # Build a two-row figure (top and bottom)
-    fig, (ax_top, ax_bottom) = plt.subplots(
-        2, 1, figsize=(width, height), constrained_layout=True
-    )
+    # Build figure - one or two rows depending on show_x_z
+    if show_x_z:
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2, 1, figsize=(width, height), constrained_layout=True
+        )
+    else:
+        fig, ax_top = plt.subplots(
+            1, 1, figsize=(width, height), constrained_layout=True
+        )
+        ax_bottom = None
 
     # Background: decimated PCD and grayscale points for XY and XZ
     try:
-        pcd_bg = pointclouds.get_decimated_pcd(pcd, max_output_points)
+        if zoom is None:
+            pcd_bg = pointclouds.get_decimated_pcd(pcd, max_output_points)
+        else:
+            pcd_bg = pcd
         pts = np.asarray(pcd_bg.points)
         if len(pts) > 0:
             # Choose background colors
@@ -908,10 +1114,11 @@ def plot_positions(
             ax_top.scatter(
                 pts[:, 0], pts[:, 1], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
             )
-            # Bottom: XZ background
-            ax_bottom.scatter(
-                pts[:, 0], pts[:, 2], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
-            )
+            # Bottom: XZ background (only if show_x_z is True)
+            if show_x_z and ax_bottom is not None:
+                ax_bottom.scatter(
+                    pts[:, 0], pts[:, 2], s=1, c=bg_cols, alpha=0.4, edgecolor="none"
+                )
     except Exception:
         # If background fails, continue with positions only
         pass
@@ -922,7 +1129,10 @@ def plot_positions(
         ys = np.asarray(coords[:, y_idx], dtype=float)
         # Draw hollow vs filled by group
         for x, y, g, z in zip(xs, ys, groups, z_vals):
-            col = cmap(norm(z))
+            if show_z and cmap is not None and norm is not None:
+                col = cmap(norm(z))
+            else:
+                col = "red"
             filled = group_to_fill.get(g, True)
             if filled:
                 ax.scatter(
@@ -952,14 +1162,38 @@ def plot_positions(
 
     # Top: X–Y
     _plot_axis(ax_top, 0, 1, "X coordinate", "Y coordinate", "Positions (X–Y)")
-    # Bottom: X–Z
-    _plot_axis(ax_bottom, 0, 2, "X coordinate", "Z coordinate", "Positions (X–Z)")
+    # Bottom: X–Z (only if show_x_z is True)
+    if show_x_z and ax_bottom is not None:
+        _plot_axis(ax_bottom, 0, 2, "X coordinate", "Z coordinate", "Positions (X–Z)")
 
-    # Shared colorbar for Z coordinate
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=[ax_top, ax_bottom], fraction=0.046, pad=0.04)
-    cbar.set_label("Z (m)")
+    # Apply zoom limits if zoom is specified and we have a single annotation
+    if zoom is not None and is_single_annotation and annotation_coords is not None:
+        half_zoom = zoom / 2.0
+        # Set X-Y limits
+        ax_top.set_xlim(
+            annotation_coords[0] - half_zoom, annotation_coords[0] + half_zoom
+        )
+        ax_top.set_ylim(
+            annotation_coords[1] - half_zoom, annotation_coords[1] + half_zoom
+        )
+        # Set X-Z limits if showing X-Z view
+        if show_x_z and ax_bottom is not None:
+            ax_bottom.set_xlim(
+                annotation_coords[0] - half_zoom, annotation_coords[0] + half_zoom
+            )
+            ax_bottom.set_ylim(
+                annotation_coords[2] - half_zoom, annotation_coords[2] + half_zoom
+            )
+
+    # Shared colorbar for Z coordinate (only if show_z is True)
+    if show_z and cmap is not None and norm is not None:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        if show_x_z and ax_bottom is not None:
+            cbar = fig.colorbar(sm, ax=[ax_top, ax_bottom], fraction=0.046, pad=0.04)
+        else:
+            cbar = fig.colorbar(sm, ax=ax_top, fraction=0.046, pad=0.04)
+        cbar.set_label("Z (m)")
 
     # Group legend (if groups present)
     if unique_groups:
@@ -1285,6 +1519,209 @@ def save_cropped_image_matches_to_pdf(
                 pdf.add_page()
                 row_idx = 0
                 idx = 0
+
+    pdf.output(output_filepath)
+    print(f"PDF created: {output_filepath}")
+
+
+def save_measurement_visualizations_to_pdf(
+    annotations,
+    output_filepath,
+    n_cols=None,
+    n_rows=4,
+):
+    """
+    Save measurement visualization images to a PDF file.
+
+    Iterates over an Annotations object and outputs every measurement column
+    that contains "_image" to the PDF. Each annotation is shown on one or more
+    rows (if it has more image measurements than n_cols), but never more than
+    one annotation per row.
+
+    Args:
+        annotations: Annotations object containing annotations with measurements.
+        output_filepath: Path where the PDF will be saved.
+        n_cols: Number of columns per row. If None (default), determined by the
+            maximum number of image measurements per annotation.
+        n_rows: Number of rows per page (default 4).
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(False)
+    pdf.set_font("Arial", size=8)
+
+    # Collect all annotations with their image measurements
+    annotation_data = []
+    max_images_per_annotation = 0
+
+    for ann in annotations.data.values():
+        # Find all measurement keys containing "_image"
+        image_measurements = {
+            key: value
+            for key, value in ann.measurements.items()
+            if "_image" in key and value is not None
+        }
+
+        if image_measurements:
+            # Convert numpy arrays to images if needed
+            image_data = {}
+            for key, value in image_measurements.items():
+                if isinstance(value, np.ndarray):
+                    # Ensure it's in the right format (H, W, 3) uint8 RGB
+                    img = value.copy()
+                    if img.dtype != np.uint8:
+                        # Normalize to 0-255 if needed
+                        if img.max() <= 1.0:
+                            img = (img * 255).astype(np.uint8)
+                        else:
+                            img = img.astype(np.uint8)
+                    # Measurement images are in RGB format (H, W, 3)
+                    # Keep as RGB - we'll use PIL for encoding
+                    image_data[key] = img
+                else:
+                    # Assume it's already an image or can be converted
+                    image_data[key] = value
+
+            if image_data:
+                annotation_data.append((ann, image_data))
+                max_images_per_annotation = max(
+                    max_images_per_annotation, len(image_data)
+                )
+
+    if not annotation_data:
+        print("No image measurements found in annotations.")
+        return
+
+    # Determine n_cols if not specified
+    if n_cols is None:
+        n_cols = max_images_per_annotation
+
+    pdf.add_page()
+    # Page width and height in FPDF's units (default: mm)
+    page_w = pdf.w
+    page_h = pdf.h
+    margin = 10
+
+    # Compute the usable space (accounting for margins)
+    usable_w = page_w - 2 * margin
+    usable_h = page_h - 2 * margin
+
+    # Cell size in the grid
+    cell_w = usable_w / n_cols
+    cell_h = usable_h / n_rows
+    image_h = cell_h * 0.8
+
+    # Track current row and column in the grid
+    row_idx = 0
+    col_idx = 0
+
+    for ann, image_data in annotation_data:
+        # Get annotation info for label
+        ann_id = ann.id if ann.id else "N/A"
+        ann_label = ann.label if hasattr(ann, "label") and ann.label else "N/A"
+        label_text = f"{ann_id} {ann_label}"
+
+        # Sort image keys with standard order: gapF_image, elevation_image, roughness_image
+        # Any other keys come after in alphabetical order
+        standard_order = ["gapF_image", "elevation_image", "roughness_image"]
+        image_keys = list(image_data.keys())
+        ordered_keys = []
+        # Add keys in standard order if they exist
+        for key in standard_order:
+            if key in image_keys:
+                ordered_keys.append(key)
+        # Add remaining keys in alphabetical order
+        remaining_keys = sorted([k for k in image_keys if k not in standard_order])
+        image_keys = ordered_keys + remaining_keys
+
+        # For each image measurement, add it to the PDF
+        # Never put more than one annotation per row
+        for img_idx, img_key in enumerate(image_keys):
+            # Check if we need a new page
+            if row_idx >= n_rows:
+                pdf.add_page()
+                row_idx = 0
+                col_idx = 0
+
+            # If we've filled a row, move to next row
+            if col_idx >= n_cols:
+                col_idx = 0
+                row_idx += 1
+                # Check if we need a new page
+                if row_idx >= n_rows:
+                    pdf.add_page()
+                    row_idx = 0
+                    col_idx = 0
+
+            # Calculate the (x, y) position for this cell
+            x = margin + col_idx * cell_w
+            y = margin + row_idx * cell_h
+
+            # Get the image
+            img = image_data[img_key]
+
+            # Encode image to buffer and preserve aspect ratio
+            try:
+                # Convert to PIL Image (handles RGB correctly)
+                if isinstance(img, np.ndarray):
+                    # Images are in RGB format, convert to PIL Image
+                    pil_img = Image.fromarray(img)
+                elif isinstance(img, Image.Image):
+                    # Already a PIL Image
+                    pil_img = img
+                else:
+                    # For other types, try to convert to PIL Image
+                    pil_img = Image.fromarray(np.array(img))
+
+                # Get image dimensions
+                img_width, img_height = pil_img.size
+                img_aspect = img_width / img_height if img_height > 0 else 1.0
+                cell_aspect = cell_w / image_h if image_h > 0 else 1.0
+
+                # Calculate scaled dimensions preserving aspect ratio
+                if img_aspect > cell_aspect:
+                    # Image is wider - fit to cell width
+                    scaled_w = cell_w
+                    scaled_h = cell_w / img_aspect
+                else:
+                    # Image is taller - fit to cell height
+                    scaled_h = image_h
+                    scaled_w = image_h * img_aspect
+
+                # Center the image in the cell
+                img_x = x + (cell_w - scaled_w) / 2.0
+                img_y = y + (image_h - scaled_h) / 2.0
+
+                # Save to buffer as PNG
+                img_buffer = BytesIO()
+                pil_img.save(img_buffer, format="PNG")
+                img_buffer.seek(0)
+
+                # Add image to PDF with preserved aspect ratio
+                pdf.image(img_buffer, x=img_x, y=img_y, w=scaled_w, h=scaled_h)
+            except Exception as e:
+                logger.warning(f"Failed to encode image {img_key} for {ann_id}: {e}")
+                # Draw a placeholder rectangle
+                pdf.rect(x, y, cell_w, image_h)
+
+            # Position the text below the image
+            label_x = x + 2  # small offset from left edge
+            label_y = y + image_h + 4  # 4 units below bottom of the image
+
+            # Show annotation info only for the first image of each annotation
+            if img_idx == 0:
+                pdf.text(label_x, label_y, label_text)
+            else:
+                # Just show the measurement key for subsequent images
+                pdf.text(label_x, label_y, img_key)
+
+            # Move to the next column
+            col_idx += 1
+
+        # After finishing all images for this annotation, move to next row
+        # (ensuring only one annotation per row - next annotation starts on new row)
+        if col_idx > 0:  # If we didn't end exactly at the end of a row
+            col_idx = 0
+            row_idx += 1
 
     pdf.output(output_filepath)
     print(f"PDF created: {output_filepath}")
@@ -2577,7 +3014,7 @@ def create_annotated_video(
         shutil.rmtree(temp_image_matches_output, ignore_errors=True)
 
 
-def visualize_elevation_angle(
+def visualize_elevation_angle_legacy(
     pcd,
     plane_coeffs,
     output_filename=None,
@@ -2711,6 +3148,564 @@ def visualize_elevation_angle(
         plt.savefig(output_filename)
     else:
         plt.show()
+
+
+def visualize_elevation_angle(
+    pcd,
+    plane_coeffs,
+    output_filename=None,
+    max_output_points=50000,
+    width=600,
+    height=400,
+    point_size=2,
+    interactive=False,
+):
+    """
+    Visualize the fitted plane and the point cloud using plotly for interactive 3D visualization.
+
+    Works in both Jupyter notebooks and VS Code. Can be displayed interactively, saved to file,
+    or returned as a static image.
+
+    Args:
+        pcd: The point cloud object.
+        plane_coeffs: Plane coefficients [a, b, c, d] where ax + by + cz + d = 0.
+        output_filename: Optional filename to save the visualization. If provided, saves to file.
+            Supports formats: .html, .png, .pdf, .svg, .jpeg. If None and interactive=False,
+            returns a static image as bytes.
+        max_output_points: Maximum number of points to plot. The point cloud will be decimated
+            if it exceeds this limit.
+        width: Figure width in pixels (default 800).
+        height: Figure height in pixels (default 600).
+        point_size: Scatter marker size for the point cloud (default 2).
+        interactive: If True and output_filename is None, displays interactively. If False and
+            output_filename is None, returns a static image as numpy array (default False).
+
+    Returns:
+        plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if interactive=True
+            or output_filename is provided, otherwise returns static image as numpy array
+            (H, W, 3), dtype uint8, RGB format (same format as calc_gap_fraction).
+    """
+    import plotly.graph_objects as go
+
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
+
+    a, b, c, d = plane_coeffs
+
+    # Extract points and colors
+    points = np.asarray(pcd.points)
+    colors = getattr(pcd, "colors", None)
+    if colors is not None:
+        colors = np.asarray(colors)
+        # Normalize colors to 0-255 range if needed
+        if colors.max() <= 1.0:
+            colors_uint8 = (colors * 255).astype(np.uint8)
+        else:
+            colors_uint8 = colors.astype(np.uint8)
+        # Convert to RGB strings for plotly
+        color_strings = [
+            f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in colors_uint8
+        ]
+    else:
+        color_strings = "blue"
+
+    # Calculate bounds and origin
+    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
+    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+    mid_x = 0.5 * (x_min + x_max)
+    mid_y = 0.5 * (y_min + y_max)
+    mid_z = 0.5 * (z_min + z_max)
+    origin = np.array([mid_x, mid_y, mid_z])
+
+    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
+    arrow_length = max_range
+
+    # Calculate plane normal and elevation angle
+    plane_normal_unit = np.array([a, b, c]) / np.linalg.norm([a, b, c])
+    elevation_angle = np.degrees(
+        np.arccos(np.clip(np.dot(plane_normal_unit, [0, 0, 1]), -1.0, 1.0))
+    )
+
+    # Create figure
+    fig = go.Figure()
+
+    # 1) Plot the fitted plane (semi-transparent red surface)
+    x_plane = np.linspace(x_min, x_max, 20)
+    y_plane = np.linspace(y_min, y_max, 20)
+    xx, yy = np.meshgrid(x_plane, y_plane)
+    zz = (-a * xx - b * yy - d) / c
+
+    fig.add_trace(
+        go.Surface(
+            x=xx,
+            y=yy,
+            z=zz,
+            colorscale=[[0, "red"], [1, "red"]],
+            showscale=False,
+            opacity=0.3,
+            name="Plane",
+        )
+    )
+
+    # 2) Plot the point cloud
+    fig.add_trace(
+        go.Scatter3d(
+            x=points[:, 0],
+            y=points[:, 1],
+            z=points[:, 2],
+            mode="markers",
+            marker=dict(
+                size=point_size,
+                color=(
+                    color_strings if isinstance(color_strings, list) else color_strings
+                ),
+                opacity=0.6,
+            ),
+            showlegend=False,
+            name="Point Cloud",
+        )
+    )
+
+    # 3) Plot the vertical arrow (blue)
+    vertical_end = origin + np.array([0, 0, arrow_length])
+    fig.add_trace(
+        go.Scatter3d(
+            x=[origin[0], vertical_end[0]],
+            y=[origin[1], vertical_end[1]],
+            z=[origin[2], vertical_end[2]],
+            mode="lines+markers",
+            marker=dict(size=8, color="blue"),
+            line=dict(color="blue", width=8),
+            showlegend=False,
+            name="Vertical",
+        )
+    )
+    # Add arrowhead
+    fig.add_trace(
+        go.Cone(
+            x=[vertical_end[0]],
+            y=[vertical_end[1]],
+            z=[vertical_end[2]],
+            u=[0],
+            v=[0],
+            w=[arrow_length * 0.1],
+            colorscale=[[0, "blue"], [1, "blue"]],
+            showscale=False,
+            showlegend=False,
+        )
+    )
+
+    # 4) Plot the plane normal arrow (green)
+    normal_end = origin + plane_normal_unit * arrow_length
+    fig.add_trace(
+        go.Scatter3d(
+            x=[origin[0], normal_end[0]],
+            y=[origin[1], normal_end[1]],
+            z=[origin[2], normal_end[2]],
+            mode="lines+markers",
+            marker=dict(size=8, color="green"),
+            line=dict(color="green", width=8),
+            showlegend=False,
+            name="Plane Normal",
+        )
+    )
+    # Add arrowhead
+    fig.add_trace(
+        go.Cone(
+            x=[normal_end[0]],
+            y=[normal_end[1]],
+            z=[normal_end[2]],
+            u=[plane_normal_unit[0] * arrow_length * 0.1],
+            v=[plane_normal_unit[1] * arrow_length * 0.1],
+            w=[plane_normal_unit[2] * arrow_length * 0.1],
+            colorscale=[[0, "green"], [1, "green"]],
+            showscale=False,
+            showlegend=False,
+        )
+    )
+
+    # 5) Plot the spherical arc between vertical and plane normal (orange)
+    num_arc_points = 40
+    arc_points = []
+    for i in range(num_arc_points):
+        t = i / (num_arc_points - 1)
+        direction = geom.slerp(np.array([0, 0, 1]), plane_normal_unit, t)
+        arc_points.append(origin + arrow_length * direction)
+    arc_points = np.array(arc_points)
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=arc_points[:, 0],
+            y=arc_points[:, 1],
+            z=arc_points[:, 2],
+            mode="lines",
+            line=dict(color="orange", width=6),
+            showlegend=False,
+            name="Arc",
+        )
+    )
+
+    # 6) Add text annotation for elevation angle (using Scatter3d with text mode)
+    mid_idx = num_arc_points // 2
+    arc_mid = arc_points[mid_idx]
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=[arc_mid[0]],
+            y=[arc_mid[1]],
+            z=[arc_mid[2]],
+            mode="text",
+            text=[f"{elevation_angle:.1f}°"],
+            textfont=dict(size=14, color="orange"),
+            showlegend=False,
+            name="Angle",
+        )
+    )
+
+    # Update layout with equal aspect ratio (same pixels per meter for all axes)
+    # Set camera view similar to matplotlib default (x on right, y going back)
+    half_range = max_range / 2.0
+    camera_eye = {
+        "x": 1.25,
+        "y": -1.25,
+        "z": 1.25,
+    }
+    camera_center = {"x": 0, "y": 0, "z": 0}
+    camera_up = {"x": 0, "y": 0, "z": 1}
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+            aspectmode="cube",  # Ensures equal unit distances across all axes
+            xaxis=dict(
+                range=[mid_x - half_range, mid_x + half_range],
+            ),
+            yaxis=dict(
+                range=[mid_y - half_range, mid_y + half_range],
+            ),
+            zaxis=dict(
+                range=[mid_z - half_range, mid_z + half_range],
+            ),
+            camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
+        ),
+        title=f"Elevation angle: {elevation_angle:.1f}°",
+        width=width,
+        height=height,
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+
+    # Show, save, or return static image
+    if output_filename is not None:
+        # Determine file format from extension
+        ext = os.path.splitext(output_filename)[1].lower()
+        if ext == ".html":
+            fig.write_html(output_filename)
+        elif ext in [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".webp"]:
+            # For static images, use write_image (requires kaleido)
+            try:
+                fig.write_image(output_filename, width=width, height=height)
+            except Exception as e:
+                # Fallback to HTML if image export fails
+                logger.warning(
+                    f"Image export failed ({e}). Saving as HTML instead. "
+                    "Install kaleido for image export: pip install kaleido"
+                )
+                html_filename = os.path.splitext(output_filename)[0] + ".html"
+                fig.write_html(html_filename)
+        else:
+            # Default to HTML
+            fig.write_html(output_filename)
+        return fig
+    elif interactive:
+        # Show interactively
+        try:
+            from IPython import get_ipython
+
+            in_jupyter = get_ipython() is not None
+        except ImportError:
+            in_jupyter = False
+
+        if in_jupyter:
+            try:
+                fig.show()
+            except (ValueError, ImportError) as e:
+                if "nbformat" in str(e):
+                    import warnings
+
+                    warnings.warn(
+                        "nbformat>=4.2.0 not installed. Using browser renderer. "
+                        "Install with: pip install nbformat>=4.2.0 for inline display."
+                    )
+                    fig.show(renderer="browser")
+                else:
+                    raise
+        else:
+            fig.show(renderer="browser")
+        return fig
+    else:
+        # Return static image as numpy array (same format as calc_gap_fraction)
+        try:
+            image_bytes = fig.to_image(format="png", width=width, height=height)
+            # Convert PNG bytes to numpy array (H, W, 3), dtype uint8, RGB format
+            img = Image.open(BytesIO(image_bytes))
+            # Convert to RGB if needed (handles RGBA, etc.)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            image_array = np.array(img, dtype=np.uint8)
+            return image_array
+        except Exception as e:
+            logger.warning(
+                f"Image export failed ({e}). Returning figure object instead. "
+                "Install kaleido for image export: pip install kaleido"
+            )
+            return fig
+
+
+def visualize_roughness(
+    pcd,
+    output_filename=None,
+    max_output_points=50000,
+    width=600,
+    height=400,
+    point_size=2,
+    interactive=False,
+    ra=None,
+    rq=None,
+):
+    """
+    Visualize the roughness calculation (Ra and Rq) for a point cloud.
+
+    Shows the point cloud colored by distance from the best-fit plane, with the
+    fitted plane surface visible. The Ra and Rq values are displayed in the title.
+
+    Works in both Jupyter notebooks and VS Code. Can be displayed interactively,
+    saved to file, or returned as a static image.
+
+    Args:
+        pcd: The point cloud object.
+        output_filename: Optional filename to save the visualization. If provided,
+            saves to file. Supports formats: .html, .png, .pdf, .svg, .jpeg. If None
+            and interactive=False, returns a static image as numpy array.
+        max_output_points: Maximum number of points to plot. The point cloud will be
+            decimated if it exceeds this limit.
+        width: Figure width in pixels (default 800).
+        height: Figure height in pixels (default 600).
+        point_size: Scatter marker size for the point cloud (default 2).
+        interactive: If True and output_filename is None, displays interactively.
+            If False and output_filename is None, returns a static image as numpy
+            array (default False).
+        ra: Optional Ra (arithmetical mean roughness) value. If None, will be
+            calculated from the point cloud.
+        rq: Optional Rq (root mean square roughness) value. If None, will be
+            calculated from the point cloud.
+
+    Returns:
+        plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if
+            interactive=True or output_filename is provided, otherwise returns static
+            image as numpy array (H, W, 3), dtype uint8, RGB format.
+    """
+    import plotly.graph_objects as go
+    from substrata import measurements
+
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
+
+    # Get plane coefficients (needed for visualization and possibly for ra/rq)
+    a, b, c, d = measurements.get_best_fit_plane_PCA(pcd)[:4]
+
+    # Calculate roughness if not provided
+    if ra is None or rq is None:
+        pts = np.asarray(pcd.points, dtype=float)
+        if pts.size == 0:
+            raise ValueError("Point cloud has no points")
+
+        normal = np.array([a, b, c], dtype=float)
+        denom = np.linalg.norm(normal)
+        if denom == 0.0:
+            raise ValueError("Best-fit plane has zero-length normal")
+
+        # Perpendicular distances of all points to the plane
+        dist = np.abs(pts @ normal + d) / denom
+
+        if ra is None:
+            ra = float(dist.mean())
+        if rq is None:
+            rq = float(np.sqrt((dist**2).mean()))
+
+    # Extract points
+    points = np.asarray(pcd.points)
+
+    # Calculate perpendicular distances from points to plane for coloring
+    normal = np.array([a, b, c], dtype=float)
+    denom = np.linalg.norm(normal)
+    if denom == 0.0:
+        raise ValueError("Best-fit plane has zero-length normal")
+
+    # Perpendicular distances (signed, for better color mapping)
+    dists = (points @ normal + d) / denom
+
+    # Calculate max absolute distance for colorbar scaling
+    max_abs_dist = np.max(np.abs(dists)) if len(dists) > 0 else 1.0
+
+    # Calculate bounds and origin
+    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
+    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+    mid_x = 0.5 * (x_min + x_max)
+    mid_y = 0.5 * (y_min + y_max)
+    mid_z = 0.5 * (z_min + z_max)
+
+    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
+    half_range = max_range / 2.0
+
+    # Create figure
+    fig = go.Figure()
+
+    # 1) Plot the fitted plane (semi-transparent gray surface)
+    x_plane = np.linspace(x_min, x_max, 20)
+    y_plane = np.linspace(y_min, y_max, 20)
+    xx, yy = np.meshgrid(x_plane, y_plane)
+    zz = (-a * xx - b * yy - d) / c
+
+    fig.add_trace(
+        go.Surface(
+            x=xx,
+            y=yy,
+            z=zz,
+            colorscale=[[0, "gray"], [1, "gray"]],
+            showscale=False,
+            opacity=0.3,
+            name="Fitted Plane",
+        )
+    )
+
+    # 2) Plot the point cloud colored by distance from plane
+    fig.add_trace(
+        go.Scatter3d(
+            x=points[:, 0],
+            y=points[:, 1],
+            z=points[:, 2],
+            mode="markers",
+            marker=dict(
+                size=point_size,
+                color=dists,  # Use numeric distances for colorbar
+                colorscale="RdBu_r",  # Red-Blue reversed colormap
+                opacity=0.8,
+                colorbar=dict(
+                    title="Distance from<br>plane (m)",
+                    len=0.5,
+                    y=0.5,
+                ),
+                cmin=-max_abs_dist,
+                cmax=max_abs_dist,
+            ),
+            showlegend=False,
+            name="Point Cloud",
+        )
+    )
+
+    # Update layout with equal aspect ratio
+    camera_eye = {
+        "x": 1.25,
+        "y": -1.25,
+        "z": 1.25,
+    }
+    camera_center = {"x": 0, "y": 0, "z": 0}
+    camera_up = {"x": 0, "y": 0, "z": 1}
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+            aspectmode="cube",
+            xaxis=dict(
+                range=[mid_x - half_range, mid_x + half_range],
+            ),
+            yaxis=dict(
+                range=[mid_y - half_range, mid_y + half_range],
+            ),
+            zaxis=dict(
+                range=[mid_z - half_range, mid_z + half_range],
+            ),
+            camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
+        ),
+        title=f"Rq (RMS Roughness): {rq:.6f} m, Ra: {ra:.6f} m",
+        width=width,
+        height=height,
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+
+    # Show, save, or return static image
+    if output_filename is not None:
+        # Determine file format from extension
+        ext = os.path.splitext(output_filename)[1].lower()
+        if ext == ".html":
+            fig.write_html(output_filename)
+        elif ext in [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".webp"]:
+            # For static images, use write_image (requires kaleido)
+            try:
+                fig.write_image(output_filename, width=width, height=height)
+            except Exception as e:
+                # Fallback to HTML if image export fails
+                logger.warning(
+                    f"Image export failed ({e}). Saving as HTML instead. "
+                    "Install kaleido for image export: pip install kaleido"
+                )
+                html_filename = os.path.splitext(output_filename)[0] + ".html"
+                fig.write_html(html_filename)
+        else:
+            # Default to HTML
+            fig.write_html(output_filename)
+        return fig
+    elif interactive:
+        # Show interactively
+        try:
+            from IPython import get_ipython
+
+            in_jupyter = get_ipython() is not None
+        except ImportError:
+            in_jupyter = False
+
+        if in_jupyter:
+            try:
+                fig.show()
+            except (ValueError, ImportError) as e:
+                if "nbformat" in str(e):
+                    import warnings
+
+                    warnings.warn(
+                        "nbformat>=4.2.0 not installed. Using browser renderer. "
+                        "Install with: pip install nbformat>=4.2.0 for inline display."
+                    )
+                    fig.show(renderer="browser")
+                else:
+                    raise
+        else:
+            fig.show(renderer="browser")
+        return fig
+    else:
+        # Return static image as numpy array (same format as calc_gap_fraction)
+        try:
+            image_bytes = fig.to_image(format="png", width=width, height=height)
+            # Convert PNG bytes to numpy array (H, W, 3), dtype uint8, RGB format
+            img = Image.open(BytesIO(image_bytes))
+            # Convert to RGB if needed (handles RGBA, etc.)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            image_array = np.array(img, dtype=np.uint8)
+            return image_array
+        except Exception as e:
+            logger.warning(
+                f"Image export failed ({e}). Returning figure object instead. "
+                "Install kaleido for image export: pip install kaleido"
+            )
+            return fig
 
 
 def plot_xy_pca(points, mean, eig_vecs, eig_vals) -> None:

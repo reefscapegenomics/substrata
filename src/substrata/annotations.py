@@ -129,6 +129,14 @@ class Annotations:
         """
         visualizations.plot_positions(self, pcd, color=color)
 
+    def show_position(self, pcd: Any, color=False) -> None:
+        """Show annotation position overlaid on a point cloud.
+
+        Args:
+            pcd: Point cloud to draw as background.
+        """
+        visualizations.plot_positions(self, pcd, color=color)
+
     def append(self, annotation: "Annotation") -> None:
         if annotation.id in self.data:
             raise ValueError(f"Annotation with id {annotation.id} already exists.")
@@ -842,6 +850,7 @@ class Annotations:
             if measurement_func.__name__ == "calc_gap_fraction":
                 self.data[id].measurements["gapF_raw"] = output[0]
                 self.data[id].measurements["gapF_fill"] = output[1]
+                self.data[id].measurements["gapF_image"] = output[2]
             elif measurement_func.__name__ == "get_rgb_stats":
                 self.data[id].measurements["median_red"] = output[0]
                 self.data[id].measurements["median_green"] = output[1]
@@ -849,6 +858,10 @@ class Annotations:
                 self.data[id].measurements["luminance"] = output[3]
             elif measurement_func.__name__ == "get_dev_rugosity":
                 self.data[id].measurements["dev_rug"] = output[0]
+            elif measurement_func.__name__ == "calc_roughness":
+                self.data[id].measurements["Ra"] = output[0]
+                self.data[id].measurements["Rq"] = output[1]
+                self.data[id].measurements["roughness_image"] = output[2]
             elif measurement_func.__name__ == "get_vector_dispersion":
                 self.data[id].measurements["vector_disp"] = output[0]
             elif measurement_func.__name__ == "get_mask_surface_area":
@@ -859,6 +872,7 @@ class Annotations:
                 self.data[id].measurements["elevation"] = output[2]
                 self.data[id].measurements["plane_coeffs"] = output[3]
                 self.data[id].measurements["azimuth"] = output[4]
+                self.data[id].measurements["elevation_image"] = output[5]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
@@ -898,7 +912,10 @@ class Annotations:
         col_headers.extend(sorted(col_headers_meta))
         col_headers_measure = set()
         for ann in self.data.values():
-            col_headers_measure.update(ann.measurements.keys())
+            # Exclude measurement keys with '_image' anywhere in the name
+            col_headers_measure.update(
+                key for key in ann.measurements.keys() if "_image" not in key
+            )
         col_headers.extend(sorted(col_headers_measure))
         output_lines.append(col_headers)
 
@@ -952,8 +969,10 @@ class Annotations:
                 else:
                     row.append("NA")
 
-            # Measurements
+            # Measurements (exclude keys with partial match "_image")
             for name in sorted(col_headers_measure):
+                if "_image" in name:
+                    continue
                 if name in ann.measurements:
                     row.append(ann.measurements[name])
                 else:
@@ -1103,7 +1122,15 @@ class Annotation:
         """Show the annotation."""
         if self.simple_pcd is None:
             self.get_point_cloud_by_radius(self.parent.pcd, 0.2)
-        visualizations.plot(self.simple_pcd, highlight_coords=self.coords)
+        visualizations.show(self.simple_pcd, highlight_coords=self.coords)
+
+    def show_position(self, pcd: Any, color=False, zoom=None) -> None:
+        """Show annotation position overlaid on a point cloud.
+
+        Args:
+            pcd: Point cloud to draw as background.
+        """
+        visualizations.plot_positions(self, pcd, color=color, zoom=zoom)
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.
@@ -1349,10 +1376,11 @@ class Annotation:
             Tuple containing (annotation id, result).
         """
         if measurement_func.__name__ == "calc_gap_fraction":
-            gapF_raw, gapF_fill, _ = measurement_func(self, *args)
+            gapF_raw, gapF_fill, gapF_image = measurement_func(self, *args)
             self.measurements["gapF_raw"] = gapF_raw
             self.measurements["gapF_fill"] = gapF_fill
-            return self.id, [gapF_raw, gapF_fill]
+            self.measurements["gapF_image"] = gapF_image
+            return self.id, [gapF_raw, gapF_fill, gapF_image]
         elif measurement_func.__name__ == "get_rgb_stats":
             r, g, b, lum = measurement_func(self.simple_pcd)
             self.measurements["median_red"] = r
@@ -1364,6 +1392,12 @@ class Annotation:
             dev_rug = measurement_func(self.simple_pcd)
             self.measurements["dev_rug"] = dev_rug
             return self.id, [dev_rug]
+        elif measurement_func.__name__ == "calc_roughness":
+            ra, rq, roughness_image = measurement_func(self.simple_pcd)
+            self.measurements["Ra"] = ra
+            self.measurements["Rq"] = rq
+            self.measurements["roughness_image"] = roughness_image
+            return self.id, [ra, rq, roughness_image]
         elif measurement_func.__name__ == "get_vector_dispersion":
             vector_disp = measurement_func(self.simple_pcd)
             self.measurements["vector_disp"] = vector_disp
@@ -1373,15 +1407,23 @@ class Annotation:
             self.measurements["SA_in_cm2"] = SA_in_cm2
             return self.id, [SA_in_cm2]
         elif measurement_func.__name__ == "get_plane_angles":
-            theta, psi, elevation, plane_coeffs, azimuth = measurement_func(
-                self.simple_pcd
+            theta, psi, elevation, plane_coeffs, azimuth, elevation_image = (
+                measurement_func(self.simple_pcd)
             )
             self.measurements["theta"] = theta
             self.measurements["psi"] = psi
             self.measurements["elevation"] = elevation
             self.measurements["plane_coeffs"] = plane_coeffs
             self.measurements["azimuth"] = azimuth
-            return self.id, [theta, psi, elevation, plane_coeffs, azimuth]
+            self.measurements["elevation_image"] = elevation_image
+            return self.id, [
+                theta,
+                psi,
+                elevation,
+                plane_coeffs,
+                azimuth,
+                elevation_image,
+            ]
         else:
             logger.error("Measurement not recognized!")
         return self.id, None
