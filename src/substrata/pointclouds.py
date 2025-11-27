@@ -1628,11 +1628,15 @@ def get_decimated_pcd(
         return pcd
     elif len(points) <= target_points and not isinstance(pcd, PointCloud):
         # No decimation required; wrap input arrays in a PointCloud
+        # Ensure arrays are writeable copies (Vector3dVector requires writeable arrays)
+        points = np.array(points, copy=True)
         pcd_undecimated = PointCloud()
         pcd_undecimated.o3d_pcd.points = o3d.utility.Vector3dVector(points)
         if len(colors) > 0:
+            colors = np.array(colors, copy=True)
             pcd_undecimated.o3d_pcd.colors = o3d.utility.Vector3dVector(colors)
         if len(normals) > 0:
+            normals = np.array(normals, copy=True)
             pcd_undecimated.o3d_pcd.normals = o3d.utility.Vector3dVector(normals)
         if hasattr(pcd, "world_transform"):
             pcd_undecimated.world_transform = pcd.world_transform
