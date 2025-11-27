@@ -928,11 +928,11 @@ class Annotations:
             if hasattr(ann, "label"):
                 row.append(ann.label)
             else:
-                row.append("NA")
+                row.append("")
             if hasattr(ann, "label_conf"):
                 row.append(ann.label_conf)
             else:
-                row.append("NA")
+                row.append("")
             if not orig_coords_only:
                 row += [value for value in ann.coords]
 
@@ -967,7 +967,7 @@ class Annotations:
                 if name in ann.meta_data:
                     row.append(ann.meta_data[name])
                 else:
-                    row.append("NA")
+                    row.append("")
 
             # Measurements (exclude keys with partial match "_image")
             for name in sorted(col_headers_measure):
@@ -976,7 +976,7 @@ class Annotations:
                 if name in ann.measurements:
                     row.append(ann.measurements[name])
                 else:
-                    row.append("NA")
+                    row.append("")
             output_lines.append(row)
 
         with open(filepath, "w", newline="") as f:
