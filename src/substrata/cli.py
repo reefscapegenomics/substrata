@@ -666,7 +666,10 @@ def handle_images(args):
 
     # Save to PDF
     pdf_output = args.pdf_output or os.path.join(cwd, f"{base}_imagematches.pdf")
-    visualizations.save_cropped_image_matches_to_pdf(image_matches, pdf_output)
+    crop_size = args.size if args.size is not None else 1000
+    visualizations.save_cropped_image_matches_to_pdf(
+        image_matches, pdf_output, crop_w=crop_size, crop_h=crop_size
+    )
 
 
 def handle_transform(args):
@@ -1121,6 +1124,16 @@ def main():
         help=(
             "Optional output PDF filepath. "
             "Default: <cwd_basename>_imagematches.pdf in current folder."
+        ),
+    )
+    p_images.add_argument(
+        "--size",
+        dest="size",
+        type=int,
+        default=None,
+        help=(
+            "Crop size in pixels for image matches (sets both crop_w and crop_h). "
+            "Default: 1000 (uses function default)."
         ),
     )
 
