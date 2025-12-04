@@ -3445,7 +3445,6 @@ def visualize_elevation_angle(
                     raise
         else:
             fig.show(renderer="browser")
-        return fig
     else:
         # Return static image as numpy array (same format as calc_gap_fraction)
         try:

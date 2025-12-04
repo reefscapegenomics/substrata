@@ -353,6 +353,12 @@ class PointCloud:
                 plot_title=z_rot_name if plot else None,
             )
 
+    def show(self):
+        """Show the point cloud using plotly for interactive 3D visualization."""
+        from substrata.visualizations import show
+
+        return show(self)
+
     def plot(
         self,
         point_size=2,
@@ -767,8 +773,6 @@ class PointCloud:
             return np.mean(filtered_distances), filtered_pcd
 
         return np.mean(filtered_distances)
-
-    from __future__ import annotations
 
     def get_z_intercepts(
         self,
