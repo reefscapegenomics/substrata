@@ -1676,7 +1676,7 @@ class ImageMatch:
         Args:
             sam_predictor: Predictor object for SAM2 segmentation.
         """
-        from unicorn import segmentation
+        from substrata import segmentation
 
         self.masks = segmentation.get_sam2_masks(
             self.filepath, self.x, self.y, sam_predictor
@@ -1717,16 +1717,17 @@ class ImageMatch:
         self.mask.area_in_cm2 = self.mask.area_in_px * (self.pixel_scale**2) * 10000
         return self.mask.area_in_cm2
 
-    def create_rectangular_mask(self, width_m, height_m):
+    def create_rectangular_masks(self, mask_sizes):
         """
-        Create a rectangular mask of specified size around the match point.
+        Create rectangular masks of specified sizes around the match point.
 
         Args:
-            width_m (float): Width of the mask in meters
-            height_m (float): Height of the mask in meters
+            mask_sizes (list): List of [width_m, height_m] tuples specifying mask
+                sizes in meters. Each entry creates a separate mask.
 
         Returns:
-            np.ndarray: Binary mask array (True for mask area, False for background)
+            None: Masks are stored in self.masks, with the first mask also
+                assigned to self.mask.
         """
         if not self.pixel_scale:
             self.calc_pixel_scale_from_crosshair()
@@ -1736,9 +1737,9 @@ class ImageMatch:
                 "Pixel scale not available. Call calc_pixel_scale_from_crosshair() first."
             )
 
-        # Convert meters to pixels using pixel scale (round to minimize discretization error)
-        width_px = round(width_m / self.pixel_scale)
-        height_px = round(height_m / self.pixel_scale)
+        # Validate input
+        if not mask_sizes or len(mask_sizes) == 0:
+            raise ValueError("mask_sizes must be a non-empty list")
 
         # Get image dimensions
         img = cv2.imread(self.filepath)
@@ -1746,16 +1747,6 @@ class ImageMatch:
             raise ValueError(f"Cannot load image: {self.filepath}")
 
         img_height, img_width = img.shape[:2]
-
-        # Calculate rectangle bounds
-        x1 = max(0, self.x - width_px // 2)
-        y1 = max(0, self.y - height_px // 2)
-        x2 = min(img_width, self.x + width_px // 2)
-        y2 = min(img_height, self.y + height_px // 2)
-
-        # Create binary mask (use uint8 instead of bool for OpenCV compatibility)
-        mask_vals = np.zeros((img_height, img_width), dtype=np.uint8)
-        mask_vals[y1:y2, x1:x2] = 255
 
         # Create a Mask object compatible with segmentation.py Mask class
         class LocalMask:
@@ -1766,18 +1757,40 @@ class ImageMatch:
                 self.area_in_px = cv2.countNonZero(mask_vals)
                 self.area_in_cm2 = None
 
-        # Store the mask as a Mask object
-        self.mask = LocalMask(mask_vals, score=1.0)
-        self.mask.area_in_px = cv2.countNonZero(mask_vals)
-        self.mask.area_in_cm2 = self.mask.area_in_px * (self.pixel_scale**2) * 10000
+        # Create masks for each size
+        mask_objects = []
+        for idx, (width_m, height_m) in enumerate(mask_sizes):
+            # Convert meters to pixels using pixel scale
+            width_px = round(width_m / self.pixel_scale)
+            height_px = round(height_m / self.pixel_scale)
 
-        self.masks = np.array([self.mask])
+            # Calculate rectangle bounds
+            x1 = max(0, self.x - width_px // 2)
+            y1 = max(0, self.y - height_px // 2)
+            x2 = min(img_width, self.x + width_px // 2)
+            y2 = min(img_height, self.y + height_px // 2)
 
-        print(f"Created rectangular mask: {width_m:.2f}m x {height_m:.2f}m")
-        print(f"Mask bounds: ({x1}, {y1}) to ({x2}, {y2})")
-        print(
-            f"Mask area: {self.mask.area_in_px} pixels = {self.mask.area_in_cm2/10000:.4f} m²"
-        )
+            # Create binary mask (use uint8 instead of bool for OpenCV compatibility)
+            mask_vals = np.zeros((img_height, img_width), dtype=np.uint8)
+            mask_vals[y1:y2, x1:x2] = 255
+
+            # Create Mask object
+            mask_obj = LocalMask(mask_vals, score=1.0)
+            mask_obj.area_in_px = cv2.countNonZero(mask_vals)
+            mask_obj.area_in_cm2 = mask_obj.area_in_px * (self.pixel_scale**2) * 10000
+
+            mask_objects.append(mask_obj)
+
+            print(f"Created rectangular mask {idx+1}: {width_m:.2f}m x {height_m:.2f}m")
+            print(f"Mask bounds: ({x1}, {y1}) to ({x2}, {y2})")
+            print(
+                f"Mask area: {mask_obj.area_in_px} pixels = {mask_obj.area_in_cm2/10000:.4f} m²"
+            )
+
+        # Store all masks
+        self.masks = np.array(mask_objects)
+        # Assign the first mask as the primary mask
+        self.mask = mask_objects[0]
 
     def show(
         self,
@@ -1831,23 +1844,22 @@ class ImageMatch:
                     )
                 except Exception:
                     pass
-        if self.masks:
+        if getattr(self, "masks", None) is not None and len(self.masks) > 0:
             cropped_img = visualizations.get_crop_img_from_masks(
                 self, crop_w, crop_h, single_mask=single_mask
             )
+            # Convert BGR (OpenCV) to RGB for matplotlib
+            cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
         else:
             cropped_img = visualizations.get_crop_img(
                 self.cam.filepath, self.x, self.y, crop_w, crop_h
             )
-        # cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
-        # plt.imshow(cropped_img)
-        # plt.show()
 
-        # Expecting PIL image, display directly
+        # Display the image
         plt.imshow(cropped_img)
 
         # Highlight the center pixel in red
-        if hasattr(cropped_img, "size"):  # PIL image
+        if isinstance(cropped_img, Image.Image):  # PIL image
             center_x = cropped_img.size[0] // 2
             center_y = cropped_img.size[1] // 2
         else:  # numpy array

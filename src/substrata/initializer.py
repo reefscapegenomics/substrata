@@ -74,6 +74,7 @@ class ProjectInitializer:
 
         # Reset paths to local if requested
         if local:
+            print(f"Resetting paths to local folder!")
             self.reset_paths_to_local()
 
     def __str__(self) -> str:
@@ -357,17 +358,27 @@ class ProjectInitializer:
             self.cams.offset = self.depth_offset
             self.cams.per_unit = self.depth_per_unit
 
-        if self.markers_filepath:
+        if self.markers_filepath is not None and os.path.exists(self.markers_filepath):
             print(f"Loading markers from {self.markers_filepath}")
             self.markers = annotations.Annotations(
                 self.markers_filepath, orig_coords_only=True
             )
+        elif self.markers_filepath is not None and not os.path.exists(
+            self.markers_filepath
+        ):
+            print(f"No markers file found at {self.markers_filepath}")
 
-        if self.annotations_filepath:
+        if self.annotations_filepath is not None and os.path.exists(
+            self.annotations_filepath
+        ):
             print(f"Loading annotations from {self.annotations_filepath}")
             self.annotations = annotations.Annotations(
                 self.annotations_filepath, orig_coords_only=True
             )
+        elif self.annotations_filepath is not None and not os.path.exists(
+            self.annotations_filepath
+        ):
+            print(f"No annotations file found at {self.annotations_filepath}")
 
         if apply_transform:
             print(
@@ -487,9 +498,7 @@ class ProjectInitializer:
             path (str, optional): New base path. If None, uses self.path.
         """
         if path is None:
-            if self.path is None:
-                raise ValueError("path must be provided if self.path is None")
-            path = self.path
+            path = os.getcwd()
 
         # Normalize the new base path
         new_base_path = os.path.normpath(path)

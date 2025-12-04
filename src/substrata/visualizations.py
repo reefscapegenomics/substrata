@@ -1551,7 +1551,8 @@ def save_measurement_visualizations_to_pdf(
 
     # Collect all annotations with their image measurements
     annotation_data = []
-    max_images_per_annotation = 0
+    max_measurement_images = 0
+    has_image_match = False
 
     for ann in annotations.data.values():
         # Find all measurement keys containing "_image"
@@ -1561,9 +1562,52 @@ def save_measurement_visualizations_to_pdf(
             if "_image" in key and value is not None
         }
 
-        if image_measurements:
+        # Check if annotation has image_match
+        ann_has_image_match = (
+            hasattr(ann, "image_match")
+            and ann.image_match is not None
+            and hasattr(ann.image_match, "filepath")
+            and ann.image_match.filepath is not None
+        )
+        if ann_has_image_match:
+            has_image_match = True
+
+        if image_measurements or ann_has_image_match:
             # Convert numpy arrays to images if needed
             image_data = {}
+
+            # Add image_match image first if available
+            if ann_has_image_match:
+                try:
+                    # Try to get cropped image from masks if available
+                    if (
+                        hasattr(ann.image_match, "masks")
+                        and ann.image_match.masks is not None
+                        and len(ann.image_match.masks) > 0
+                    ):
+                        img = get_crop_img_from_masks(
+                            ann.image_match, output_img_w=1000, output_img_h=1000
+                        )
+                        # Convert OpenCV image (BGR) to PIL Image (RGB)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        image_data["image_match"] = Image.fromarray(img)
+                    else:
+                        # Use simple crop around the match point
+                        img = get_crop_img(
+                            ann.image_match.filepath,
+                            ann.image_match.x,
+                            ann.image_match.y,
+                            1000,
+                            1000,
+                        )
+                        image_data["image_match"] = img
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load image_match image for annotation {ann.id}: {e}"
+                    )
+                    # Continue without image_match for this annotation
+
+            # Add measurement images
             for key, value in image_measurements.items():
                 if isinstance(value, np.ndarray):
                     # Ensure it's in the right format (H, W, 3) uint8 RGB
@@ -1583,9 +1627,11 @@ def save_measurement_visualizations_to_pdf(
 
             if image_data:
                 annotation_data.append((ann, image_data))
-                max_images_per_annotation = max(
-                    max_images_per_annotation, len(image_data)
+                # Count only measurement images (excluding image_match)
+                measurement_count = len(
+                    [k for k in image_data.keys() if k != "image_match"]
                 )
+                max_measurement_images = max(max_measurement_images, measurement_count)
 
     if not annotation_data:
         print("No image measurements found in annotations.")
@@ -1593,7 +1639,10 @@ def save_measurement_visualizations_to_pdf(
 
     # Determine n_cols if not specified
     if n_cols is None:
-        n_cols = max_images_per_annotation
+        # Count: 1 column for image_match (if any has it) + max measurement images
+        n_cols = max_measurement_images
+        if has_image_match:
+            n_cols += 1
 
     pdf.add_page()
     # Page width and height in FPDF's units (default: mm)
@@ -1620,18 +1669,31 @@ def save_measurement_visualizations_to_pdf(
         ann_label = ann.label if hasattr(ann, "label") and ann.label else "N/A"
         label_text = f"{ann_id} {ann_label}"
 
-        # Sort image keys with standard order: gapF_image, elevation_image, roughness_image
+        # Sort image keys with image_match first, then standard order:
+        # gapF_image, elevation_image, roughness_image
         # Any other keys come after in alphabetical order
-        standard_order = ["gapF_image", "elevation_image", "roughness_image"]
         image_keys = list(image_data.keys())
         ordered_keys = []
-        # Add keys in standard order if they exist
+        # Add image_match first if it exists
+        if "image_match" in image_keys:
+            ordered_keys.append("image_match")
+        # Add standard order keys if they exist
+        standard_order = ["gapF_image", "elevation_image", "roughness_image"]
         for key in standard_order:
             if key in image_keys:
                 ordered_keys.append(key)
-        # Add remaining keys in alphabetical order
-        remaining_keys = sorted([k for k in image_keys if k not in standard_order])
+        # Add remaining keys in alphabetical order (excluding image_match and standard_order)
+        remaining_keys = sorted(
+            [k for k in image_keys if k not in standard_order and k != "image_match"]
+        )
         image_keys = ordered_keys + remaining_keys
+
+        # If this annotation doesn't have image_match but some do,
+        # skip column 0 to leave space for image_match column
+        if has_image_match and "image_match" not in image_keys:
+            # Skip column 0 - start at column 1
+            if col_idx == 0:
+                col_idx = 1
 
         # For each image measurement, add it to the PDF
         # Never put more than one annotation per row
@@ -1707,9 +1769,13 @@ def save_measurement_visualizations_to_pdf(
             label_x = x + 2  # small offset from left edge
             label_y = y + image_h + 4  # 4 units below bottom of the image
 
-            # Show annotation info only for the first image of each annotation
+            # Show annotation info for the first image of each annotation
+            # If it's image_match, show both annotation info and "image_match" label
             if img_idx == 0:
-                pdf.text(label_x, label_y, label_text)
+                if img_key == "image_match":
+                    pdf.text(label_x, label_y, f"{label_text} (image_match)")
+                else:
+                    pdf.text(label_x, label_y, label_text)
             else:
                 # Just show the measurement key for subsequent images
                 pdf.text(label_x, label_y, img_key)
