@@ -37,6 +37,7 @@ class ProjectInitializer:
         self.annotations_last_highest_id = None
         self.photos_path = None
         self.cropped_path = None
+        self.crop_size = None
         self.thumbnail_path = None
         self.classes_filepath = None
         self.classifier_filepath = None
@@ -142,6 +143,8 @@ class ProjectInitializer:
         )
         self.photos_path = self.__add_path_if_needed(yaml_config.get("photos_path"))
         self.cropped_path = self.__add_path_if_needed(yaml_config.get("cropped_path"))
+        crop_size = yaml_config.get("crop_size")
+        self.crop_size = int(crop_size) if crop_size is not None else None
         self.thumbnail_path = self.__add_path_if_needed(
             yaml_config.get("thumbnails_path")
         )
@@ -218,6 +221,8 @@ class ProjectInitializer:
             config["photos_path"] = self.photos_path
         if self.cropped_path is not None:
             config["cropped_path"] = self.cropped_path
+        if self.crop_size is not None:
+            config["crop_size"] = int(self.crop_size)
         if self.thumbnail_path is not None:
             config["thumbnails_path"] = self.thumbnail_path
         if self.classes_filepath is not None:
