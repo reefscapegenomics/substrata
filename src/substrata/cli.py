@@ -51,7 +51,7 @@ def handle_decimate(args):
     from substrata.initializer import ProjectInitializer
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     input_path = args.input or init.ply_full_path
     if not input_path:
@@ -78,7 +78,7 @@ def handle_head(args):
     from substrata.initializer import ProjectInitializer
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     input_path = args.input or init.ply_full_path
     if not input_path:
@@ -94,7 +94,7 @@ def handle_scalebars(args):
     from substrata.initializer import ProjectInitializer
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # 1) resolve inputs
     pcd_path = args.input or init.ply_full_path
@@ -142,7 +142,7 @@ def handle_views(args):
     from substrata.initializer import ProjectInitializer
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Allow explicit override of PLY path
     if args.input:
@@ -161,7 +161,7 @@ def handle_orient(args):
     from substrata.initializer import ProjectInitializer
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Allow explicit override of PLY path
     if args.input:
@@ -218,7 +218,7 @@ def handle_firefish(args):
         args: Parsed command-line arguments.
     """
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Arguments
     target_depth = _infer_target_depth(base, args.target_depth)
@@ -300,7 +300,7 @@ def handle_cams2video(args):
     from substrata import visualizations
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Allow explicit override of PLY path
     if args.input:
@@ -360,7 +360,7 @@ def handle_intercepts(args):
     from substrata import measurements, visualizations
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Allow explicit override of PLY path
     if getattr(args, "input", None):
@@ -597,7 +597,7 @@ def handle_images(args):
     from substrata import visualizations
 
     base, cwd = _cwd_base()
-    init = ProjectInitializer(path=cwd)
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
     # Allow explicit override of PLY path
     if args.input:
@@ -764,6 +764,12 @@ def main():
         default=50_000_000,
         help="Number of points to keep (default: 50,000,000).",
     )
+    p_dec.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
 
     # head (PLY preview)
     p_head = subparsers.add_parser(
@@ -783,6 +789,12 @@ def main():
         type=int,
         default=5,
         help="Number of vertex rows to display (default: 5).",
+    )
+    p_head.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # scalebars
@@ -827,6 +839,12 @@ def main():
         action="store_true",
         help="Save computed scale_factor into a YAML config for this project.",
     )
+    p_sb.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
 
     # views
     p_views = subparsers.add_parser(
@@ -846,6 +864,12 @@ def main():
         type=str,
         default=None,
         help="Output PDF filepath.",
+    )
+    p_views.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # orient
@@ -885,6 +909,12 @@ def main():
         type=str,
         default=None,
         help="Optional markers CSV filepath to use for up vector calculation.",
+    )
+    p_orient.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # firefish
@@ -962,6 +992,12 @@ def main():
         action="store_true",
         help="Save computed up_vector, depth_offset, depth_per_unit into YAML.",
     )
+    p_ff.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
 
     # cams2video
     p_c2v = subparsers.add_parser(
@@ -1013,6 +1049,12 @@ def main():
         type=str,
         default=None,
         help="Optional output MP4 filepath (default: <id>_cams.mp4).",
+    )
+    p_c2v.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # intercepts
@@ -1086,6 +1128,12 @@ def main():
         action="store_true",
         help="Apply along-slope transform to pointcloud before processing.",
     )
+    p_intercepts.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
 
     # images
     p_images = subparsers.add_parser(
@@ -1135,6 +1183,12 @@ def main():
             "Crop size in pixels for image matches (sets both crop_w and crop_h). "
             "Default: 1000 (uses function default)."
         ),
+    )
+    p_images.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # transform

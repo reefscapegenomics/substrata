@@ -16,7 +16,7 @@ class ProjectInitializer:
 
     """
 
-    def __init__(self, yaml=None, path=None):
+    def __init__(self, yaml=None, path=None, local=False):
         # Check that either yaml (path or filepath) or project_path is provided
         if yaml is None and path is None:
             raise ValueError("Either yaml or path must be provided.")
@@ -71,6 +71,10 @@ class ProjectInitializer:
                     f"Loading project using default naming conventions from path: {path}"
                 )
                 self.init_with_path(path)
+
+        # Reset paths to local if requested
+        if local:
+            self.reset_paths_to_local()
 
     def __str__(self) -> str:
         """
