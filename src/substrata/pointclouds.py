@@ -534,6 +534,147 @@ class PointCloud:
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def remove_edge_clusters(
+        self,
+        eps: float = 0.1,
+        min_samples: int = 10,
+        keep_top_n_clusters: int = 1,
+    ) -> None:
+        """Remove stray points and edge clusters when viewed from top-down.
+
+        This method projects points to the XY plane and uses DBSCAN clustering
+        to identify disconnected clusters. It keeps only the largest cluster(s)
+        and removes all points belonging to smaller edge clusters and stray
+        points.
+
+        Args:
+            eps: Maximum distance between two points to be considered neighbors
+                in the DBSCAN clustering (in the same units as point
+                coordinates). This should be adjusted based on the scale of your
+                point cloud.
+            min_samples: Minimum number of points required to form a cluster.
+                Points with fewer neighbors will be marked as noise and removed.
+            keep_top_n_clusters: Number of largest clusters to keep. Default is
+                1 (keeps only the main cluster). Set to a higher value to keep
+                multiple large clusters.
+
+        Raises:
+            ImportError: If sklearn is not available.
+        """
+        try:
+            from sklearn.cluster import DBSCAN
+        except ImportError:
+            raise ImportError(
+                "sklearn is required for remove_edge_clusters. "
+                "Install it with: pip install scikit-learn"
+            )
+
+        pts = np.asarray(self.points)
+        if len(pts) == 0:
+            logger.warning("Point cloud is empty, nothing to filter.")
+            return
+
+        # Warn if point cloud is very large (DBSCAN can be memory-intensive)
+        if len(pts) > 1_000_000:
+            logger.warning(
+                f"Point cloud has {len(pts):,} points. DBSCAN clustering may be "
+                "memory-intensive. Consider downsampling first or using a larger "
+                "eps value."
+            )
+
+        # Validate eps parameter
+        if eps <= 0:
+            raise ValueError(
+                "eps must be positive. Consider the scale of your "
+                "point cloud coordinates."
+            )
+
+        # Project to XY plane (2D coordinates)
+        xy_coords = pts[:, :2]
+
+        # Perform DBSCAN clustering in 2D
+        try:
+            clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(xy_coords)
+            labels = clustering.labels_
+        except MemoryError:
+            raise MemoryError(
+                "DBSCAN ran out of memory. Try downsampling the point cloud first "
+                "or using a larger eps value to reduce computational complexity."
+            )
+
+        # Count points in each cluster (excluding noise, which has label -1)
+        non_noise_labels = labels[labels >= 0]
+        unique_labels, counts = np.unique(non_noise_labels, return_counts=True)
+
+        if len(unique_labels) == 0:
+            # All points are noise - shouldn't happen with reasonable params
+            logger.warning(
+                "All points were classified as noise. Consider adjusting "
+                "eps or min_samples parameters."
+            )
+            return
+
+        # Sort clusters by size (largest first)
+        sorted_indices = np.argsort(counts)[::-1]
+        sorted_labels = unique_labels[sorted_indices]
+
+        # Keep only the top N clusters
+        labels_to_keep = sorted_labels[:keep_top_n_clusters]
+        mask = np.isin(labels, labels_to_keep)
+
+        # Count removed points for logging
+        n_removed = np.sum(~mask)
+        n_kept = np.sum(mask)
+
+        if n_removed == 0:
+            logger.info("No edge clusters found to remove.")
+            return
+
+        logger.info(
+            f"Removed {n_removed:,} points from edge clusters, "
+            f"kept {n_kept:,} points in main cluster(s)."
+        )
+
+        # Filter the point cloud
+        filtered_points = pts[mask]
+
+        # Colors and normals may be absent; only filter if present and aligned
+        try:
+            colors_np = np.asarray(self.o3d_pcd.colors)
+            use_colors = (
+                len(colors_np) > 0
+                and colors_np.shape[0] == pts.shape[0]
+                and len(colors_np.shape) > 1
+            )
+        except (AttributeError, ValueError):
+            use_colors = False
+            colors_np = None
+
+        try:
+            normals_np = np.asarray(self.o3d_pcd.normals)
+            use_normals = (
+                len(normals_np) > 0
+                and normals_np.shape[0] == pts.shape[0]
+                and len(normals_np.shape) > 1
+            )
+        except (AttributeError, ValueError):
+            use_normals = False
+            normals_np = None
+
+        new_pcd = o3d.geometry.PointCloud()
+        new_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+        if use_colors and colors_np is not None:
+            new_pcd.colors = o3d.utility.Vector3dVector(colors_np[mask])
+        if use_normals and normals_np is not None:
+            new_pcd.normals = o3d.utility.Vector3dVector(normals_np[mask])
+
+        self.o3d_pcd = new_pcd
+
+        # Invalidate any cached kd-trees as indices changed
+        for attr in ("o3d_pcd_tree", "o3d_pcd_tree_xy"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
     def reduce_pcd_to_points_in_mesh(self, mesh) -> None:
         """Reduce the number of points by sampling points from a target mesh.
 
@@ -627,12 +768,15 @@ class PointCloud:
 
         return np.mean(filtered_distances)
 
+    from __future__ import annotations
+
     def get_z_intercepts(
         self,
         xy_coords: np.ndarray,
         search_radius: float,
         always_return: bool = False,
         store_neighboring_coords: bool = False,
+        id_prefix: str | None = None,
     ) -> "Annotations":
         """Find intercept points for a list of XY coordinates by searching within a specified radius.
 
@@ -641,6 +785,7 @@ class PointCloud:
             search_radius: Search radius for finding intercept points.
             always_return: Whether to always return a result, extrapolating if necessary.
             store_neighboring_coords: Whether to store neighboring coordinates for visualization.
+            id_prefix: Optional ID prefix to prepend to each annotation's ID.
 
         Returns:
             Annotations object containing the found intercept points.
@@ -651,22 +796,22 @@ class PointCloud:
             intercept_point = self.get_z_intercept(
                 xy_point, search_radius, always_return, store_neighboring_coords
             )
-            intercept_point.id = idx
             if intercept_point is not None:
+                if id_prefix is not None:
+                    intercept_point.id = f"{id_prefix}_{idx}"
+                else:
+                    intercept_point.id = idx
                 intercept_points.append(intercept_point)
 
         # Provide a short output summary
-        print(
-            "Intercept points returned: {}/{}".format(
-                len(intercept_points), len(xy_coords)
-            )
-        )
+        print(f"Intercept points returned: {len(intercept_points)}/{len(xy_coords)}")
         if always_return:
             extrapolated_count = sum(
                 1 for point in intercept_points if point.is_extrapolated
             )
             print(
-                f"Extrapolated intercepts (no point found): {extrapolated_count}/{len(intercept_points)}"
+                f"Extrapolated intercepts (no point found): "
+                f"{extrapolated_count}/{len(intercept_points)}"
             )
         return intercept_points
 
@@ -1506,6 +1651,161 @@ def _stream_sample_ply_to_arrays(
                 normals = normals[:taken]
 
     return points, colors, normals
+
+
+def stream_extract_neighborhoods_ply(
+    input_path: str,
+    target_coords: List[np.ndarray],
+    radius: Union[float, List[float]],
+    show_progress: bool = True,
+    chunk_bytes: int = 64 * 1024 * 1024,
+) -> List["SimplePointCloud"]:
+    """
+    Stream a binary PLY and extract neighborhoods around target coordinates.
+
+    Scans the PLY file once and collects all points within radius of each target
+    coordinate. Returns a list of SimplePointCloud objects, one per target coordinate.
+
+    Args:
+        input_path: Path to the binary PLY file.
+        target_coords: List of target coordinates (each as 3-element array).
+        radius: Search radius (float) or list of radii (one per target_coord).
+        show_progress: Whether to show progress bar.
+        chunk_bytes: Chunk size for reading.
+
+    Returns:
+        List of SimplePointCloud objects, one per target coordinate.
+    """
+    from tqdm import tqdm
+
+    # Normalize radius to a list
+    if isinstance(radius, (int, float)):
+        radii = [float(radius)] * len(target_coords)
+    else:
+        if len(radius) != len(target_coords):
+            raise ValueError(
+                "If radius is a list, it must have the same length as target_coords"
+            )
+        radii = [float(r) for r in radius]
+
+    target_coords = [np.asarray(coord, dtype=float) for coord in target_coords]
+    if not all(coord.shape == (3,) for coord in target_coords):
+        raise ValueError("All target_coords must be 3-element arrays")
+
+    with open(input_path, "rb") as fin:
+        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
+
+        # Build structured dtype for this vertex layout
+        np_dtypes = {
+            "char": "i1",
+            "uchar": "u1",
+            "int8": "i1",
+            "uint8": "u1",
+            "short": "i2",
+            "ushort": "u2",
+            "int16": "i2",
+            "uint16": "u2",
+            "int": "i4",
+            "uint": "u4",
+            "int32": "i4",
+            "uint32": "u4",
+            "float": "f4",
+            "float32": "f4",
+            "double": "f8",
+            "float64": "f8",
+        }
+        fields = []
+        for t, name in vprops:
+            if t not in np_dtypes:
+                raise ValueError(f"Unsupported PLY type: {t}")
+            fields.append((name, endian + np_dtypes[t]))
+        dt = np.dtype(fields)
+
+        # Check for xyz / rgb / normals
+        has_rgb = all(n in dt.names for n in ("red", "green", "blue"))
+        has_nrm = all(n in dt.names for n in ("nx", "ny", "nz"))
+        if not all(n in dt.names for n in ("x", "y", "z")):
+            raise ValueError("PLY must contain x,y,z vertex properties.")
+
+        # Pre-allocate lists for each neighborhood
+        neighborhoods = [[] for _ in target_coords]
+        neighborhoods_colors = [[] for _ in target_coords] if has_rgb else None
+        neighborhoods_normals = [[] for _ in target_coords] if has_nrm else None
+
+        # Chunked read loop
+        chunk_recs = max(1, chunk_bytes // rec_size)
+        remaining = n_vertices
+
+        # Pre-compute squared radii for distance comparison
+        radii_sq = [r**2 for r in radii]
+
+        # Read vertex section in chunks
+        with tqdm(
+            total=n_vertices,
+            unit="vtx",
+            desc="Extract neighborhoods",
+            disable=not show_progress,
+        ) as pbar:
+            while remaining > 0:
+                # Read a whole-number of records
+                to_read = int(min(remaining, chunk_recs))
+                buf = fin.read(to_read * rec_size)
+                if len(buf) != to_read * rec_size:
+                    raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
+
+                arr = np.frombuffer(buf, dtype=dt, count=to_read)
+
+                # Extract coordinates for this chunk
+                coords = np.column_stack([arr["x"], arr["y"], arr["z"]])
+
+                # For each target coordinate, find points within radius
+                for idx, (target_coord, radius_sq_val) in enumerate(
+                    zip(target_coords, radii_sq)
+                ):
+                    # Compute squared distances (vectorized)
+                    distances_sq = np.sum((coords - target_coord) ** 2, axis=1)
+                    mask = distances_sq <= radius_sq_val
+
+                    if np.any(mask):
+                        # Extract points within radius
+                        neighborhoods[idx].append(coords[mask])
+
+                        if has_rgb:
+                            # Scale 0..255 → 0..1
+                            rgb = np.column_stack(
+                                [
+                                    arr["red"][mask] / 255.0,
+                                    arr["green"][mask] / 255.0,
+                                    arr["blue"][mask] / 255.0,
+                                ]
+                            )
+                            neighborhoods_colors[idx].append(rgb)
+
+                        if has_nrm:
+                            normals_chunk = np.column_stack(
+                                [arr["nx"][mask], arr["ny"][mask], arr["nz"][mask]]
+                            )
+                            neighborhoods_normals[idx].append(normals_chunk)
+
+                remaining -= to_read
+                pbar.update(to_read)
+
+    # Concatenate all chunks for each neighborhood and create SimplePointCloud objects
+    result = []
+    for idx in range(len(target_coords)):
+        if len(neighborhoods[idx]) == 0:
+            # Empty neighborhood
+            points = np.zeros((0, 3), dtype=float)
+            colors = np.zeros((0, 3), dtype=float) if has_rgb else None
+            normals = np.zeros((0, 3), dtype=float) if has_nrm else None
+        else:
+            points = np.vstack(neighborhoods[idx])
+            colors = np.vstack(neighborhoods_colors[idx]) if has_rgb else None
+            normals = np.vstack(neighborhoods_normals[idx]) if has_nrm else None
+
+        result.append(SimplePointCloud(points, colors, normals, None))
+
+    return result
 
 
 def decimate_ply_file(

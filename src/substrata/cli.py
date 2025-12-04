@@ -391,7 +391,7 @@ def handle_intercepts(args):
     # Sample random XY points inside cells and compute intercepts
     random_points = measurements.generate_random_xy_points_within_cells(bboxes, 1, 0)
     intercepts = init.pcd.get_z_intercepts(
-        random_points, args.search_radius, always_return=True
+        random_points, args.search_radius, always_return=True, id_prefix=init.id
     )
 
     # Back-compute original coords and get first image matches if cameras are available

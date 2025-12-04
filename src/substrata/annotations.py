@@ -810,6 +810,55 @@ class Annotations:
                 ann.coords, radius
             )
 
+    def load_undecimated_neighborhoods(
+        self,
+        ply_filepath: str,
+        radius: Union[float, List[float]],
+        show_progress: bool = True,
+    ) -> None:
+        """Load undecimated point cloud neighborhoods from a PLY file for all annotations.
+
+        Streams through the PLY file once and extracts neighborhoods around each
+        annotation coordinate. This is memory-efficient as it only loads points
+        within the specified radius for each annotation, avoiding loading the
+        entire point cloud into memory.
+
+        The neighborhoods are stored in each annotation's `simple_pcd` attribute.
+        Each neighborhood is a separate SimplePointCloud object, so there are no
+        memory duplicates between annotations.
+
+        Args:
+            ply_filepath: Path to the undecimated PLY file.
+            radius: Search radius (float) or list of radii (one per annotation).
+            show_progress: Whether to show progress bar during extraction.
+
+        Raises:
+            ValueError: If radius is a list with length different from number of annotations.
+        """
+        from substrata import pointclouds
+
+        if len(self.data) == 0:
+            logger.warning("No annotations to process")
+            return
+
+        # Collect coordinates in consistent order (by annotation ID)
+        # Store mapping from index to annotation ID
+        ann_ids = sorted(self.data.keys())
+        target_coords = [self.data[ann_id].coords for ann_id in ann_ids]
+
+        # Extract neighborhoods in a single pass
+        neighborhoods = pointclouds.stream_extract_neighborhoods_ply(
+            ply_filepath, target_coords, radius, show_progress=show_progress
+        )
+
+        # Assign results back to annotations
+        for ann_id, neighborhood in zip(ann_ids, neighborhoods):
+            self.data[ann_id].simple_pcd = neighborhood
+
+        logger.info(
+            f"Loaded undecimated neighborhoods for {len(neighborhoods)} annotations"
+        )
+
     def measure_all(
         self, measurement_func: Callable, *args: Any, **kwargs: Any
     ) -> None:
