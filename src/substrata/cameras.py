@@ -1665,9 +1665,9 @@ class ImageMatch:
         Returns:
             float: Pixels per mm, or None if pixel_scale is not set.
         """
-        if self.pixel_scale is not None and self.pixel_scale != 0:
-            return 1.0 / (self.pixel_scale * 1000.0)
-        return None
+        if self.pixel_scale is None:
+            self.calc_pixel_scale_from_crosshair()
+        return 1.0 / (self.pixel_scale * 1000.0)
 
     def get_sam2_masks(self, sam_predictor):
         """
