@@ -378,9 +378,31 @@ def handle_intercepts(args):
         slope_normal, slope_elev = init.pcd.apply_along_slope_transform()
 
     # Create bounding box, subdivide to grid, and visualize
-    optimal_bbox = measurements.find_optimal_box_position(
-        init.pcd, box_length=args.box_length, box_width=args.box_width, step_size=0.1
-    )
+    if getattr(args, "position", None):
+        # Parse manual position [x, y] (top-left coordinate)
+        try:
+            position = ast.literal_eval(args.position)
+            if not isinstance(position, (list, tuple)) or len(position) != 2:
+                raise ValueError("Position must be a list or tuple of length 2")
+            x_top_left, y_top_left = float(position[0]), float(position[1])
+        except (ValueError, SyntaxError) as e:
+            sys.exit(
+                f"Failed to parse --position argument: {e}. Expected format: [x,y]"
+            )
+
+        # Construct bbox from top-left position by adding box_length and box_width
+        optimal_bbox = [
+            [x_top_left, y_top_left],
+            [x_top_left + args.box_length, y_top_left + args.box_width],
+        ]
+    else:
+        # Use automatic optimal box position finding
+        optimal_bbox = measurements.find_optimal_box_position(
+            init.pcd,
+            box_length=args.box_length,
+            box_width=args.box_width,
+            step_size=0.1,
+        )
     try:
         bboxes = measurements.subdivide_boxes(optimal_bbox, args.box_size)
     except ValueError as e:
@@ -1107,6 +1129,18 @@ def main():
         type=float,
         default=4.0,
         help="Rectangle width in meters for optimal box search (default: 4).",
+    )
+    p_intercepts.add_argument(
+        "--position",
+        dest="position",
+        type=str,
+        default=None,
+        help=(
+            "Manual top-left coordinate [x,y] for the bounding box. "
+            "When provided, skips find_optimal_box_position and uses this position "
+            "plus box_length and box_width to define the bounding box. "
+            "Format: [x,y] (e.g., '[1.4, 2.6]')."
+        ),
     )
     p_intercepts.add_argument(
         "--box-size",
