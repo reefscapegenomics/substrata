@@ -1730,6 +1730,20 @@ def save_measurement_visualizations_to_pdf(
                 elif isinstance(img, Image.Image):
                     # Already a PIL Image
                     pil_img = img
+                elif hasattr(img, "to_image") and callable(getattr(img, "to_image")):
+                    # Plotly Figure (e.g. when kaleido failed on Windows during
+                    # measurement) - render to PNG and convert to PIL
+                    try:
+                        image_bytes = img.to_image(format="png", width=600, height=400)
+                        pil_img = Image.open(BytesIO(image_bytes))
+                        if pil_img.mode != "RGB":
+                            pil_img = pil_img.convert("RGB")
+                    except Exception as fig_err:
+                        logger.warning(
+                            f"Plotly to_image failed for {img_key} ({fig_err}). "
+                            "Install kaleido for image export: pip install kaleido"
+                        )
+                        raise
                 else:
                     # For other types, try to convert to PIL Image
                     pil_img = Image.fromarray(np.array(img))
