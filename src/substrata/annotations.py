@@ -913,6 +913,7 @@ class Annotations:
                 self.data[id].measurements["roughness_image"] = output[2]
             elif measurement_func.__name__ == "get_vector_dispersion":
                 self.data[id].measurements["vector_disp"] = output[0]
+                self.data[id].measurements["vector_dispersion_image"] = output[1]
             elif measurement_func.__name__ == "get_mask_surface_area":
                 self.data[id].measurements["SA_in_cm2"] = output[0]
             elif measurement_func.__name__ == "get_plane_angles":
@@ -1448,9 +1449,10 @@ class Annotation:
             self.measurements["roughness_image"] = roughness_image
             return self.id, [ra, rq, roughness_image]
         elif measurement_func.__name__ == "get_vector_dispersion":
-            vector_disp = measurement_func(self.simple_pcd)
+            vector_disp, vector_dispersion_image = measurement_func(self.simple_pcd)
             self.measurements["vector_disp"] = vector_disp
-            return self.id, [vector_disp]
+            self.measurements["vector_dispersion_image"] = vector_dispersion_image
+            return self.id, [vector_disp, vector_dispersion_image]
         elif measurement_func.__name__ == "get_mask_surface_area":
             SA_in_cm2 = measurement_func(self, *args)
             self.measurements["SA_in_cm2"] = SA_in_cm2

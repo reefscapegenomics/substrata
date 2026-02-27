@@ -383,7 +383,11 @@ def get_fractal_dimension(pcd, iterations=10, plot=False):
 def get_vector_dispersion(geom):
     """
     Function to get the vector normal dispersion of a geometry (either
-    PointCloud or Mesh). Adapted from Young et al., 2017
+    PointCloud or Mesh). Adapted from Young et al., 2017.
+
+    Returns the dispersion scalar and a static visualization image (numpy array),
+    same pattern as calc_roughness. Only PointCloud-like geometry is visualized;
+    for TriangleMesh, the image is None.
     """
     if isinstance(
         geom,
@@ -406,8 +410,18 @@ def get_vector_dispersion(geom):
         normals[:, 0] ** 2 + normals[:, 1] ** 2 + normals[:, 2] ** 2
     )
     R1 = np.sqrt(sum(cos_x) ** 2 + sum(cos_y) ** 2 + sum(cos_z) ** 2)
-    vector_normal_dispersion = (i - R1) / (i - 1)
-    return vector_normal_dispersion
+    vector_normal_dispersion = (i - R1) / (i - 1) if i > 1 else 0.0
+
+    image = None
+    if isinstance(
+        geom,
+        (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
+    ) and i > 0:
+        image = visualizations.visualize_vector_dispersion(
+            geom, interactive=False, dispersion=vector_normal_dispersion
+        )
+
+    return vector_normal_dispersion, image
 
 
 def get_rgb_stats(pcd):

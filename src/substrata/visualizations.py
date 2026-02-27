@@ -1670,7 +1670,7 @@ def save_measurement_visualizations_to_pdf(
         label_text = f"{ann_id} {ann_label}"
 
         # Sort image keys with image_match first, then standard order:
-        # gapF_image, elevation_image, roughness_image
+        # gapF_image, elevation_image, roughness_image, vector_dispersion_image
         # Any other keys come after in alphabetical order
         image_keys = list(image_data.keys())
         ordered_keys = []
@@ -1678,7 +1678,12 @@ def save_measurement_visualizations_to_pdf(
         if "image_match" in image_keys:
             ordered_keys.append("image_match")
         # Add standard order keys if they exist
-        standard_order = ["gapF_image", "elevation_image", "roughness_image"]
+        standard_order = [
+            "gapF_image",
+            "elevation_image",
+            "roughness_image",
+            "vector_dispersion_image",
+        ]
         for key in standard_order:
             if key in image_keys:
                 ordered_keys.append(key)
@@ -3775,6 +3780,240 @@ def visualize_roughness(
             # Convert PNG bytes to numpy array (H, W, 3), dtype uint8, RGB format
             img = Image.open(BytesIO(image_bytes))
             # Convert to RGB if needed (handles RGBA, etc.)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            image_array = np.array(img, dtype=np.uint8)
+            return image_array
+        except Exception as e:
+            logger.warning(
+                f"Image export failed ({e}). Returning figure object instead. "
+                "Install kaleido for image export: pip install kaleido"
+            )
+            return fig
+
+
+def visualize_vector_dispersion(
+    pcd,
+    output_filename=None,
+    max_output_points=50000,
+    width=600,
+    height=400,
+    point_size=2,
+    interactive=False,
+    dispersion=None,
+):
+    """
+    Visualize global vector normal dispersion (Young et al., 2017) on a point cloud.
+
+    Expects a (typically subsampled) point cloud, e.g. points within a radius from
+    a given point. Computes the single scalar dispersion via get_vector_dispersion
+    and shows each point as a short stick in the direction of its normal, colored
+    by deviation from the average (mean) normal: blue = aligned (0°), red = max
+    deviation (90°). The heatmap value is the angle in degrees from the mean normal.
+
+    Works in both Jupyter notebooks and VS Code. Can be displayed interactively,
+    saved to file, or returned as a static image.
+
+    Args:
+        pcd: The point cloud object (must have normals). Typically a subsampled
+            cloud within a radius from a point.
+        output_filename: Optional filename to save the visualization. If provided,
+            saves to file. Supports formats: .html, .png, .pdf, .svg, .jpeg. If None
+            and interactive=False, returns a static image as numpy array.
+        max_output_points: Maximum number of points to plot. The point cloud will be
+            decimated if it exceeds this limit.
+        width: Figure width in pixels (default 600).
+        height: Figure height in pixels (default 400).
+        point_size: Scatter marker size for the point cloud (default 2).
+        interactive: If True and output_filename is None, displays interactively.
+            If False and output_filename is None, returns a static image as numpy
+            array (default False).
+        dispersion: Optional precomputed global dispersion scalar. If None, will be
+            calculated from the point cloud using get_vector_dispersion.
+
+    Returns:
+        plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if
+            interactive=True or output_filename is provided, otherwise returns static
+            image as numpy array (H, W, 3), dtype uint8, RGB format.
+    """
+    import plotly
+    import plotly.graph_objects as go
+    from substrata import measurements
+
+    # Decimate if required (and ensure PointCloud format)
+    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
+
+    points = np.asarray(pcd.points)
+    if points.size == 0:
+        raise ValueError("Point cloud has no points")
+    normals = np.asarray(pcd.normals)
+    if len(normals) != len(points):
+        raise ValueError(
+            "Point cloud must have normals for vector dispersion visualization."
+        )
+
+    if dispersion is None:
+        dispersion, _ = measurements.get_vector_dispersion(pcd)
+    dispersion = float(dispersion)
+
+    # Unit normals and resultant (mean) direction (same as in get_vector_dispersion)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit_normals = normals / norms
+    resultant = np.array(
+        [unit_normals[:, 0].sum(), unit_normals[:, 1].sum(), unit_normals[:, 2].sum()]
+    )
+    r_len = np.linalg.norm(resultant)
+    if r_len > 1e-10:
+        mean_normal = resultant / r_len
+        # Dot product of each normal with mean normal (in [-1, 1])
+        alignment = unit_normals @ mean_normal
+        # Deviation = angle in degrees from mean normal (0° = aligned, 90° = max)
+        deviation_deg = np.degrees(np.arccos(np.clip(np.abs(alignment), 0.0, 1.0)))
+    else:
+        deviation_deg = np.full(len(points), 90.0)
+
+    # Bounds and layout (same as visualize_roughness)
+    x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
+    y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
+    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
+    mid_x = 0.5 * (x_min + x_max)
+    mid_y = 0.5 * (y_min + y_max)
+    mid_z = 0.5 * (z_min + z_max)
+    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
+    half_range = max_range / 2.0
+
+    # Stick length as fraction of scene (normals point outward from surface)
+    stick_length = max_range * 0.025
+    stick_ends = points + stick_length * unit_normals
+
+    # Bin deviation for stick coloring (Plotly line traces need one color per trace)
+    n_bins = 10
+    bin_edges = np.linspace(0, 90, n_bins + 1)
+    fig = go.Figure()
+
+    # Invisible scatter to get a continuous colorbar for deviation (0-90°)
+    fig.add_trace(
+        go.Scatter3d(
+            x=points[:, 0],
+            y=points[:, 1],
+            z=points[:, 2],
+            mode="markers",
+            marker=dict(
+                size=0.1,
+                color=deviation_deg,
+                colorscale="RdBu_r",
+                opacity=0,
+                cmin=0.0,
+                cmax=90.0,
+                colorbar=dict(
+                    title="Deviation from<br>mean normal (°)",
+                    len=0.5,
+                    y=0.5,
+                ),
+            ),
+            showlegend=False,
+            name="colorbar",
+        )
+    )
+
+    # One line trace per bin: sticks colored by deviation bin (same RdBu_r scale)
+    for b in range(n_bins):
+        lo, hi = bin_edges[b], bin_edges[b + 1]
+        mask = (
+            (deviation_deg >= lo) & (deviation_deg <= hi)
+            if b == n_bins - 1
+            else (deviation_deg >= lo) & (deviation_deg < hi)
+        )
+        if not np.any(mask):
+            continue
+        seg_x = []
+        seg_y = []
+        seg_z = []
+        for i in np.where(mask)[0]:
+            seg_x.extend([points[i, 0], stick_ends[i, 0], np.nan])
+            seg_y.extend([points[i, 1], stick_ends[i, 1], np.nan])
+            seg_z.extend([points[i, 2], stick_ends[i, 2], np.nan])
+        t = (lo + hi) / 2.0 / 90.0
+        bin_color = plotly.colors.sample_colorscale("RdBu_r", [t])[0]
+        fig.add_trace(
+            go.Scatter3d(
+                x=seg_x,
+                y=seg_y,
+                z=seg_z,
+                mode="lines",
+                line=dict(color=bin_color, width=2),
+                showlegend=False,
+            )
+        )
+
+    camera_eye = {"x": 1.25, "y": -1.25, "z": 1.25}
+    camera_center = {"x": 0, "y": 0, "z": 0}
+    camera_up = {"x": 0, "y": 0, "z": 1}
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+            aspectmode="cube",
+            xaxis=dict(range=[mid_x - half_range, mid_x + half_range]),
+            yaxis=dict(range=[mid_y - half_range, mid_y + half_range]),
+            zaxis=dict(range=[mid_z - half_range, mid_z + half_range]),
+            camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
+        ),
+        title=f"Vector dispersion: {dispersion:.4f} (blue = aligned, red = max deviation)",
+        width=width,
+        height=height,
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+
+    if output_filename is not None:
+        ext = os.path.splitext(output_filename)[1].lower()
+        if ext == ".html":
+            fig.write_html(output_filename)
+        elif ext in [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".webp"]:
+            try:
+                fig.write_image(output_filename, width=width, height=height)
+            except Exception as e:
+                logger.warning(
+                    f"Image export failed ({e}). Saving as HTML instead. "
+                    "Install kaleido for image export: pip install kaleido"
+                )
+                html_filename = os.path.splitext(output_filename)[0] + ".html"
+                fig.write_html(html_filename)
+        else:
+            fig.write_html(output_filename)
+        return fig
+    elif interactive:
+        try:
+            from IPython import get_ipython
+
+            in_jupyter = get_ipython() is not None
+        except ImportError:
+            in_jupyter = False
+
+        if in_jupyter:
+            try:
+                fig.show()
+            except (ValueError, ImportError) as e:
+                if "nbformat" in str(e):
+                    import warnings
+
+                    warnings.warn(
+                        "nbformat>=4.2.0 not installed. Using browser renderer. "
+                        "Install with: pip install nbformat>=4.2.0 for inline display."
+                    )
+                    fig.show(renderer="browser")
+                else:
+                    raise
+        else:
+            fig.show(renderer="browser")
+        return fig
+    else:
+        try:
+            image_bytes = fig.to_image(format="png", width=width, height=height)
+            img = Image.open(BytesIO(image_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
             image_array = np.array(img, dtype=np.uint8)
