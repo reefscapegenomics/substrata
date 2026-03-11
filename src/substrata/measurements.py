@@ -171,16 +171,32 @@ def get_best_fit_plane_ransac(
 
 
 def get_plane_angles(pcd, vis=False):
-    """
+    """Calculate orientation angles for the best-fit plane of a point cloud.
+
+    The plane normal is aligned with the point cloud normals by
+    ``get_best_fit_plane_PCA``, so its direction encodes whether the surface
+    faces upward or downward.
+
+    Args:
+        pcd: Point cloud object with ``.points`` (and optionally ``.normals``).
+        vis: If True, show an interactive 3-D visualisation of the elevation.
+
     Returns:
-      theta_deg: rotation about +Y to bring n's xz-projection to +Z
-      psi_deg:   rotation about +X to then bring n to +Z
-      elev_deg:  tilt of plane from horizontal (0..90)
-      plane:     [a, b, c, d]
-      az_deg:    azimuth of normal in XY from +X CCW (None if vertical)
+        tuple: A 6-element tuple containing:
+            - **theta_deg** (*float*): Rotation about +Y to null the x-component
+              of n in the xz-plane (brings n's xz-projection toward +Z).
+            - **psi_deg** (*float*): Rotation about +X to then align n with +Z.
+            - **elev_deg** (*float*): Angle between the plane normal and +Z
+              (0 = up, 90 = vertical, 180 = down).
+            - **plane** (*list[float]*): Plane coefficients ``[a, b, c, d]``.
+            - **az_deg** (*float | None*): Azimuth of the normal projected onto
+              XY, measured from +X counter-clockwise (``None`` if the normal is
+              nearly vertical).
+            - **image** (*np.ndarray*): Static elevation-angle visualisation as
+              an (H, W, 3) uint8 RGB array.
     """
     if len(pcd.points) <= 1:
-        return 0.0, 0.0, 0.0, [], None
+        return 0.0, 0.0, 0.0, [], None, None
 
     a, b, c, d, inliers_idx = get_best_fit_plane_PCA(pcd)
 
@@ -190,35 +206,27 @@ def get_plane_angles(pcd, vis=False):
         raise ValueError("Degenerate plane normal.")
     n = n / n_norm
 
-    # Stabilize sign so elevation/azimuth are consistent
-    if n[2] < 0:
-        n = -n
     nx, ny, nz = n
 
-    # Elevation: angle between normal and +Z (tilt of plane from horizontal)
     elev = np.arccos(np.clip(nz, -1.0, 1.0))
     elev_deg = float(np.degrees(elev))
 
     # Y-then-X rotations to align n -> +Z
-    # theta: rotate about +Y to null x component in xz-plane
-    # psi:   rotate about +X to null y component
-    theta = np.arctan2(nx, nz)  # about Y
-    # after Y rotation by -theta, residual "up" length in xz is sqrt(nx^2+nz^2)
-    psi = np.arctan2(-ny, np.hypot(nx, nz))  # about X
+    theta = np.arctan2(nx, nz)
+    psi = np.arctan2(-ny, np.hypot(nx, nz))
 
     theta_deg = float(np.degrees(theta))
     psi_deg = float(np.degrees(psi))
 
-    # Azimuth of normal in XY (from +X, CCW). None if normal ~ vertical.
     r_xy = np.hypot(nx, ny)
     if r_xy < 1e-8:
         az_deg = None
     else:
-        az = np.arctan2(ny, nx)  # +X→0°, CCW
+        az = np.arctan2(ny, nx)
         az_deg = float((np.degrees(az) + 360.0) % 360.0)
 
     if vis:
-        visualizations.visualize_elevation_angle(pcd, [a, b, c, d])
+        visualizations.visualize_elevation_angle(pcd, [a, b, c, d], interactive=True)
 
     image = visualizations.visualize_elevation_angle(
         pcd, [a, b, c, d], interactive=False
@@ -238,8 +246,11 @@ def get_elevation_angle(normal) -> float:
     """
     Return the elevation angle (degrees) of a plane given its normal vector.
 
-    Elevation is defined as the tilt of the plane from horizontal:
-    0° for a horizontal plane, 90° for a vertical plane.
+    Elevation is the angle between the normal and +Z:
+    0° for upward-facing, 90° for vertical, 180° for downward-facing.
+
+    The normal orientation matters: the caller is responsible for ensuring it
+    points in the correct direction (e.g. aligned with point cloud normals).
 
     The input can be any 3-element array-like; it is normalized internally.
 
@@ -247,7 +258,6 @@ def get_elevation_angle(normal) -> float:
         ValueError: If the provided normal is not a length-3 non-zero vector.
     """
     n = np.asarray(normal, dtype=float)
-    # Accept (3,) or any 1-D length-3
     if n.ndim != 1 or n.size != 3:
         raise ValueError("normal must be a length-3 vector")
 
@@ -256,10 +266,6 @@ def get_elevation_angle(normal) -> float:
         raise ValueError("normal vector must be non-zero")
 
     n = n / norm
-    # Stabilize sign so elevation is always in [0, 90]
-    if n[2] < 0:
-        n = -n
-
     elev_rad = np.arccos(np.clip(n[2], -1.0, 1.0))
     return float(np.degrees(elev_rad))
 
@@ -413,10 +419,13 @@ def get_vector_dispersion(geom):
     vector_normal_dispersion = (i - R1) / (i - 1) if i > 1 else 0.0
 
     image = None
-    if isinstance(
-        geom,
-        (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
-    ) and i > 0:
+    if (
+        isinstance(
+            geom,
+            (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
+        )
+        and i > 0
+    ):
         image = visualizations.visualize_vector_dispersion(
             geom, interactive=False, dispersion=vector_normal_dispersion
         )
