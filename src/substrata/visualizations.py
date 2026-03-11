@@ -3947,6 +3947,36 @@ def visualize_vector_dispersion(
             )
         )
 
+    # Mean normal arrow (solid green line from centroid)
+    origin = np.array([mid_x, mid_y, mid_z])
+    arrow_length = max_range * 0.5
+    if r_len > 1e-10:
+        arrow_end = origin + mean_normal * arrow_length
+        fig.add_trace(
+            go.Scatter3d(
+                x=[origin[0], arrow_end[0]],
+                y=[origin[1], arrow_end[1]],
+                z=[origin[2], arrow_end[2]],
+                mode="lines",
+                line=dict(color="green", width=6),
+                showlegend=False,
+                name="Mean Normal",
+            )
+        )
+        fig.add_trace(
+            go.Cone(
+                x=[arrow_end[0]],
+                y=[arrow_end[1]],
+                z=[arrow_end[2]],
+                u=[mean_normal[0] * arrow_length * 0.1],
+                v=[mean_normal[1] * arrow_length * 0.1],
+                w=[mean_normal[2] * arrow_length * 0.1],
+                colorscale=[[0, "green"], [1, "green"]],
+                showscale=False,
+                showlegend=False,
+            )
+        )
+
     camera_eye = {"x": 1.25, "y": -1.25, "z": 1.25}
     camera_center = {"x": 0, "y": 0, "z": 0}
     camera_up = {"x": 0, "y": 0, "z": 1}
