@@ -2,7 +2,7 @@
 import logging
 import os
 import re
-from typing import List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 # Third-Party Libraries
 import numpy as np
@@ -284,6 +284,40 @@ class PointCloud:
         """Apply several 4x4 transforms in sequence."""
         for idx, tm in enumerate(transform_matrices):
             self.apply_transform(tm)
+
+    def apply_color_correction(
+        self, correction: Dict[str, np.ndarray],
+        chunk_size: int = 5_000_000,
+    ) -> None:
+        """Apply an affine colour correction to the point cloud.
+
+        Operates in chunks to avoid duplicating the full colour array
+        in memory (important for large point clouds).
+
+        Args:
+            correction: Dict with ``"matrix"`` (3x3) and ``"offset"``
+                (length-3), both in 0-255 colour space.  Typically
+                obtained from ``ColorCalibrations.compute_color_correction()``.
+            chunk_size: Number of points processed per batch.
+        """
+        matrix = np.asarray(correction["matrix"], dtype=float)
+        offset = np.asarray(correction["offset"], dtype=float)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"matrix must be (3,3), got {matrix.shape}")
+        if offset.shape != (3,):
+            raise ValueError(f"offset must be (3,), got {offset.shape}")
+
+        colors = np.asarray(self.o3d_pcd.colors)
+        n = len(colors)
+        for start in tqdm(range(0, n, chunk_size), desc="Colour correction"):
+            end = min(start + chunk_size, n)
+            chunk = colors[start:end] * 255.0
+            chunk = chunk @ matrix.T + offset
+            np.clip(chunk, 0.0, 255.0, out=chunk)
+            chunk /= 255.0
+            colors[start:end] = chunk
+
+        logger.info("Applied affine colour correction to %d points", n)
 
     def apply_orientation_transforms(
         self,

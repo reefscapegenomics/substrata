@@ -46,6 +46,7 @@ class ProjectInitializer:
         self.up_vector = None
         self.depth_offset = None
         self.depth_per_unit = None
+        self.color_correction = None
 
         self.pcd = None
         self.cams = None
@@ -174,6 +175,13 @@ class ProjectInitializer:
         if world_transform is not None:
             self.world_transform = np.array(world_transform, dtype=float)
 
+        cc = yaml_config.get("color_correction")
+        if cc is not None:
+            self.color_correction = {
+                "matrix": np.array(cc["matrix"], dtype=float),
+                "offset": np.array(cc["offset"], dtype=float),
+            }
+
     @property
     def pcd_filepath(self) -> str:
         """Backwards compatibility property for ply_filepath."""
@@ -245,6 +253,11 @@ class ProjectInitializer:
             config["depth_offset"] = float(self.depth_offset)
         if self.depth_per_unit is not None:
             config["depth_per_unit"] = float(self.depth_per_unit)
+        if self.color_correction is not None:
+            config["color_correction"] = {
+                "matrix": _as_flow_sequence(self.color_correction["matrix"]),
+                "offset": _as_flow_sequence(self.color_correction["offset"]),
+            }
 
         if filepath is None:
             filepath = self.yaml_path
@@ -334,7 +347,7 @@ class ProjectInitializer:
         classes_path = os.path.join(filepath, "classes.csv")
         self.classes_filepath = classes_path if os.path.exists(classes_path) else None
 
-    def initialize(self, apply_transform=True):
+    def initialize(self, apply_transform=True, apply_color_correction=True):
         """
         Instantiate the PointCloud, Cameras, Markers and Annotations objects
 
@@ -343,6 +356,9 @@ class ProjectInitializer:
 
         Args:
             apply_transform (bool): If True, apply world_transform to loaded objects.
+            apply_color_correction (bool): If True and a colour correction is
+                stored in the YAML config, apply it to the point cloud after
+                loading.
         """
         from substrata import (
             cameras,
@@ -390,6 +406,14 @@ class ProjectInitializer:
                 f"Applying world_transform to loaded objects:\n{self.world_transform}"
             )
             self.apply_world_transform()
+
+        if (
+            apply_color_correction
+            and self.color_correction is not None
+            and self.pcd is not None
+        ):
+            print("Applying colour correction from YAML config")
+            self.pcd.apply_color_correction(self.color_correction)
 
     def apply_world_transform(self, skip_pcd=False):
         """

@@ -1,6 +1,7 @@
 # Standard Library
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -11,6 +12,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
 from substrata import settings
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +152,13 @@ class ColorCalibration:
         bl_label: str,
         tr_label: str,
         br_label: str,
+        name: Optional[str] = None,
     ) -> None:
         self.tl_label = tl_label
         self.bl_label = bl_label
         self.tr_label = tr_label
         self.br_label = br_label
+        self.name = name
         self.tl_coords: Optional[np.ndarray] = None
         self.bl_coords: Optional[np.ndarray] = None
         self.tr_coords: Optional[np.ndarray] = None
@@ -282,33 +287,45 @@ class ColorCalibrations:
         self,
         calibration_data: List[Sequence[str]],
         target_data: Optional[Union[Dict, Any]] = None,
+        pcd: Optional[Any] = None,
         patch_definitions: Optional[Sequence[Tuple[str, float, float, int, int, int]]] = None,
     ) -> None:
         """Build one ColorCalibration per row of four corner labels.
 
         Args:
-            calibration_data: Rows of [tl_label, bl_label, tr_label, br_label].
+            calibration_data: Rows of ``[tl, bl, tr, br]`` or
+                ``[tl, bl, tr, br, name]`` where the optional fifth element
+                is a human-readable label for the card.
             target_data: Optional dict label -> coords list, or Annotations instance.
+            pcd: Optional PointCloud.  When provided (together with
+                ``target_data``), ``sample_point_cloud`` and
+                ``compute_color_correction`` are called automatically.
             patch_definitions: Defaults to settings.COLORCHECKER_CLASSIC_PATCHES.
         """
         self.data: List[ColorCalibration] = []
         for row in calibration_data:
-            if len(row) != 4:
+            if len(row) not in (4, 5):
                 raise ValueError(
-                    "Each color calibration row must have 4 labels: "
-                    "tl, bl, tr, br."
+                    "Each color calibration row must have 4 or 5 elements: "
+                    "tl, bl, tr, br[, name]."
                 )
+            name = str(row[4]) if len(row) == 5 else None
             self.data.append(
-                ColorCalibration(str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+                ColorCalibration(
+                    str(row[0]), str(row[1]), str(row[2]), str(row[3]),
+                    name=name,
+                )
             )
         self.patch_definitions: Sequence[Tuple[str, float, float, int, int, int]] = (
             patch_definitions
             if patch_definitions is not None
             else settings.COLORCHECKER_CLASSIC_PATCHES
         )
+        self.pcd: Optional[Any] = None
         self.num_cards: Optional[int] = None
         self.median_rgb_255_per_patch: Optional[np.ndarray] = None
         self.outlier_mask: Optional[np.ndarray] = None
+        self.color_correction: Optional[Dict[str, np.ndarray]] = None
         self._last_marker_u_min: Optional[float] = None
         self._last_marker_v_min: Optional[float] = None
         self._last_marker_u_max: Optional[float] = None
@@ -323,6 +340,11 @@ class ColorCalibrations:
                 self.store_target_coords(target_data_dict)
             else:
                 self.store_target_coords(target_data)
+
+        if pcd is not None:
+            self.pcd = pcd
+            self.sample_point_cloud(pcd)
+            self.compute_color_correction()
 
     def store_target_coords(self, target_data: Dict) -> None:
         """Assign 3D coordinates to corner labels from a label -> coords mapping."""
@@ -359,6 +381,7 @@ class ColorCalibrations:
             marker_u_min, marker_v_min, marker_u_max, marker_v_max: Override
                 the marker-quad bounds in chart UV (defaults from settings).
         """
+        self.pcd = pcd
         u_lo = (
             float(marker_u_min)
             if marker_u_min is not None
@@ -442,6 +465,65 @@ class ColorCalibrations:
 
         self.outlier_mask = out
 
+    def compute_color_correction(self) -> Dict[str, np.ndarray]:
+        """Compute a global affine colour correction from measured vs. reference patches.
+
+        Solves ``corrected = M @ measured + b`` via ordinary least-squares over
+        the 24 ColorChecker patches.  Patches where *every* card is flagged as
+        an outlier are excluded from the fit.
+
+        ``sample_point_cloud()`` must have been called first.
+
+        Returns:
+            Dict with ``"matrix"`` (3x3 ndarray) and ``"offset"`` (length-3
+            ndarray).  Both operate in 0-255 colour space.
+        """
+        if self.median_rgb_255_per_patch is None:
+            raise RuntimeError(
+                "No patch data available. Call sample_point_cloud() first."
+            )
+
+        ref = np.array(
+            [[r, g, b] for (_name, _u, _v, r, g, b) in self.patch_definitions],
+            dtype=float,
+        )
+        measured = self.median_rgb_255_per_patch.copy()
+        n_patches = measured.shape[0]
+
+        if ref.shape[0] != n_patches:
+            raise ValueError(
+                f"Reference has {ref.shape[0]} patches but measured has {n_patches}."
+            )
+
+        mask = np.ones(n_patches, dtype=bool)
+        if self.outlier_mask is not None and self.num_cards and self.num_cards > 1:
+            all_outlier = np.all(self.outlier_mask[:, :n_patches], axis=0)
+            mask &= ~all_outlier
+
+        measured_fit = measured[mask]
+        ref_fit = ref[mask]
+
+        A = np.hstack([measured_fit, np.ones((measured_fit.shape[0], 1))])
+        params, _res, _rank, _sv = np.linalg.lstsq(A, ref_fit, rcond=None)
+
+        matrix = params[:3, :].T
+        offset = params[3, :]
+
+        corrected = measured @ matrix.T + offset
+        residuals = corrected - ref
+        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+
+        logger.info(
+            "Colour correction fitted on %d/%d patches  (RMSE = %.2f RGB units)",
+            int(mask.sum()), n_patches, rmse,
+        )
+
+        self.color_correction = {
+            "matrix": matrix,
+            "offset": offset,
+        }
+        return self.color_correction
+
     def __str__(self) -> str:
         lines = ["ColorCalibrations("]
         lines.append(f"  num_charts={len(self.data)},")
@@ -492,49 +574,43 @@ class ColorCalibrations:
             )
             fig = visualizations.plot_colorchecker_qc_grid(
                 card.patch_results,
-                title=f"Card {i + 1}: {card.tl_label} … {card.br_label}\n{title_extra}",
+                title=f"Card {i + 1}: {card.name or card.tl_label + ' … ' + card.br_label}"
+                      f"\n{title_extra}",
                 outlier_mask=om,
             )
             figs.append(fig)
         return figs
 
-    def show(self, pcd: Any) -> List[Any]:
-        """Run sampling if needed, then display QC figures.
-
-        Args:
-            pcd: Point cloud used for sampling (required if not yet sampled).
-
-        Returns:
-            List of matplotlib figures.
-        """
-        if self.num_cards is None:
-            self.sample_point_cloud(pcd)
-        figs = self._generate_qc_figs()
-        for fig in figs:
-            fig.show()
-        return figs
-
-    def plot_plane_view(
+    def show(
         self,
-        pcd: Any,
+        pcd: Optional[Any] = None,
         margin_frac: float = 0.15,
-        point_size: float = 0.3,
-        width: int = 10,
-        height: int = 10,
+        point_size: float = 25,
+        plane_thickness: float = 0.01,
+        resample: bool = False,
+        width: int = 16,
+        height: int = 5,
     ) -> List[Any]:
-        """Render a face-on 2D view of each card aligned to the card edges.
+        """Show plane-normal view and measured-vs-reference colour grid per card.
 
-        The x-axis aligns with the top edge (TL -> TR) and the y-axis with
-        the left edge (TL -> BL). The view is clipped to the card corners
-        plus a small margin so only the immediate neighbourhood is shown.
+        For each valid card the figure contains two side-by-side panels:
 
-        No decimation is applied -- every point within the fetch radius is
-        plotted.
+        * **Left** — face-on 2D projection of the point cloud with sampling
+          circles (same as the old ``plot_plane_view``).
+        * **Right** — 6x4 grid of measured average colours with a thick
+          border showing the reference sRGB from the patch definitions.
 
         Args:
-            pcd: PointCloud with colours.
+            pcd: PointCloud with colours.  Falls back to ``self.pcd`` when
+                omitted.
             margin_frac: Extra margin around corners as fraction of card extent.
             point_size: Scatter marker size for the projected points.
+            plane_thickness: Only points within this distance (in metres)
+                above or below the card plane are shown.  Defaults to 0.025
+                (2.5 cm).
+            resample: If True, re-run ``sample_point_cloud`` even if results
+                are already cached.  Useful after applying colour correction
+                to see updated colours.
             width: Figure width in inches.
             height: Figure height in inches.
 
@@ -543,8 +619,20 @@ class ColorCalibrations:
         """
         from substrata import visualizations
 
+        if pcd is None:
+            pcd = self.pcd
+        if pcd is None:
+            raise ValueError("No point cloud available. Pass pcd or set it at init.")
+
+        if resample:
+            self.num_cards = None
+            self.color_correction = None
+            for card in self.data:
+                card.patch_results = []
+
         if self.num_cards is None:
             self.sample_point_cloud(pcd)
+            self.compute_color_correction()
 
         sample_r = float(settings.DEFAULT_COLOR_CALIBRATION_RADIUS)
 
@@ -567,12 +655,31 @@ class ColorCalibrations:
             if pts.shape[0] == 0:
                 continue
 
+            normal, origin = fit_plane_from_corners(
+                card.tl_coords, card.tr_coords, card.bl_coords,
+            )
+            signed_dist = (pts - origin) @ normal
+            slab_mask = np.abs(signed_dist) <= plane_thickness
+            pts = pts[slab_mask]
+            cols = cols[slab_mask]
+            if pts.shape[0] == 0:
+                continue
+
             patch_centers = np.array([
                 pr["world_xyz"] for pr in card.patch_results
             ])
             patch_names = [pr["name"] for pr in card.patch_results]
+            card_title = (
+                f"Card {i + 1}: "
+                f"{card.name or card.tl_label + ' … ' + card.br_label}"
+            )
 
-            fig = visualizations.plot_colorchecker_plane_view(
+            om = (
+                self.outlier_mask[i]
+                if self.outlier_mask is not None
+                else np.zeros(len(card.patch_results), dtype=bool)
+            )
+            fig = visualizations.plot_colorchecker_card_summary(
                 pcd_points=pts,
                 pcd_colors=cols,
                 tl=card.tl_coords,
@@ -581,21 +688,51 @@ class ColorCalibrations:
                 br=card.br_coords,
                 patch_centers_3d=patch_centers,
                 patch_names=patch_names,
+                patch_results=card.patch_results,
+                outlier_mask=om,
                 radius=sample_r,
-                title=(
-                    f"Card {i + 1}: {card.tl_label} … {card.br_label}  "
-                    f"(plane-normal view)"
-                ),
+                title=card_title,
                 point_size=point_size,
                 margin_frac=margin_frac,
                 width=width,
                 height=height,
             )
             figs.append(fig)
+
+        if self.color_correction is not None and self.median_rgb_255_per_patch is not None:
+            ref = np.array(
+                [[r, g, b] for (_, _, _, r, g, b) in self.patch_definitions],
+                dtype=float,
+            )
+            names = [name for (name, *_rest) in self.patch_definitions]
+            global_om = None
+            if self.outlier_mask is not None and self.num_cards and self.num_cards > 1:
+                global_om = np.all(self.outlier_mask[:, :ref.shape[0]], axis=0)
+            figs.append(visualizations.plot_color_correction_summary(
+                measured_rgb_255=self.median_rgb_255_per_patch,
+                reference_rgb_255=ref,
+                correction=self.color_correction,
+                patch_names=names,
+                outlier_mask=global_om,
+                title="Colour Correction Summary",
+            ))
+            figs.append(visualizations.plot_color_before_after(
+                pcd=pcd,
+                correction=self.color_correction,
+                title="Point Cloud Before / After Colour Correction",
+            ))
+
         return figs
 
-    def save_pdf(self, pcd: Any, filepath: Optional[str] = None) -> None:
+    def save_pdf(
+        self, pcd: Optional[Any] = None, filepath: Optional[str] = None,
+    ) -> None:
         """Save QC report to PDF using a non-interactive backend."""
+        if pcd is None:
+            pcd = self.pcd
+        if pcd is None:
+            raise ValueError("No point cloud available. Pass pcd or set it at init.")
+
         if self.num_cards is None:
             self.sample_point_cloud(pcd)
 
@@ -607,9 +744,7 @@ class ColorCalibrations:
                 filepath = f"{base}_color_calibration.pdf"
 
             pdf = PdfPages(filepath)
-            for fig in self._generate_qc_figs():
-                pdf.savefig(fig)
-            for fig in self.plot_plane_view(pcd):
+            for fig in self.show(pcd):
                 pdf.savefig(fig)
             pdf.close()
         finally:

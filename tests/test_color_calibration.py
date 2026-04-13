@@ -114,5 +114,74 @@ class TestSettingsPatchTable(unittest.TestCase):
         self.assertEqual(len(st.COLORCHECKER_CLASSIC_PATCHES), 24)
 
 
+class TestAffineColorCorrection(unittest.TestCase):
+    """Verify the affine least-squares solve in compute_color_correction."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cc = _load_color_calibration()
+        cls.st = _load_settings_module()
+
+    def _make_calibrations(self, measured_rgb_255: np.ndarray) -> object:
+        """Create a minimal ColorCalibrations with pre-filled measured data."""
+        cc_cls = self.cc.ColorCalibrations
+        dummy_labels = ["a", "b", "c", "d"]
+        obj = cc_cls.__new__(cc_cls)
+        obj.data = []
+        obj.patch_definitions = self.st.COLORCHECKER_CLASSIC_PATCHES
+        obj.num_cards = 1
+        obj.median_rgb_255_per_patch = measured_rgb_255.copy()
+        obj.outlier_mask = None
+        obj._last_marker_u_min = None
+        obj._last_marker_u_max = None
+        obj._last_marker_v_min = None
+        obj._last_marker_v_max = None
+        return obj
+
+    def test_identity_correction(self) -> None:
+        """When measured == reference, the correction should be (near) identity."""
+        ref = np.array(
+            [[r, g, b] for (_, _, _, r, g, b) in self.st.COLORCHECKER_CLASSIC_PATCHES],
+            dtype=float,
+        )
+        obj = self._make_calibrations(ref)
+        corr = obj.compute_color_correction()
+
+        np.testing.assert_allclose(corr["matrix"], np.eye(3), atol=1e-8)
+        np.testing.assert_allclose(corr["offset"], np.zeros(3), atol=1e-8)
+
+    def test_known_affine_roundtrip(self) -> None:
+        """Apply a known affine transform, then verify the solver recovers it."""
+        rng = np.random.RandomState(42)
+        M_true = np.eye(3) + rng.randn(3, 3) * 0.1
+        b_true = rng.randn(3) * 5.0
+
+        ref = np.array(
+            [[r, g, b] for (_, _, _, r, g, b) in self.st.COLORCHECKER_CLASSIC_PATCHES],
+            dtype=float,
+        )
+        measured = (ref - b_true) @ np.linalg.inv(M_true).T
+
+        obj = self._make_calibrations(measured)
+        corr = obj.compute_color_correction()
+
+        corrected = measured @ corr["matrix"].T + corr["offset"]
+        np.testing.assert_allclose(corrected, ref, atol=1e-6)
+
+    def test_correction_dict_keys(self) -> None:
+        """The returned dict has the expected keys and shapes."""
+        ref = np.array(
+            [[r, g, b] for (_, _, _, r, g, b) in self.st.COLORCHECKER_CLASSIC_PATCHES],
+            dtype=float,
+        )
+        obj = self._make_calibrations(ref)
+        corr = obj.compute_color_correction()
+
+        self.assertIn("matrix", corr)
+        self.assertIn("offset", corr)
+        self.assertEqual(corr["matrix"].shape, (3, 3))
+        self.assertEqual(corr["offset"].shape, (3,))
+
+
 if __name__ == "__main__":
     unittest.main()

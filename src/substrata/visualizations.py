@@ -536,7 +536,8 @@ def plot_colorchecker_qc_grid(
     return fig
 
 
-def plot_colorchecker_plane_view(
+def _render_plane_view_on_ax(
+    ax: Any,
     pcd_points: np.ndarray,
     pcd_colors: np.ndarray,
     tl: np.ndarray,
@@ -549,36 +550,8 @@ def plot_colorchecker_plane_view(
     title: Optional[str] = None,
     point_size: float = 0.3,
     margin_frac: float = 0.15,
-    width: int = 10,
-    height: int = 10,
-) -> Any:
-    """2D face-on view of a ColorChecker card with sampling circles.
-
-    The coordinate frame is derived from the four corner targets so that the
-    card edges align with the plot axes:
-
-    * **x-axis** runs along the top edge (TL -> TR).
-    * **y-axis** runs along the left edge (TL -> BL).
-    * View is clipped to the corner bounds plus a small margin.
-
-    Args:
-        pcd_points: (N, 3) point positions.
-        pcd_colors: (N, 3) colours in 0-1 range.
-        tl, tr, bl, br: 3D corner positions (top-left, top-right, bottom-left,
-            bottom-right of the marker quad).
-        patch_centers_3d: (M, 3) world positions of each patch centre.
-        patch_names: Length-M list of human-readable patch labels.
-        radius: Sampling radius (same units as pcd_points) drawn as circles.
-        title: Optional figure title.
-        point_size: Scatter marker size.
-        margin_frac: Extra margin around the corner bounds as a fraction of the
-            card extent (default 15 %).
-        width: Figure width in inches.
-        height: Figure height in inches.
-
-    Returns:
-        matplotlib Figure.
-    """
+) -> None:
+    """Render the plane-normal view onto an existing axes object."""
     tl = np.asarray(tl, dtype=float).reshape(3)
     tr = np.asarray(tr, dtype=float).reshape(3)
     bl = np.asarray(bl, dtype=float).reshape(3)
@@ -586,12 +559,10 @@ def plot_colorchecker_plane_view(
     origin = tl.copy()
 
     u_axis = tr - tl
-    u_len = np.linalg.norm(u_axis) + 1e-15
-    u_axis = u_axis / u_len
+    u_axis = u_axis / (np.linalg.norm(u_axis) + 1e-15)
 
     v_axis = bl - tl
-    v_len = np.linalg.norm(v_axis) + 1e-15
-    v_axis = v_axis / v_len
+    v_axis = v_axis / (np.linalg.norm(v_axis) + 1e-15)
 
     pts = np.asarray(pcd_points, dtype=float)
     cols = np.asarray(pcd_colors, dtype=float)
@@ -618,7 +589,6 @@ def plot_colorchecker_plane_view(
     proj_v = proj_v[mask]
     cols = cols[mask]
 
-    fig, ax = plt.subplots(figsize=(width, height))
     ax.set_aspect("equal")
     ax.scatter(
         proj_u, proj_v, c=np.clip(cols, 0, 1), s=point_size, edgecolor="none",
@@ -635,13 +605,13 @@ def plot_colorchecker_plane_view(
             radius,
             fill=False,
             edgecolor="red",
-            linewidth=0.8,
+            linewidth=2.5,
             linestyle="--",
         )
         ax.add_patch(circle)
         ax.text(
             cu[i],
-            cv[i] + radius * 1.3,
+            cv[i] - radius * 1.3,
             patch_names[i],
             fontsize=4,
             ha="center",
@@ -651,11 +621,324 @@ def plot_colorchecker_plane_view(
 
     ax.set_xlim(u_min - mu, u_max + mu)
     ax.set_ylim(v_min - mv, v_max + mv)
+    ax.invert_yaxis()
     if title:
         ax.set_title(title, fontsize=9)
     ax.set_xlabel("u  (TL → TR)")
     ax.set_ylabel("v  (TL → BL)")
     ax.set_rasterized(True)
+
+
+def _render_comparison_grid_on_ax(
+    ax: Any,
+    patch_results: List[Dict[str, Any]],
+    outlier_mask: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Render a 6x4 measured-vs-reference colour grid onto an existing axes.
+
+    Each cell is filled with the measured median RGB; a thick border shows
+    the reference sRGB. Outlier patches get a red cross overlay.
+    """
+    n_cols, n_rows = 6, 4
+    border_w = 0.4
+
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=9)
+
+    for idx in range(n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        if idx >= len(patch_results):
+            continue
+        pr = patch_results[idx]
+        ref = np.clip(np.asarray(pr["ref_rgb_255"], dtype=float) / 255.0, 0, 1)
+
+        ax.add_patch(mpatches.Rectangle(
+            (col - 0.5, row - 0.5), 1.0, 1.0,
+            facecolor=ref, edgecolor="none",
+        ))
+
+        med = pr.get("median_rgb_0_1")
+        if med is not None:
+            meas = np.clip(np.asarray(med, dtype=float), 0, 1)
+        else:
+            meas = (0.3, 0.3, 0.3)
+
+        inset = border_w / 2
+        ax.add_patch(mpatches.Rectangle(
+            (col - 0.5 + inset, row - 0.5 + inset),
+            1.0 - 2 * inset, 1.0 - 2 * inset,
+            facecolor=meas, edgecolor="none",
+        ))
+
+        if outlier_mask is not None and idx < len(outlier_mask) and outlier_mask[idx]:
+            x0, y0 = col - 0.5, row - 0.5
+            ax.plot(
+                [x0, x0 + 1], [y0, y0 + 1],
+                color="red", linewidth=2.5, clip_on=True,
+            )
+            ax.plot(
+                [x0 + 1, x0], [y0, y0 + 1],
+                color="red", linewidth=2.5, clip_on=True,
+            )
+
+
+def plot_colorchecker_card_summary(
+    pcd_points: np.ndarray,
+    pcd_colors: np.ndarray,
+    tl: np.ndarray,
+    tr: np.ndarray,
+    bl: np.ndarray,
+    br: np.ndarray,
+    patch_centers_3d: np.ndarray,
+    patch_names: List[str],
+    patch_results: List[Dict[str, Any]],
+    radius: float,
+    outlier_mask: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+    point_size: float = 0.3,
+    margin_frac: float = 0.15,
+    width: int = 16,
+    height: int = 5,
+) -> Any:
+    """Side-by-side plane-normal view (left) and colour comparison grid (right).
+
+    Args:
+        pcd_points: (N, 3) point positions.
+        pcd_colors: (N, 3) colours in 0-1 range.
+        tl, tr, bl, br: 3D corner positions of the marker quad.
+        patch_centers_3d: (M, 3) world positions of each patch centre.
+        patch_names: Length-M list of patch labels.
+        patch_results: Per-patch dicts with ``median_rgb_0_1`` and ``ref_rgb_255``.
+        radius: Sampling radius drawn as circles.
+        outlier_mask: Boolean array, length ``len(patch_results)``.
+            True marks the patch as an outlier (red cross overlay).
+        title: Overall figure title.
+        point_size: Scatter marker size for point cloud.
+        margin_frac: Margin around corner bounds.
+        width: Figure width in inches.
+        height: Figure height in inches.
+
+    Returns:
+        matplotlib Figure.
+    """
+    fig, (ax_plane, ax_grid) = plt.subplots(
+        1, 2, figsize=(width, height),
+        gridspec_kw={"width_ratios": [3, 2]},
+    )
+
+    _render_plane_view_on_ax(
+        ax_plane,
+        pcd_points, pcd_colors,
+        tl, tr, bl, br,
+        patch_centers_3d, patch_names,
+        radius,
+        title="Plane-normal view",
+        point_size=point_size,
+        margin_frac=margin_frac,
+    )
+
+    _render_comparison_grid_on_ax(
+        ax_grid,
+        patch_results,
+        outlier_mask=outlier_mask,
+        title="Measured (inner) vs reference (border)",
+    )
+
+    if title:
+        fig.suptitle(title, fontsize=11, y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+def _render_swatch_grid_on_ax(
+    ax: Any,
+    colors_255: np.ndarray,
+    patch_names: List[str],
+    outlier_mask: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Render a plain 6x4 colour swatch grid onto an existing axes.
+
+    Args:
+        colors_255: (24, 3) array of RGB values in 0-255.
+        patch_names: Length-24 list of patch labels.
+        outlier_mask: Optional boolean array; True draws a red cross.
+        title: Axes title.
+    """
+    n_cols, n_rows = 6, 4
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=9)
+
+    for idx in range(n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        if idx >= len(colors_255):
+            continue
+        c = np.clip(np.asarray(colors_255[idx], dtype=float) / 255.0, 0, 1)
+        ax.add_patch(mpatches.Rectangle(
+            (col - 0.5, row - 0.5), 1.0, 1.0,
+            facecolor=c, edgecolor="grey", linewidth=0.3,
+        ))
+
+        lum = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+        txt_col = "white" if lum < 0.45 else "black"
+        ax.text(
+            col, row, patch_names[idx], ha="center", va="center",
+            fontsize=5, color=txt_col,
+        )
+
+        if outlier_mask is not None and idx < len(outlier_mask) and outlier_mask[idx]:
+            x0, y0 = col - 0.5, row - 0.5
+            ax.plot([x0, x0 + 1], [y0, y0 + 1], color="red", linewidth=2.5)
+            ax.plot([x0 + 1, x0], [y0, y0 + 1], color="red", linewidth=2.5)
+
+
+def plot_color_correction_summary(
+    measured_rgb_255: np.ndarray,
+    reference_rgb_255: np.ndarray,
+    correction: Dict[str, np.ndarray],
+    patch_names: List[str],
+    outlier_mask: Optional[np.ndarray] = None,
+    title: Optional[str] = None,
+    width: int = 16,
+    height: int = 10,
+) -> Any:
+    """Summary figure showing the effect of the affine colour correction.
+
+    Top row: three 6x4 swatch grids (Measured / Corrected / Reference).
+    Bottom row: per-channel scatter plots (R, G, B) with before and after.
+
+    Args:
+        measured_rgb_255: (N, 3) measured median RGB in 0-255.
+        reference_rgb_255: (N, 3) reference sRGB in 0-255.
+        correction: Dict with ``"matrix"`` (3x3) and ``"offset"`` (3,).
+        patch_names: Patch label strings.
+        outlier_mask: Optional boolean array for the measured grid.
+        title: Overall figure title.
+        width: Figure width in inches.
+        height: Figure height in inches.
+
+    Returns:
+        matplotlib Figure.
+    """
+    matrix = np.asarray(correction["matrix"], dtype=float)
+    offset = np.asarray(correction["offset"], dtype=float)
+    corrected = np.clip(measured_rgb_255 @ matrix.T + offset, 0, 255)
+
+    fig = plt.figure(figsize=(width, height))
+    gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.25)
+
+    ax_meas = fig.add_subplot(gs[0, 0])
+    ax_corr = fig.add_subplot(gs[0, 1])
+    ax_ref = fig.add_subplot(gs[0, 2])
+
+    _render_swatch_grid_on_ax(
+        ax_meas, measured_rgb_255, patch_names,
+        outlier_mask=outlier_mask, title="Measured",
+    )
+    _render_swatch_grid_on_ax(
+        ax_corr, corrected, patch_names, title="Corrected",
+    )
+    _render_swatch_grid_on_ax(
+        ax_ref, reference_rgb_255, patch_names, title="Reference",
+    )
+
+    channel_names = ["Red", "Green", "Blue"]
+    channel_colors = ["tab:red", "tab:green", "tab:blue"]
+    for ch in range(3):
+        ax = fig.add_subplot(gs[1, ch])
+        ref_ch = reference_rgb_255[:, ch]
+        meas_ch = measured_rgb_255[:, ch]
+        corr_ch = corrected[:, ch]
+
+        ax.scatter(
+            ref_ch, meas_ch, s=30, alpha=0.4, color=channel_colors[ch],
+            label="Before", edgecolors="none",
+        )
+        ax.scatter(
+            ref_ch, corr_ch, s=30, marker="D", color=channel_colors[ch],
+            label="After", edgecolors="black", linewidths=0.3,
+        )
+
+        ax.plot([0, 255], [0, 255], "k--", linewidth=0.8, alpha=0.5)
+        ax.set_xlim(0, 260)
+        ax.set_ylim(0, 260)
+        ax.set_xlabel("Reference", fontsize=8)
+        ax.set_ylabel("Measured / Corrected", fontsize=8)
+        ax.tick_params(labelsize=7)
+
+        rmse_before = float(np.sqrt(np.mean((meas_ch - ref_ch) ** 2)))
+        rmse_after = float(np.sqrt(np.mean((corr_ch - ref_ch) ** 2)))
+        ax.set_title(
+            f"{channel_names[ch]}  (RMSE {rmse_before:.1f} -> {rmse_after:.1f})",
+            fontsize=9,
+        )
+        ax.legend(fontsize=7, loc="upper left")
+
+    if title:
+        fig.suptitle(title, fontsize=12, y=1.01)
+    plt.tight_layout()
+    return fig
+
+
+def plot_color_before_after(
+    pcd: Any,
+    correction: Dict[str, np.ndarray],
+    max_output_points: int = 500_000,
+    point_size: float = 1,
+    width: int = 16,
+    height: int = 6,
+    title: Optional[str] = None,
+) -> Any:
+    """Side-by-side 2D scatter of the point cloud before and after colour correction.
+
+    A small decimated copy is created so memory stays low.
+
+    Args:
+        pcd: PointCloud (substrata or Open3D).
+        correction: Dict with ``"matrix"`` (3x3) and ``"offset"`` (3,).
+        max_output_points: Number of points in the decimated preview.
+        point_size: Scatter marker size.
+        width: Figure width in inches.
+        height: Figure height in inches.
+        title: Optional suptitle.
+
+    Returns:
+        matplotlib Figure.
+    """
+    dec = pointclouds.get_decimated_pcd(pcd, max_output_points)
+    pts = dec.points
+    colors_before = np.clip(dec.colors, 0, 1)
+
+    matrix = np.asarray(correction["matrix"], dtype=float)
+    offset = np.asarray(correction["offset"], dtype=float)
+    corrected_255 = np.clip(dec.colors * 255.0 @ matrix.T + offset, 0, 255)
+    colors_after = corrected_255 / 255.0
+
+    fig, (ax_before, ax_after) = plt.subplots(
+        1, 2, figsize=(width, height), sharex=True, sharey=True,
+    )
+    for ax, cols, label in [
+        (ax_before, colors_before, "Before correction"),
+        (ax_after, colors_after, "After correction"),
+    ]:
+        ax.set_aspect("equal")
+        ax.scatter(
+            pts[:, 0], pts[:, 1], c=cols, s=point_size, edgecolor="none",
+        )
+        ax.set_title(label, fontsize=10)
+        ax.set_rasterized(True)
+
+    if title:
+        fig.suptitle(title, fontsize=12, y=1.01)
     plt.tight_layout()
     return fig
 

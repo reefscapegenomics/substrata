@@ -101,39 +101,40 @@ COLORCHECKER_CLASSIC_PATCHES = [
     ("black", 11 / 12, 7 / 8, 52, 52, 52),
 ]
 
-# Marker-quad bounds in chart UV space.
+# Marker-quad bounds in patch-grid UV space.
 #
-# The marker quad (four survey targets) does not always coincide with the
-# printed chart corners. These four values describe where the TL and BR
-# targets sit expressed as fractions of the full printed chart area
-# (chart UV [0,1]x[0,1] where u=0 is the left edge, u=1 the right edge,
-# v=0 the top edge, v=1 the bottom edge).
+# Patch UV [0,1]×[0,1] maps to the printed 6×4 colour-patch grid, which is
+# SMALLER than the full card (there is a border/frame around the patches).
+# These four values locate the TL and BR survey targets in that same UV space.
+# Values outside [0,1] mean the target sits outside the printed patches.
 #
-#   TL target  =>  chart UV (MARKER_U_MIN, MARKER_V_MIN)
-#   BR target  =>  chart UV (MARKER_U_MAX, MARKER_V_MAX)
-#
-# Values < 0 or > 1 mean the target sits outside the printed card area.
-# (0, 0) -> (1, 1) means markers sit exactly on the chart corners.
-#
-# RGL layout (derived from scalebar distances + physical offsets):
-#   Card:   130 mm (u) x 75 mm (v)
-#   Markers span: 200 mm (u) x 70 mm (v)  (from scalebar pairs)
-#   TL target is 36 mm left of the card (u < 0) and 3 mm below the top (v > 0).
-#   Right gap = 200 - 36 - 130 = 34 mm; bottom gap = 75 - 3 - 70 = 2 mm.
-COLORCHECKER_MARKER_U_MIN = -36 / 130           # -0.277  TL target u
-COLORCHECKER_MARKER_V_MIN = 3 / 75              #  0.040  TL target v
-COLORCHECKER_MARKER_U_MAX = (130 + 34) / 130    #  1.262  BR target u
-COLORCHECKER_MARKER_V_MAX = (75 - 2) / 75       #  0.973  BR target v
+# All distances below are in mm; fine-tune from the plane-view plot.
+#   Full card:          130 × 75 mm
+#   Printed patch grid: ~102 × ~50 mm
+#   Marker quad span:   200 (u) × 70 (v) mm  (from scalebar pairs)
+#   TL target → left patch edge:  ~49 mm
+#   TL target → top patch edge:   ~15 mm
+_PATCH_GRID_W = 90
+_PATCH_GRID_H = 60
+_TL_TO_PATCHES_LEFT = 52
+_TL_TO_PATCHES_TOP = 5
+_MARKER_SPAN_U = 200
+_MARKER_SPAN_V = 70
+
+COLORCHECKER_MARKER_U_MIN = -_TL_TO_PATCHES_LEFT / _PATCH_GRID_W
+COLORCHECKER_MARKER_V_MIN = -_TL_TO_PATCHES_TOP / _PATCH_GRID_H
+COLORCHECKER_MARKER_U_MAX = (_MARKER_SPAN_U - _TL_TO_PATCHES_LEFT) / _PATCH_GRID_W
+COLORCHECKER_MARKER_V_MAX = (_MARKER_SPAN_V - _TL_TO_PATCHES_TOP) / _PATCH_GRID_H
 
 # Sampling and QC (units match the point cloud).
 DEFAULT_COLOR_CALIBRATION_RADIUS = 0.005
 DEFAULT_COLOR_CALIBRATION_PLANE_EPSILON = 0.003
 COLOR_CALIBRATION_OUTLIER_Z = 2.5
 
-# Four labels per card: top-left, bottom-left, top-right, bottom-right (marker quad).
+# Per card: [tl, bl, tr, br, name]  (name is optional).
 RGL_COLOR_CALIBRATIONS = [
-    ["target 31", "target 32", "target 33", "target 34"],
-    ["target 35", "target 36", "target 37", "target 38"],
-    ["target 39", "target 40", "target 41", "target 42"],
-    ["target 43", "target 44", "target 45", "target 46"],
+    ["target 34", "target 33", "target 32", "target 31", "top-left"],
+    ["target 38", "target 37", "target 36", "target 35", "bottom-left"],
+    ["target 42", "target 41", "target 40", "target 39", "top-right"],
+    ["target 43", "target 44", "target 45", "target 46", "bottom-right"],
 ]
