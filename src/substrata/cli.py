@@ -219,10 +219,17 @@ def handle_colors(args):
     print(f"Saved colour calibration PDF: {output_pdf}")
 
     if getattr(args, "save_yaml", False):
-        init.color_correction = cc.color_correction
-        yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
-        init.save_config_to_yaml(yaml_path)
-        print(f"Saved colour correction to YAML: {yaml_path}")
+        if cc.color_correction is None:
+            print(
+                "Warning: no colour correction computed (no valid ColorChecker patch "
+                "samples). Not updating color_correction in YAML.",
+                file=sys.stderr,
+            )
+        else:
+            init.color_correction = cc.color_correction
+            yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
+            init.save_config_to_yaml(yaml_path)
+            print(f"Saved colour correction to YAML: {yaml_path}")
 
 
 def handle_views(args):

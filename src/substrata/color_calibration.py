@@ -386,7 +386,13 @@ class ColorCalibrations:
         if pcd is not None:
             self.pcd = pcd
             self.sample_point_cloud(pcd)
-            self.compute_color_correction()
+            if self.median_rgb_255_per_patch is not None:
+                self.compute_color_correction()
+            else:
+                logger.warning(
+                    "Colour calibration skipped affine fit: no valid patch samples "
+                    "(check marker labels, exclusions, and point cloud colours)."
+                )
 
     def store_target_coords(self, target_data: Dict) -> None:
         """Assign 3D coordinates to corner labels from a label -> coords mapping."""
@@ -688,7 +694,10 @@ class ColorCalibrations:
 
         if self.num_cards is None:
             self.sample_point_cloud(pcd)
-            self.compute_color_correction()
+            if self.median_rgb_255_per_patch is not None:
+                self.compute_color_correction()
+            else:
+                self.color_correction = None
 
         sample_r = float(settings.DEFAULT_COLOR_CALIBRATION_RADIUS)
 
