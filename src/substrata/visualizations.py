@@ -4,6 +4,7 @@ import tempfile
 import shutil
 from io import BytesIO
 import subprocess
+from typing import Any, Dict, List, Optional
 
 # Third-Party Libraries
 import matplotlib.pyplot as plt
@@ -448,6 +449,214 @@ def plot_text(text, width=10, height=5):
     ax.text(0.1, 0.5, text, ha="left", va="center")
     ax.set_axis_off()  # Hide all axes
     ax.set_rasterized(True)
+    return fig
+
+
+def plot_colorchecker_qc_grid(
+    patch_results: List[Dict[str, Any]],
+    title: str,
+    outlier_mask: Optional[np.ndarray] = None,
+) -> Any:
+    """6×4 grid of ColorChecker patches with reference vs measured sRGB and outliers.
+
+    Args:
+        patch_results: List of dicts with keys ``name``, ``median_rgb_0_1``,
+            ``ref_rgb_255``, ``n_points``, ``chart_u``, ``chart_v``, ``marker_u``,
+            ``marker_v``.
+        title: Figure title (inset / shift text may be appended by caller).
+        outlier_mask: Boolean array, length ``len(patch_results)``, True = outlier
+            vs other cards.
+
+    Returns:
+        matplotlib Figure.
+    """
+    n = len(patch_results)
+    if outlier_mask is None:
+        outlier_mask = np.zeros(n, dtype=bool)
+    fig, axes = plt.subplots(4, 6, figsize=(14, 9))
+    fig.suptitle(title, fontsize=10)
+    for idx in range(24):
+        row, col = divmod(idx, 6)
+        ax = axes[row, col]
+        ax.set_aspect("equal")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        if idx >= n:
+            continue
+        pr = patch_results[idx]
+        ref = np.asarray(pr["ref_rgb_255"], dtype=float) / 255.0
+        ref = np.clip(ref, 0.0, 1.0)
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.0, 0.35),
+                1.0,
+                0.65,
+                facecolor=ref,
+                edgecolor="0.3",
+                linewidth=0.5,
+            )
+        )
+        med = pr.get("median_rgb_0_1")
+        if med is not None:
+            m255 = np.asarray(med, dtype=float).reshape(3) * 255.0
+            t = (
+                f"{pr['name'][:14]}\n"
+                f"meas: {m255[0]:.0f},{m255[1]:.0f},{m255[2]:.0f}\n"
+                f"ref:  {pr['ref_rgb_255'][0]},"
+                f"{pr['ref_rgb_255'][1]},"
+                f"{pr['ref_rgb_255'][2]}\n"
+                f"n={pr['n_points']}"
+            )
+        else:
+            t = f"{pr['name'][:14]}\n(no color)"
+        if outlier_mask[idx]:
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (0, 0),
+                    1,
+                    0.34,
+                    facecolor=(1.0, 0.85, 0.85),
+                    edgecolor="red",
+                    linewidth=2,
+                )
+            )
+            t += "\nOUTLIER"
+        ax.text(
+            0.5,
+            0.2,
+            t,
+            ha="center",
+            va="center",
+            fontsize=5,
+            clip_on=True,
+        )
+    plt.tight_layout()
+    fig.set_rasterized(True)
+    return fig
+
+
+def plot_colorchecker_plane_view(
+    pcd_points: np.ndarray,
+    pcd_colors: np.ndarray,
+    tl: np.ndarray,
+    tr: np.ndarray,
+    bl: np.ndarray,
+    br: np.ndarray,
+    patch_centers_3d: np.ndarray,
+    patch_names: List[str],
+    radius: float,
+    title: Optional[str] = None,
+    point_size: float = 0.3,
+    margin_frac: float = 0.15,
+    width: int = 10,
+    height: int = 10,
+) -> Any:
+    """2D face-on view of a ColorChecker card with sampling circles.
+
+    The coordinate frame is derived from the four corner targets so that the
+    card edges align with the plot axes:
+
+    * **x-axis** runs along the top edge (TL -> TR).
+    * **y-axis** runs along the left edge (TL -> BL).
+    * View is clipped to the corner bounds plus a small margin.
+
+    Args:
+        pcd_points: (N, 3) point positions.
+        pcd_colors: (N, 3) colours in 0-1 range.
+        tl, tr, bl, br: 3D corner positions (top-left, top-right, bottom-left,
+            bottom-right of the marker quad).
+        patch_centers_3d: (M, 3) world positions of each patch centre.
+        patch_names: Length-M list of human-readable patch labels.
+        radius: Sampling radius (same units as pcd_points) drawn as circles.
+        title: Optional figure title.
+        point_size: Scatter marker size.
+        margin_frac: Extra margin around the corner bounds as a fraction of the
+            card extent (default 15 %).
+        width: Figure width in inches.
+        height: Figure height in inches.
+
+    Returns:
+        matplotlib Figure.
+    """
+    tl = np.asarray(tl, dtype=float).reshape(3)
+    tr = np.asarray(tr, dtype=float).reshape(3)
+    bl = np.asarray(bl, dtype=float).reshape(3)
+    br = np.asarray(br, dtype=float).reshape(3)
+    origin = tl.copy()
+
+    u_axis = tr - tl
+    u_len = np.linalg.norm(u_axis) + 1e-15
+    u_axis = u_axis / u_len
+
+    v_axis = bl - tl
+    v_len = np.linalg.norm(v_axis) + 1e-15
+    v_axis = v_axis / v_len
+
+    pts = np.asarray(pcd_points, dtype=float)
+    cols = np.asarray(pcd_colors, dtype=float)
+    delta = pts - origin.reshape(1, 3)
+    proj_u = delta @ u_axis
+    proj_v = delta @ v_axis
+
+    corners_2d = np.array([
+        [0.0, 0.0],
+        [np.dot(tr - origin, u_axis), np.dot(tr - origin, v_axis)],
+        [np.dot(bl - origin, u_axis), np.dot(bl - origin, v_axis)],
+        [np.dot(br - origin, u_axis), np.dot(br - origin, v_axis)],
+    ])
+    u_min, v_min = corners_2d.min(axis=0)
+    u_max, v_max = corners_2d.max(axis=0)
+    mu = (u_max - u_min) * margin_frac
+    mv = (v_max - v_min) * margin_frac
+
+    mask = (
+        (proj_u >= u_min - mu) & (proj_u <= u_max + mu)
+        & (proj_v >= v_min - mv) & (proj_v <= v_max + mv)
+    )
+    proj_u = proj_u[mask]
+    proj_v = proj_v[mask]
+    cols = cols[mask]
+
+    fig, ax = plt.subplots(figsize=(width, height))
+    ax.set_aspect("equal")
+    ax.scatter(
+        proj_u, proj_v, c=np.clip(cols, 0, 1), s=point_size, edgecolor="none",
+    )
+
+    centres = np.asarray(patch_centers_3d, dtype=float)
+    delta_c = centres - origin.reshape(1, 3)
+    cu = delta_c @ u_axis
+    cv = delta_c @ v_axis
+
+    for i in range(len(cu)):
+        circle = plt.Circle(
+            (cu[i], cv[i]),
+            radius,
+            fill=False,
+            edgecolor="red",
+            linewidth=0.8,
+            linestyle="--",
+        )
+        ax.add_patch(circle)
+        ax.text(
+            cu[i],
+            cv[i] + radius * 1.3,
+            patch_names[i],
+            fontsize=4,
+            ha="center",
+            va="bottom",
+            color="red",
+        )
+
+    ax.set_xlim(u_min - mu, u_max + mu)
+    ax.set_ylim(v_min - mv, v_max + mv)
+    if title:
+        ax.set_title(title, fontsize=9)
+    ax.set_xlabel("u  (TL → TR)")
+    ax.set_ylabel("v  (TL → BL)")
+    ax.set_rasterized(True)
+    plt.tight_layout()
     return fig
 
 
