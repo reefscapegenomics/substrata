@@ -280,6 +280,37 @@ class ColorCalibration:
             )
 
 
+def _resolved_excluded_card_indices(
+    cards: List[ColorCalibration],
+    exclude_card_indices: Optional[Sequence[int]],
+    exclude_names: Optional[Sequence[str]],
+) -> frozenset:
+    """Return 0-based card indices excluded from aggregation and QC figures."""
+    n = len(cards)
+    out: set = set()
+    if exclude_card_indices:
+        for i in exclude_card_indices:
+            if i < 0 or i >= n:
+                raise ValueError(
+                    f"exclude_card_indices: invalid index {i} (have {n} cards)."
+                )
+            out.add(int(i))
+    if exclude_names:
+        for nm in exclude_names:
+            hits = [i for i, c in enumerate(cards) if c.name == str(nm)]
+            if not hits:
+                raise ValueError(
+                    f"exclude_names: no card with name {nm!r} "
+                    "(names come from the optional 5th column per row)."
+                )
+            if len(hits) > 1:
+                raise ValueError(
+                    f"exclude_names: ambiguous name {nm!r} ({len(hits)} matches)."
+                )
+            out.add(hits[0])
+    return frozenset(out)
+
+
 class ColorCalibrations:
     """Container for several ColorChecker cards; aggregates samples across children."""
 
@@ -289,6 +320,8 @@ class ColorCalibrations:
         target_data: Optional[Union[Dict, Any]] = None,
         pcd: Optional[Any] = None,
         patch_definitions: Optional[Sequence[Tuple[str, float, float, int, int, int]]] = None,
+        exclude_card_indices: Optional[Sequence[int]] = None,
+        exclude_names: Optional[Sequence[str]] = None,
     ) -> None:
         """Build one ColorCalibration per row of four corner labels.
 
@@ -301,6 +334,11 @@ class ColorCalibrations:
                 ``target_data``), ``sample_point_cloud`` and
                 ``compute_color_correction`` are called automatically.
             patch_definitions: Defaults to settings.COLORCHECKER_CLASSIC_PATCHES.
+            exclude_card_indices: 0-based indices into ``calibration_data`` /
+                ``self.data`` to omit from cross-card medians, outlier aggregation,
+                affine colour fit, and ``show`` / ``save_pdf`` card figures.
+            exclude_names: Card ``name`` values (5th column per row) to exclude;
+                mutually combinable with ``exclude_card_indices``.
         """
         self.data: List[ColorCalibration] = []
         for row in calibration_data:
@@ -316,6 +354,10 @@ class ColorCalibrations:
                     name=name,
                 )
             )
+        self._excluded_card_indices: frozenset = _resolved_excluded_card_indices(
+            self.data, exclude_card_indices, exclude_names,
+        )
+        self._aggregation_card_indices: Optional[Tuple[int, ...]] = None
         self.patch_definitions: Sequence[Tuple[str, float, float, int, int, int]] = (
             patch_definitions
             if patch_definitions is not None
@@ -408,7 +450,10 @@ class ColorCalibrations:
         self._last_marker_v_max = v_hi
 
         n_patches = len(self.patch_definitions)
-        for card in self.data:
+        for i, card in enumerate(self.data):
+            if i in self._excluded_card_indices:
+                card.patch_results = []
+                continue
             card.sample_patches(
                 pcd,
                 self.patch_definitions,
@@ -423,12 +468,14 @@ class ColorCalibrations:
         valid_cards = [
             i
             for i, c in enumerate(self.data)
-            if c.has_all_corners()
+            if i not in self._excluded_card_indices
+            and c.has_all_corners()
             and len(c.patch_results) == n_patches
             and all(
                 pr["median_rgb_0_1"] is not None for pr in c.patch_results
             )
         ]
+        self._aggregation_card_indices = tuple(valid_cards)
         self.num_cards = len(valid_cards)
         if self.num_cards == 0:
             self.median_rgb_255_per_patch = None
@@ -496,8 +543,15 @@ class ColorCalibrations:
             )
 
         mask = np.ones(n_patches, dtype=bool)
-        if self.outlier_mask is not None and self.num_cards and self.num_cards > 1:
-            all_outlier = np.all(self.outlier_mask[:, :n_patches], axis=0)
+        if (
+            self.outlier_mask is not None
+            and self.num_cards
+            and self.num_cards > 1
+            and self._aggregation_card_indices
+        ):
+            rows = np.array(self._aggregation_card_indices, dtype=int)
+            sub = self.outlier_mask[rows, :n_patches]
+            all_outlier = np.all(sub, axis=0)
             mask &= ~all_outlier
 
         measured_fit = measured[mask]
@@ -565,6 +619,8 @@ class ColorCalibrations:
             )
         figs.append(visualizations.plot_text(self._qc_summary_text(), width=10, height=6))
         for i, card in enumerate(self.data):
+            if i in self._excluded_card_indices:
+                continue
             if not card.patch_results:
                 continue
             om = (
@@ -638,6 +694,8 @@ class ColorCalibrations:
 
         figs: List[Any] = []
         for i, card in enumerate(self.data):
+            if i in self._excluded_card_indices:
+                continue
             if not card.has_all_corners() or not card.patch_results:
                 continue
 
@@ -706,8 +764,16 @@ class ColorCalibrations:
             )
             names = [name for (name, *_rest) in self.patch_definitions]
             global_om = None
-            if self.outlier_mask is not None and self.num_cards and self.num_cards > 1:
-                global_om = np.all(self.outlier_mask[:, :ref.shape[0]], axis=0)
+            if (
+                self.outlier_mask is not None
+                and self.num_cards
+                and self.num_cards > 1
+                and self._aggregation_card_indices
+            ):
+                rows = np.array(self._aggregation_card_indices, dtype=int)
+                global_om = np.all(
+                    self.outlier_mask[rows, :ref.shape[0]], axis=0,
+                )
             figs.append(visualizations.plot_color_correction_summary(
                 measured_rgb_255=self.median_rgb_255_per_patch,
                 reference_rgb_255=ref,

@@ -114,6 +114,40 @@ class TestSettingsPatchTable(unittest.TestCase):
         self.assertEqual(len(st.COLORCHECKER_CLASSIC_PATCHES), 24)
 
 
+class TestResolvedExcludedCardIndices(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load_color_calibration()
+
+    def test_indices_and_names(self) -> None:
+        g = self.mod
+        C = g.ColorCalibration
+        cards = [
+            C("a", "b", "c", "d", name="left"),
+            C("e", "f", "g", "h", name="right"),
+        ]
+        r = g._resolved_excluded_card_indices(cards, [1], None)
+        self.assertEqual(r, frozenset({1}))
+        r2 = g._resolved_excluded_card_indices(cards, None, ["left"])
+        self.assertEqual(r2, frozenset({0}))
+        r3 = g._resolved_excluded_card_indices(cards, [0], ["right"])
+        self.assertEqual(r3, frozenset({0, 1}))
+
+    def test_invalid_index_raises(self) -> None:
+        g = self.mod
+        C = g.ColorCalibration
+        cards = [C("a", "b", "c", "d")]
+        with self.assertRaises(ValueError):
+            g._resolved_excluded_card_indices(cards, [3], None)
+
+    def test_unknown_name_raises(self) -> None:
+        g = self.mod
+        C = g.ColorCalibration
+        cards = [C("a", "b", "c", "d", name="only")]
+        with self.assertRaises(ValueError):
+            g._resolved_excluded_card_indices(cards, None, ["missing"])
+
+
 class TestAffineColorCorrection(unittest.TestCase):
     """Verify the affine least-squares solve in compute_color_correction."""
 

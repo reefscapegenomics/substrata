@@ -72,6 +72,26 @@ def handle_decimate(args):
         show_progress=True,
     )
 
+    if getattr(args, "color_calibrate", False):
+        if init.color_correction is None:
+            raise SystemExit(
+                "No color_correction in project YAML. Run `substrata colors -s` first, "
+                "or add color_correction to the YAML."
+            )
+        import open3d as o3d
+
+        print(f"Applying colour correction from YAML to {output_path} ...")
+        pcd_out = PointCloud(output_path)
+        n_col = len(np.asarray(pcd_out.o3d_pcd.colors))
+        if n_col == 0:
+            raise SystemExit(
+                "Output PLY has no per-vertex colours; cannot apply colour correction."
+            )
+        pcd_out.apply_color_correction(init.color_correction)
+        if not o3d.io.write_point_cloud(output_path, pcd_out.o3d_pcd):
+            raise SystemExit(f"Failed to write colour-corrected PLY: {output_path}")
+        print(f"Wrote colour-corrected PLY: {output_path}")
+
 
 def handle_head(args):
     # Use initializer to infer defaults from CWD when not provided
@@ -135,6 +155,74 @@ def handle_scalebars(args):
         )
         init.save_config_to_yaml(yaml_path)
         print(f"Saved to YAML: {yaml_path}")
+
+
+def handle_colors(args):
+    """Colour calibration QC PDF and optional affine correction in YAML."""
+    from substrata.color_calibration import ColorCalibrations
+    from substrata.initializer import ProjectInitializer
+
+    _base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+
+    if args.input:
+        init.pcd_filepath = args.input
+
+    markers_path = args.markers or init.markers_filepath
+    if not markers_path:
+        raise SystemExit(
+            "No markers file found. Provide --markers or set markers in the project YAML."
+        )
+
+    # Stream-decimate only for the default YAML PLY; explicit --input/--ply is always full load.
+    points_cap = getattr(args, "points", None)
+    if args.input:
+        points_cap = None
+
+    if points_cap is not None:
+        pcd_path = init.ply_filepath
+        if not pcd_path:
+            raise SystemExit(
+                "No input PLY found. Provide --input/--ply or ensure the project YAML "
+                "specifies a ply file."
+            )
+        pcd = PointCloud(pcd_path, max_points=int(points_cap))
+        markers = Annotations(markers_path, orig_coords_only=True)
+    else:
+        init.initialize(apply_color_correction=False)
+        if init.pcd is None:
+            raise SystemExit(
+                "No point cloud loaded. Provide --input/--ply or ensure the project YAML "
+                "specifies a ply file."
+            )
+        if args.markers:
+            markers = Annotations(args.markers, orig_coords_only=True)
+        else:
+            markers = init.markers
+        if markers is None:
+            raise SystemExit(
+                "No markers loaded. Provide --markers or ensure markers exist in the project."
+            )
+        pcd = init.pcd
+
+    ex_idx = getattr(args, "exclude_indices", None) or None
+    ex_names = getattr(args, "exclude_names", None) or None
+    cc = ColorCalibrations(
+        calibration_data=settings.RGL_COLOR_CALIBRATIONS,
+        target_data=markers,
+        pcd=pcd,
+        exclude_card_indices=ex_idx,
+        exclude_names=ex_names,
+    )
+    output_pdf = args.output_pdf or _get_output_filepath(init, "colorcal.pdf")
+    cc.save_pdf(filepath=output_pdf)
+    print(f"Saved colour calibration PDF: {output_pdf}")
+
+    if getattr(args, "save_yaml", False):
+        init.color_correction = cc.color_correction
+        yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
+        init.save_config_to_yaml(yaml_path)
+        print(f"Saved colour correction to YAML: {yaml_path}")
 
 
 def handle_views(args):
@@ -792,6 +880,16 @@ def main():
         action="store_true",
         help="Reset all paths to local (relative to project path).",
     )
+    p_dec.add_argument(
+        "-c",
+        "--color_calibrate",
+        dest="color_calibrate",
+        action="store_true",
+        help=(
+            "After decimation, load the output PLY and apply color_correction from "
+            "the project YAML (requires `substrata colors -s` or equivalent)."
+        ),
+    )
 
     # head (PLY preview)
     p_head = subparsers.add_parser(
@@ -933,6 +1031,88 @@ def main():
         help="Optional markers CSV filepath to use for up vector calculation.",
     )
     p_orient.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
+
+    # colors (ColorChecker calibration QC + optional YAML colour correction)
+    p_colors = subparsers.add_parser(
+        "colors",
+        help=(
+            "Run ColorCalibrations from project markers, save QC PDF and optionally "
+            "store affine colour correction in YAML."
+        ),
+    )
+    p_colors.add_argument(
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
+        help=(
+            "Explicit PLY path (overrides YAML). Always loaded in full (never stream-decimated)."
+        ),
+    )
+    p_colors.add_argument(
+        "--markers",
+        dest="markers",
+        type=str,
+        default=None,
+        help="Optional markers CSV path (overrides initializer / YAML).",
+    )
+    p_colors.add_argument(
+        "--output_pdf",
+        dest="output_pdf",
+        type=str,
+        default=None,
+        help="Output PDF path (default: <project_id>_colorcal.pdf in project folder).",
+    )
+    p_colors.add_argument(
+        "-n",
+        "--points",
+        dest="points",
+        type=int,
+        default=None,
+        help=(
+            "Stream-sample at most N vertices from the default YAML PLY only (.ply). "
+            "Ignored when --input/--ply is set."
+        ),
+    )
+    p_colors.add_argument(
+        "-s",
+        "--save_yaml",
+        dest="save_yaml",
+        action="store_true",
+        help="Write affine colour_correction (matrix + offset) into the project YAML.",
+    )
+    p_colors.add_argument(
+        "--exclude-index",
+        "--exclude-card",
+        dest="exclude_indices",
+        action="append",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "0-based ColorChecker card index to omit from medians, fit, and PDF card "
+            "pages (repeatable). Same order as settings.RGL_COLOR_CALIBRATIONS."
+        ),
+    )
+    p_colors.add_argument(
+        "--exclude-name",
+        dest="exclude_names",
+        action="append",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Exclude a card by its name (optional 5th column per row in "
+            "RGL_COLOR_CALIBRATIONS, e.g. top-left). Repeatable."
+        ),
+    )
+    p_colors.add_argument(
         "--local",
         dest="local",
         action="store_true",
@@ -1275,6 +1455,7 @@ def main():
         "scalebars": handle_scalebars,
         "views": handle_views,
         "orient": handle_orient,
+        "colors": handle_colors,
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,
