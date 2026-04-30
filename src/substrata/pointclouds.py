@@ -2165,25 +2165,24 @@ def repair_ply_for_open3d(
     output_path: Optional[str] = None,
     show_progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
+    verify: bool = True,
 ) -> str:
-    """Re-emit a binary PLY in a strictly Open3D-compatible form.
+    """Re-emit a PLY with a clean header but verbatim vertex bytes.
 
-    Some Metashape PLY exports trigger Open3D's
-    ``Read PLY failed: number of vertex <= 0`` warning because of strict
-    PLY-property handling (e.g. ``double`` xyz, modern type aliases like
-    ``float32``/``uint8``, or extra vertex properties such as ``confidence``).
-    This helper reads the source via the permissive substrata header parser
-    and writes a minimal, normalized binary PLY containing only:
+    Many Metashape PLY exports trigger Open3D's
+    ``Read PLY failed: number of vertex <= 0`` warning because of extra
+    header lines (``obj_info``, multiple comments, custom keys) or other
+    parser quirks that Open3D's RPly-based reader does not tolerate. The
+    vertex *data* itself is fine — :func:`decimate_ply_file` already proves
+    this by emitting a clean header followed by verbatim vertex bytes, and
+    the resulting decimated file loads in Open3D without issue.
 
-    * ``x``, ``y``, ``z`` as ``float`` (float32)
-    * ``nx``, ``ny``, ``nz`` as ``float`` if present in the input
-    * ``red``, ``green``, ``blue`` as ``uchar`` if present in the input
-      (RGB stored as float/double in 0..1 is rescaled to 0..255)
-    * Rows containing NaN or inf in xyz are dropped.
-    * Endianness matches the host (little/big) so callers can rely on
-      ``binary_little_endian`` on common hardware.
-    * All other vertex properties and ``obj_info``-style header lines are
-      discarded.
+    This helper applies the same recipe **without sampling**: it reads the
+    source via the permissive substrata header parser and writes a minimal
+    binary PLY whose header lists only the ``vertex`` element and its
+    properties (using whatever types the input declared), preserving
+    ``confidence`` and any other extra properties. Vertex bytes are copied
+    verbatim, so no precision is lost.
 
     Args:
         input_path: Path to the source binary PLY file.
@@ -2193,6 +2192,8 @@ def repair_ply_for_open3d(
         chunk_bytes: Target read buffer size; each read uses the largest
             multiple of the input vertex record size not exceeding this so
             chunks always contain whole vertices.
+        verify: If True, attempt to re-read the output with Open3D after
+            writing and emit a clear warning if it returns 0 points.
 
     Returns:
         The output file path.
@@ -2201,202 +2202,67 @@ def repair_ply_for_open3d(
         base, _ = os.path.splitext(input_path)
         output_path = f"{base}_o3d.ply"
 
-    np_dtypes = {
-        "char": "i1",
-        "uchar": "u1",
-        "int8": "i1",
-        "uint8": "u1",
-        "short": "i2",
-        "ushort": "u2",
-        "int16": "i2",
-        "uint16": "u2",
-        "int": "i4",
-        "uint": "u4",
-        "int32": "i4",
-        "uint32": "u4",
-        "float": "f4",
-        "float32": "f4",
-        "double": "f8",
-        "float64": "f8",
-    }
-
     with open(input_path, "rb") as fin:
         fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
 
-        if not all(n in {p[1] for p in vprops} for n in ("x", "y", "z")):
-            raise ValueError("PLY must contain x, y, z vertex properties.")
+        # Reuse the same clean-header generator as decimate_ply_file; that
+        # output has been verified to load in Open3D.
+        out_header = _make_output_header(fmt, vprops, n_vertices)
+        # Reads must be multiples of rec_size to keep whole vertex records.
+        aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
 
-        # Build structured input dtype matching the source layout.
-        in_fields = []
-        for ptype, pname in vprops:
-            if ptype not in np_dtypes:
-                raise ValueError(f"Unsupported PLY type: {ptype}")
-            in_fields.append((pname, endian + np_dtypes[ptype]))
-        in_dt = np.dtype(in_fields)
-
-        prop_names = {n for _, n in vprops}
-        has_rgb = {"red", "green", "blue"}.issubset(prop_names)
-        has_nrm = {"nx", "ny", "nz"}.issubset(prop_names)
-        rgb_types = {n: t for t, n in vprops if n in {"red", "green", "blue"}}
-
-        # Determine RGB scaling: float/double sources are stored 0..1 in
-        # PLY convention; integer sources are already 0..255.
-        rgb_is_float = False
-        if has_rgb:
-            float_like = {"float", "float32", "double", "float64"}
-            rgb_is_float = all(
-                rgb_types[c] in float_like for c in ("red", "green", "blue")
-            )
-
-        # Build output dtype (host-endian) and clean header.
-        out_fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
-        if has_nrm:
-            out_fields += [("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")]
-        if has_rgb:
-            out_fields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
-        out_dt = np.dtype(out_fields)
-
-        out_header_props: List[Tuple[str, str]] = [
-            ("float", "x"),
-            ("float", "y"),
-            ("float", "z"),
-        ]
-        if has_nrm:
-            out_header_props += [("float", "nx"), ("float", "ny"), ("float", "nz")]
-        if has_rgb:
-            out_header_props += [
-                ("uchar", "red"),
-                ("uchar", "green"),
-                ("uchar", "blue"),
-            ]
-
-        # Stream rows to a temp data file, then prepend the final header
-        # once the kept count is known. This avoids needing to seek/read
-        # the output file when the header length depends on vertex_count.
-        chunk_recs = max(1, chunk_bytes // rec_size)
-        kept = 0
-        tmp_data_path = output_path + ".data.tmp"
-        try:
-            with open(tmp_data_path, "wb") as ftmp:
-                remaining = n_vertices
-                with tqdm(
-                    total=n_vertices,
-                    unit="vtx",
-                    desc="Repair PLY",
-                    disable=not show_progress,
-                ) as pbar:
-                    while remaining > 0:
-                        to_read = int(min(remaining, chunk_recs))
-                        buf = fin.read(to_read * rec_size)
-                        if len(buf) != to_read * rec_size:
-                            raise ValueError(
-                                "Corrupt PLY: unexpected EOF in vertex data."
-                            )
-                        arr = np.frombuffer(buf, dtype=in_dt, count=to_read)
-
-                        x = arr["x"].astype(np.float32, copy=False)
-                        y = arr["y"].astype(np.float32, copy=False)
-                        z = arr["z"].astype(np.float32, copy=False)
-                        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-
-                        n_finite = int(np.count_nonzero(finite))
-                        if n_finite == 0:
-                            remaining -= to_read
-                            pbar.update(to_read)
-                            continue
-
-                        out = np.empty(n_finite, dtype=out_dt)
-                        out["x"] = x[finite]
-                        out["y"] = y[finite]
-                        out["z"] = z[finite]
-                        if has_nrm:
-                            out["nx"] = arr["nx"].astype(np.float32, copy=False)[
-                                finite
-                            ]
-                            out["ny"] = arr["ny"].astype(np.float32, copy=False)[
-                                finite
-                            ]
-                            out["nz"] = arr["nz"].astype(np.float32, copy=False)[
-                                finite
-                            ]
-                        if has_rgb:
-                            r = arr["red"][finite]
-                            g = arr["green"][finite]
-                            b = arr["blue"][finite]
-                            if rgb_is_float:
-                                r = np.clip(np.asarray(r) * 255.0, 0.0, 255.0)
-                                g = np.clip(np.asarray(g) * 255.0, 0.0, 255.0)
-                                b = np.clip(np.asarray(b) * 255.0, 0.0, 255.0)
-                            out["red"] = np.asarray(r).astype(np.uint8)
-                            out["green"] = np.asarray(g).astype(np.uint8)
-                            out["blue"] = np.asarray(b).astype(np.uint8)
-
-                        ftmp.write(out.tobytes())
-                        kept += n_finite
-                        remaining -= to_read
-                        pbar.update(to_read)
-
-            # Concatenate header + temp data into the final output.
-            final_header = _make_clean_ply_header(
-                fmt="binary_little_endian",
-                properties=out_header_props,
-                vertex_count=kept,
-            )
-            with open(output_path, "wb") as fout, open(tmp_data_path, "rb") as ftmp:
-                fout.write(final_header)
-                block = 64 * 1024 * 1024
-                while True:
-                    chunk = ftmp.read(block)
+        with open(output_path, "wb") as fout:
+            fout.write(out_header)
+            bytes_left = n_vertices * rec_size
+            with tqdm(
+                total=n_vertices,
+                unit="vtx",
+                desc="Repair PLY",
+                disable=not show_progress,
+            ) as pbar:
+                while bytes_left:
+                    chunk = fin.read(min(aligned_chunk_bytes, bytes_left))
                     if not chunk:
                         break
                     fout.write(chunk)
-        finally:
-            if os.path.exists(tmp_data_path):
-                try:
-                    os.remove(tmp_data_path)
-                except OSError:
-                    pass
+                    bytes_left -= len(chunk)
+                    pbar.update(len(chunk) // rec_size)
 
-    if kept != n_vertices:
-        logger.info(
-            "repair_ply_for_open3d: dropped %d non-finite vertices (kept %d/%d).",
-            n_vertices - kept,
-            kept,
-            n_vertices,
-        )
-    else:
-        logger.info(
-            "repair_ply_for_open3d: rewrote %d vertices to %s.", kept, output_path
-        )
+    logger.info(
+        "repair_ply_for_open3d: rewrote %d vertices to %s.",
+        n_vertices,
+        output_path,
+    )
+
+    if verify:
+        try:
+            verify_pcd = o3d.io.read_point_cloud(
+                output_path, print_progress=False
+            )
+            n_read = len(verify_pcd.points)
+            if n_read == 0:
+                logger.warning(
+                    "Open3D STILL returned 0 points for repaired file %s. "
+                    "This typically means the source has > 2^31 vertices "
+                    "(Open3D vertex-count overflow) or contains a vertex "
+                    "property type Open3D does not handle. Consider running "
+                    "decimate_ply_file to reduce the vertex count first.",
+                    output_path,
+                )
+            else:
+                logger.info(
+                    "Open3D verification: read %d points from %s.",
+                    n_read,
+                    output_path,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Open3D verification raised an exception for %s: %s",
+                output_path,
+                exc,
+            )
+
     return output_path
-
-
-def _make_clean_ply_header(
-    fmt: str,
-    properties: List[Tuple[str, str]],
-    vertex_count: int,
-) -> bytes:
-    """Build a minimal Open3D-friendly PLY header.
-
-    Args:
-        fmt: Format string, typically ``"binary_little_endian"``.
-        properties: Ordered ``(type, name)`` pairs using legacy PLY type
-            names (``float``, ``uchar``).
-        vertex_count: Number of vertex records.
-
-    Returns:
-        Encoded header bytes terminated with ``end_header``.
-    """
-    lines = [
-        b"ply\n",
-        f"format {fmt} 1.0\n".encode("ascii"),
-        b"comment repaired for open3d by substrata\n",
-        f"element vertex {int(vertex_count)}\n".encode("ascii"),
-    ]
-    for ptype, pname in properties:
-        lines.append(f"property {ptype} {pname}\n".encode("ascii"))
-    lines.append(b"end_header\n")
-    return b"".join(lines)
 
 
 def get_decimated_pcd(

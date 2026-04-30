@@ -412,11 +412,38 @@ def handle_repair(args):
             "No input PLY found. Provide --input or ensure initializer finds a PLY in CWD."
         )
 
-    out_path = repair_ply_for_open3d(
-        input_path=input_path,
-        output_path=args.output,
-        show_progress=True,
-    )
+    if args.output:
+        # Explicit output: leave input untouched.
+        out_path = repair_ply_for_open3d(
+            input_path=input_path,
+            output_path=args.output,
+            show_progress=True,
+        )
+        print(f"Repaired PLY written to: {out_path}")
+        return
+
+    # Default: rename the input to <basename>_old.ply and write the repaired
+    # PLY back to the original path so downstream tools see no path change.
+    base_no_ext, ext = os.path.splitext(input_path)
+    backup_path = f"{base_no_ext}_old{ext}"
+    if os.path.exists(backup_path):
+        raise SystemExit(
+            f"Backup target {backup_path} already exists; refusing to overwrite. "
+            "Move/delete it or pass --output to write to a separate path."
+        )
+    os.rename(input_path, backup_path)
+    print(f"Backed up original to: {backup_path}")
+    try:
+        out_path = repair_ply_for_open3d(
+            input_path=backup_path,
+            output_path=input_path,
+            show_progress=True,
+        )
+    except Exception:
+        # Restore the original on failure so the caller isn't left without a PLY.
+        if not os.path.exists(input_path):
+            os.rename(backup_path, input_path)
+        raise
     print(f"Repaired PLY written to: {out_path}")
 
 
@@ -1451,7 +1478,9 @@ def main():
         help=(
             "Rewrite a PLY in a strict Open3D-compatible form "
             "(float32 xyz, optional uchar RGB, optional float32 normals); "
-            "drops extra vertex properties and non-finite rows."
+            "drops extra vertex properties and non-finite rows. By default "
+            "renames the input to <input>_old.ply and writes the repaired "
+            "PLY in its place."
         ),
     )
     p_rep.add_argument(
@@ -1467,7 +1496,11 @@ def main():
         dest="output",
         type=str,
         default=None,
-        help="Optional explicit output PLY path (defaults to <input>_o3d.ply).",
+        help=(
+            "Optional explicit output PLY path. If omitted (default), the input "
+            "is renamed to <input>_old.ply and the repaired file is written to "
+            "the original input path."
+        ),
     )
     p_rep.add_argument(
         "--local",
