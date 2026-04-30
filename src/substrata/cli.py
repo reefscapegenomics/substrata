@@ -1,6 +1,7 @@
 # Standard Library
 import argparse
 import ast
+from collections import Counter
 import os
 import re
 import sys
@@ -10,7 +11,12 @@ import yaml
 import numpy as np
 
 # Local Modules
-from substrata.pointclouds import PointCloud, decimate_ply_file, ply_head
+from substrata.pointclouds import (
+    PointCloud,
+    decimate_ply_file,
+    ply_head,
+    repair_ply_for_open3d,
+)
 from substrata.initializer import ProjectInitializer
 from substrata.annotations import Annotations, Scalebars
 from substrata import settings
@@ -43,6 +49,316 @@ def _get_output_filepath(init: ProjectInitializer, postfix: str):
     return os.path.join(init.path or os.getcwd(), f"{init.id}_{postfix}")
 
 
+def _parse_xyz_csv(s: str) -> list[float]:
+    """Parse ``x,y,z`` into three floats."""
+    parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+    if len(parts) != 3:
+        raise SystemExit(
+            f"Expected three comma-separated values for xyz, got {len(parts)} part(s): {s!r}"
+        )
+    try:
+        return [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError as e:
+        raise SystemExit(f"Invalid xyz values: {s!r} ({e})") from e
+
+
+def _camsync_summary_figure(summary: dict):
+    """Return a matplotlib Figure with a text summary of the camsync run."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    lines: list[str] = []
+    s = summary
+
+    def add(label: str, value: object) -> None:
+        lines.append(f"{label}: {value}")
+
+    fig = plt.figure(figsize=(8.5, 11))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    fig.suptitle("Camsync - run summary", fontsize=12, y=0.98)
+
+    def _fmt_cli(val: object) -> str:
+        return "(not set)" if val is None else repr(val)
+
+    add("Project path", s.get("project_path", ""))
+    add("Working directory", s.get("cwd", ""))
+    add("Project id", s.get("project_id", ""))
+    lines.append("")
+    add("Pose source sensor_id", s.get("pose_source", ""))
+    add("Updated target sensor_id", s.get("updated_target", ""))
+    lines.append("")
+    ox = s.get("offset_xyz")
+    if ox is not None:
+        oa = np.asarray(ox, dtype=float).ravel()
+        add(
+            "offset_xyz (pose-local m; applied to sync)",
+            f"[{oa[0]:.6g}, {oa[1]:.6g}, {oa[2]:.6g}]",
+        )
+    else:
+        add("offset_xyz (pose-local)", "none (poses copied without xyz offset)")
+    lines.append("")
+    add("time_offset_sec (applied to target EXIF)", s.get("time_offset_sec", ""))
+    add("scale_factor (project / initializer)", s.get("scale_factor", ""))
+    lines.append("")
+    add("Flag --auto-offsets", s.get("auto_offsets", ""))
+    add("Flag --auto-time", s.get("auto_time", ""))
+    add("Flag --auto-xyz", s.get("auto_xyz", ""))
+    add("Flag --yes", s.get("assume_yes", ""))
+    add("Flag --local", s.get("local", ""))
+    lines.append("")
+    add("spatial_max_dist (m, for --auto-time)", s.get("spatial_max_dist", ""))
+    add("min_spatial_pairs (for --auto-time)", s.get("min_spatial_pairs", ""))
+    lines.append("")
+    add(
+        "CLI --time-offset (ignored if --auto-time)",
+        _fmt_cli(s.get("cli_time_offset")),
+    )
+    add("CLI --xyz (ignored if --auto-xyz)", _fmt_cli(s.get("cli_xyz")))
+    lines.append("")
+    add("PDF intercept_search_radius", s.get("intercept_search_radius", ""))
+    add("Point cloud loaded (intercept highlights)", s.get("pcd_loaded", ""))
+
+    text = "\n".join(lines)
+    ax.text(
+        0.06,
+        0.94,
+        text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=8,
+    )
+    return fig
+
+
+def _write_camsync_sanity_pdf(
+    pose_cams,
+    updated_cams,
+    output_path: str,
+    *,
+    time_offset_sec: float,
+    pcd=None,
+    camsync_summary: dict | None = None,
+    max_pairs: int = 5,
+    intercept_search_radius: float = 0.01,
+) -> None:
+    """Write a PDF: first a text summary page, then pose/target image pairs.
+
+    Titles use raw EXIF from each file (``get_datetime_original(None)``). Brackets
+    label ``dt`` (seconds) applied for sync on the target side only (pose uses 0 s).
+    If
+    ``pcd`` is set, draws the same PCD intercept (ray from target camera along its
+    viewing axis) highlighted on both images, matching ``sandbox_macros`` notebook
+    logic.
+
+    Args:
+        pose_cams: Pose-source :class:`~substrata.cameras.Cameras` subset.
+        updated_cams: Updated-target :class:`~substrata.cameras.Cameras` subset.
+        output_path: Destination ``.pdf`` path.
+        time_offset_sec: Seconds applied to updated-target EXIF for time alignment.
+        pcd: Optional loaded :class:`~substrata.pointclouds.PointCloud` for intercepts.
+        camsync_summary: Optional dict for the first-page run summary (see
+            :func:`_camsync_summary_figure`).
+        max_pairs: Number of match rows to render (default 5).
+        intercept_search_radius: Step radius for :meth:`PointCloud.get_intercept`
+            (default 0.01, same as sandbox notebook).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from PIL import Image, ImageDraw
+
+    if pcd is None:
+        print(
+            "Camsync sanity PDF: no point cloud loaded; "
+            "intercept highlights skipped."
+        )
+
+    targets = sorted(
+        updated_cams.data.values(),
+        key=lambda c: (c.datetime is None, str(c.datetime), str(c.cam_id)),
+    )
+    pairs: list[tuple] = []
+    for tcam in targets:
+        pcam = pose_cams.get_camera_by_datetime(tcam.datetime)
+        if pcam is not None:
+            pairs.append((pcam, tcam))
+        if len(pairs) >= max_pairs:
+            break
+
+    if not pairs:
+        print("Camsync sanity PDF skipped: no time-matched pairs with pose cameras.")
+        return
+
+    def _exif_title_line(cam, is_target: bool) -> str:
+        raw = cam.get_datetime_original(None)
+        if raw is None:
+            raw = "(no EXIF DateTimeOriginal)"
+        k = float(time_offset_sec)
+        if is_target:
+            bracket = f"(sync dt={k:+.4g} s to target EXIF)"
+        else:
+            bracket = "(sync dt=0 s)"
+        return f"{raw} {bracket}"
+
+    def _pixel_highlight_from_cam(cam, world_pt: np.ndarray):
+        px = cam.get_pixel_coords(
+            world_pt, required_to_be_in_view=False, use_orig_coords=False
+        )
+        if px is None or px[0] is None:
+            return None
+        return (int(px[0]), int(px[1]))
+
+    def _rgb_with_highlight(fp: str, highlight_xy: tuple[int, int] | None):
+        if not fp or not os.path.isfile(fp):
+            return None
+        try:
+            image = Image.open(fp).convert("RGB")
+        except OSError:
+            return None
+        if highlight_xy is not None:
+            x, y = highlight_xy
+            w, h = image.size
+            r = max(12, min(50, min(w, h) // 8))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse(
+                (x - r, y - r, x + r, y + r),
+                fill=(255, 0, 0),
+            )
+        return np.asarray(image)
+
+    n = len(pairs)
+    fig, axes = plt.subplots(n, 2, figsize=(10, max(2.5, 2.6 * n)))
+    axes = np.atleast_2d(axes)
+
+    for i, (pose_cam, tgt_cam) in enumerate(pairs):
+        pose_hl = None
+        tgt_hl = None
+        if pcd is not None:
+            origin = np.asarray(tgt_cam.coords, dtype=float).ravel()[:3]
+            icpt = pcd.get_intercept(
+                origin,
+                intercept_search_radius,
+                vector=tgt_cam.vector,
+            )
+            if icpt is not None:
+                world_pt = np.asarray(icpt.coords, dtype=float).ravel()[:3]
+                pose_hl = _pixel_highlight_from_cam(pose_cam, world_pt)
+                tgt_hl = _pixel_highlight_from_cam(tgt_cam, world_pt)
+
+        for j, (cam, col_title, is_tgt, hl) in enumerate(
+            (
+                (pose_cam, "source (pose)", False, pose_hl),
+                (tgt_cam, "target", True, tgt_hl),
+            )
+        ):
+            ax = axes[i, j]
+            fp = cam.filepath
+            rgb = _rgb_with_highlight(fp, hl) if fp else None
+            if rgb is not None:
+                ax.imshow(rgb)
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "(missing or unreadable image)",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                )
+            ax.set_axis_off()
+            short = os.path.basename(fp) if fp else "(no path)"
+            dt_line = _exif_title_line(cam, is_tgt)
+            ax.set_title(f"{col_title}\n{dt_line}\n{short}", fontsize=7)
+
+    fig.suptitle(
+        "Camsync sanity check: first pose vs target pairs (EXIF time match)",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    pdf = PdfPages(output_path)
+    if camsync_summary is not None:
+        fig_sum = _camsync_summary_figure(camsync_summary)
+        pdf.savefig(fig_sum)
+        plt.close(fig_sum)
+    pdf.savefig(fig)
+    pdf.close()
+    plt.close(fig)
+    print(f"Wrote camsync sanity PDF: {output_path}")
+
+
+def _print_spatial_time_report(report: dict, scale_factor: float) -> None:
+    """Print spatial nearest-neighbor time offset diagnostics."""
+    print("\n--- Auto time offset (spatial nearest pose per target) ---")
+    print(
+        f"scale_factor={scale_factor} (dist_metric_m = dist_stored * scale_factor); "
+        "threshold applies to dist_metric_m."
+    )
+    for i, row in enumerate(report.get("pairs") or [], 1):
+        if row.get("skip_reason"):
+            print(
+                f"  [{i}] target={row['target_id']}  SKIPPED: {row['skip_reason']}"
+            )
+            print(
+                f"      dt_target={row['dt_target']!r}  dt_pose={row['dt_pose']!r}  "
+                f"k_sec={row.get('k_sec')}"
+            )
+            continue
+        print(
+            f"  [{i}] target={row['target_id']}  pose={row['pose_id']}  "
+            f"dist_stored={row['dist_stored']:.6g}  "
+            f"dist_metric_m={row['dist_metric_m']:.6g}  inlier={row['inlier']}"
+        )
+        print(
+            f"      dt_target={row['dt_target']!r}  dt_pose={row['dt_pose']!r}  "
+            f"k_sec={row.get('k_sec')}"
+        )
+    st = report.get("stats") or {}
+    print(
+        f"Inlier pairs with valid EXIF: {report.get('n_inliers', 0)} / "
+        f"targets={report.get('n_targets', 0)}"
+    )
+    if st:
+        print(
+            f"k_sec stats (inliers): median={st.get('median')}  mean={st.get('mean')}  "
+            f"std={st.get('std')}  min={st.get('min')}  max={st.get('max')}"
+        )
+    print(f"median_k_sec (chosen if ok): {report.get('median_k_sec')}")
+    print(f"ok={report.get('ok')}  reason={report.get('reason')!r}")
+
+
+def _print_xyz_offset_report(report: dict) -> None:
+    """Print datetime-matched xyz offset diagnostics."""
+    print("\n--- Auto xyz offset (time-matched pairs, pose-local frame) ---")
+    for i, row in enumerate(report.get("rows") or [], 1):
+        if row.get("error"):
+            print(f"  [{i}] target={row['target_id']}  ERROR: {row['error']}")
+            continue
+        if row.get("skip_reason"):
+            print(
+                f"  [{i}] target={row['target_id']}  pose={row['pose_id']}  "
+                f"SKIPPED: {row['skip_reason']}"
+            )
+            continue
+        print(
+            f"  [{i}] target={row['target_id']}  pose={row['pose_id']}  "
+            f"delta_world={row['delta_world']}  "
+            f"offset_xyz_local={row['offset_xyz_local']}"
+        )
+    print(f"median_xyz (chosen): {report.get('median_xyz')}")
+    print(f"mean_xyz: {report.get('mean_xyz')}")
+    print(f"ok={report.get('ok')}  reason={report.get('reason')!r}")
+
+
 # -------------------------------------- handlers -------------------------------------
 
 
@@ -65,32 +381,43 @@ def handle_decimate(args):
     )
     output_path = args.output or default_output
 
-    decimate_ply_file(
-        input_path=input_path,
-        output_path=output_path,
-        target_points=args.points,
-        show_progress=True,
-    )
-
+    color_correction = None
     if getattr(args, "color_calibrate", False):
         if init.color_correction is None:
             raise SystemExit(
                 "No color_correction in project YAML. Run `substrata colors -s` first, "
                 "or add color_correction to the YAML."
             )
-        import open3d as o3d
+        color_correction = init.color_correction
 
-        print(f"Applying colour correction from YAML to {output_path} ...")
-        pcd_out = PointCloud(output_path)
-        n_col = len(np.asarray(pcd_out.o3d_pcd.colors))
-        if n_col == 0:
-            raise SystemExit(
-                "Output PLY has no per-vertex colours; cannot apply colour correction."
-            )
-        pcd_out.apply_color_correction(init.color_correction)
-        if not o3d.io.write_point_cloud(output_path, pcd_out.o3d_pcd):
-            raise SystemExit(f"Failed to write colour-corrected PLY: {output_path}")
-        print(f"Wrote colour-corrected PLY: {output_path}")
+    decimate_ply_file(
+        input_path=input_path,
+        output_path=output_path,
+        target_points=args.points,
+        show_progress=True,
+        color_correction=color_correction,
+    )
+
+
+def handle_repair(args):
+    # Use initializer to infer defaults from CWD when not provided
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+
+    input_path = args.input or init.ply_full_path
+    if not input_path:
+        raise SystemExit(
+            "No input PLY found. Provide --input or ensure initializer finds a PLY in CWD."
+        )
+
+    out_path = repair_ply_for_open3d(
+        input_path=input_path,
+        output_path=args.output,
+        show_progress=True,
+    )
+    print(f"Repaired PLY written to: {out_path}")
 
 
 def handle_head(args):
@@ -701,6 +1028,226 @@ def _get_transform_from_user() -> np.ndarray:
     return cumulative_transform
 
 
+def handle_camsync(args):
+    """Copy poses from a pose-source sensor to an updated-target sensor via time match."""
+    from substrata.cameras import (
+        spatial_nearest_time_offset_report,
+        xyz_offset_datetime_matches_report,
+    )
+    from substrata.firefish import get_time_diff_in_secs
+    from substrata.initializer import ProjectInitializer
+
+    _base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+    if not init.cams_meta_json_filepath or not init.cams_xml_filepath:
+        raise SystemExit(
+            "No cameras meta/XML paths found. Set cams_meta_json and cams_xml in "
+            "the project YAML or use default project layout."
+        )
+    init.initialize()
+    if init.cams is None or not init.cams.data:
+        raise SystemExit("No cameras loaded.")
+
+    interactive = sys.stdin.isatty()
+    pose_id = getattr(args, "pose_source", None)
+    tgt_id = getattr(args, "updated_target", None)
+
+    if pose_id is None or tgt_id is None:
+        if not interactive:
+            raise SystemExit(
+                "Specify --pose-source and --updated-target (sensor ids), or run "
+                "interactively in a terminal."
+            )
+        sensor_counts = Counter(
+            getattr(cam, "sensor_id", None) for cam in init.cams.data.values()
+        )
+        print("Sensors (from .cams.xml):")
+        for sid in sorted(init.cams.sensors.keys()):
+            sens = init.cams.sensors[sid]
+            n_cams = int(sensor_counts.get(sid, 0))
+            print(
+                f"  sensor_id={sid}  label={sens.label!r}  "
+                f"resolution={sens.width}x{sens.height}  cameras={n_cams}"
+            )
+        if pose_id is None:
+            pose_id = int(input("Pose source sensor id: ").strip())
+        if tgt_id is None:
+            tgt_id = int(input("Updated target sensor id: ").strip())
+
+    pose_cams = init.cams.subset_by_sensor(pose_id)
+    updated_cams = init.cams.subset_by_sensor(tgt_id)
+    if not pose_cams.data:
+        raise SystemExit(f"No cameras with sensor_id={pose_id}.")
+    if not updated_cams.data:
+        raise SystemExit(f"No cameras with sensor_id={tgt_id}.")
+    if pose_id == tgt_id:
+        raise SystemExit("Pose source and updated target must be different sensors.")
+
+    auto_time = bool(
+        getattr(args, "auto_offsets", False) or getattr(args, "auto_time", False)
+    )
+    auto_xyz = bool(
+        getattr(args, "auto_offsets", False) or getattr(args, "auto_xyz", False)
+    )
+    assume_yes = bool(getattr(args, "yes", False))
+    scale_factor = (
+        float(init.scale_factor) if init.scale_factor is not None else 1.0
+    )
+    spatial_max_m = float(getattr(args, "spatial_max_dist", 0.5))
+    min_pairs = int(getattr(args, "min_spatial_pairs", 3))
+
+    if auto_time and getattr(args, "time_offset", None) is not None:
+        print(
+            "Note: --auto-time/--auto-offsets takes precedence; "
+            "ignoring explicit --time-offset."
+        )
+
+    manual_xyz = getattr(args, "xyz", None)
+
+    if auto_xyz and manual_xyz:
+        print("Note: --auto-xyz/--auto-offsets takes precedence; ignoring --xyz.")
+
+    # Raw EXIF on both subsets (same chunk, comparable centers).
+    pose_cams.get_datetime_originals()
+    updated_cams.get_datetime_originals()
+
+    spatial_report = None
+    if auto_time:
+        spatial_report = spatial_nearest_time_offset_report(
+            updated_cams,
+            pose_cams,
+            spatial_max_dist_m=spatial_max_m,
+            min_pairs=min_pairs,
+            scale_factor=scale_factor,
+        )
+        _print_spatial_time_report(spatial_report, scale_factor)
+
+    time_offset = None
+    if auto_time:
+        if spatial_report is not None and spatial_report.get("ok"):
+            time_offset = float(spatial_report["median_k_sec"])
+            print(f"Using auto time offset k = {time_offset} s (spatial median).")
+        else:
+            dt_pose, _ = pose_cams.earliest_exif_datetime()
+            dt_tgt, _ = updated_cams.earliest_exif_datetime()
+            if dt_pose is None or dt_tgt is None:
+                raise SystemExit(
+                    "Spatial time estimate failed and could not read earliest EXIF; "
+                    "set --time-offset or adjust --spatial-max-dist / "
+                    "--min-spatial-pairs."
+                )
+            time_offset = float(get_time_diff_in_secs(dt_pose, dt_tgt))
+            print(
+                "Spatial auto time failed or too few inliers; falling back to "
+                f"earliest-EXIF delta: k = {time_offset} s "
+                f"(pose earliest {dt_pose!r}, target earliest {dt_tgt!r})."
+            )
+    elif getattr(args, "time_offset", None) is not None:
+        time_offset = float(args.time_offset)
+    else:
+        dt_pose, _ = pose_cams.earliest_exif_datetime()
+        dt_tgt, _ = updated_cams.earliest_exif_datetime()
+        if dt_pose is None or dt_tgt is None:
+            raise SystemExit(
+                "Could not read EXIF DateTimeOriginal for the earliest image in one "
+                "or both subsets; set --time-offset explicitly."
+            )
+        suggested = float(get_time_diff_in_secs(dt_pose, dt_tgt))
+        if interactive:
+            print(
+                f"Earliest pose-source EXIF: {dt_pose}\n"
+                f"Earliest updated-target EXIF: {dt_tgt}\n"
+                "Suggested time offset (seconds, applied to updated-target EXIF): "
+                f"{suggested}"
+            )
+            raw = input(
+                "Enter time offset in seconds for updated-target EXIF "
+                "[Enter to use suggested]: "
+            ).strip()
+            time_offset = suggested if raw == "" else float(raw)
+        else:
+            time_offset = suggested
+            print(
+                f"Using suggested time offset {time_offset} s "
+                f"(pose earliest {dt_pose}, target earliest {dt_tgt})."
+            )
+
+    updated_cams.get_datetime_originals(offset_secs=time_offset)
+
+    offset_xyz = None
+    xyz_report = None
+    if auto_xyz:
+        xyz_report = xyz_offset_datetime_matches_report(
+            updated_cams,
+            pose_cams,
+            scale_factor=scale_factor,
+        )
+        _print_xyz_offset_report(xyz_report)
+        if not xyz_report.get("ok"):
+            raise SystemExit(
+                f"Auto xyz failed: {xyz_report.get('reason')}. "
+                "Fix time alignment or use manual --xyz."
+            )
+        offset_xyz = xyz_report["median_xyz"]
+    elif manual_xyz and not auto_xyz:
+        offset_xyz = _parse_xyz_csv(manual_xyz)
+
+    need_confirm = (auto_time or auto_xyz) and not assume_yes
+    if need_confirm:
+        if not interactive:
+            raise SystemExit(
+                "Auto time/xyz mode in non-interactive context requires --yes "
+                "(after reviewing output in a log)."
+            )
+        ans = input("\nProceed with camsync (apply poses and save meta JSON)? [y/N]: ")
+        if ans.strip().lower() not in ("y", "yes"):
+            raise SystemExit("Aborted.")
+
+    updated_cams.get_centers_and_transforms_based_on_timematch(
+        pose_cams, offset_xyz=offset_xyz
+    )
+
+    intercept_r = 0.01
+    camsync_summary = {
+        "project_path": init.path,
+        "cwd": cwd,
+        "project_id": init.id,
+        "pose_source": pose_id,
+        "updated_target": tgt_id,
+        "offset_xyz": offset_xyz,
+        "time_offset_sec": float(time_offset),
+        "scale_factor": scale_factor,
+        "auto_offsets": getattr(args, "auto_offsets", False),
+        "auto_time": auto_time,
+        "auto_xyz": auto_xyz,
+        "assume_yes": assume_yes,
+        "local": getattr(args, "local", False),
+        "spatial_max_dist": spatial_max_m,
+        "min_spatial_pairs": min_pairs,
+        "cli_time_offset": getattr(args, "time_offset", None),
+        "cli_xyz": getattr(args, "xyz", None),
+        "intercept_search_radius": intercept_r,
+        "pcd_loaded": getattr(init, "pcd", None) is not None,
+    }
+
+    _write_camsync_sanity_pdf(
+        pose_cams,
+        updated_cams,
+        _get_output_filepath(init, "camsync.pdf"),
+        time_offset_sec=float(time_offset),
+        pcd=getattr(init, "pcd", None),
+        camsync_summary=camsync_summary,
+        intercept_search_radius=intercept_r,
+    )
+
+    n_tgt = len(updated_cams.data)
+    for cam in updated_cams.data.values():
+        cam.enabled = True
+    print(f"Set enabled=True on {n_tgt} target sensor camera(s) before save.")
+
+    init.cams.save()
+
+
 def handle_images(args):
     """Handle the image matching CLI command.
 
@@ -893,9 +1440,40 @@ def main():
         dest="color_calibrate",
         action="store_true",
         help=(
-            "After decimation, load the output PLY and apply color_correction from "
-            "the project YAML (requires `substrata colors -s` or equivalent)."
+            "Apply color_correction from the project YAML while writing the output "
+            "PLY (requires `substrata colors -s` or equivalent). No second load."
         ),
+    )
+
+    # repair (re-emit a PLY that Open3D can parse, e.g. Metashape exports)
+    p_rep = subparsers.add_parser(
+        "repair",
+        help=(
+            "Rewrite a PLY in a strict Open3D-compatible form "
+            "(float32 xyz, optional uchar RGB, optional float32 normals); "
+            "drops extra vertex properties and non-finite rows."
+        ),
+    )
+    p_rep.add_argument(
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_rep.add_argument(
+        "--output",
+        dest="output",
+        type=str,
+        default=None,
+        help="Optional explicit output PLY path (defaults to <input>_o3d.ply).",
+    )
+    p_rep.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # head (PLY preview)
@@ -1412,6 +1990,125 @@ def main():
         help="Reset all paths to local (relative to project path).",
     )
 
+    # camsync
+    p_camsync = subparsers.add_parser(
+        "camsync",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help=(
+            "Copy camera centers/transforms from a pose-source sensor to an "
+            "updated-target sensor using EXIF time matching; writes meta JSON."
+        ),
+        epilog=(
+            "Per-camera poses are written to the cameras meta JSON only; .cams.xml is "
+            "not modified (this tool reads sensor calibration from XML).\n"
+            "Use --auto-time / --auto-xyz / --auto-offsets for spatial and median-offset "
+            "estimation (see --help on those flags). Auto modes print detailed reports "
+            "and prompt before saving unless you pass --yes."
+        ),
+    )
+    p_camsync.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
+    p_camsync.add_argument(
+        "--pose-source",
+        "-s",
+        dest="pose_source",
+        type=int,
+        default=None,
+        metavar="ID",
+        help=(
+            "Sensor id whose centers/transforms are used as the source of truth "
+            "(e.g. GoPro). If omitted, lists sensors and prompts (TTY only)."
+        ),
+    )
+    p_camsync.add_argument(
+        "--updated-target",
+        "-u",
+        dest="updated_target",
+        type=int,
+        default=None,
+        metavar="ID",
+        help=(
+            "Sensor id whose cameras are updated (e.g. macro). If omitted, "
+            "prompts after --pose-source (TTY only)."
+        ),
+    )
+    p_camsync.add_argument(
+        "--time-offset",
+        "-t",
+        dest="time_offset",
+        type=float,
+        default=None,
+        help=(
+            "Seconds added to updated-target EXIF datetimes before matching. "
+            "If omitted, suggests offset from earliest EXIF in each subset (TTY: prompt)."
+        ),
+    )
+    p_camsync.add_argument(
+        "--xyz",
+        dest="xyz",
+        type=str,
+        default=None,
+        metavar="X,Y,Z",
+        help=(
+            "Optional offset in the pose-source camera frame (meters), "
+            "comma-separated, e.g. 0,0.12,0. Applied when copying pose."
+        ),
+    )
+    p_camsync.add_argument(
+        "--auto-time",
+        dest="auto_time",
+        action="store_true",
+        help=(
+            "Estimate time offset from 3D nearest pose per target (same chunk); "
+            "verbose report; falls back to earliest-EXIF delta if too few inliers."
+        ),
+    )
+    p_camsync.add_argument(
+        "--auto-xyz",
+        dest="auto_xyz",
+        action="store_true",
+        help=(
+            "After time alignment, estimate pose-local x,y,z offset from "
+            "time-matched camera centers (median; uses scale_factor from YAML)."
+        ),
+    )
+    p_camsync.add_argument(
+        "--auto-offsets",
+        dest="auto_offsets",
+        action="store_true",
+        help="Shorthand for --auto-time and --auto-xyz together.",
+    )
+    p_camsync.add_argument(
+        "--spatial-max-dist",
+        dest="spatial_max_dist",
+        type=float,
+        default=0.5,
+        metavar="M",
+        help=(
+            "Max metric distance (m) for spatial NN time pair "
+            "(dist_stored * scale_factor). Default: 0.5."
+        ),
+    )
+    p_camsync.add_argument(
+        "--min-spatial-pairs",
+        dest="min_spatial_pairs",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Minimum inlier pairs required for spatial auto time. Default: 3.",
+    )
+    p_camsync.add_argument(
+        "--yes",
+        "-y",
+        dest="yes",
+        action="store_true",
+        help="Skip confirmation prompt after auto offset reports (non-interactive).",
+    )
+
     # transform
     p_transform = subparsers.add_parser(
         "transform",
@@ -1458,6 +2155,7 @@ def main():
 
     handlers = {
         "decimate": handle_decimate,
+        "repair": handle_repair,
         "head": handle_head,
         "scalebars": handle_scalebars,
         "views": handle_views,
@@ -1468,6 +2166,7 @@ def main():
         "intercepts": handle_intercepts,
         "align": handle_align,
         "images": handle_images,
+        "camsync": handle_camsync,
         "transform": handle_transform,
     }
     handlers[args.command](args)

@@ -1089,6 +1089,9 @@ def show_img(img_path, highlight_pixels=None):
     This function ignores the EXIF orientation (unless otherwise handled by PIL)
     and always displays the image in its raw pixel orientation.
 
+    If the path is missing or the file cannot be read, logs a warning and returns
+    without raising (execution continues for the caller).
+
     Args:
         img_path (str): Path to the image file.
         highlight_pixels (None, list, or np.ndarray):
@@ -1096,8 +1099,18 @@ def show_img(img_path, highlight_pixels=None):
             as a single point [x, y] with a larger circle; if 2D, each sub-list
             represents a point with a smaller circle.
     """
-    # Open the image and convert to RGB.
-    image = Image.open(img_path).convert("RGB")
+    if not img_path:
+        logger.warning("show_img: no image path given; skipping display.")
+        return
+    if not os.path.isfile(img_path):
+        logger.warning("show_img: file not found: %s", img_path)
+        return
+
+    try:
+        image = Image.open(img_path).convert("RGB")
+    except OSError as e:
+        logger.warning("show_img: could not open image %s: %s", img_path, e)
+        return
 
     # Prepare drawing context.
     draw = ImageDraw.Draw(image)

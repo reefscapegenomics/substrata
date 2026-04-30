@@ -217,7 +217,8 @@ class PointCloud:
         """
         logger.info("Loading in pointcloud {}...".format(filepath))
         self.filepath = filepath
-        if max_points is not None and str(filepath).lower().endswith(".ply"):
+        is_ply = str(filepath).lower().endswith(".ply")
+        if max_points is not None and is_ply:
             points, colors, normals = _stream_sample_ply_to_arrays(
                 filepath, int(max_points), show_progress=show_progress
             )
@@ -227,6 +228,29 @@ class PointCloud:
                 pcd.colors = o3d.utility.Vector3dVector(colors)
             if normals is not None:
                 pcd.normals = o3d.utility.Vector3dVector(normals)
+            self.o3d_pcd = pcd
+        elif is_ply:
+            # Try Open3D first; fall back to the streaming parser when Open3D
+            # rejects the file (e.g. Metashape exports with `double` xyz or
+            # extra vertex properties trigger "number of vertex <= 0").
+            pcd = o3d.io.read_point_cloud(filepath, print_progress=show_progress)
+            if len(pcd.points) == 0:
+                logger.warning(
+                    "Open3D returned 0 points for %s; falling back to "
+                    "substrata streaming PLY reader.",
+                    filepath,
+                )
+                with open(filepath, "rb") as fin:
+                    _, _, n_vertices, *_ = _parse_ply_header(fin)
+                points, colors, normals = _stream_sample_ply_to_arrays(
+                    filepath, n_vertices, show_progress=show_progress
+                )
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points)
+                if colors is not None:
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                if normals is not None:
+                    pcd.normals = o3d.utility.Vector3dVector(normals)
             self.o3d_pcd = pcd
         else:
             self.o3d_pcd = o3d.io.read_point_cloud(filepath, print_progress=True)
@@ -1434,6 +1458,149 @@ def _make_output_header(fmt: str, vertex_props, vertex_count_out: int) -> bytes:
     return b"".join(lines)
 
 
+def _ply_red_green_blue_layout(
+    vertex_props: List[Tuple[str, str]],
+) -> Optional[Tuple[int, int, int, str, str, str]]:
+    """Return byte offsets and PLY types for ``red``, ``green``, ``blue`` properties."""
+    off = 0
+    positions: Dict[str, Tuple[int, str]] = {}
+    for ptype, pname in vertex_props:
+        positions[pname] = (off, ptype)
+        off += ply_type_sizes[ptype]
+    try:
+        ro, rt = positions["red"]
+        go, gt = positions["green"]
+        bo, bt = positions["blue"]
+    except KeyError:
+        return None
+    return (ro, go, bo, rt, gt, bt)
+
+
+def _validate_color_correction_dict(correction: Dict[str, np.ndarray]) -> None:
+    matrix = np.asarray(correction["matrix"], dtype=float)
+    offset = np.asarray(correction["offset"], dtype=float)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"matrix must be (3,3), got {matrix.shape}")
+    if offset.shape != (3,):
+        raise ValueError(f"offset must be (3,), got {offset.shape}")
+
+
+def _apply_color_correction_vertex_chunk(
+    chunk: bytes,
+    rec_size: int,
+    endian: str,
+    layout: Tuple[int, int, int, str, str, str],
+    matrix: np.ndarray,
+    offset_vec: np.ndarray,
+) -> bytes:
+    """Apply affine RGB correction in 0–255 space while preserving PLY storage types.
+
+    Matches :meth:`PointCloud.apply_color_correction` (Open3D stores colours in 0–1;
+    float/double PLY components are interpreted as 0–1; uchar as 0–255).
+    """
+    ro, go, bo, rt, gt, bt = layout
+    m = np.asarray(matrix, dtype=np.float64)
+    o = np.asarray(offset_vec, dtype=np.float64).reshape(3)
+
+    step = ply_type_sizes[rt]
+    packed = rt == gt == bt and go == ro + step and bo == go + step
+
+    n = len(chunk) // rec_size
+    if n == 0:
+        return chunk
+
+    arr = np.frombuffer(chunk, dtype=np.uint8).reshape(n, rec_size)
+    out = arr.copy()
+
+    if packed and rt in ("uchar", "uint8"):
+        seg = out[:, ro : ro + 3]
+        rgb = seg.astype(np.float64)
+        corrected = rgb @ m.T + o
+        np.clip(corrected, 0.0, 255.0, out=corrected)
+        out[:, ro : ro + 3] = np.round(corrected).astype(np.uint8)
+        return out.tobytes()
+
+    if packed and rt in ("float", "float32"):
+        width = step * 3
+        edt = "<f4" if endian == "<" else ">f4"
+        seg = np.ascontiguousarray(out[:, ro : ro + width])
+        rgb = seg.view(edt).reshape(n, 3).astype(np.float64) * 255.0
+        corrected = rgb @ m.T + o
+        np.clip(corrected, 0.0, 255.0, out=corrected)
+        packed_f = (corrected / 255.0).astype(edt)
+        out[:, ro : ro + width] = packed_f.view(np.uint8).reshape(n, width)
+        return out.tobytes()
+
+    if packed and rt in ("double", "float64"):
+        width = step * 3
+        edt = "<f8" if endian == "<" else ">f8"
+        seg = np.ascontiguousarray(out[:, ro : ro + width])
+        rgb = seg.view(edt).reshape(n, 3).astype(np.float64) * 255.0
+        corrected = rgb @ m.T + o
+        np.clip(corrected, 0.0, 255.0, out=corrected)
+        packed_f = (corrected / 255.0).astype(edt)
+        out[:, ro : ro + width] = packed_f.view(np.uint8).reshape(n, width)
+        return out.tobytes()
+
+    # General path: arbitrary offsets / mixed types (rare)
+    def sample_to_m255(val: float, ptype: str) -> float:
+        if ptype in ("uchar", "uint8", "char", "int8"):
+            return float(val)
+        if ptype in ("float", "float32", "double", "float64"):
+            return float(val) * 255.0
+        raise ValueError(
+            f"Unsupported RGB property type for color correction: {ptype}"
+        )
+
+    def m255_to_sample(val: float, ptype: str) -> Union[int, float]:
+        val = float(np.clip(val, 0.0, 255.0))
+        if ptype in ("uchar", "uint8"):
+            return int(round(val))
+        if ptype in ("float", "float32", "double", "float64"):
+            return val / 255.0
+        raise ValueError(
+            f"Unsupported RGB property type for color correction: {ptype}"
+        )
+
+    buf = bytearray(chunk)
+    for i in range(n):
+        base = i * rec_size
+        mr = sample_to_m255(
+            float(struct.unpack_from(endian + ply_type_struct[rt], buf, base + ro)[0]),
+            rt,
+        )
+        mg = sample_to_m255(
+            float(struct.unpack_from(endian + ply_type_struct[gt], buf, base + go)[0]),
+            gt,
+        )
+        mb = sample_to_m255(
+            float(struct.unpack_from(endian + ply_type_struct[bt], buf, base + bo)[0]),
+            bt,
+        )
+        v = np.array([mr, mg, mb], dtype=np.float64)
+        v = v @ m.T + o
+        np.clip(v, 0.0, 255.0, out=v)
+        struct.pack_into(
+            endian + ply_type_struct[rt],
+            buf,
+            base + ro,
+            m255_to_sample(v[0], rt),
+        )
+        struct.pack_into(
+            endian + ply_type_struct[gt],
+            buf,
+            base + go,
+            m255_to_sample(v[1], gt),
+        )
+        struct.pack_into(
+            endian + ply_type_struct[bt],
+            buf,
+            base + bo,
+            m255_to_sample(v[2], bt),
+        )
+    return bytes(buf)
+
+
 def _reservoir_slots(n_vertices: int, k: int, rng=None):
     # yields slot index to write into (0..k-1) or None for discard
 
@@ -1852,10 +2019,43 @@ def decimate_ply_file(
     target_points: int,
     show_progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
+    color_correction: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
+    """Decimate a binary PLY by uniform random subsampling with a streaming read.
+
+    Args:
+        input_path: Path to the source binary PLY.
+        output_path: Path to write the decimated PLY.
+        target_points: Desired vertex count (clamped to ``[0, N]``).
+        show_progress: Whether to show tqdm progress bars.
+        chunk_bytes: Target read buffer size for streaming; each read uses the
+            largest multiple of the vertex record size not exceeding this (so chunks
+            always contain whole vertices).
+        color_correction: Optional dict with ``matrix`` (3×3) and ``offset`` (3,)
+            in 0–255 RGB space (same as :meth:`PointCloud.apply_color_correction`).
+            When set, RGB is adjusted per vertex as data is written (no second load).
+    """
+    matrix: Optional[np.ndarray] = None
+    offset_cc: Optional[np.ndarray] = None
+    if color_correction is not None:
+        _validate_color_correction_dict(color_correction)
+        matrix = np.asarray(color_correction["matrix"], dtype=np.float64)
+        offset_cc = np.asarray(color_correction["offset"], dtype=np.float64)
 
     with open(input_path, "rb") as fin:
         fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
+
+        # Reads must be multiples of rec_size (e.g. 64 MiB is not divisible by 28).
+        aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
+
+        rgb_layout: Optional[Tuple[int, int, int, str, str, str]] = None
+        if color_correction is not None:
+            rgb_layout = _ply_red_green_blue_layout(vprops)
+            if rgb_layout is None:
+                raise ValueError(
+                    "PLY has no vertex properties named red, green, and blue; "
+                    "cannot apply color_correction during decimation."
+                )
 
         k = max(0, min(int(target_points), n_vertices))
         if k == 0:
@@ -1875,12 +2075,25 @@ def decimate_ply_file(
                     total=n_vertices, unit="vtx", disable=not show_progress
                 ) as pbar:
                     while bytes_left:
-                        chunk = fin.read(min(chunk_bytes, bytes_left))
+                        chunk = fin.read(min(aligned_chunk_bytes, bytes_left))
                         if not chunk:
                             break
+                        if color_correction is not None:
+                            chunk = _apply_color_correction_vertex_chunk(
+                                chunk,
+                                rec_size,
+                                endian,
+                                rgb_layout,
+                                matrix,
+                                offset_cc,
+                            )
                         fout.write(chunk)
                         bytes_left -= len(chunk)
                         pbar.update(len(chunk) // rec_size)
+            if color_correction is not None:
+                logger.info(
+                    "Applied streaming colour correction to %d vertices", n_vertices
+                )
             return
 
         # Two-pass approach: first pass to collect samples, second pass to write with correct header
@@ -1917,7 +2130,17 @@ def decimate_ply_file(
                 if sel.size > need:
                     sel = sel[rng.choice(sel.size, size=need, replace=False)]
                 if sel.size:
-                    selected_vertices.append(sel.tobytes())
+                    blob = sel.tobytes()
+                    if color_correction is not None:
+                        blob = _apply_color_correction_vertex_chunk(
+                            blob,
+                            rec_size,
+                            endian,
+                            rgb_layout,
+                            matrix,
+                            offset_cc,
+                        )
+                    selected_vertices.append(blob)
                     taken += sel.size
 
                 seen += to_read
@@ -1931,6 +2154,249 @@ def decimate_ply_file(
             fout.write(out_header)
             for vertex_data in selected_vertices:
                 fout.write(vertex_data)
+        if color_correction is not None:
+            logger.info(
+                "Applied streaming colour correction to %d vertices", actual_count
+            )
+
+
+def repair_ply_for_open3d(
+    input_path: str,
+    output_path: Optional[str] = None,
+    show_progress: bool = True,
+    chunk_bytes: int = 64 * 1024 * 1024,
+) -> str:
+    """Re-emit a binary PLY in a strictly Open3D-compatible form.
+
+    Some Metashape PLY exports trigger Open3D's
+    ``Read PLY failed: number of vertex <= 0`` warning because of strict
+    PLY-property handling (e.g. ``double`` xyz, modern type aliases like
+    ``float32``/``uint8``, or extra vertex properties such as ``confidence``).
+    This helper reads the source via the permissive substrata header parser
+    and writes a minimal, normalized binary PLY containing only:
+
+    * ``x``, ``y``, ``z`` as ``float`` (float32)
+    * ``nx``, ``ny``, ``nz`` as ``float`` if present in the input
+    * ``red``, ``green``, ``blue`` as ``uchar`` if present in the input
+      (RGB stored as float/double in 0..1 is rescaled to 0..255)
+    * Rows containing NaN or inf in xyz are dropped.
+    * Endianness matches the host (little/big) so callers can rely on
+      ``binary_little_endian`` on common hardware.
+    * All other vertex properties and ``obj_info``-style header lines are
+      discarded.
+
+    Args:
+        input_path: Path to the source binary PLY file.
+        output_path: Destination PLY path. Defaults to
+            ``<input_basename>_o3d.ply`` next to the source.
+        show_progress: Whether to display a tqdm progress bar.
+        chunk_bytes: Target read buffer size; each read uses the largest
+            multiple of the input vertex record size not exceeding this so
+            chunks always contain whole vertices.
+
+    Returns:
+        The output file path.
+    """
+    if output_path is None:
+        base, _ = os.path.splitext(input_path)
+        output_path = f"{base}_o3d.ply"
+
+    np_dtypes = {
+        "char": "i1",
+        "uchar": "u1",
+        "int8": "i1",
+        "uint8": "u1",
+        "short": "i2",
+        "ushort": "u2",
+        "int16": "i2",
+        "uint16": "u2",
+        "int": "i4",
+        "uint": "u4",
+        "int32": "i4",
+        "uint32": "u4",
+        "float": "f4",
+        "float32": "f4",
+        "double": "f8",
+        "float64": "f8",
+    }
+
+    with open(input_path, "rb") as fin:
+        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
+
+        if not all(n in {p[1] for p in vprops} for n in ("x", "y", "z")):
+            raise ValueError("PLY must contain x, y, z vertex properties.")
+
+        # Build structured input dtype matching the source layout.
+        in_fields = []
+        for ptype, pname in vprops:
+            if ptype not in np_dtypes:
+                raise ValueError(f"Unsupported PLY type: {ptype}")
+            in_fields.append((pname, endian + np_dtypes[ptype]))
+        in_dt = np.dtype(in_fields)
+
+        prop_names = {n for _, n in vprops}
+        has_rgb = {"red", "green", "blue"}.issubset(prop_names)
+        has_nrm = {"nx", "ny", "nz"}.issubset(prop_names)
+        rgb_types = {n: t for t, n in vprops if n in {"red", "green", "blue"}}
+
+        # Determine RGB scaling: float/double sources are stored 0..1 in
+        # PLY convention; integer sources are already 0..255.
+        rgb_is_float = False
+        if has_rgb:
+            float_like = {"float", "float32", "double", "float64"}
+            rgb_is_float = all(
+                rgb_types[c] in float_like for c in ("red", "green", "blue")
+            )
+
+        # Build output dtype (host-endian) and clean header.
+        out_fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+        if has_nrm:
+            out_fields += [("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")]
+        if has_rgb:
+            out_fields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        out_dt = np.dtype(out_fields)
+
+        out_header_props: List[Tuple[str, str]] = [
+            ("float", "x"),
+            ("float", "y"),
+            ("float", "z"),
+        ]
+        if has_nrm:
+            out_header_props += [("float", "nx"), ("float", "ny"), ("float", "nz")]
+        if has_rgb:
+            out_header_props += [
+                ("uchar", "red"),
+                ("uchar", "green"),
+                ("uchar", "blue"),
+            ]
+
+        # Stream rows to a temp data file, then prepend the final header
+        # once the kept count is known. This avoids needing to seek/read
+        # the output file when the header length depends on vertex_count.
+        chunk_recs = max(1, chunk_bytes // rec_size)
+        kept = 0
+        tmp_data_path = output_path + ".data.tmp"
+        try:
+            with open(tmp_data_path, "wb") as ftmp:
+                remaining = n_vertices
+                with tqdm(
+                    total=n_vertices,
+                    unit="vtx",
+                    desc="Repair PLY",
+                    disable=not show_progress,
+                ) as pbar:
+                    while remaining > 0:
+                        to_read = int(min(remaining, chunk_recs))
+                        buf = fin.read(to_read * rec_size)
+                        if len(buf) != to_read * rec_size:
+                            raise ValueError(
+                                "Corrupt PLY: unexpected EOF in vertex data."
+                            )
+                        arr = np.frombuffer(buf, dtype=in_dt, count=to_read)
+
+                        x = arr["x"].astype(np.float32, copy=False)
+                        y = arr["y"].astype(np.float32, copy=False)
+                        z = arr["z"].astype(np.float32, copy=False)
+                        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+
+                        n_finite = int(np.count_nonzero(finite))
+                        if n_finite == 0:
+                            remaining -= to_read
+                            pbar.update(to_read)
+                            continue
+
+                        out = np.empty(n_finite, dtype=out_dt)
+                        out["x"] = x[finite]
+                        out["y"] = y[finite]
+                        out["z"] = z[finite]
+                        if has_nrm:
+                            out["nx"] = arr["nx"].astype(np.float32, copy=False)[
+                                finite
+                            ]
+                            out["ny"] = arr["ny"].astype(np.float32, copy=False)[
+                                finite
+                            ]
+                            out["nz"] = arr["nz"].astype(np.float32, copy=False)[
+                                finite
+                            ]
+                        if has_rgb:
+                            r = arr["red"][finite]
+                            g = arr["green"][finite]
+                            b = arr["blue"][finite]
+                            if rgb_is_float:
+                                r = np.clip(np.asarray(r) * 255.0, 0.0, 255.0)
+                                g = np.clip(np.asarray(g) * 255.0, 0.0, 255.0)
+                                b = np.clip(np.asarray(b) * 255.0, 0.0, 255.0)
+                            out["red"] = np.asarray(r).astype(np.uint8)
+                            out["green"] = np.asarray(g).astype(np.uint8)
+                            out["blue"] = np.asarray(b).astype(np.uint8)
+
+                        ftmp.write(out.tobytes())
+                        kept += n_finite
+                        remaining -= to_read
+                        pbar.update(to_read)
+
+            # Concatenate header + temp data into the final output.
+            final_header = _make_clean_ply_header(
+                fmt="binary_little_endian",
+                properties=out_header_props,
+                vertex_count=kept,
+            )
+            with open(output_path, "wb") as fout, open(tmp_data_path, "rb") as ftmp:
+                fout.write(final_header)
+                block = 64 * 1024 * 1024
+                while True:
+                    chunk = ftmp.read(block)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+        finally:
+            if os.path.exists(tmp_data_path):
+                try:
+                    os.remove(tmp_data_path)
+                except OSError:
+                    pass
+
+    if kept != n_vertices:
+        logger.info(
+            "repair_ply_for_open3d: dropped %d non-finite vertices (kept %d/%d).",
+            n_vertices - kept,
+            kept,
+            n_vertices,
+        )
+    else:
+        logger.info(
+            "repair_ply_for_open3d: rewrote %d vertices to %s.", kept, output_path
+        )
+    return output_path
+
+
+def _make_clean_ply_header(
+    fmt: str,
+    properties: List[Tuple[str, str]],
+    vertex_count: int,
+) -> bytes:
+    """Build a minimal Open3D-friendly PLY header.
+
+    Args:
+        fmt: Format string, typically ``"binary_little_endian"``.
+        properties: Ordered ``(type, name)`` pairs using legacy PLY type
+            names (``float``, ``uchar``).
+        vertex_count: Number of vertex records.
+
+    Returns:
+        Encoded header bytes terminated with ``end_header``.
+    """
+    lines = [
+        b"ply\n",
+        f"format {fmt} 1.0\n".encode("ascii"),
+        b"comment repaired for open3d by substrata\n",
+        f"element vertex {int(vertex_count)}\n".encode("ascii"),
+    ]
+    for ptype, pname in properties:
+        lines.append(f"property {ptype} {pname}\n".encode("ascii"))
+    lines.append(b"end_header\n")
+    return b"".join(lines)
 
 
 def get_decimated_pcd(

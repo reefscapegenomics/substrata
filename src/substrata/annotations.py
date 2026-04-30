@@ -1376,6 +1376,10 @@ class Annotation:
                 self.image_match = image_matches[0]
                 return image_matches
 
+        self.image_matches = []
+        self.image_match = None
+        return []
+
     def get_first_image_match(
         self,
         cams: List[Any],

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 # Standard Library
+import copy
 import csv
 import datetime
 import json
@@ -6,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 # Third-Party Libraries
@@ -16,6 +20,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from scipy.optimize import minimize
+from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist, squareform
 from tqdm import tqdm
 from joblib import Parallel, delayed
@@ -26,6 +31,52 @@ from substrata import visualizations, settings, geom, measurements
 from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_camera_enabled_to_cams_xml(cameras: Cameras, xml_path: str) -> None:
+    """Update ``<camera enabled="...">`` from in-memory :attr:`Camera.enabled`.
+
+    Writes the XML file atomically. Intended for workflows such as ``camsync`` that
+    re-enable cameras after pose transfer.
+
+    Args:
+        cameras: Loaded cameras whose ``enabled`` flags should be reflected in XML.
+        xml_path: Path to the Metashape ``.cams.xml`` export.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError) as e:
+        logger.warning("Could not parse %s for enabled sync: %s", xml_path, e)
+        return
+    root = tree.getroot()
+    updated = 0
+    for elem in root.findall(".//camera"):
+        cid = elem.get("id")
+        if cid is None or cid not in cameras.data:
+            continue
+        cam = cameras.data[cid]
+        if not hasattr(cam, "enabled"):
+            continue
+        val = "true" if bool(cam.enabled) else "false"
+        if elem.get("enabled") != val:
+            elem.set("enabled", val)
+            updated += 1
+    if updated == 0:
+        return
+    xml_abs = os.path.abspath(xml_path)
+    out_dir = os.path.dirname(xml_abs) or "."
+    fd, tmp_path = tempfile.mkstemp(suffix=".xml.tmp", prefix=".cams_", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as xf:
+            tree.write(xf, encoding="utf-8", xml_declaration=True)
+        os.replace(tmp_path, xml_abs)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    print(f"Updated {updated} <camera enabled> flags in {xml_abs}")
 
 
 class Sensor:
@@ -385,39 +436,143 @@ class Cameras:
     def get_cams_from_file(self, cams_meta_filepath):
         """Load cameras from a JSON file and store them in the container.
 
+        Entries with a valid ``path`` but null ``center``/``transform`` (e.g. disabled
+        or unaligned in Metashape) are still loaded using a placeholder pose so they
+        can receive poses later (e.g. ``camsync``). Such cameras have
+        ``missing_pose_from_meta`` set to True.
+
         Args:
             cams_meta_filepath (str): Path to the JSON file with camera metadata.
         """
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
+        n_placeholder = 0
         for cam_id, cam_data in data["cameras"].items():
-            if (
-                cam_data.get("center") is None
-                or cam_data.get("center") == "null"
-                or cam_data.get("transform") is None
-                or cam_data.get("transform") == "null"
-                or cam_data.get("path") is None
-                or cam_data.get("path") == "null"
-            ):
+            if cam_data.get("path") is None or cam_data.get("path") == "null":
                 continue
-            self.data[cam_id] = Camera(
-                self,
-                cam_id,
-                cam_data["transform"],
-                cam_data["center"],
-                cam_data["path"],
+            center = cam_data.get("center")
+            transform = cam_data.get("transform")
+            pose_ok = (
+                center is not None
+                and center != "null"
+                and transform is not None
+                and transform != "null"
             )
-            if "reference" in cam_data:
-                self.data[cam_id].reference = cam_data["reference"]
-                # Ensure depth is negative (in meters)
-                self.data[cam_id].depth_sensor_m = -abs(cam_data["reference"][2])
-            if "reference_accuracy" in cam_data:
-                self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
-                self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
-            if "center_crs" in cam_data:
-                self.data[cam_id].center_crs = cam_data["center_crs"]
-            if "enabled" in cam_data:
-                self.data[cam_id].enabled = bool(cam_data["enabled"])
+            if pose_ok:
+                self.data[cam_id] = Camera(
+                    self,
+                    cam_id,
+                    cam_data["transform"],
+                    cam_data["center"],
+                    cam_data["path"],
+                )
+                if "reference" in cam_data:
+                    self.data[cam_id].reference = cam_data["reference"]
+                    # Ensure depth is negative (in meters)
+                    self.data[cam_id].depth_sensor_m = -abs(cam_data["reference"][2])
+                if "reference_accuracy" in cam_data:
+                    self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
+                    self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
+                if "center_crs" in cam_data:
+                    self.data[cam_id].center_crs = cam_data["center_crs"]
+                if "enabled" in cam_data:
+                    self.data[cam_id].enabled = bool(cam_data["enabled"])
+            else:
+                self.data[cam_id] = Camera(
+                    self,
+                    cam_id,
+                    np.eye(4).tolist(),
+                    [0.0, 0.0, 0.0],
+                    cam_data["path"],
+                )
+                self.data[cam_id].missing_pose_from_meta = True
+                if "enabled" in cam_data:
+                    self.data[cam_id].enabled = bool(cam_data["enabled"])
+                n_placeholder += 1
+        if n_placeholder:
+            logger.info(
+                "Loaded %s cameras with placeholder pose (null center/transform in meta)",
+                n_placeholder,
+            )
+
+    def save(
+        self,
+        cams_meta_filepath: str | None = None,
+        cams_xml_filepath: str | None = None,
+    ) -> None:
+        """Persist camera poses to the meta JSON file.
+
+        Merges ``center`` and ``transform`` for each loaded camera from in-memory
+        state (preferring ``orig_coords`` / ``orig_camera_transform`` when set).
+        If a camera has an ``enabled`` attribute, it is written to JSON as well.
+        Other keys for each camera entry are preserved from the existing file.
+
+        Args:
+            cams_meta_filepath: Output path. Defaults to :attr:`cams_meta_filepath`.
+            cams_xml_filepath: Optional path to ``.cams.xml``. If provided (or set on
+                the container) and the file exists, ``<camera enabled="...">`` is
+                updated from each in-memory :attr:`Camera.enabled` (poses are not
+                written to XML here).
+
+        Raises:
+            ValueError: If no output path is known or the file has no ``cameras`` key.
+        """
+        xml_path = cams_xml_filepath or getattr(self, "cams_xml_filepath", None)
+        out_path = cams_meta_filepath or getattr(self, "cams_meta_filepath", None)
+        if not out_path:
+            raise ValueError("No cams_meta_filepath; pass cams_meta_filepath=...")
+
+        with open(out_path, "r") as f:
+            data = json.load(f)
+        if "cameras" not in data:
+            raise ValueError(f"Invalid cameras meta JSON (no 'cameras' key): {out_path}")
+
+        cameras_out = copy.deepcopy(data["cameras"])
+        for cam_id, cam in self.data.items():
+            if cam_id not in cameras_out:
+                logger.warning(
+                    "Camera %s in memory but not in meta JSON; skipping save for it",
+                    cam_id,
+                )
+                continue
+            center = cam.orig_coords if cam.orig_coords is not None else cam.coords
+            transform = (
+                cam.orig_camera_transform
+                if cam.orig_camera_transform is not None
+                else cam.camera_transform
+            )
+            if center is None or transform is None:
+                logger.warning("Skipping %s: missing center or transform", cam_id)
+                continue
+            cameras_out[cam_id]["center"] = np.asarray(center, dtype=float).tolist()
+            cameras_out[cam_id]["transform"] = (
+                np.asarray(transform, dtype=float).reshape(4, 4).tolist()
+            )
+            if hasattr(cam, "enabled"):
+                cameras_out[cam_id]["enabled"] = bool(cam.enabled)
+
+        data["cameras"] = cameras_out
+
+        out_abs = os.path.abspath(out_path)
+        out_dir = os.path.dirname(out_abs) or "."
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".json.tmp", prefix=".cams_meta_", dir=out_dir
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, out_abs)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        print(f"Saved camera metadata to {out_abs}")
+
+        if xml_path and os.path.isfile(xml_path):
+            _sync_camera_enabled_to_cams_xml(self, xml_path)
 
     def get_cam_sensor_parameters_from_file(self, cams_xml_filepath):
         """Parse XML file and create Sensor objects, then assign to cameras.
@@ -687,6 +842,8 @@ class Cameras:
                     cam.camera_transform = other_cam.camera_transform
                     cam.orig_coords = other_cam.orig_coords
                     cam.orig_camera_transform = other_cam.orig_camera_transform
+                if hasattr(cam, "missing_pose_from_meta"):
+                    delattr(cam, "missing_pose_from_meta")
             else:
                 raise ValueError(
                     f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}"
@@ -759,6 +916,37 @@ class Cameras:
             self.data.values(), desc="Retrieving timestamps from camera files..."
         ):
             cam.datetime = cam.get_datetime_original(offset_secs)
+
+    def earliest_exif_datetime(
+        self, cam_ids: list[str] | None = None
+    ) -> tuple[str | None, str | None]:
+        """Earliest EXIF DateTimeOriginal among cameras (does not set ``cam.datetime``).
+
+        Args:
+            cam_ids: Camera ids to consider; default is all keys in ``self.data``.
+
+        Returns:
+            Tuple ``(earliest_datetime_str, cam_id)``, or ``(None, None)`` if none found.
+        """
+        from substrata import firefish
+
+        ids = cam_ids if cam_ids is not None else list(self.data.keys())
+        best_t: float | None = None
+        best_dt: str | None = None
+        best_id: str | None = None
+        for cid in ids:
+            cam = self.data.get(cid)
+            if cam is None:
+                continue
+            dt = cam.get_datetime_original(None)
+            if dt is None:
+                continue
+            t = firefish.get_unix_time(dt)
+            if best_t is None or t < best_t:
+                best_t = t
+                best_dt = dt
+                best_id = cid
+        return (best_dt, best_id)
 
     def get_camera_by_filename(self, filename):
         """Get a camera object by its filename.
@@ -994,6 +1182,238 @@ class Cameras:
             depth_accuracy_threshold=settings.DEFAULT_DEPTH_ACCURACY_THRESHOLD,
             use_accuracy_filter=True,
         )
+
+
+def orthonormal_rotation_from_camera_transform(
+    camera_transform: np.ndarray | list,
+) -> np.ndarray:
+    """Return a proper 3x3 rotation from a 4x4 camera transform (same logic as camsync)."""
+    rotation_matrix = np.asarray(camera_transform, dtype=float).reshape(4, 4)[:3, :3]
+    u, _, vt = np.linalg.svd(rotation_matrix)
+    r_mat = u @ vt
+    if np.linalg.det(r_mat) < 0:
+        vt = vt.copy()
+        vt[-1, :] *= -1
+        r_mat = u @ vt
+    return r_mat
+
+
+def spatial_nearest_time_offset_report(
+    target_cams: Cameras,
+    pose_cams: Cameras,
+    *,
+    spatial_max_dist_m: float,
+    min_pairs: int,
+    scale_factor: float | None = 1.0,
+) -> dict:
+    """Estimate EXIF time offset from nearest-neighbor pose cameras in 3D (same chunk).
+
+    Assumes both subsets share one reconstruction frame. ``spatial_max_dist_m`` is
+    compared to ``euclidean(center_T, center_P) * scale_factor`` (metric distance in
+    meters if coords are model units and ``scale_factor`` converts to meters).
+
+    Args:
+        target_cams: Cameras to update (e.g. macro); must have ``cam.coords`` and EXIF
+            times available (e.g. via ``get_datetime_originals()``).
+        pose_cams: Pose source cameras (e.g. GoPro).
+        spatial_max_dist_m: Max metric distance (m) for a pair to count as inlier.
+        min_pairs: Minimum number of inlier pairs with valid times required for ``ok``.
+        scale_factor: Multiplier from stored coords to meters (1.0 if already metric).
+
+    Returns:
+        Dict with ``ok``, ``median_k_sec``, ``pairs`` (per-target rows), ``stats``,
+        ``n_inliers``, ``n_targets``, and optional ``reason`` if not ok.
+    """
+    from substrata import firefish
+
+    sf = float(scale_factor) if scale_factor is not None else 1.0
+    pose_list = list(pose_cams.data.values())
+    n_targets = len(target_cams.data)
+    if not pose_list or n_targets == 0:
+        return {
+            "ok": False,
+            "median_k_sec": None,
+            "pairs": [],
+            "stats": {},
+            "n_inliers": 0,
+            "n_targets": n_targets,
+            "reason": "empty pose or target subset",
+        }
+
+    centers_pose = np.array(
+        [np.asarray(c.coords, dtype=float).ravel()[:3] for c in pose_list]
+    )
+    tree = cKDTree(centers_pose)
+    pairs: list[dict] = []
+    k_inliers: list[float] = []
+
+    for tcam in target_cams.data.values():
+        if getattr(tcam, "missing_pose_from_meta", False):
+            dt_t = getattr(tcam, "datetime", None) or tcam.get_datetime_original(
+                None
+            )
+            pairs.append(
+                {
+                    "target_id": tcam.cam_id,
+                    "pose_id": None,
+                    "dist_stored": None,
+                    "dist_metric_m": None,
+                    "inlier": False,
+                    "dt_target": dt_t,
+                    "dt_pose": None,
+                    "k_sec": None,
+                    "skip_reason": "missing_pose_in_meta",
+                }
+            )
+            continue
+        ct = np.asarray(tcam.coords, dtype=float).ravel()[:3]
+        dist_stored, j = tree.query(ct, k=1)
+        pcam = pose_list[int(j)]
+        dist_metric_m = float(dist_stored) * sf
+        inlier = dist_metric_m <= float(spatial_max_dist_m)
+
+        dt_t = getattr(tcam, "datetime", None) or tcam.get_datetime_original(None)
+        dt_p = getattr(pcam, "datetime", None) or pcam.get_datetime_original(None)
+        k_sec: float | None = None
+        if dt_t is not None and dt_p is not None and inlier:
+            k_sec = float(
+                firefish.get_unix_time(dt_p) - firefish.get_unix_time(dt_t)
+            )
+            k_inliers.append(k_sec)
+
+        pairs.append(
+            {
+                "target_id": tcam.cam_id,
+                "pose_id": pcam.cam_id,
+                "dist_stored": float(dist_stored),
+                "dist_metric_m": dist_metric_m,
+                "inlier": inlier,
+                "dt_target": dt_t,
+                "dt_pose": dt_p,
+                "k_sec": k_sec,
+            }
+        )
+
+    stats: dict[str, float | None] = {}
+    median_k: float | None = None
+    if k_inliers:
+        arr = np.array(k_inliers, dtype=float)
+        median_k = float(np.median(arr))
+        stats = {
+            "median": median_k,
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+
+    n_inliers = len(k_inliers)
+    ok = n_inliers >= int(min_pairs) and median_k is not None
+    reason = None
+    if not ok:
+        reason = (
+            f"need >= {min_pairs} inlier pairs with valid EXIF; got {n_inliers}"
+        )
+
+    return {
+        "ok": ok,
+        "median_k_sec": median_k,
+        "pairs": pairs,
+        "stats": stats,
+        "n_inliers": n_inliers,
+        "n_targets": n_targets,
+        "reason": reason,
+    }
+
+
+def xyz_offset_datetime_matches_report(
+    target_cams: Cameras,
+    pose_cams: Cameras,
+    *,
+    scale_factor: float | None = 1.0,
+) -> dict:
+    """Estimate median pose-local ``[x,y,z]`` offset from time-matched camera pairs.
+
+    For each target camera with ``cam.datetime``, finds the pose camera with the same
+    datetime. Computes ``delta_world = (C_pose - C_target) * scale_factor`` (scale
+    when coords are in model units), then ``offset_xyz = R^T @ delta_world`` using the
+    orthonormalized rotation from the pose camera transform (matches
+    ``get_centers_and_transforms_based_on_timematch``).
+
+    Args:
+        target_cams: Target subset (datetimes must match pose after time offset).
+        pose_cams: Pose source subset.
+        scale_factor: Multiply center difference by this (1.0 if coords already meters).
+
+    Returns:
+        Dict with ``ok``, ``median_xyz``, ``mean_xyz``, ``rows`` (one dict per target),
+        and ``unmatched_ids`` if any target has no pose at same datetime.
+    """
+    sf = float(scale_factor) if scale_factor is not None else 1.0
+    rows: list[dict] = []
+    locals_list: list[np.ndarray] = []
+    unmatched: list[str] = []
+
+    for tcam in target_cams.data.values():
+        pose = pose_cams.get_camera_by_datetime(tcam.datetime)
+        if pose is None:
+            unmatched.append(str(tcam.cam_id))
+            rows.append(
+                {
+                    "target_id": tcam.cam_id,
+                    "pose_id": None,
+                    "error": "no pose camera with same datetime",
+                }
+            )
+            continue
+        if getattr(tcam, "missing_pose_from_meta", False):
+            rows.append(
+                {
+                    "target_id": tcam.cam_id,
+                    "pose_id": pose.cam_id,
+                    "skip_reason": (
+                        "missing_pose_in_meta (median xyz uses cameras with pose only; "
+                        "this camera omitted)"
+                    ),
+                }
+            )
+            continue
+        ct = np.asarray(tcam.coords, dtype=float).ravel()[:3]
+        cp = np.asarray(pose.coords, dtype=float).ravel()[:3]
+        delta_w = (cp - ct) * sf
+        r_mat = orthonormal_rotation_from_camera_transform(pose.camera_transform)
+        off = r_mat.T @ delta_w
+        locals_list.append(off)
+        rows.append(
+            {
+                "target_id": tcam.cam_id,
+                "pose_id": pose.cam_id,
+                "delta_world": delta_w.tolist(),
+                "offset_xyz_local": off.tolist(),
+            }
+        )
+
+    ok = len(unmatched) == 0
+    median_xyz: list[float] | None = None
+    mean_xyz: list[float] | None = None
+    if locals_list:
+        arr = np.stack(locals_list, axis=0)
+        median_xyz = np.median(arr, axis=0).tolist()
+        mean_xyz = np.mean(arr, axis=0).tolist()
+    elif ok:
+        median_xyz = [0.0, 0.0, 0.0]
+        mean_xyz = [0.0, 0.0, 0.0]
+
+    reason = None if ok else f"unmatched target ids: {unmatched}"
+
+    return {
+        "ok": ok,
+        "median_xyz": median_xyz,
+        "mean_xyz": mean_xyz,
+        "rows": rows,
+        "unmatched_ids": unmatched,
+        "reason": reason,
+    }
 
 
 class Camera:
