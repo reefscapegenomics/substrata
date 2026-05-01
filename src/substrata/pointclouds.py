@@ -26,6 +26,12 @@ if TYPE_CHECKING:  # hint-only imports
 
 logger = logging.getLogger(__name__)
 
+# Open3D's PLY reader uses int32 internally for the vertex count, so files
+# with more than ~2^31 vertices trigger the "number of vertex <= 0" warning.
+# We cap loads at this many vertices (a round 2 billion, comfortably under
+# 2^31 - 1 = 2,147,483,647) and stream-decimate larger files automatically.
+OPEN3D_MAX_VERTICES = 2_000_000_000
+
 # PLY scalar sizes (bytes) and struct codes
 ply_type_sizes = {
     "char": 1,
@@ -212,15 +218,57 @@ class PointCloud:
     ) -> None:
         """Read a pointcloud directly from a file.
 
-        If max_points is provided and the file is a binary PLY, stream-sample
-        at most max_points vertices (no full-file load).
+        If ``max_points`` is provided and the file is a binary PLY,
+        stream-sample at most ``max_points`` vertices (no full-file load).
+
+        For binary PLYs the vertex count is peeked from the header first;
+        if it exceeds :data:`OPEN3D_MAX_VERTICES` (Open3D's int32 limit,
+        ~2 billion) the load is automatically stream-decimated to that
+        cap to avoid Open3D's "number of vertex <= 0" overflow.
         """
         logger.info("Loading in pointcloud {}...".format(filepath))
         self.filepath = filepath
         is_ply = str(filepath).lower().endswith(".ply")
-        if max_points is not None and is_ply:
+
+        # For PLYs, peek the vertex count so we can cap loads above
+        # Open3D's int32 limit before invoking its native reader.
+        n_vertices: Optional[int] = None
+        if is_ply:
+            try:
+                with open(filepath, "rb") as fin:
+                    _, _, n_vertices, *_ = _parse_ply_header(fin)
+            except Exception as exc:
+                logger.warning(
+                    "Could not peek PLY header for %s (%s); deferring to "
+                    "Open3D directly.",
+                    filepath,
+                    exc,
+                )
+
+        # Decide an effective sampling target. If the file is too large
+        # for Open3D, force streaming with the cap; otherwise honor any
+        # user-supplied max_points.
+        effective_max: Optional[int] = max_points
+        if (
+            is_ply
+            and n_vertices is not None
+            and n_vertices > OPEN3D_MAX_VERTICES
+        ):
+            cap = OPEN3D_MAX_VERTICES
+            if effective_max is None or effective_max > cap:
+                logger.warning(
+                    "PLY %s has %d vertices, exceeding Open3D's safe limit "
+                    "(%d); stream-decimating to %d points on load.",
+                    filepath,
+                    n_vertices,
+                    OPEN3D_MAX_VERTICES,
+                    cap,
+                )
+                effective_max = cap
+
+        if effective_max is not None and is_ply:
             points, colors, normals = _stream_sample_ply_to_arrays(
-                filepath, int(max_points), show_progress=show_progress
+                filepath, int(effective_max), show_progress=show_progress
             )
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points)
@@ -240,8 +288,9 @@ class PointCloud:
                     "substrata streaming PLY reader.",
                     filepath,
                 )
-                with open(filepath, "rb") as fin:
-                    _, _, n_vertices, *_ = _parse_ply_header(fin)
+                if n_vertices is None:
+                    with open(filepath, "rb") as fin:
+                        _, _, n_vertices, *_ = _parse_ply_header(fin)
                 points, colors, normals = _stream_sample_ply_to_arrays(
                     filepath, n_vertices, show_progress=show_progress
                 )
