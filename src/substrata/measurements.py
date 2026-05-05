@@ -621,6 +621,7 @@ def calc_gap_fraction(
     color_output=True,
     max_radius=None,
     output_filename=None,
+    seed_points=None,
 ):
     """
     Calculate gap fraction based on hemispherical projection:
@@ -635,6 +636,14 @@ def calc_gap_fraction(
         output_filename: Optional filename to save the image. If None, the image
             is not saved to file. If not provided, uses default path based on
             annotation.id and settings.OUTPUT_FOLDER.
+        seed_points: Optional list of ``(x, y)`` tuples with proportional
+            coordinates in ``[0, 1]`` specifying flood-fill seed locations
+            (``x`` horizontal, ``y`` vertical, origin top-left). If ``None``,
+            the default seeds ``(0.5, 0.5)`` (image centre) and ``(0.25, 0.5)``
+            (an "upslope" point) are used. When provided, the seed points are
+            drawn as markers on the output image after the gap fraction is
+            calculated, so they do not affect the result and can be used to
+            iteratively tune their placement.
     """
 
     # Translate the point cloud by the negation of the center coordinates
@@ -695,19 +704,57 @@ def calc_gap_fraction(
         for i in range(len(trans_points)):
             image[cover_pixels[i][0], cover_pixels[i][1]] = [255, 255, 255]
 
-    # Apply floodFill algorithm to calculate center gap fraction
-    # using a center point and upslope point
-    # TODO: make this more general
-    seed_points = [[radius, radius], [radius // 2, radius]]
+    # Apply floodFill algorithm to calculate center gap fraction.
+    # By default, use a centre point and an "upslope" point; otherwise convert
+    # the user-supplied proportional coordinates to pixel coordinates.
+    if seed_points is None:
+        seed_points_px = [(radius, radius), (radius // 2, radius)]
+        visualize_seeds = False
+    else:
+        seed_points_px = [
+            (
+                int(round(sx * resolution)),
+                int(round(sy * resolution)),
+            )
+            for sx, sy in seed_points
+        ]
+        visualize_seeds = True
+
     diff = (1, 1, 1)
     fill_color = (0, 0, 255)
-    for seed_point in seed_points:
+    for seed_point in seed_points_px:
         retval, image, _, _ = cv2.floodFill(
             image, None, seed_point, fill_color, diff, diff
         )
 
     fill_pixel_count = cv2.countNonZero(cv2.inRange(image, fill_color, fill_color))
     gapF_fill = fill_pixel_count / img_area
+
+    # Draw seed markers AFTER counting so they don't affect gapF_fill.
+    # A high-contrast green cross with a thin black outline is used so the
+    # markers remain visible against the red sky, blue fill, and varied
+    # benthic colours.
+    if visualize_seeds:
+        marker_size = max(6, resolution // 25)
+        for seed_point in seed_points_px:
+            cv2.drawMarker(
+                image,
+                seed_point,
+                color=(0, 0, 0),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=marker_size,
+                thickness=3,
+                line_type=cv2.LINE_AA,
+            )
+            cv2.drawMarker(
+                image,
+                seed_point,
+                color=(0, 255, 0),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=marker_size,
+                thickness=1,
+                line_type=cv2.LINE_AA,
+            )
 
     # Output the image only if output_filename is provided
     if output_filename is not None:
