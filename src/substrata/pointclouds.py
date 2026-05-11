@@ -32,6 +32,68 @@ logger = logging.getLogger(__name__)
 # 2^31 - 1 = 2,147,483,647) and stream-decimate larger files automatically.
 OPEN3D_MAX_VERTICES = 2_000_000_000
 
+# Open3D stores xyz / rgb / normals as Eigen::Vector3d (3 * float64 = 24 B
+# per attribute per vertex). At full attributes (xyz + rgb + normals) that's
+# 72 B per vertex *inside the o3d PointCloud alone*. During the
+# stream-and-transfer load we ALSO transiently hold a float64 numpy buffer
+# per attribute, and at any one moment Open3D is allocating a fresh
+# Vector3dVector copy of one of those attributes (~24 B/vtx). The realistic
+# peak resident footprint is therefore steady_state + 24 B/vtx. To stay
+# clear of OOM on hosts with other consumers we cap the streaming load
+# target to a fraction of the *currently available* RAM. Override at
+# runtime by reassigning either of these module globals if needed.
+OPEN3D_MEMORY_BUDGET_FRACTION = 0.4
+# Transient overhead per vertex during Vector3dVector construction.
+_O3D_TRANSFER_OVERHEAD_BPV = 24
+# Floor used when /proc/meminfo and psutil are unavailable (very conservative).
+_FALLBACK_AVAILABLE_BYTES = 8 * 1024**3
+
+
+def _available_memory_bytes() -> int:
+    """Best-effort estimate of RAM available to this process, in bytes."""
+    try:  # Optional dep — psutil gives the most accurate "available" figure.
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:  # POSIX fallback (Linux/macOS): pages currently free.
+        return int(
+            os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        )
+    except (ValueError, OSError, AttributeError):
+        return _FALLBACK_AVAILABLE_BYTES
+
+
+def _o3d_bytes_per_vertex(has_rgb: bool, has_normals: bool) -> int:
+    """Resident bytes per vertex inside the final o3d.geometry.PointCloud."""
+    return 24 + (24 if has_rgb else 0) + (24 if has_normals else 0)
+
+
+def _o3d_peak_bytes_per_vertex(has_rgb: bool, has_normals: bool) -> int:
+    """Peak bytes per vertex during the stream-load and transfer to Open3D.
+
+    Equals the steady-state footprint plus a one-attribute transient
+    overhead for the in-flight Vector3dVector allocation.
+    """
+    return _o3d_bytes_per_vertex(has_rgb, has_normals) + _O3D_TRANSFER_OVERHEAD_BPV
+
+
+def _memory_safe_vertex_cap(
+    has_rgb: bool,
+    has_normals: bool,
+    fraction: Optional[float] = None,
+) -> int:
+    """How many vertices can be safely loaded into an o3d PointCloud here.
+
+    Uses the *peak* bytes-per-vertex (steady + transient transfer) so the
+    cap reflects the worst moment during construction, not the final size.
+    """
+    if fraction is None:
+        fraction = OPEN3D_MEMORY_BUDGET_FRACTION
+    peak_bpv = _o3d_peak_bytes_per_vertex(has_rgb, has_normals)
+    return max(1, int((_available_memory_bytes() * fraction) // peak_bpv))
+
 # PLY scalar sizes (bytes) and struct codes
 ply_type_sizes = {
     "char": 1,
@@ -230,13 +292,19 @@ class PointCloud:
         self.filepath = filepath
         is_ply = str(filepath).lower().endswith(".ply")
 
-        # For PLYs, peek the vertex count so we can cap loads above
-        # Open3D's int32 limit before invoking its native reader.
+        # For PLYs, peek the vertex count + property layout so we can cap
+        # loads above Open3D's int32 limit AND above the host's RAM budget
+        # before invoking its native reader.
         n_vertices: Optional[int] = None
+        has_rgb = False
+        has_normals = False
         if is_ply:
             try:
                 with open(filepath, "rb") as fin:
-                    _, _, n_vertices, *_ = _parse_ply_header(fin)
+                    _, _, n_vertices, vprops, _, _ = _parse_ply_header(fin)
+                prop_names = {n for _, n in vprops}
+                has_rgb = {"red", "green", "blue"}.issubset(prop_names)
+                has_normals = {"nx", "ny", "nz"}.issubset(prop_names)
             except Exception as exc:
                 logger.warning(
                     "Could not peek PLY header for %s (%s); deferring to "
@@ -245,38 +313,61 @@ class PointCloud:
                     exc,
                 )
 
-        # Decide an effective sampling target. If the file is too large
-        # for Open3D, force streaming with the cap; otherwise honor any
-        # user-supplied max_points.
+        # Decide an effective sampling target.
+        #
+        # - Open3D's int32 vertex-count limit is a HARD ceiling: anything
+        #   above it triggers "number of vertex <= 0" in the o3d PLY
+        #   reader, so we always clamp to OPEN3D_MAX_VERTICES.
+        # - The RAM budget is a SOFT default: applied only when the caller
+        #   did not pass max_points explicitly. If the user supplied
+        #   max_points (e.g. via -n), it wins over the memory cap so they
+        #   can override the default. The o3d PointCloud is ~72 B/vertex
+        #   with xyz + rgb + normals (24 B per attribute), and during the
+        #   numpy -> Vector3dVector transfer we transiently hold an extra
+        #   ~24 B/vertex copy of one attribute.
         effective_max: Optional[int] = max_points
-        if (
-            is_ply
-            and n_vertices is not None
-            and n_vertices > OPEN3D_MAX_VERTICES
-        ):
-            cap = OPEN3D_MAX_VERTICES
-            if effective_max is None or effective_max > cap:
+        if is_ply and n_vertices is not None:
+            if effective_max is None:
+                mem_cap = _memory_safe_vertex_cap(has_rgb, has_normals)
+                cap = min(OPEN3D_MAX_VERTICES, mem_cap)
+                if n_vertices > cap:
+                    reason = (
+                        "RAM budget" if mem_cap < OPEN3D_MAX_VERTICES
+                        else "Open3D int32 limit"
+                    )
+                    bpv = _o3d_bytes_per_vertex(has_rgb, has_normals)
+                    peak_bpv = _o3d_peak_bytes_per_vertex(has_rgb, has_normals)
+                    logger.warning(
+                        "PLY %s has %d vertices; capping load to %d (%s, "
+                        "~%.1f GB steady / ~%.1f GB peak in PointCloud at "
+                        "%d B/vtx steady, %d B/vtx peak with rgb=%s, "
+                        "normals=%s; pass max_points/-n explicitly to "
+                        "override).",
+                        filepath,
+                        n_vertices,
+                        cap,
+                        reason,
+                        cap * bpv / 1e9,
+                        cap * peak_bpv / 1e9,
+                        bpv,
+                        peak_bpv,
+                        has_rgb,
+                        has_normals,
+                    )
+                    effective_max = cap
+            elif effective_max > OPEN3D_MAX_VERTICES:
                 logger.warning(
-                    "PLY %s has %d vertices, exceeding Open3D's safe limit "
-                    "(%d); stream-decimating to %d points on load.",
-                    filepath,
-                    n_vertices,
+                    "Requested max_points (%d) exceeds Open3D's int32 limit "
+                    "(%d); clamping.",
+                    effective_max,
                     OPEN3D_MAX_VERTICES,
-                    cap,
                 )
-                effective_max = cap
+                effective_max = OPEN3D_MAX_VERTICES
 
         if effective_max is not None and is_ply:
-            points, colors, normals = _stream_sample_ply_to_arrays(
+            self.o3d_pcd = _stream_load_ply_into_o3d_pcd(
                 filepath, int(effective_max), show_progress=show_progress
             )
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points)
-            if colors is not None:
-                pcd.colors = o3d.utility.Vector3dVector(colors)
-            if normals is not None:
-                pcd.normals = o3d.utility.Vector3dVector(normals)
-            self.o3d_pcd = pcd
         elif is_ply:
             # Try Open3D first; fall back to the streaming parser when Open3D
             # rejects the file (e.g. Metashape exports with `double` xyz or
@@ -291,15 +382,9 @@ class PointCloud:
                 if n_vertices is None:
                     with open(filepath, "rb") as fin:
                         _, _, n_vertices, *_ = _parse_ply_header(fin)
-                points, colors, normals = _stream_sample_ply_to_arrays(
+                pcd = _stream_load_ply_into_o3d_pcd(
                     filepath, n_vertices, show_progress=show_progress
                 )
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(points)
-                if colors is not None:
-                    pcd.colors = o3d.utility.Vector3dVector(colors)
-                if normals is not None:
-                    pcd.normals = o3d.utility.Vector3dVector(normals)
             self.o3d_pcd = pcd
         else:
             self.o3d_pcd = o3d.io.read_point_cloud(filepath, print_progress=True)
@@ -1781,6 +1866,49 @@ def ply_head(input_path: str, n: int = 5, print_output: bool = True):
             raise ValueError(f"Unsupported PLY format: {fmt}")
 
     return records
+
+
+def _stream_load_ply_into_o3d_pcd(
+    filepath: str,
+    target_points: int,
+    show_progress: bool = True,
+) -> o3d.geometry.PointCloud:
+    """Stream-sample a PLY and build an o3d.PointCloud, freeing transients.
+
+    ``o3d.utility.Vector3dVector(arr)`` copies ``arr`` into Open3D's internal
+    Eigen storage; for very large point clouds (e.g. hundreds of millions of
+    vertices) each numpy attribute is ~24 B/vtx, so naive code that keeps
+    references alive while copying balloons peak RSS toward 2× the
+    steady-state footprint.
+
+    To actually free the numpy buffers during transfer, the streaming call
+    must live *inside* the function that does the transfer — otherwise the
+    caller's locals keep the buffers alive until its frame returns.
+    This helper owns the only references to the numpy arrays it builds and
+    clears each one immediately after handing it to Open3D, keeping peak
+    RSS close to the final PointCloud size.
+
+    Args:
+        filepath: Path to the binary PLY file.
+        target_points: Maximum number of points to stream-sample.
+        show_progress: Whether to display the tqdm progress bar.
+
+    Returns:
+        A populated ``o3d.geometry.PointCloud``.
+    """
+    points, colors, normals = _stream_sample_ply_to_arrays(
+        filepath, int(target_points), show_progress=show_progress
+    )
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    points = None  # drop ref so the ~k*24 B numpy buffer is freed now
+    if colors is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        colors = None
+    if normals is not None:
+        pcd.normals = o3d.utility.Vector3dVector(normals)
+        normals = None
+    return pcd
 
 
 def _stream_sample_ply_to_arrays(

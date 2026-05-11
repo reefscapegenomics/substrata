@@ -62,6 +62,120 @@ def _parse_xyz_csv(s: str) -> list[float]:
         raise SystemExit(f"Invalid xyz values: {s!r} ({e})") from e
 
 
+def _parse_pose_time_arg(raw: str, fallback_date: str) -> str:
+    """Parse a pose-source timestamp string into EXIF format.
+
+    Accepts:
+      * ``YYYY:MM:DD HH:MM:SS`` (EXIF form)
+      * ``YYYY-MM-DD HH:MM:SS`` (dashed date)
+      * ``YYYY-MM-DDTHH:MM:SS`` (ISO-like)
+      * ``HH:MM:SS`` (time-only; uses ``fallback_date`` for the date)
+
+    Args:
+        raw: User-supplied string.
+        fallback_date: Date string (``YYYY:MM:DD`` or ``YYYY-MM-DD``) used
+            when ``raw`` is time-only.
+
+    Returns:
+        Timestamp formatted as ``"%Y:%m:%d %H:%M:%S"``.
+
+    Raises:
+        SystemExit: If ``raw`` cannot be parsed.
+    """
+    import datetime as _dt
+
+    s = (raw or "").strip()
+    if not s:
+        raise SystemExit("Empty pose-source timestamp.")
+
+    candidates = (
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y:%m:%dT%H:%M:%S",
+    )
+    for fmt in candidates:
+        try:
+            return _dt.datetime.strptime(s, fmt).strftime("%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            continue
+
+    try:
+        t = _dt.datetime.strptime(s, "%H:%M:%S").time()
+    except ValueError:
+        raise SystemExit(
+            "Could not parse pose-source timestamp "
+            f"{raw!r}.\n  Expected one of: 'YYYY:MM:DD HH:MM:SS', "
+            "'YYYY-MM-DD HH:MM:SS', or 'HH:MM:SS' (date taken from suggested)."
+        ) from None
+    date_norm = fallback_date.replace("-", ":")[:10]
+    try:
+        d = _dt.datetime.strptime(date_norm, "%Y:%m:%d").date()
+    except ValueError:
+        raise SystemExit(
+            f"Invalid fallback date {fallback_date!r} for time-only "
+            "pose-source timestamp."
+        ) from None
+    return _dt.datetime.combine(d, t).strftime("%Y:%m:%d %H:%M:%S")
+
+
+def _resolve_dates(cams, flag_value: str | None, label: str, interactive: bool):
+    """Resolve a date filter for one side of camsync.
+
+    If ``flag_value`` is set, parse and validate it against the dates present
+    in ``cams``. Otherwise, in interactive TTY mode, print a per-date count
+    histogram and prompt the user. Returns ``None`` when no filter should be
+    applied (single date present, or user accepts "all" at the prompt).
+
+    Args:
+        cams: A ``Cameras`` instance with ``cam.datetime`` already populated.
+        flag_value: Raw CLI argument value (e.g. ``"2026-04-05,2026-04-06"``)
+            or ``None``.
+        label: Human label used in prompts/messages (e.g. ``"Pose-source"``).
+        interactive: Whether stdin is a TTY (controls prompting).
+
+    Returns:
+        list[str] | None: Normalized list of ``YYYY:MM:DD`` to keep, or
+        ``None`` to indicate no filter.
+    """
+    counts = cams.datetime_date_counts()
+
+    if flag_value is not None:
+        raw_parts = [p.strip() for p in flag_value.split(",") if p.strip()]
+        if not raw_parts:
+            raise SystemExit(f"--{label.lower()}-date value is empty.")
+        wanted = [p.replace("-", ":")[:10] for p in raw_parts]
+        missing = [d for d in wanted if d not in counts]
+        if missing:
+            avail = ", ".join(f"{d} ({n})" for d, n in counts.items()) or "<none>"
+            raise SystemExit(
+                f"{label} date(s) not found in EXIF: {missing}. "
+                f"Available: {avail}."
+            )
+        return wanted
+
+    if not interactive or len(counts) <= 1:
+        return None
+
+    print(f"\n{label} dates (cam counts):")
+    for d, n in counts.items():
+        print(f"  {d}  {n:>5d} cams")
+    raw = input(
+        f"{label} date(s) [comma-separated; Enter for all]: "
+    ).strip()
+    if raw == "":
+        return None
+    raw_parts = [p.strip() for p in raw.split(",") if p.strip()]
+    wanted = [p.replace("-", ":")[:10] for p in raw_parts]
+    missing = [d for d in wanted if d not in counts]
+    if missing:
+        avail = ", ".join(f"{d} ({n})" for d, n in counts.items())
+        raise SystemExit(
+            f"{label} date(s) not found in EXIF: {missing}. Available: {avail}."
+        )
+    return wanted
+
+
 def _camsync_summary_figure(summary: dict):
     """Return a matplotlib Figure with a text summary of the camsync run."""
     import matplotlib
@@ -528,10 +642,11 @@ def handle_colors(args):
             "No markers file found. Provide --markers or set markers in the project YAML."
         )
 
-    # Stream-decimate only for the default YAML PLY; explicit --input/--ply is always full load.
+    # If -n/--points is provided, always honor it (streaming load with that
+    # cap), regardless of whether the PLY came from --input or the YAML.
+    # Without -n, defer to the full project initializer; PointCloud's
+    # memory-aware cap will still protect against OOM on huge files.
     points_cap = getattr(args, "points", None)
-    if args.input:
-        points_cap = None
 
     if points_cap is not None:
         pcd_path = init.ply_filepath
@@ -1110,6 +1225,39 @@ def handle_camsync(args):
     if pose_id == tgt_id:
         raise SystemExit("Pose source and updated target must be different sensors.")
 
+    # Raw EXIF on both subsets (same chunk, comparable centers). Needed early
+    # for date-based subsetting below.
+    pose_cams.get_datetime_originals()
+    updated_cams.get_datetime_originals()
+
+    pose_dates = _resolve_dates(
+        pose_cams, getattr(args, "pose_date", None), "Pose-source", interactive
+    )
+    target_dates = _resolve_dates(
+        updated_cams, getattr(args, "target_date", None), "Updated-target", interactive
+    )
+    if pose_dates is not None:
+        pose_cams = pose_cams.subset_by_dates(pose_dates)
+        if not pose_cams.data:
+            raise SystemExit(
+                f"No pose-source cameras left after date filter: {pose_dates}."
+            )
+        print(
+            f"Pose-source filtered to {len(pose_cams.data)} cam(s) on "
+            f"{pose_dates}."
+        )
+    if target_dates is not None:
+        updated_cams = updated_cams.subset_by_dates(target_dates)
+        if not updated_cams.data:
+            raise SystemExit(
+                f"No updated-target cameras left after date filter: "
+                f"{target_dates}."
+            )
+        print(
+            f"Updated-target filtered to {len(updated_cams.data)} cam(s) on "
+            f"{target_dates}."
+        )
+
     auto_time = bool(
         getattr(args, "auto_offsets", False) or getattr(args, "auto_time", False)
     )
@@ -1123,20 +1271,23 @@ def handle_camsync(args):
     spatial_max_m = float(getattr(args, "spatial_max_dist", 0.5))
     min_pairs = int(getattr(args, "min_spatial_pairs", 3))
 
-    if auto_time and getattr(args, "time_offset", None) is not None:
+    cli_time_offset = getattr(args, "time_offset", None)
+    cli_pose_time = getattr(args, "pose_time", None)
+    if cli_time_offset is not None and cli_pose_time is not None:
+        raise SystemExit(
+            "--time-offset and --pose-time are mutually exclusive; pass only one."
+        )
+    if auto_time and (cli_time_offset is not None or cli_pose_time is not None):
+        which = "--time-offset" if cli_time_offset is not None else "--pose-time"
         print(
             "Note: --auto-time/--auto-offsets takes precedence; "
-            "ignoring explicit --time-offset."
+            f"ignoring explicit {which}."
         )
 
     manual_xyz = getattr(args, "xyz", None)
 
     if auto_xyz and manual_xyz:
         print("Note: --auto-xyz/--auto-offsets takes precedence; ignoring --xyz.")
-
-    # Raw EXIF on both subsets (same chunk, comparable centers).
-    pose_cams.get_datetime_originals()
-    updated_cams.get_datetime_originals()
 
     spatial_report = None
     if auto_time:
@@ -1169,34 +1320,56 @@ def handle_camsync(args):
                 f"earliest-EXIF delta: k = {time_offset} s "
                 f"(pose earliest {dt_pose!r}, target earliest {dt_tgt!r})."
             )
-    elif getattr(args, "time_offset", None) is not None:
-        time_offset = float(args.time_offset)
+    elif cli_time_offset is not None:
+        time_offset = float(cli_time_offset)
     else:
         dt_pose, _ = pose_cams.earliest_exif_datetime()
         dt_tgt, _ = updated_cams.earliest_exif_datetime()
         if dt_pose is None or dt_tgt is None:
             raise SystemExit(
-                "Could not read EXIF DateTimeOriginal for the earliest image in one "
-                "or both subsets; set --time-offset explicitly."
+                "Could not read EXIF DateTimeOriginal for the earliest image in "
+                "one or both subsets; set --time-offset or --pose-time explicitly."
             )
-        suggested = float(get_time_diff_in_secs(dt_pose, dt_tgt))
-        if interactive:
+        suggested_pose_ts = dt_pose
+        if cli_pose_time is not None:
+            chosen_pose_ts = _parse_pose_time_arg(
+                cli_pose_time, fallback_date=suggested_pose_ts[:10]
+            )
+            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
             print(
-                f"Earliest pose-source EXIF: {dt_pose}\n"
+                f"Using --pose-time {cli_pose_time!r} -> {chosen_pose_ts} "
+                f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
+            )
+        elif interactive:
+            print(
                 f"Earliest updated-target EXIF: {dt_tgt}\n"
-                "Suggested time offset (seconds, applied to updated-target EXIF): "
-                f"{suggested}"
+                f"Earliest pose-source EXIF:    {dt_pose}\n"
+                f"Suggested pose-source timestamp matching earliest target: "
+                f"{suggested_pose_ts}"
             )
             raw = input(
-                "Enter time offset in seconds for updated-target EXIF "
-                "[Enter to use suggested]: "
+                "Enter pose-source timestamp matching earliest target.\n"
+                "  Format: 'YYYY:MM:DD HH:MM:SS' or 'HH:MM:SS' "
+                "(date from suggested if time-only).\n"
+                "  [Enter to use suggested]: "
             ).strip()
-            time_offset = suggested if raw == "" else float(raw)
-        else:
-            time_offset = suggested
+            if raw == "":
+                chosen_pose_ts = suggested_pose_ts
+            else:
+                chosen_pose_ts = _parse_pose_time_arg(
+                    raw, fallback_date=suggested_pose_ts[:10]
+                )
+            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
             print(
-                f"Using suggested time offset {time_offset} s "
-                f"(pose earliest {dt_pose}, target earliest {dt_tgt})."
+                f"Using pose-source timestamp {chosen_pose_ts} "
+                f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
+            )
+        else:
+            chosen_pose_ts = suggested_pose_ts
+            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
+            print(
+                f"Using suggested pose-source timestamp {chosen_pose_ts} "
+                f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
             )
 
     updated_cams.get_datetime_originals(offset_secs=time_offset)
@@ -1230,8 +1403,10 @@ def handle_camsync(args):
         if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("Aborted.")
 
-    updated_cams.get_centers_and_transforms_based_on_timematch(
-        pose_cams, offset_xyz=offset_xyz
+    matched_ids, unmatched_ids = (
+        updated_cams.get_centers_and_transforms_based_on_timematch(
+            pose_cams, offset_xyz=offset_xyz
+        )
     )
 
     intercept_r = 0.01
@@ -1241,6 +1416,8 @@ def handle_camsync(args):
         "project_id": init.id,
         "pose_source": pose_id,
         "updated_target": tgt_id,
+        "pose_dates": pose_dates,
+        "target_dates": target_dates,
         "offset_xyz": offset_xyz,
         "time_offset_sec": float(time_offset),
         "scale_factor": scale_factor,
@@ -1252,9 +1429,13 @@ def handle_camsync(args):
         "spatial_max_dist": spatial_max_m,
         "min_spatial_pairs": min_pairs,
         "cli_time_offset": getattr(args, "time_offset", None),
+        "cli_pose_time": getattr(args, "pose_time", None),
         "cli_xyz": getattr(args, "xyz", None),
         "intercept_search_radius": intercept_r,
         "pcd_loaded": getattr(init, "pcd", None) is not None,
+        "n_matched": len(matched_ids),
+        "n_unmatched": len(unmatched_ids),
+        "unmatched_cam_ids": unmatched_ids,
     }
 
     _write_camsync_sanity_pdf(
@@ -1267,10 +1448,21 @@ def handle_camsync(args):
         intercept_search_radius=intercept_r,
     )
 
+    matched_set = set(matched_ids)
     n_tgt = len(updated_cams.data)
+    n_enabled = 0
+    n_disabled = 0
     for cam in updated_cams.data.values():
-        cam.enabled = True
-    print(f"Set enabled=True on {n_tgt} target sensor camera(s) before save.")
+        if str(cam.cam_id) in matched_set:
+            cam.enabled = True
+            n_enabled += 1
+        else:
+            cam.enabled = False
+            n_disabled += 1
+    print(
+        f"Set enabled=True on {n_enabled}/{n_tgt} target sensor camera(s) "
+        f"(disabled {n_disabled} unmatched) before save."
+    )
 
     init.cams.save()
 
@@ -2070,6 +2262,28 @@ def main():
         ),
     )
     p_camsync.add_argument(
+        "--pose-date",
+        dest="pose_date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD[,...]",
+        help=(
+            "Filter pose-source cameras to one or more EXIF dates (comma-"
+            "separated). If omitted in TTY, prompts when multiple dates exist."
+        ),
+    )
+    p_camsync.add_argument(
+        "--target-date",
+        dest="target_date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD[,...]",
+        help=(
+            "Filter updated-target cameras to one or more EXIF dates (comma-"
+            "separated). If omitted in TTY, prompts when multiple dates exist."
+        ),
+    )
+    p_camsync.add_argument(
         "--time-offset",
         "-t",
         dest="time_offset",
@@ -2077,7 +2291,22 @@ def main():
         default=None,
         help=(
             "Seconds added to updated-target EXIF datetimes before matching. "
-            "If omitted, suggests offset from earliest EXIF in each subset (TTY: prompt)."
+            "Mutually exclusive with --pose-time. If both are omitted, "
+            "prompts in TTY for a pose-source timestamp (or uses suggested "
+            "in non-TTY)."
+        ),
+    )
+    p_camsync.add_argument(
+        "--pose-time",
+        dest="pose_time",
+        type=str,
+        default=None,
+        metavar="TIMESTAMP",
+        help=(
+            "Pose-source timestamp matching the earliest updated-target "
+            "image. Accepts 'YYYY:MM:DD HH:MM:SS', 'YYYY-MM-DD HH:MM:SS', "
+            "or 'HH:MM:SS' (date taken from earliest pose-source EXIF). "
+            "Mutually exclusive with --time-offset."
         ),
     )
     p_camsync.add_argument(

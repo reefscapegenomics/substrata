@@ -381,6 +381,51 @@ class Cameras:
             print(f"No cameras found with sensor_id={sensor_id}")
         return cameras_subset
 
+    def subset_by_dates(self, dates: list[str]) -> "Cameras":
+        """Return a subset of cameras whose EXIF date matches one of ``dates``.
+
+        Matches the first 10 characters of ``cam.datetime`` (``YYYY:MM:DD``).
+        Input dates may use either ``YYYY-MM-DD`` or ``YYYY:MM:DD`` form and
+        are normalized internally. Cameras without ``cam.datetime`` set are
+        excluded. Assumes :meth:`get_datetime_originals` has already been
+        called on this container.
+
+        Args:
+            dates: Iterable of date strings (``YYYY-MM-DD`` or ``YYYY:MM:DD``).
+
+        Returns:
+            Cameras: New container with cameras whose EXIF date matches.
+        """
+        wanted = {d.replace("-", ":")[:10] for d in dates}
+        cameras_subset = self._empty_like()
+        for cam in self.data.values():
+            dt = getattr(cam, "datetime", None)
+            if dt is None:
+                continue
+            if str(dt)[:10] in wanted:
+                cameras_subset.data[cam.cam_id] = cam
+                cam.parent = cameras_subset
+        return cameras_subset
+
+    def datetime_date_counts(self) -> dict[str, int]:
+        """Count cameras per EXIF date (``YYYY:MM:DD``).
+
+        Assumes :meth:`get_datetime_originals` has already been called.
+        Cameras without ``cam.datetime`` set are skipped.
+
+        Returns:
+            dict[str, int]: Ordered mapping of ``YYYY:MM:DD`` to camera count,
+            sorted ascending by date.
+        """
+        counts: dict[str, int] = {}
+        for cam in self.data.values():
+            dt = getattr(cam, "datetime", None)
+            if dt is None:
+                continue
+            day = str(dt)[:10]
+            counts[day] = counts.get(day, 0) + 1
+        return dict(sorted(counts.items()))
+
     # Convenience alias to match the requested call-site: Cameras.group("name")
     def group(self, group_name):
         return self.subset_by_group(group_name)
@@ -802,14 +847,25 @@ class Cameras:
     def get_centers_and_transforms_based_on_timematch(
         self, other_cams, offset_xyz=None
     ):
-        """
-        Adopt the centers and transform from other cameras based on a timesync.
-        Provide an offset_xyz in the camera's local coordinate system to apply to the camera positions.
+        """Adopt centers and transforms from ``other_cams`` via exact datetime match.
+
+        Cameras in ``self`` whose ``datetime`` has no exact string match in
+        ``other_cams`` are left untouched, tagged with
+        ``missing_pose_from_timematch = True``, and reported via a single
+        ``logger.warning``. A ``ValueError`` is raised only if zero cameras
+        matched (which almost always indicates a wrong ``--time-offset``).
 
         Args:
-            other_cams (Cameras): The other cameras to match against.
-            offset_xyz (array-like): [x, y, z] offsets in the camera's local coordinate system.
+            other_cams: The other ``Cameras`` to match against.
+            offset_xyz: ``[x, y, z]`` offset in the camera's local frame, applied
+                to the matched pose before writing back to ``self``.
+
+        Returns:
+            tuple[list[str], list[str]]: ``(matched_cam_ids, unmatched_cam_ids)``.
         """
+        n_matched = 0
+        matched_ids: list[str] = []
+        unmatched: list[tuple[str, str]] = []  # (cam_id, datetime)
         for cam in self.data.values():
             other_cam = other_cams.get_camera_by_datetime(cam.datetime)
             if other_cam is not None:
@@ -844,10 +900,70 @@ class Cameras:
                     cam.orig_camera_transform = other_cam.orig_camera_transform
                 if hasattr(cam, "missing_pose_from_meta"):
                     delattr(cam, "missing_pose_from_meta")
+                if hasattr(cam, "missing_pose_from_timematch"):
+                    delattr(cam, "missing_pose_from_timematch")
+                matched_ids.append(str(cam.cam_id))
+                n_matched += 1
             else:
+                cam.missing_pose_from_timematch = True
+                unmatched.append((str(cam.cam_id), str(cam.datetime)))
+
+        unmatched_ids = [cid for cid, _ in unmatched]
+
+        if unmatched:
+            from substrata.firefish import get_time_diff_in_secs
+
+            other_dts = sorted(
+                str(c.datetime)
+                for c in other_cams.data.values()
+                if getattr(c, "datetime", None) is not None
+            )
+            first_id, first_dt = unmatched[0]
+            closest_info = ""
+            if other_dts:
+                try:
+                    diffs = [
+                        (abs(get_time_diff_in_secs(d, first_dt)), d) for d in other_dts
+                    ]
+                    _, closest = min(diffs, key=lambda x: x[0])
+                    signed = get_time_diff_in_secs(closest, first_dt)
+                    closest_info = (
+                        f"\n  Closest other_cams datetime to first unmatched: "
+                        f"{closest} (off by {signed:+.1f}s)."
+                    )
+                except Exception:
+                    pass
+            range_info = (
+                f"\n  other_cams datetime range: [{other_dts[0]} .. {other_dts[-1]}] "
+                f"(n={len(other_dts)})"
+                if other_dts
+                else "\n  other_cams have no datetimes set."
+            )
+            preview = ", ".join(f"{cid}@{dt}" for cid, dt in unmatched[:6])
+            more = "" if len(unmatched) <= 6 else f", ... (+{len(unmatched) - 6} more)"
+            unmatched_list = f"\n  Unmatched: {preview}{more}"
+            summary = (
+                f"Time-match: {len(unmatched)}/{len(self.data)} target cameras "
+                f"had no exact datetime match in other_cams "
+                f"(matched {n_matched}/{len(self.data)})."
+                f"{range_info}"
+                f"{closest_info}"
+                f"{unmatched_list}"
+                "\n  Matching is exact on DateTimeOriginal; these cameras may "
+                "fall outside the other_cams time range (e.g. source video "
+                "cut out early) or indicate a wrong --time-offset."
+            )
+            if n_matched == 0:
                 raise ValueError(
-                    f"No camera found for camera {cam.cam_id} with datetime {cam.datetime}"
+                    "Time-match failed: 0 cameras matched. " + summary
                 )
+            logger.warning(
+                "%s\n  Unmatched cameras were left untouched and tagged with "
+                "missing_pose_from_timematch=True.",
+                summary,
+            )
+
+        return matched_ids, unmatched_ids
 
     def set_filepath_replace(self, find_str, replace_str):
         """Set a find/replace pair for adjusting filepaths.
@@ -1912,12 +2028,25 @@ class Camera:
                     return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
                 else:
                     return dt_orig
-            else:
-                logger.error(f"No exif DateTimeOriginal for: {self.filepath}")
-                return None
-        else:
-            logger.error(f"No exif data for: {self.filepath}")
-            return None
+
+        # Final fallback: parse "..._YYYYMMDD_HHMMSS" suffix from the filename
+        # (e.g. for ffmpeg-extracted video frames that carry no EXIF segment).
+        match = re.search(
+            r"_(\d{8})_(\d{6})(?=\.[^.]+$|$)", os.path.basename(self.filepath)
+        )
+        if match:
+            try:
+                dt = datetime.datetime.strptime(
+                    match.group(1) + match.group(2), "%Y%m%d%H%M%S"
+                )
+                if offset_secs is not None:
+                    dt = dt + datetime.timedelta(seconds=offset_secs)
+                return dt.strftime("%Y:%m:%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        logger.error(f"No exif data for: {self.filepath}")
+        return None
 
     def has_coords_datetime(self):
         return (

@@ -130,6 +130,11 @@ COLORCHECKER_MARKER_V_MAX = (_MARKER_SPAN_V - _TL_TO_PATCHES_TOP) / _PATCH_GRID_
 DEFAULT_COLOR_CALIBRATION_RADIUS = 0.005
 DEFAULT_COLOR_CALIBRATION_PLANE_EPSILON = 0.003
 COLOR_CALIBRATION_OUTLIER_Z = 2.5
+# Minimum number of points (after radius + plane filtering) required for a
+# patch to produce a measured median; below this, the patch is treated as
+# "no data" and excluded from aggregation/QC.  Prevents 1-2 spurious points
+# captured outside the chart from producing a garbage measurement.
+DEFAULT_COLOR_CALIBRATION_MIN_POINTS = 5
 
 # Per card: [tl, bl, tr, br, name]  (name is optional).
 RGL_COLOR_CALIBRATIONS = [

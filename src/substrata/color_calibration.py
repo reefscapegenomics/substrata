@@ -197,6 +197,7 @@ class ColorCalibration:
         marker_v_min: Optional[float] = None,
         marker_u_max: Optional[float] = None,
         marker_v_max: Optional[float] = None,
+        min_points: Optional[int] = None,
     ) -> None:
         """Sample the point cloud at each patch center and store results.
 
@@ -207,6 +208,10 @@ class ColorCalibration:
             plane_epsilon: Max distance to fitted plane through corners; None skips filter.
             marker_u_min, marker_v_min, marker_u_max, marker_v_max: Override
                 the marker-quad bounds in chart UV (defaults from settings).
+            min_points: Minimum point count (after radius + plane filter)
+                required for a patch to produce a median. Patches below this
+                threshold get ``median_rgb_0_1 = None``. Defaults to
+                ``settings.DEFAULT_COLOR_CALIBRATION_MIN_POINTS``.
         """
         self.patch_results = []
         if not self.has_all_corners():
@@ -221,6 +226,11 @@ class ColorCalibration:
             float(plane_epsilon)
             if plane_epsilon is not None
             else float(settings.DEFAULT_COLOR_CALIBRATION_PLANE_EPSILON)
+        )
+        min_pts = (
+            int(min_points)
+            if min_points is not None
+            else int(settings.DEFAULT_COLOR_CALIBRATION_MIN_POINTS)
         )
         u_lo = (
             float(marker_u_min)
@@ -263,7 +273,11 @@ class ColorCalibration:
                     mask = dist <= eps
                     pts = pts[mask]
                     cols = cols[mask]
-                median_col = median_rgb_0_1(cols)
+                # Treat very-low-count patches as "no data" so a couple of
+                # spurious points outside the chart cannot produce a measured
+                # median.
+                if pts.shape[0] >= max(1, min_pts):
+                    median_col = median_rgb_0_1(cols)
             ref = np.array([ref_r, ref_g, ref_b], dtype=float)
             self.patch_results.append(
                 {
@@ -417,6 +431,7 @@ class ColorCalibrations:
         marker_v_min: Optional[float] = None,
         marker_u_max: Optional[float] = None,
         marker_v_max: Optional[float] = None,
+        min_points: Optional[int] = None,
     ) -> None:
         """Sample all cards and compute cross-card medians and outlier flags.
 
@@ -428,6 +443,9 @@ class ColorCalibrations:
             plane_epsilon: Max distance to corner plane; None uses settings default.
             marker_u_min, marker_v_min, marker_u_max, marker_v_max: Override
                 the marker-quad bounds in chart UV (defaults from settings).
+            min_points: Minimum point count (after radius + plane filter)
+                required for a patch to produce a median.  Defaults to
+                ``settings.DEFAULT_COLOR_CALIBRATION_MIN_POINTS``.
         """
         self.pcd = pcd
         u_lo = (
@@ -469,6 +487,7 @@ class ColorCalibrations:
                 marker_v_min=v_lo,
                 marker_u_max=u_hi,
                 marker_v_max=v_hi,
+                min_points=min_points,
             )
 
         valid_cards = [
@@ -624,6 +643,7 @@ class ColorCalibrations:
                 f"v=[{self._last_marker_v_min:.4f}, {self._last_marker_v_max:.4f}]"
             )
         figs.append(visualizations.plot_text(self._qc_summary_text(), width=10, height=6))
+        aggregating = set(self._aggregation_card_indices or ())
         for i, card in enumerate(self.data):
             if i in self._excluded_card_indices:
                 continue
@@ -634,10 +654,14 @@ class ColorCalibrations:
                 if self.outlier_mask is not None
                 else np.zeros(len(card.patch_results), dtype=bool)
             )
+            status = "" if i in aggregating else "  [EXCLUDED: missing patches]"
             fig = visualizations.plot_colorchecker_qc_grid(
                 card.patch_results,
-                title=f"Card {i + 1}: {card.name or card.tl_label + ' … ' + card.br_label}"
-                      f"\n{title_extra}",
+                title=(
+                    f"Card {i + 1}: "
+                    f"{card.name or card.tl_label + ' … ' + card.br_label}"
+                    f"{status}\n{title_extra}"
+                ),
                 outlier_mask=om,
             )
             figs.append(fig)
@@ -700,6 +724,7 @@ class ColorCalibrations:
                 self.color_correction = None
 
         sample_r = float(settings.DEFAULT_COLOR_CALIBRATION_RADIUS)
+        aggregating = set(self._aggregation_card_indices or ())
 
         figs: List[Any] = []
         for i, card in enumerate(self.data):
@@ -736,9 +761,11 @@ class ColorCalibrations:
                 pr["world_xyz"] for pr in card.patch_results
             ])
             patch_names = [pr["name"] for pr in card.patch_results]
+            status = "" if i in aggregating else "  [EXCLUDED: missing patches]"
             card_title = (
                 f"Card {i + 1}: "
                 f"{card.name or card.tl_label + ' … ' + card.br_label}"
+                f"{status}"
             )
 
             om = (

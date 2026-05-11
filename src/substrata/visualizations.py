@@ -650,6 +650,7 @@ def _render_comparison_grid_on_ax(
     if title:
         ax.set_title(title, fontsize=9)
 
+    inset = border_w / 2
     for idx in range(n_rows * n_cols):
         row, col = divmod(idx, n_cols)
         if idx >= len(patch_results):
@@ -665,15 +666,28 @@ def _render_comparison_grid_on_ax(
         med = pr.get("median_rgb_0_1")
         if med is not None:
             meas = np.clip(np.asarray(med, dtype=float), 0, 1)
+            ax.add_patch(mpatches.Rectangle(
+                (col - 0.5 + inset, row - 0.5 + inset),
+                1.0 - 2 * inset, 1.0 - 2 * inset,
+                facecolor=meas, edgecolor="none",
+            ))
         else:
-            meas = (0.3, 0.3, 0.3)
-
-        inset = border_w / 2
-        ax.add_patch(mpatches.Rectangle(
-            (col - 0.5 + inset, row - 0.5 + inset),
-            1.0 - 2 * inset, 1.0 - 2 * inset,
-            facecolor=meas, edgecolor="none",
-        ))
+            ax.add_patch(mpatches.Rectangle(
+                (col - 0.5 + inset, row - 0.5 + inset),
+                1.0 - 2 * inset, 1.0 - 2 * inset,
+                facecolor="white", edgecolor="0.4", linewidth=0.5,
+            ))
+            x0 = col - 0.5 + inset
+            y0 = row - 0.5 + inset
+            s = 1.0 - 2 * inset
+            ax.plot(
+                [x0, x0 + s], [y0, y0 + s],
+                color="0.4", linewidth=1.2, clip_on=True,
+            )
+            ax.plot(
+                [x0 + s, x0], [y0, y0 + s],
+                color="0.4", linewidth=1.2, clip_on=True,
+            )
 
         if outlier_mask is not None and idx < len(outlier_mask) and outlier_mask[idx]:
             x0, y0 = col - 0.5, row - 0.5
@@ -782,7 +796,26 @@ def _render_swatch_grid_on_ax(
         row, col = divmod(idx, n_cols)
         if idx >= len(colors_255):
             continue
-        c = np.clip(np.asarray(colors_255[idx], dtype=float) / 255.0, 0, 1)
+        raw = np.asarray(colors_255[idx], dtype=float)
+        if not np.all(np.isfinite(raw)):
+            ax.add_patch(mpatches.Rectangle(
+                (col - 0.5, row - 0.5), 1.0, 1.0,
+                facecolor="white", edgecolor="0.4", linewidth=0.5,
+            ))
+            ax.plot(
+                [col - 0.5, col + 0.5], [row - 0.5, row + 0.5],
+                color="0.4", linewidth=1.2,
+            )
+            ax.plot(
+                [col + 0.5, col - 0.5], [row - 0.5, row + 0.5],
+                color="0.4", linewidth=1.2,
+            )
+            ax.text(
+                col, row, patch_names[idx], ha="center", va="center",
+                fontsize=5, color="0.4",
+            )
+            continue
+        c = np.clip(raw / 255.0, 0, 1)
         ax.add_patch(mpatches.Rectangle(
             (col - 0.5, row - 0.5), 1.0, 1.0,
             facecolor=c, edgecolor="grey", linewidth=0.3,
