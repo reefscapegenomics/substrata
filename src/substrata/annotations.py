@@ -853,7 +853,7 @@ class Annotations:
 
         # Assign results back to annotations and apply world transform so that
         # simple_pcd.points are in the same space as ann.coords (not orig_coords)
-        apply_transform = not self.world_transform_is_identity()
+        apply_transform = not self.world_transform_is_identity
         for ann_id, neighborhood in zip(ann_ids, neighborhoods):
             if apply_transform:
                 neighborhood.transform(self.world_transform)
