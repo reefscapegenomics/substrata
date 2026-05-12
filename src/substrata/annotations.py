@@ -859,6 +859,73 @@ class Annotations:
             f"Loaded undecimated neighborhoods for {len(neighborhoods)} annotations"
         )
 
+    def load_measurements_from_csv(
+        self,
+        filepath: str,
+        id_column: str = "id",
+        measurement_columns: Optional[List[str]] = None,
+    ) -> None:
+        """Load measurements from a CSV file into each matching annotation.
+
+        Matches rows by annotation ID and stores numeric column values in
+        ann.measurements. Non-numeric columns (other than the ID column) are
+        skipped automatically unless explicitly listed in measurement_columns.
+
+        Args:
+            filepath: Path to the CSV file.
+            id_column: Column name containing annotation IDs. Defaults to the
+                standard annotations ID column ("id").
+            measurement_columns: Explicit list of columns to import. If None,
+                all numeric columns except id_column are imported.
+        """
+        import csv
+
+        unmatched = []
+        with open(filepath, newline="") as f:
+            reader = csv.DictReader(f)
+            if id_column not in reader.fieldnames:
+                raise ValueError(
+                    f"ID column '{id_column}' not found in CSV. "
+                    f"Available columns: {list(reader.fieldnames)}"
+                )
+
+            if measurement_columns is not None:
+                cols = [c for c in measurement_columns if c != id_column]
+            else:
+                # Auto-detect: keep only columns whose first non-empty value
+                # can be parsed as float (determined per-row below)
+                cols = None
+
+            for row in reader:
+                ann_id = row[id_column].strip()
+                if ann_id not in self.data:
+                    unmatched.append(ann_id)
+                    continue
+
+                if cols is None:
+                    # First pass: build list from this row's parseable columns
+                    cols = []
+                    for col, val in row.items():
+                        if col == id_column:
+                            continue
+                        try:
+                            float(val)
+                            cols.append(col)
+                        except (ValueError, TypeError):
+                            pass
+
+                for col in cols:
+                    try:
+                        self.data[ann_id].measurements[col] = float(row[col])
+                    except (ValueError, KeyError):
+                        pass
+
+        if unmatched:
+            logger.warning(
+                "The following CSV IDs had no matching annotation (skipped): %s",
+                ", ".join(unmatched),
+            )
+
     def reduce_point_cloud_based_on_SA(self) -> None:
         """Reduce each annotation's simple_pcd to the radius derived from SA_in_cm2.
 
