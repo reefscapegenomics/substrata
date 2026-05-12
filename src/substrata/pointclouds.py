@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 # Third-Party Libraries
 import numpy as np
 import open3d as o3d
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import numpy.typing as npt
 from collections.abc import Iterable
 import struct
@@ -1924,7 +1924,7 @@ def _stream_sample_ply_to_arrays(
     and Bernoulli-samples in vectorized fashion. No per-vertex Python loop.
     """
     import struct
-    from tqdm import tqdm
+    from tqdm.auto import tqdm
 
     with open(input_path, "rb") as fin:
         fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
@@ -2058,8 +2058,6 @@ def stream_extract_neighborhoods_ply(
     Returns:
         List of SimplePointCloud objects, one per target coordinate.
     """
-    from tqdm import tqdm
-
     # Normalize radius to a list
     if isinstance(radius, (int, float)):
         radii = [float(radius)] * len(target_coords)
@@ -2109,6 +2107,11 @@ def stream_extract_neighborhoods_ply(
         if not all(n in dt.names for n in ("x", "y", "z")):
             raise ValueError("PLY must contain x,y,z vertex properties.")
 
+        # Determine scale factor for RGB: uchar/uint8 stored as 0-255, float as 0-1
+        if has_rgb:
+            rgb_prop_type = next(t for t, n in vprops if n == "red")
+            rgb_scale = 255.0 if rgb_prop_type in ("uchar", "uint8", "char", "int8") else 1.0
+
         # Pre-allocate lists for each neighborhood
         neighborhoods = [[] for _ in target_coords]
         neighborhoods_colors = [[] for _ in target_coords] if has_rgb else None
@@ -2124,7 +2127,8 @@ def stream_extract_neighborhoods_ply(
         # Read vertex section in chunks
         with tqdm(
             total=n_vertices,
-            unit="vtx",
+            unit=" pts",
+            unit_scale=True,
             desc="Extract neighborhoods",
             disable=not show_progress,
         ) as pbar:
@@ -2153,12 +2157,11 @@ def stream_extract_neighborhoods_ply(
                         neighborhoods[idx].append(coords[mask])
 
                         if has_rgb:
-                            # Scale 0..255 → 0..1
                             rgb = np.column_stack(
                                 [
-                                    arr["red"][mask] / 255.0,
-                                    arr["green"][mask] / 255.0,
-                                    arr["blue"][mask] / 255.0,
+                                    arr["red"][mask] / rgb_scale,
+                                    arr["green"][mask] / rgb_scale,
+                                    arr["blue"][mask] / rgb_scale,
                                 ]
                             )
                             neighborhoods_colors[idx].append(rgb)

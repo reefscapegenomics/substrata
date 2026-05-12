@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
 import matplotlib
 from matplotlib.backends.backend_pdf import PdfPages
@@ -844,7 +844,7 @@ class Annotations:
         # Collect coordinates in consistent order (by annotation ID)
         # Store mapping from index to annotation ID
         ann_ids = sorted(self.data.keys())
-        target_coords = [self.data[ann_id].coords for ann_id in ann_ids]
+        target_coords = [self.data[ann_id].orig_coords for ann_id in ann_ids]
 
         # Extract neighborhoods in a single pass
         neighborhoods = pointclouds.stream_extract_neighborhoods_ply(
@@ -858,6 +858,39 @@ class Annotations:
         logger.info(
             f"Loaded undecimated neighborhoods for {len(neighborhoods)} annotations"
         )
+
+    def reduce_point_cloud_based_on_SA(self) -> None:
+        """Reduce each annotation's simple_pcd to the radius derived from SA_in_cm2.
+
+        For each annotation, filters simple_pcd to only retain points within the
+        radius determined by get_radius_from_2D_surface_area(). Annotations without
+        a SA_in_cm2 measurement are skipped and reported as a warning.
+        """
+        missing_sa = []
+        for ann_id, ann in self.data.items():
+            if not ann.measurements.get("SA_in_cm2"):
+                missing_sa.append(ann_id)
+                continue
+            if ann.simple_pcd is None:
+                continue
+            radius = ann.get_radius_from_2D_surface_area()
+            distances_sq = np.sum(
+                (ann.simple_pcd.points - ann.orig_coords) ** 2, axis=1
+            )
+            mask = distances_sq <= radius**2
+            ann.simple_pcd.points = ann.simple_pcd.points[mask]
+            if hasattr(ann.simple_pcd, "colors"):
+                ann.simple_pcd.colors = ann.simple_pcd.colors[mask]
+            if hasattr(ann.simple_pcd, "normals"):
+                ann.simple_pcd.normals = ann.simple_pcd.normals[mask]
+            if hasattr(ann.simple_pcd, "labels"):
+                ann.simple_pcd.labels = ann.simple_pcd.labels[mask]
+
+        if missing_sa:
+            logger.warning(
+                "SA_in_cm2 not set for the following annotations (skipped): %s",
+                ", ".join(str(ann_id) for ann_id in missing_sa),
+            )
 
     def measure_all(
         self, measurement_func: Callable, *args: Any, **kwargs: Any
