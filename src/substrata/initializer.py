@@ -16,12 +16,15 @@ class ProjectInitializer:
 
     """
 
-    def __init__(self, yaml=None, path=None, local=False):
+    def __init__(self, yaml=None, path=None, local=False, max_points=None):
         # Check that either yaml (path or filepath) or project_path is provided
         if yaml is None and path is None:
             raise ValueError("Either yaml or path must be provided.")
         elif yaml is not None and path is not None:
             raise ValueError("Either yaml or path must be provided, not both.")
+
+        # Runtime-only option (not stored in YAML): cap on points loaded from PLY
+        self.max_points = max_points
 
         # Initialize all attributes to None
         self.path = None
@@ -367,7 +370,12 @@ class ProjectInitializer:
 
         if self.ply_filepath:
             print(f"Loading pointcloud from {self.ply_filepath}")
-            self.pcd = pointclouds.PointCloud(self.ply_filepath)
+            if self.max_points is None:
+                self.pcd = pointclouds.PointCloud(self.ply_filepath)
+            else:
+                self.pcd = pointclouds.PointCloud(
+                    self.ply_filepath, max_points=self.max_points
+                )
 
         if self.cams_meta_json_filepath and self.cams_xml_filepath:
             print(
