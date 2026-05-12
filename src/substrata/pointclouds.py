@@ -1512,6 +1512,29 @@ class SimplePointCloud:
         if labels is not None:
             self.labels = np.asarray(labels)
 
+    def transform(self, transform_matrix: np.ndarray) -> None:
+        """Apply a 4x4 homogeneous transform to the point cloud in-place.
+
+        Points are fully transformed (rotation + translation). Normals are
+        rotated only (upper-left 3x3), preserving their directional meaning.
+        Colors and labels are unaffected.
+
+        Args:
+            transform_matrix: 4x4 homogeneous transformation matrix.
+        """
+        if hasattr(transform_matrix, "mat"):
+            transform_matrix = transform_matrix.mat
+        elif hasattr(transform_matrix, "matrix"):
+            transform_matrix = transform_matrix.matrix
+        m = np.asarray(transform_matrix, dtype=float)
+        if m.shape != (4, 4):
+            raise ValueError("transform_matrix must be 4x4.")
+        # Vectorized point transform: (N,3) -> homogeneous (N,4) -> (N,3)
+        ones = np.ones((len(self.points), 1), dtype=float)
+        self.points = (np.hstack([self.points, ones]) @ m.T)[:, :3]
+        if hasattr(self, "normals"):
+            self.normals = self.normals @ m[:3, :3].T
+
     def geto3d_pcd(self) -> o3d.geometry.PointCloud:
         """Convert to Open3D PointCloud object.
 
