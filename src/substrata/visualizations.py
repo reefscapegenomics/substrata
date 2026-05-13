@@ -2062,292 +2062,311 @@ def save_cropped_image_matches_to_pdf(
     print(f"PDF created: {output_filepath}")
 
 
+def _pil_to_pdf(pdf, pil_img, x, y, max_w, max_h):
+    """Place *pil_img* centred inside the cell (x, y, max_w, max_h), preserving aspect ratio."""
+    try:
+        iw, ih = pil_img.size
+        aspect = iw / ih if ih > 0 else 1.0
+        cell_aspect = max_w / max_h if max_h > 0 else 1.0
+        if aspect > cell_aspect:
+            scaled_w = max_w
+            scaled_h = max_w / aspect
+        else:
+            scaled_h = max_h
+            scaled_w = max_h * aspect
+        img_x = x + (max_w - scaled_w) / 2.0
+        img_y = y + (max_h - scaled_h) / 2.0
+        buf = BytesIO()
+        pil_img.save(buf, format="PNG")
+        buf.seek(0)
+        pdf.image(buf, x=img_x, y=img_y, w=scaled_w, h=scaled_h)
+    except Exception as e:
+        logger.warning("_pil_to_pdf failed: %s", e)
+        pdf.rect(x, y, max_w, max_h)
+
+
+def _draw_placeholder(pdf, x, y, w, h, text=""):
+    """Draw a light-grey filled rectangle with an optional centred label."""
+    pdf.set_fill_color(220, 220, 220)
+    pdf.rect(x, y, w, h, style="F")
+    pdf.set_fill_color(0, 0, 0)
+    if text:
+        pdf.set_xy(x, y + h / 2 - 2)
+        pdf.cell(w, 4, text, align="C")
+
+
+def _ann_pcd_camera_view(ann):
+    """Return a PIL Image of ann.simple_pcd viewed from the camera direction, or None."""
+    try:
+        from substrata.ortho import OrthoMap
+        from PIL import ImageFilter
+        if ann.simple_pcd is None or ann.image_match is None:
+            return None
+        cam_vec = ann.image_match.cam.vector
+        view = OrthoMap(ann.simple_pcd, up_vector=cam_vec)
+        img = view.show(highlights=ann, point_size=15)
+        n_pts = max(len(ann.simple_pcd.points), 1)
+        raw = int(np.sqrt(view.width * view.height / n_pts) * 2.5)
+        filter_size = max(3, raw if raw % 2 == 1 else raw + 1)
+        return img.filter(ImageFilter.MinFilter(size=filter_size))
+    except Exception as e:
+        logger.warning("_ann_pcd_camera_view failed for %s: %s", ann.id, e)
+        return None
+
+
 def save_measurement_visualizations_to_pdf(
     annotations,
     output_filepath,
-    n_cols=None,
-    n_rows=4,
+    orthomap=None,
 ):
-    """
-    Save measurement visualization images to a PDF file.
+    """Save per-annotation measurement visualizations to a landscape A4 PDF.
 
-    Iterates over an Annotations object and outputs every measurement column
-    that contains "_image" to the PDF. Each annotation is shown on one or more
-    rows (if it has more image measurements than n_cols), but never more than
-    one annotation per row.
+    Each annotation occupies one page with three rows:
+
+    * **Row 1** – OrthoMap overview (left ¾) + annotation metadata text (right ¼).
+    * **Row 2** – Full camera image with annotation marked | zoomed crop |
+      point-cloud rendered from the camera direction.
+    * **Row 3** – Measurement images (one column each) + scalar values column.
 
     Args:
-        annotations: Annotations object containing annotations with measurements.
-        output_filepath: Path where the PDF will be saved.
-        n_cols: Number of columns per row. If None (default), determined by the
-            maximum number of image measurements per annotation.
-        n_rows: Number of rows per page (default 4).
+        annotations: Annotations object whose items will be rendered.
+        output_filepath: Destination PDF path.
+        orthomap: Optional shared :class:`~substrata.ortho.OrthoMap`.  When
+            provided the annotation location is highlighted on the map in row 1.
     """
-    pdf = FPDF()
+    pdf = FPDF(orientation="L", format="A4")
     pdf.set_auto_page_break(False)
-    pdf.set_font("Arial", size=8)
+    pdf.set_font("Arial", size=7)
 
-    # Collect all annotations with their image measurements
-    annotation_data = []
-    max_measurement_images = 0
-    has_image_match = False
+    margin = 10
+    # A4 landscape: 297 × 210 mm  →  usable 277 × 190 mm
+    usable_w = 297 - 2 * margin
+    usable_h = 210 - 2 * margin
+    row_h = usable_h / 3
+    label_gap = 3   # mm below an image before the text label
+    label_h = 4     # mm for a single text row
+
+    standard_order = [
+        "gapF_image",
+        "elevation_image",
+        "roughness_image",
+        "vector_dispersion_image",
+    ]
 
     for ann in annotations.data.values():
-        # Find all measurement keys containing "_image"
-        image_measurements = {
-            key: value
-            for key, value in ann.measurements.items()
-            if "_image" in key and value is not None
-        }
+        pdf.add_page(orientation="L")
+        pdf.set_font("Arial", size=7)
+        pdf.set_text_color(0, 0, 0)
 
-        # Check if annotation has image_match
-        ann_has_image_match = (
-            hasattr(ann, "image_match")
-            and ann.image_match is not None
-            and hasattr(ann.image_match, "filepath")
-            and ann.image_match.filepath is not None
-        )
-        if ann_has_image_match:
-            has_image_match = True
+        # ── Row 1: OrthoMap + metadata ────────────────────────────────────
+        r1_y = margin
+        ortho_w = usable_w * 3 / 4
+        text_x = margin + ortho_w
+        text_w = usable_w / 4
 
-        if image_measurements or ann_has_image_match:
-            # Convert numpy arrays to images if needed
-            image_data = {}
-
-            # Add image_match image first if available
-            if ann_has_image_match:
-                try:
-                    # Try to get cropped image from masks if available
-                    if (
-                        hasattr(ann.image_match, "masks")
-                        and ann.image_match.masks is not None
-                        and len(ann.image_match.masks) > 0
-                    ):
-                        img = get_crop_img_from_masks(
-                            ann.image_match, output_img_w=1000, output_img_h=1000
-                        )
-                        # Convert OpenCV image (BGR) to PIL Image (RGB)
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        image_data["image_match"] = Image.fromarray(img)
-                    else:
-                        # Use simple crop around the match point
-                        img = get_crop_img(
-                            ann.image_match.filepath,
-                            ann.image_match.x,
-                            ann.image_match.y,
-                            1000,
-                            1000,
-                        )
-                        image_data["image_match"] = img
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to load image_match image for annotation {ann.id}: {e}"
-                    )
-                    # Continue without image_match for this annotation
-
-            # Add measurement images
-            for key, value in image_measurements.items():
-                if isinstance(value, np.ndarray):
-                    # Ensure it's in the right format (H, W, 3) uint8 RGB
-                    img = value.copy()
-                    if img.dtype != np.uint8:
-                        # Normalize to 0-255 if needed
-                        if img.max() <= 1.0:
-                            img = (img * 255).astype(np.uint8)
-                        else:
-                            img = img.astype(np.uint8)
-                    # Measurement images are in RGB format (H, W, 3)
-                    # Keep as RGB - we'll use PIL for encoding
-                    image_data[key] = img
-                else:
-                    # Assume it's already an image or can be converted
-                    image_data[key] = value
-
-            if image_data:
-                annotation_data.append((ann, image_data))
-                # Count only measurement images (excluding image_match)
-                measurement_count = len(
-                    [k for k in image_data.keys() if k != "image_match"]
-                )
-                max_measurement_images = max(max_measurement_images, measurement_count)
-
-    if not annotation_data:
-        print("No image measurements found in annotations.")
-        return
-
-    # Determine n_cols if not specified
-    if n_cols is None:
-        # Count: 1 column for image_match (if any has it) + max measurement images
-        n_cols = max_measurement_images
-        if has_image_match:
-            n_cols += 1
-
-    pdf.add_page()
-    # Page width and height in FPDF's units (default: mm)
-    page_w = pdf.w
-    page_h = pdf.h
-    margin = 10
-
-    # Compute the usable space (accounting for margins)
-    usable_w = page_w - 2 * margin
-    usable_h = page_h - 2 * margin
-
-    # Cell size in the grid
-    cell_w = usable_w / n_cols
-    cell_h = usable_h / n_rows
-    image_h = cell_h * 0.8
-
-    # Track current row and column in the grid
-    row_idx = 0
-    col_idx = 0
-
-    for ann, image_data in annotation_data:
-        # Get annotation info for label
-        ann_id = ann.id if ann.id else "N/A"
-        ann_label = ann.label if hasattr(ann, "label") and ann.label else "N/A"
-        label_text = f"{ann_id} {ann_label}"
-
-        # Sort image keys with image_match first, then standard order:
-        # gapF_image, elevation_image, roughness_image, vector_dispersion_image
-        # Any other keys come after in alphabetical order
-        image_keys = list(image_data.keys())
-        ordered_keys = []
-        # Add image_match first if it exists
-        if "image_match" in image_keys:
-            ordered_keys.append("image_match")
-        # Add standard order keys if they exist
-        standard_order = [
-            "gapF_image",
-            "elevation_image",
-            "roughness_image",
-            "vector_dispersion_image",
-        ]
-        for key in standard_order:
-            if key in image_keys:
-                ordered_keys.append(key)
-        # Add remaining keys in alphabetical order (excluding image_match and standard_order)
-        remaining_keys = sorted(
-            [k for k in image_keys if k not in standard_order and k != "image_match"]
-        )
-        image_keys = ordered_keys + remaining_keys
-
-        # If this annotation doesn't have image_match but some do,
-        # skip column 0 to leave space for image_match column
-        if has_image_match and "image_match" not in image_keys:
-            # Skip column 0 - start at column 1
-            if col_idx == 0:
-                col_idx = 1
-
-        # For each image measurement, add it to the PDF
-        # Never put more than one annotation per row
-        for img_idx, img_key in enumerate(image_keys):
-            # Check if we need a new page
-            if row_idx >= n_rows:
-                pdf.add_page()
-                row_idx = 0
-                col_idx = 0
-
-            # If we've filled a row, move to next row
-            if col_idx >= n_cols:
-                col_idx = 0
-                row_idx += 1
-                # Check if we need a new page
-                if row_idx >= n_rows:
-                    pdf.add_page()
-                    row_idx = 0
-                    col_idx = 0
-
-            # Calculate the (x, y) position for this cell
-            x = margin + col_idx * cell_w
-            y = margin + row_idx * cell_h
-
-            # Get the image
-            img = image_data[img_key]
-
-            # Encode image to buffer and preserve aspect ratio
+        if orthomap is not None:
             try:
-                # Convert to PIL Image (handles RGB correctly)
-                if isinstance(img, np.ndarray):
-                    # Images are in RGB format, convert to PIL Image
-                    pil_img = Image.fromarray(img)
-                elif isinstance(img, Image.Image):
-                    # Already a PIL Image
-                    pil_img = img
-                elif hasattr(img, "to_image") and callable(getattr(img, "to_image")):
-                    # Plotly Figure (e.g. when kaleido failed on Windows during
-                    # measurement) - render to PNG and convert to PIL
-                    try:
-                        image_bytes = img.to_image(format="png", width=600, height=400)
-                        pil_img = Image.open(BytesIO(image_bytes))
-                        if pil_img.mode != "RGB":
-                            pil_img = pil_img.convert("RGB")
-                    except Exception as fig_err:
-                        logger.warning(
-                            f"Plotly to_image failed for {img_key} ({fig_err}). "
-                            "Install kaleido for image export: pip install kaleido"
-                        )
-                        raise
-                else:
-                    # For other types, try to convert to PIL Image
-                    pil_img = Image.fromarray(np.array(img))
-
-                # Get image dimensions
-                img_width, img_height = pil_img.size
-                img_aspect = img_width / img_height if img_height > 0 else 1.0
-                cell_aspect = cell_w / image_h if image_h > 0 else 1.0
-
-                # Calculate scaled dimensions preserving aspect ratio
-                if img_aspect > cell_aspect:
-                    # Image is wider - fit to cell width
-                    scaled_w = cell_w
-                    scaled_h = cell_w / img_aspect
-                else:
-                    # Image is taller - fit to cell height
-                    scaled_h = image_h
-                    scaled_w = image_h * img_aspect
-
-                # Center the image in the cell
-                img_x = x + (cell_w - scaled_w) / 2.0
-                img_y = y + (image_h - scaled_h) / 2.0
-
-                # Save to buffer as PNG
-                img_buffer = BytesIO()
-                pil_img.save(img_buffer, format="PNG")
-                img_buffer.seek(0)
-
-                # Add image to PDF with preserved aspect ratio
-                pdf.image(img_buffer, x=img_x, y=img_y, w=scaled_w, h=scaled_h)
+                ortho_img = orthomap.show(highlights=ann, width=1200, height=600)
+                _pil_to_pdf(pdf, ortho_img, margin, r1_y, ortho_w, row_h)
             except Exception as e:
-                logger.warning(f"Failed to encode image {img_key} for {ann_id}: {e}")
-                # Draw a placeholder rectangle
-                pdf.rect(x, y, cell_w, image_h)
+                logger.warning("OrthoMap render failed for %s: %s", ann.id, e)
+                _draw_placeholder(pdf, margin, r1_y, ortho_w, row_h, "OrthoMap error")
+        else:
+            _draw_placeholder(pdf, margin, r1_y, ortho_w, row_h, "No OrthoMap")
 
-            # Position the text below the image
-            label_x = x + 2  # small offset from left edge
-            label_y = y + image_h + 4  # 4 units below bottom of the image
+        # Metadata text block
+        try:
+            depth_str = f"{ann.depth_in_m:.4f} m"
+        except Exception:
+            depth_str = "N/A"
 
-            # Show annotation info for the first image of each annotation
-            # If it's image_match, show both annotation info and "image_match" label
-            if img_idx == 0:
-                if img_key == "image_match":
-                    pdf.text(label_x, label_y, f"{label_text} (image_match)")
+        coords_str = (
+            f"[{ann.coords[0]:.4f}, {ann.coords[1]:.4f}, {ann.coords[2]:.4f}]"
+            if ann.coords is not None else "N/A"
+        )
+        orig_coords_str = (
+            f"[{ann.orig_coords[0]:.4f}, {ann.orig_coords[1]:.4f}, {ann.orig_coords[2]:.4f}]"
+            if getattr(ann, "orig_coords", None) is not None else "N/A"
+        )
+
+        try:
+            n_pts = len(ann.simple_pcd.points) if getattr(ann, "simple_pcd", None) is not None else "N/A"
+        except Exception:
+            n_pts = "N/A"
+
+        meta_lines = [
+            ("ID",              str(ann.id) if ann.id else "N/A"),
+            ("Label",           str(ann.label) if getattr(ann, "label", None) else "N/A"),
+            ("Coords",          coords_str),
+            ("Orig coords",     orig_coords_str),
+            ("Depth",           depth_str),
+            ("Subsampled pts",  str(n_pts)),
+        ]
+        line_h = 6
+        pdf.set_font("Arial", "B", size=7)
+        pdf.set_xy(text_x + 2, r1_y + 3)
+        pdf.cell(text_w - 4, line_h, "Annotation info", ln=1)
+        pdf.set_font("Arial", size=7)
+        for key, val in meta_lines:
+            pdf.set_xy(text_x + 2, pdf.get_y())
+            pdf.multi_cell(text_w - 4, line_h * 0.8, f"{key}: {val}", border=0)
+
+        # ── Row 2: Camera views ───────────────────────────────────────────
+        r2_y = margin + row_h
+        col_w = usable_w / 3
+        img_h2 = row_h - label_gap - label_h
+
+        ann_has_image_match = (
+            getattr(ann, "image_match", None) is not None
+            and getattr(ann.image_match, "filepath", None) is not None
+        )
+
+        # Col 1: full camera image with annotation marked, downscaled for PDF filesize
+        col1_x = margin
+        if ann_has_image_match:
+            try:
+                full_img = Image.open(ann.image_match.cam.filepath).convert("RGB")
+                orig_w, orig_h = full_img.size
+                max_dim = 1500
+                if orig_w > max_dim:
+                    scale = max_dim / orig_w
+                    full_img = full_img.resize(
+                        (max_dim, int(orig_h * scale)), Image.LANCZOS
+                    )
                 else:
-                    pdf.text(label_x, label_y, label_text)
-            else:
-                # Just show the measurement key for subsequent images
-                pdf.text(label_x, label_y, img_key)
+                    scale = 1.0
+                px = int(ann.image_match.x * scale)
+                py = int(ann.image_match.y * scale)
+                half = int(500 * scale)   # crop is 1000x1000 centred on annotation
+                border = max(4, int(10 * scale))
+                draw = ImageDraw.Draw(full_img)
+                draw.rectangle(
+                    [px - half, py - half, px + half, py + half],
+                    outline=(255, 0, 0), width=border,
+                )
+                _pil_to_pdf(pdf, full_img, col1_x, r2_y, col_w, img_h2)
+            except Exception as e:
+                logger.warning("Full image render failed for %s: %s", ann.id, e)
+                _draw_placeholder(pdf, col1_x, r2_y, col_w, img_h2, "Image error")
+        else:
+            _draw_placeholder(pdf, col1_x, r2_y, col_w, img_h2, "No image match")
+        pdf.set_xy(col1_x + 2, r2_y + img_h2 + label_gap)
+        pdf.cell(col_w - 4, label_h, "full image", ln=0)
 
-            # Move to the next column
-            col_idx += 1
+        # Col 2: zoomed crop — same approach as save_cropped_image_matches_to_pdf
+        col2_x = margin + col_w
+        if ann_has_image_match:
+            try:
+                im = ann.image_match
+                if getattr(im, "masks", None) is not None and len(im.masks) > 0:
+                    cropped_img = get_crop_img_from_masks(im, output_img_w=1000, output_img_h=1000)
+                    crop_pil = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
+                else:
+                    crop_pil = get_crop_img(im.filepath, im.x, im.y, 1000, 1000)
+                    if not isinstance(crop_pil, Image.Image):
+                        crop_pil = Image.fromarray(crop_pil)
+                _pil_to_pdf(pdf, crop_pil, col2_x, r2_y, col_w, img_h2)
+            except Exception as e:
+                logger.warning("Zoomed crop failed for %s: %s", ann.id, e)
+                _draw_placeholder(pdf, col2_x, r2_y, col_w, img_h2, "Crop error")
+        else:
+            _draw_placeholder(pdf, col2_x, r2_y, col_w, img_h2, "No image match")
+        pdf.set_xy(col2_x + 2, r2_y + img_h2 + label_gap)
+        pdf.cell(col_w - 4, label_h, "zoomed crop", ln=0)
 
-        # After finishing all images for this annotation, move to next row
-        # (ensuring only one annotation per row - next annotation starts on new row)
-        if col_idx > 0:  # If we didn't end exactly at the end of a row
-            col_idx = 0
-            row_idx += 1
+        # Col 3: point cloud from camera direction
+        col3_x = margin + 2 * col_w
+        pcd_img = _ann_pcd_camera_view(ann)
+        if pcd_img is not None:
+            _pil_to_pdf(pdf, pcd_img, col3_x, r2_y, col_w, img_h2)
+        else:
+            _draw_placeholder(pdf, col3_x, r2_y, col_w, img_h2, "No point cloud")
+        pdf.set_xy(col3_x + 2, r2_y + img_h2 + label_gap)
+        pdf.cell(col_w - 4, label_h, "point cloud view", ln=0)
+
+        # ── Row 3: Measurements ───────────────────────────────────────────
+        r3_y = margin + 2 * row_h
+
+        meas = getattr(ann, "measurements", {}) or {}
+        image_keys_all = [k for k, v in meas.items() if "_image" in k and v is not None]
+        ordered_img_keys = [k for k in standard_order if k in image_keys_all]
+        ordered_img_keys += sorted(k for k in image_keys_all if k not in standard_order)
+
+        scalar_meas = {
+            k: v for k, v in meas.items()
+            if "_image" not in k
+            and v is not None
+            and isinstance(v, (int, float, np.integer, np.floating))
+        }
+        extra = getattr(ann, "extra_coords", None) or {}
+
+        has_images = bool(ordered_img_keys)
+        has_scalars = bool(scalar_meas or extra)
+
+        if has_images or has_scalars:
+            n_img_cols = len(ordered_img_keys)
+            n_r3_cols = n_img_cols + 1   # +1 for scalar column
+            cell_w3 = usable_w / n_r3_cols
+            img_h3 = row_h - label_gap - label_h
+
+            for ci, img_key in enumerate(ordered_img_keys):
+                cx = margin + ci * cell_w3
+                img_val = meas[img_key]
+                try:
+                    if isinstance(img_val, np.ndarray):
+                        arr = img_val if img_val.dtype == np.uint8 else (
+                            (np.clip(img_val, 0, 1) * 255).astype(np.uint8)
+                            if img_val.max() <= 1.0
+                            else img_val.astype(np.uint8)
+                        )
+                        pil_v = Image.fromarray(arr)
+                    elif isinstance(img_val, Image.Image):
+                        pil_v = img_val
+                    elif hasattr(img_val, "to_image"):
+                        raw = img_val.to_image(format="png", width=600, height=400)
+                        pil_v = Image.open(BytesIO(raw)).convert("RGB")
+                    else:
+                        pil_v = Image.fromarray(np.array(img_val))
+                    if img_key == "gapF_image":
+                        arr_rgb = np.array(pil_v.convert("RGB"))
+                        arr_rgb[np.all(arr_rgb == 0, axis=-1)] = 255
+                        pil_v = Image.fromarray(arr_rgb).rotate(90, expand=True)
+                    _pil_to_pdf(pdf, pil_v, cx, r3_y, cell_w3, img_h3)
+                except Exception as e:
+                    logger.warning("Meas image %s failed for %s: %s", img_key, ann.id, e)
+                    _draw_placeholder(pdf, cx, r3_y, cell_w3, img_h3)
+                pdf.set_xy(cx + 2, r3_y + img_h3 + label_gap)
+                pdf.cell(cell_w3 - 4, label_h, img_key, ln=0)
+
+            # Scalar text column (always last)
+            sc_x = margin + n_img_cols * cell_w3
+            pdf.set_fill_color(245, 245, 245)
+            pdf.rect(sc_x, r3_y, cell_w3, row_h, style="F")
+            pdf.set_fill_color(0, 0, 0)
+            pdf.set_font("Arial", "B", size=6)
+            pdf.set_xy(sc_x + 2, r3_y + 2)
+            pdf.cell(cell_w3 - 4, 4, "Measurements", ln=1)
+            pdf.set_font("Arial", size=6)
+            for k, v in scalar_meas.items():
+                if pdf.get_y() > r3_y + row_h - 4:
+                    break
+                pdf.set_xy(sc_x + 2, pdf.get_y())
+                val_str = f"{v:.6g}" if isinstance(v, float) else str(v)
+                pdf.multi_cell(cell_w3 - 4, 3.5, f"{k}: {val_str}", border=0)
+            if extra:
+                pdf.set_font("Arial", "B", size=6)
+                pdf.set_xy(sc_x + 2, pdf.get_y())
+                pdf.cell(cell_w3 - 4, 4, "Extra coords", ln=1)
+                pdf.set_font("Arial", size=6)
+                for k, v in extra.items():
+                    if pdf.get_y() > r3_y + row_h - 4:
+                        break
+                    pdf.set_xy(sc_x + 2, pdf.get_y())
+                    pdf.multi_cell(cell_w3 - 4, 3.5, f"{k}: {v}", border=0)
+            pdf.set_font("Arial", size=7)
 
     pdf.output(output_filepath)
-    print(f"PDF created: {output_filepath}")
+    logger.info("PDF created: %s", output_filepath)
 
 
 def get_crop_img_from_masks(  # TODO: needs PIL version

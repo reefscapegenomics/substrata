@@ -198,6 +198,25 @@ class OrthoMap:
         if highlights is not None:
             coords_3d = self._extract_coords(highlights)
             if len(coords_3d) > 0:
+                pixels = self.project(coords_3d)
+                if pixels.ndim == 1:
+                    pixels = pixels[np.newaxis, :]
+                out_mask = (
+                    (pixels[:, 0] < 0)
+                    | (pixels[:, 0] >= self.width)
+                    | (pixels[:, 1] < 0)
+                    | (pixels[:, 1] >= self.height)
+                )
+                if out_mask.any():
+                    out_coords = coords_3d[np.newaxis, :] if coords_3d.ndim == 1 else coords_3d
+                    logger.warning(
+                        "%d highlight(s) outside map bounds:\n%s",
+                        int(out_mask.sum()),
+                        "\n".join(
+                            f"  [{c[0]:.4f}, {c[1]:.4f}, {c[2]:.4f}]"
+                            for c in out_coords[out_mask]
+                        ),
+                    )
                 self._draw_highlights(
                     img, coords_3d,
                     point_size, point_color, point_outline,

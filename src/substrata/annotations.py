@@ -814,6 +814,7 @@ class Annotations:
         self,
         ply_filepath: str,
         radius: Union[float, List[float]],
+        scale_factor: float = 1.0,
         show_progress: bool = True,
     ) -> None:
         """Load undecimated point cloud neighborhoods from a PLY file for all annotations.
@@ -829,7 +830,13 @@ class Annotations:
 
         Args:
             ply_filepath: Path to the undecimated PLY file.
-            radius: Search radius (float) or list of radii (one per annotation).
+            radius: Real-world search radius in metres (float) or list of radii
+                (one per annotation).
+            scale_factor: Scale factor that converts model-space units to real-world
+                metres (real_distance = model_distance * scale_factor). The radius
+                is divided by this value before searching so that the result
+                corresponds to the requested real-world radius. Defaults to 1.0
+                (no scaling).
             show_progress: Whether to show progress bar during extraction.
 
         Raises:
@@ -845,6 +852,13 @@ class Annotations:
         # Store mapping from index to annotation ID
         ann_ids = sorted(self.data.keys())
         target_coords = [self.data[ann_id].orig_coords for ann_id in ann_ids]
+
+        # Convert real-world radius to model-space units
+        if scale_factor != 1.0:
+            if isinstance(radius, (list, tuple)):
+                radius = [r / scale_factor for r in radius]
+            else:
+                radius = radius / scale_factor
 
         # Extract neighborhoods in a single pass
         neighborhoods = pointclouds.stream_extract_neighborhoods_ply(
@@ -1271,6 +1285,34 @@ class Annotation:
         self.cam_x: Optional[float] = None
         self.cam_y: Optional[float] = None
         self.depth_sensor_m: Optional[float] = None
+
+    @property
+    def depth_in_m(self) -> float:
+        """Depth in meters from the 3D regression (orig frame).
+
+        Uses the regression model stored on the parent:
+            depth ≈ depth_offset + up_vector · orig_coords
+
+        Returns:
+            float: Depth value in meters, or None if inputs are missing.
+        """
+        if self.orig_coords is None:
+            print(f"No coordinates found for annotation {self.id}")
+            return None
+
+        if (
+            not hasattr(self.parent, "up_vector")
+            or self.parent.up_vector is None
+            or not hasattr(self.parent, "depth_offset")
+            or self.parent.depth_offset is None
+        ):
+            print("Annotations 'up_vector' and/or depth_offset not set")
+            return None
+
+        return float(
+            self.parent.depth_offset
+            + float(np.dot(self.parent.up_vector, self.orig_coords))
+        )
 
     def show(self) -> None:
         """Show the annotation."""
