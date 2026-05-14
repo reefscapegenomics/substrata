@@ -816,6 +816,7 @@ class Annotations:
         radius: Union[float, List[float]],
         scale_factor: float = 1.0,
         show_progress: bool = True,
+        cylinder: bool = False,
     ) -> None:
         """Load undecimated point cloud neighborhoods from a PLY file for all annotations.
 
@@ -838,6 +839,11 @@ class Annotations:
                 corresponds to the requested real-world radius. Defaults to 1.0
                 (no scaling).
             show_progress: Whether to show progress bar during extraction.
+            cylinder: If True, use a top-down cylinder search (2D XY distance
+                only, ignoring Z). The Annotations world_transform is passed to
+                the streaming extractor so that the XY search is performed in
+                oriented world space. Returned neighborhoods are in original PLY
+                space and are then transformed to world space as normal.
 
         Raises:
             ValueError: If radius is a list with length different from number of annotations.
@@ -862,7 +868,12 @@ class Annotations:
 
         # Extract neighborhoods in a single pass
         neighborhoods = pointclouds.stream_extract_neighborhoods_ply(
-            ply_filepath, target_coords, radius, show_progress=show_progress
+            ply_filepath,
+            target_coords,
+            radius,
+            show_progress=show_progress,
+            world_transform=self.world_transform,
+            cylinder=cylinder,
         )
 
         # Assign results back to annotations and apply world transform so that

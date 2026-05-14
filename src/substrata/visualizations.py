@@ -2114,10 +2114,42 @@ def _ann_pcd_camera_view(ann):
         return None
 
 
+def _ann_pcd_top_view(ann, radius=None, up_vector=None, rotation=0):
+    """Return a PIL Image of ann.simple_pcd as a top-down OrthoMap, or None.
+
+    Args:
+        ann: Annotation with a ``simple_pcd`` attribute.
+        radius: Sampling radius in metres; when set the highlight circle uses
+            ``point_size_metres`` with a red outline and transparent fill.
+        up_vector: Up vector for the OrthoMap projection.  Defaults to
+            ``[0, 0, 1]`` when ``None``.
+        rotation: Clockwise rotation in degrees applied to the output image.
+    """
+    try:
+        from substrata.ortho import OrthoMap
+        from PIL import ImageFilter
+        if ann.simple_pcd is None:
+            return None
+        view = OrthoMap(ann.simple_pcd, up_vector=up_vector, rotation=rotation)
+        kwargs = dict(highlights=ann, point_size=15)
+        if radius is not None:
+            kwargs.update(point_size_metres=radius * 2, point_color=None,
+                          point_outline=(255, 0, 0))
+        img = view.show(**kwargs)
+        n_pts = max(len(ann.simple_pcd.points), 1)
+        raw = int(np.sqrt(view.width * view.height / n_pts) * 2.5)
+        filter_size = max(3, raw if raw % 2 == 1 else raw + 1)
+        return img.filter(ImageFilter.MinFilter(size=filter_size))
+    except Exception as e:
+        logger.warning("_ann_pcd_top_view failed for %s: %s", ann.id, e)
+        return None
+
+
 def save_measurement_visualizations_to_pdf(
     annotations,
     output_filepath,
     orthomap=None,
+    radius: float = None,
 ):
     """Save per-annotation measurement visualizations to a landscape A4 PDF.
 
@@ -2133,6 +2165,10 @@ def save_measurement_visualizations_to_pdf(
         output_filepath: Destination PDF path.
         orthomap: Optional shared :class:`~substrata.ortho.OrthoMap`.  When
             provided the annotation location is highlighted on the map in row 1.
+        radius: Sampling radius in metres.  When provided, the OrthoMap
+            highlight circle diameter equals ``radius * 2`` metres and the
+            zoomed-crop column 2 is masked to the same radius (greying out
+            pixels beyond it).
     """
     pdf = FPDF(orientation="L", format="A4")
     pdf.set_auto_page_break(False)
@@ -2166,7 +2202,14 @@ def save_measurement_visualizations_to_pdf(
 
         if orthomap is not None:
             try:
-                ortho_img = orthomap.show(highlights=ann, width=1200, height=600)
+                ortho_kwargs = dict(highlights=ann, width=1200, height=600)
+                if radius is not None:
+                    ortho_kwargs.update(
+                        point_size_metres=radius * 2,
+                        point_color=None,
+                        point_outline=(255, 0, 0),
+                    )
+                ortho_img = orthomap.show(**ortho_kwargs)
                 _pil_to_pdf(pdf, ortho_img, margin, r1_y, ortho_w, row_h)
             except Exception as e:
                 logger.warning("OrthoMap render failed for %s: %s", ann.id, e)
@@ -2221,30 +2264,28 @@ def save_measurement_visualizations_to_pdf(
             and getattr(ann.image_match, "filepath", None) is not None
         )
 
-        # Col 1: full camera image with annotation marked, downscaled for PDF filesize
+        # Col 1: full camera image, oriented + square-cropped, annotation marked
         col1_x = margin
         if ann_has_image_match:
             try:
-                full_img = Image.open(ann.image_match.cam.filepath).convert("RGB")
-                orig_w, orig_h = full_img.size
-                max_dim = 1500
-                if orig_w > max_dim:
-                    scale = max_dim / orig_w
-                    full_img = full_img.resize(
-                        (max_dim, int(orig_h * scale)), Image.LANCZOS
-                    )
-                else:
-                    scale = 1.0
-                px = int(ann.image_match.x * scale)
-                py = int(ann.image_match.y * scale)
-                half = int(500 * scale)   # crop is 1000x1000 centred on annotation
-                border = max(4, int(10 * scale))
-                draw = ImageDraw.Draw(full_img)
-                draw.rectangle(
-                    [px - half, py - half, px + half, py + half],
-                    outline=(255, 0, 0), width=border,
+                highlight_radius = 50
+                if radius is not None:
+                    try:
+                        ppm = ann.image_match.pixels_per_mm
+                        if ppm is not None:
+                            highlight_radius = max(1, int(radius * 1000.0 * ppm))
+                    except Exception:
+                        pass
+                full_img = ann.image_match.cam.render(
+                    highlight_pixels=[ann.image_match.x, ann.image_match.y],
+                    orient=True,
+                    square=True,
+                    highlight_radius=highlight_radius,
                 )
-                _pil_to_pdf(pdf, full_img, col1_x, r2_y, col_w, img_h2)
+                if full_img is not None:
+                    _pil_to_pdf(pdf, full_img, col1_x, r2_y, col_w, img_h2)
+                else:
+                    _draw_placeholder(pdf, col1_x, r2_y, col_w, img_h2, "Image error")
             except Exception as e:
                 logger.warning("Full image render failed for %s: %s", ann.id, e)
                 _draw_placeholder(pdf, col1_x, r2_y, col_w, img_h2, "Image error")
@@ -2253,18 +2294,27 @@ def save_measurement_visualizations_to_pdf(
         pdf.set_xy(col1_x + 2, r2_y + img_h2 + label_gap)
         pdf.cell(col_w - 4, label_h, "full image", ln=0)
 
-        # Col 2: zoomed crop — same approach as save_cropped_image_matches_to_pdf
+        # Col 2: zoomed crop via ImageMatch.render()
+        # If a sampling radius is provided and no circular mask has been set yet,
+        # create one so that render() can auto-apply the grey-out.
         col2_x = margin + col_w
         if ann_has_image_match:
             try:
-                im = ann.image_match
-                if getattr(im, "masks", None) is not None and len(im.masks) > 0:
-                    cropped_img = get_crop_img_from_masks(im, output_img_w=1000, output_img_h=1000)
-                    crop_pil = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
-                else:
-                    crop_pil = get_crop_img(im.filepath, im.x, im.y, 1000, 1000)
-                    if not isinstance(crop_pil, Image.Image):
-                        crop_pil = Image.fromarray(crop_pil)
+                if radius is not None:
+                    existing = getattr(ann.image_match, "mask", None)
+                    already_circular = (
+                        existing is not None
+                        and hasattr(existing, "radius_m")
+                        and existing.radius_m is not None
+                    )
+                    if not already_circular:
+                        try:
+                            ann.image_match.create_circular_masks([radius])
+                        except Exception:
+                            pass
+                crop_pil = ann.image_match.render(
+                    crop_w=1000, crop_h=1000, orient=True
+                )
                 _pil_to_pdf(pdf, crop_pil, col2_x, r2_y, col_w, img_h2)
             except Exception as e:
                 logger.warning("Zoomed crop failed for %s: %s", ann.id, e)
@@ -2274,9 +2324,10 @@ def save_measurement_visualizations_to_pdf(
         pdf.set_xy(col2_x + 2, r2_y + img_h2 + label_gap)
         pdf.cell(col_w - 4, label_h, "zoomed crop", ln=0)
 
-        # Col 3: point cloud from camera direction
+        # Col 3: top-down point cloud view
         col3_x = margin + 2 * col_w
-        pcd_img = _ann_pcd_camera_view(ann)
+        up_vec = getattr(orthomap, "_up_vector", None) if orthomap is not None else None
+        pcd_img = _ann_pcd_top_view(ann, radius=radius, up_vector=up_vec, rotation=90)
         if pcd_img is not None:
             _pil_to_pdf(pdf, pcd_img, col3_x, r2_y, col_w, img_h2)
         else:

@@ -41,6 +41,7 @@ class OrthoMap:
         up_vector: Optional[Union[List[float], np.ndarray]] = None,
         pixel_width: Optional[int] = None,
         pixel_height: Optional[int] = None,
+        rotation: int = 0,
     ) -> None:
         """Initialize an OrthoMap from a point cloud.
 
@@ -65,6 +66,7 @@ class OrthoMap:
         up = up / np.linalg.norm(up)
         self._up_vector = up
 
+        self._rotation = rotation
         self.rotation: np.ndarray = self._rotation_to_z(up)
         points = np.asarray(pcd.points)
         rotated = (self.rotation @ points.T).T
@@ -152,7 +154,8 @@ class OrthoMap:
         width: Optional[int] = None,
         height: Optional[int] = None,
         point_size: int = 5,
-        point_color: Tuple[int, int, int] = (255, 0, 0),
+        point_size_metres: Optional[float] = None,
+        point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
         background_color: Optional[Tuple[int, int, int]] = None,
@@ -161,8 +164,7 @@ class OrthoMap:
 
         The base image is generated from the pre-rendered raster.  If
         *width* and/or *height* are given the image is resized (aspect
-        ratio preserved) before highlights are drawn, so *point_size*
-        is always specified in display pixels.
+        ratio preserved) before highlights are drawn.
 
         Args:
             highlights: Locations to highlight.  Accepts an
@@ -172,7 +174,14 @@ class OrthoMap:
             width: Display width in pixels.
             height: Display height in pixels.
             point_size: Radius of highlight markers in display pixels.
+                Ignored when *point_size_metres* is set.
+            point_size_metres: Diameter of highlight markers in metres.
+                When provided, the marker is scaled so that it spans
+                exactly this distance in the orthographic projection,
+                regardless of display resolution.  Takes precedence over
+                *point_size*.
             point_color: RGB fill colour for highlight markers.
+                Pass ``None`` for a transparent (hollow) fill.
             point_outline: RGB outline colour for highlight markers
                 (``None`` to disable the outline).
             point_shape: Marker shape — ``"circle"`` or ``"square"``.
@@ -220,8 +229,11 @@ class OrthoMap:
                 self._draw_highlights(
                     img, coords_3d,
                     point_size, point_color, point_outline,
-                    point_shape,
+                    point_shape, point_size_metres,
                 )
+
+        if self._rotation:
+            img = img.rotate(-self._rotation, expand=True)
 
         return img
 
@@ -370,22 +382,29 @@ class OrthoMap:
         img: Image.Image,
         coords_3d: np.ndarray,
         radius: int,
-        color: Tuple[int, int, int],
+        color: Optional[Tuple[int, int, int]],
         outline: Optional[Tuple[int, int, int]],
         shape: str = "circle",
+        radius_metres: Optional[float] = None,
     ) -> None:
         """Draw highlight markers onto *img* (modified in place).
 
         Args:
             img: PIL Image to draw onto.
             coords_3d: World coordinates ``(N, 3)``.
-            radius: Marker radius in display pixels.
-            color: Fill colour.
+            radius: Marker radius in display pixels.  Ignored when
+                *radius_metres* is set.
+            color: Fill colour, or ``None`` for transparent fill.
             outline: Outline colour or ``None``.
             shape: ``"circle"`` or ``"square"``.
+            radius_metres: Marker diameter in metres.  When provided,
+                overrides *radius* and scales the marker to span this
+                distance in world space.
         """
         scale_x = img.width / self.width
         scale_y = img.height / self.height
+        if radius_metres is not None:
+            radius = radius_metres * scale_x / (2 * self.resolution)
         pixels = self.project(coords_3d)
         if pixels.ndim == 1:
             pixels = pixels[np.newaxis, :]

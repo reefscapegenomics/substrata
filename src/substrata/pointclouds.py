@@ -2064,6 +2064,8 @@ def stream_extract_neighborhoods_ply(
     radius: Union[float, List[float]],
     show_progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
+    world_transform: Optional[np.ndarray] = None,
+    cylinder: bool = False,
 ) -> List["SimplePointCloud"]:
     """
     Stream a binary PLY and extract neighborhoods around target coordinates.
@@ -2077,6 +2079,15 @@ def stream_extract_neighborhoods_ply(
         radius: Search radius (float) or list of radii (one per target_coord).
         show_progress: Whether to show progress bar.
         chunk_bytes: Chunk size for reading.
+        world_transform: Optional 4x4 homogeneous transform. When cylinder=True,
+            both PLY points and target_coords are projected through this matrix
+            before the distance test, so the search is performed in world space.
+        cylinder: If True, use a top-down cylinder search (2D XY distance only,
+            ignoring Z). Useful for capturing a full depth column above/below
+            each annotation. If world_transform is provided the search is done
+            in the transformed (oriented) space; otherwise the original PLY
+            axes are used. Returned SimplePointCloud objects always contain the
+            original (untransformed) PLY coordinates.
 
     Returns:
         List of SimplePointCloud objects, one per target coordinate.
@@ -2094,6 +2105,15 @@ def stream_extract_neighborhoods_ply(
     target_coords = [np.asarray(coord, dtype=float) for coord in target_coords]
     if not all(coord.shape == (3,) for coord in target_coords):
         raise ValueError("All target_coords must be 3-element arrays")
+
+    # Pre-transform target_coords to search space for cylinder mode
+    if cylinder and world_transform is not None:
+        m = np.asarray(world_transform, dtype=float)
+        tc_arr = np.array(target_coords, dtype=float)
+        ones = np.ones((len(tc_arr), 1), dtype=float)
+        target_coords_search = (np.hstack([tc_arr, ones]) @ m.T)[:, :3]
+    else:
+        target_coords_search = np.array(target_coords, dtype=float)
 
     with open(input_path, "rb") as fin:
         fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
@@ -2167,16 +2187,30 @@ def stream_extract_neighborhoods_ply(
                 # Extract coordinates for this chunk
                 coords = np.column_stack([arr["x"], arr["y"], arr["z"]])
 
+                # Optionally transform coords to search space (cylinder mode)
+                if cylinder and world_transform is not None:
+                    m = np.asarray(world_transform, dtype=float)
+                    ones = np.ones((len(coords), 1), dtype=float)
+                    coords_search = (np.hstack([coords, ones]) @ m.T)[:, :3]
+                else:
+                    coords_search = coords
+
                 # For each target coordinate, find points within radius
-                for idx, (target_coord, radius_sq_val) in enumerate(
-                    zip(target_coords, radii_sq)
+                for idx, (target_coord_s, radius_sq_val) in enumerate(
+                    zip(target_coords_search, radii_sq)
                 ):
-                    # Compute squared distances (vectorized)
-                    distances_sq = np.sum((coords - target_coord) ** 2, axis=1)
+                    # Compute squared distances (vectorized); cylinder uses XY only
+                    if cylinder:
+                        diff = coords_search[:, :2] - target_coord_s[:2]
+                        distances_sq = np.sum(diff ** 2, axis=1)
+                    else:
+                        distances_sq = np.sum(
+                            (coords_search - target_coord_s) ** 2, axis=1
+                        )
                     mask = distances_sq <= radius_sq_val
 
                     if np.any(mask):
-                        # Extract points within radius
+                        # Always store original (untransformed) PLY coords
                         neighborhoods[idx].append(coords[mask])
 
                         if has_rgb:

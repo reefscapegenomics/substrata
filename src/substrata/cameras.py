@@ -18,7 +18,7 @@ from joblib.externals.cloudpickle.cloudpickle import _property_reduce
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist, squareform
@@ -1971,11 +1971,148 @@ class Camera:
 
             return image_matches
 
-    def show(self, highlight_pixels=None):
+    def render(self, highlight_pixels=None, orient=False, square=False,
+               highlight_radius: int = 50, highlight_outline_width: int = 10):
+        """Return the camera image as a PIL Image with optional highlight markers.
+
+        Args:
+            highlight_pixels: A single ``[x, y]`` coordinate or an ``(N, 2)``
+                array of pixel coordinates to highlight with red circles.
+            orient: If True, rotate the image so that the world X-axis points
+                right, making the image orientation roughly consistent with a
+                top-down OrthoMap.  The rotation angle is derived from the
+                camera_transform: the image x-axis (``T[:3, 0]``) and y-axis
+                (``T[:3, 1]``) are used to project the world X direction
+                ``[1, 0, 0]`` onto the image plane; ``atan2`` then gives the
+                clockwise offset from image-right, which is corrected by a
+                counter-clockwise PIL rotation.
+            square: If True, crop the (possibly rotated) image to the largest
+                possible square centred on the image centre.  When
+                ``orient=True`` the square is the largest axis-aligned square
+                that fits within the actual image content (no rotation
+                whitespace), computed analytically from the original image
+                dimensions and rotation angle.  A warning is logged if any
+                highlight falls outside the resulting square.
+            highlight_radius: Radius in pixels of the circle drawn at each
+                highlight position (default 50).
+            highlight_outline_width: Stroke width in pixels of the circle
+                outline (default 10, matching the selected-mask contour
+                thickness used in ``get_crop_img_from_masks``).
+
+        Returns:
+            PIL Image, or None if the file is missing or unreadable.
         """
-        Display the image match and its attributes.
-        """
-        visualizations.show_img(self.filepath, highlight_pixels=highlight_pixels)
+        if not self.filepath or not os.path.isfile(self.filepath):
+            logger.warning("Camera.render: file not found: %s", self.filepath)
+            return None
+        try:
+            image = Image.open(self.filepath).convert("RGB")
+        except OSError as e:
+            logger.warning("Camera.render: could not open %s: %s", self.filepath, e)
+            return None
+
+        orig_W, orig_H = image.size
+
+        # Parse highlight pixels into a float (N, 2) array for coordinate tracking.
+        hp_draw = None
+        is_single = False
+        if highlight_pixels is not None:
+            hp_draw = np.array(highlight_pixels, dtype=float)
+            if hp_draw.ndim == 1:
+                hp_draw = hp_draw[np.newaxis, :]
+                is_single = True
+
+        # ── Step 1: orientation rotation ─────────────────────────────────
+        angle_deg = 0.0
+        if orient and self.camera_transform is not None:
+            try:
+                T = np.array(self.camera_transform, dtype=float).reshape((4, 4))
+                cam_right = T[:3, 0] / np.linalg.norm(T[:3, 0])
+                cam_down = T[:3, 1] / np.linalg.norm(T[:3, 1])
+                world_x = np.array([1.0, 0.0, 0.0])
+                angle_deg = float(np.degrees(
+                    np.arctan2(np.dot(world_x, cam_down), np.dot(world_x, cam_right))
+                ))
+            except Exception as e:
+                logger.warning("Camera.render: orient failed: %s", e)
+
+        if angle_deg != 0.0:
+            image = image.rotate(angle_deg, expand=True)
+            rot_W, rot_H = image.size
+            # Transform highlight pixels from original to rotated canvas coordinates.
+            if hp_draw is not None:
+                a_rad = np.radians(angle_deg)
+                cos_a, sin_a = np.cos(a_rad), np.sin(a_rad)
+                dx = hp_draw[:, 0] - orig_W / 2.0
+                dy = hp_draw[:, 1] - orig_H / 2.0
+                hp_draw = np.column_stack([
+                    dx * cos_a + dy * sin_a + rot_W / 2.0,
+                    -dx * sin_a + dy * cos_a + rot_H / 2.0,
+                ])
+        else:
+            rot_W, rot_H = orig_W, orig_H
+
+        # ── Step 2: square crop ───────────────────────────────────────────
+        crop_offset_x, crop_offset_y = 0, 0
+        if square:
+            if angle_deg != 0.0:
+                # Largest axis-aligned square inscribed in the rotated content
+                # (avoids whitespace corner pixels).  Derived from the constraint
+                # that all four corners of the square must map back into the
+                # original W×H image when un-rotated:
+                #   s ≤ min(W, H) / (|cos a| + |sin a|)
+                #   s ≤ max(W, H) / ||cos a| - |sin a||
+                a_abs = abs(np.radians(angle_deg)) % (np.pi / 2)
+                cos_a, sin_a = np.cos(a_abs), np.sin(a_abs)
+                diff_cs = abs(cos_a - sin_a)
+                s1 = min(orig_W, orig_H) / (cos_a + sin_a)
+                s2 = max(orig_W, orig_H) / diff_cs if diff_cs > 1e-8 else float("inf")
+                crop_size = int(min(s1, s2))
+            else:
+                crop_size = min(rot_W, rot_H)
+
+            cx, cy = rot_W / 2.0, rot_H / 2.0
+
+            half = crop_size // 2
+            left = int(max(0, min(round(cx - half), rot_W - crop_size)))
+            top = int(max(0, min(round(cy - half), rot_H - crop_size)))
+            right = left + crop_size
+            bottom = top + crop_size
+
+            if hp_draw is not None:
+                outside = (
+                    (hp_draw[:, 0] < left) | (hp_draw[:, 0] >= right)
+                    | (hp_draw[:, 1] < top) | (hp_draw[:, 1] >= bottom)
+                )
+                if outside.any():
+                    logger.warning(
+                        "Camera.render: %d highlight(s) fall outside the square crop",
+                        int(outside.sum()),
+                    )
+
+            image = image.crop((left, top, right, bottom))
+            crop_offset_x, crop_offset_y = left, top
+
+        # ── Step 3: draw highlights ───────────────────────────────────────
+        if hp_draw is not None:
+            draw = ImageDraw.Draw(image)
+            for pixel in hp_draw:
+                x = int(round(pixel[0])) - crop_offset_x
+                y = int(round(pixel[1])) - crop_offset_y
+                draw.ellipse((x - highlight_radius, y - highlight_radius,
+                              x + highlight_radius, y + highlight_radius),
+                             fill=None, outline=(255, 0, 0),
+                             width=highlight_outline_width)
+
+        return image
+
+    def show(self, highlight_pixels=None, orient=False, square=False):
+        """Display the camera image with optional highlight markers."""
+        img = self.render(highlight_pixels=highlight_pixels, orient=orient, square=square)
+        if img is not None:
+            plt.imshow(np.array(img))
+            plt.axis("off")
+            plt.show()
 
     def get_datetime_original(self, offset_secs=None):
         """Retrieve the DateTimeOriginal from the image file EXIF data, with optional offset.
@@ -2341,15 +2478,195 @@ class ImageMatch:
         # Assign the first mask as the primary mask
         self.mask = mask_objects[0]
 
+    def create_circular_masks(self, radii):
+        """Create circular masks of specified radii around the match point.
+
+        Args:
+            radii (list): List of radii in meters. Each entry creates a separate mask.
+
+        Returns:
+            None: Masks are stored in self.masks, with the first mask also
+                assigned to self.mask.
+        """
+        if not self.pixel_scale:
+            self.calc_pixel_scale_from_crosshair()
+
+        if not self.pixel_scale:
+            raise ValueError(
+                "Pixel scale not available. Call calc_pixel_scale_from_crosshair() first."
+            )
+
+        if not radii or len(radii) == 0:
+            raise ValueError("radii must be a non-empty list")
+
+        img = cv2.imread(self.filepath)
+        if img is None:
+            raise ValueError(f"Cannot load image: {self.filepath}")
+
+        img_height, img_width = img.shape[:2]
+
+        class LocalMask:
+            def __init__(self, mask_vals, score=1.0, logits=None):
+                self.vals = mask_vals
+                self.score = score
+                self.logits = logits
+                self.area_in_px = cv2.countNonZero(mask_vals)
+                self.area_in_cm2 = None
+                self.radius_m = None
+
+        if not all(isinstance(r, (int, float)) for r in radii):
+            raise ValueError("radii must be a list of scalar values (e.g. [0.1, 0.2])")
+
+        mask_objects = []
+        for idx, radius_m in enumerate(radii):
+            radius_px = round(radius_m / self.pixel_scale)
+
+            mask_vals = np.zeros((img_height, img_width), dtype=np.uint8)
+            cv2.circle(mask_vals, (self.x, self.y), radius_px, 255, thickness=-1)
+
+            mask_obj = LocalMask(mask_vals, score=1.0)
+            mask_obj.radius_m = radius_m
+            mask_obj.area_in_px = cv2.countNonZero(mask_vals)
+            mask_obj.area_in_cm2 = mask_obj.area_in_px * (self.pixel_scale**2) * 10000
+
+            mask_objects.append(mask_obj)
+
+            print(f"Created circular mask {idx+1}: radius {radius_m:.4f} m")
+            print(f"Center: ({self.x}, {self.y}), radius: {radius_px} px")
+            print(
+                f"Mask area: {mask_obj.area_in_px} pixels = {mask_obj.area_in_cm2/10000:.4f} m²"
+            )
+
+        self.masks = np.array(mask_objects)
+        self.mask = mask_objects[0]
+
+    def render(self, crop_w=1000, crop_h=1000, single_mask=False, orient=False,
+               circular_image_mask=None):
+        """Return the cropped image match as a PIL Image.
+
+        Args:
+            crop_w: Crop width in pixels (default 1000).
+            crop_h: Crop height in pixels (default 1000).
+            single_mask: Whether to use only the primary mask when masks are present.
+            orient: If True, rotate so that the world X-axis points right, using
+                the camera_transform from :attr:`cam`.
+            circular_image_mask: Radius in pixels of a circular mask centred on
+                the annotation.  Pixels outside the circle are replaced with a
+                grey background.  Provide this only when no circular mask has been
+                set via :meth:`create_circular_masks`; when one is present its
+                radius is used automatically.
+
+        Returns:
+            PIL Image.
+        """
+        # Detect a circular mask created by create_circular_masks (has radius_m).
+        # Such masks use the fixed-center crop path + automatic grey-out rather
+        # than the SAM2 contour-overlay path.
+        is_circular = (
+            getattr(self, "mask", None) is not None
+            and hasattr(self.mask, "radius_m")
+            and self.mask.radius_m is not None
+        )
+
+        angle_deg = 0.0
+        if orient and getattr(self.cam, "camera_transform", None) is not None:
+            try:
+                T = np.array(self.cam.camera_transform, dtype=float).reshape((4, 4))
+                cam_right = T[:3, 0] / np.linalg.norm(T[:3, 0])
+                cam_down = T[:3, 1] / np.linalg.norm(T[:3, 1])
+                world_x = np.array([1.0, 0.0, 0.0])
+                angle_deg = float(np.degrees(
+                    np.arctan2(np.dot(world_x, cam_down), np.dot(world_x, cam_right))
+                ))
+            except Exception as e:
+                logger.warning("ImageMatch.render: orient failed: %s", e)
+
+        if getattr(self, "masks", None) is not None and len(self.masks) > 0 and not is_circular:
+            if angle_deg != 0.0:
+                # Inflate the canvas so that after rotating in-place (expand=False)
+                # the central crop_w × crop_h region has no black corners.
+                # pad_ratio shrinks the mask within the inflated canvas so it still
+                # occupies crop_w pixels — exactly matching the final crop size.
+                a_abs = abs(np.radians(angle_deg)) % (np.pi / 2)
+                cos_a, sin_a = np.cos(a_abs), np.sin(a_abs)
+                inflate = int(max(crop_w, crop_h) * (cos_a + sin_a)) + 2
+                rotate_pad = (cos_a + sin_a - 1.0) / 2.0
+                arr = visualizations.get_crop_img_from_masks(
+                    self, inflate, inflate, single_mask=single_mask,
+                    pad_ratio=rotate_pad,
+                )
+                pil_img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+                pil_img = pil_img.rotate(angle_deg, expand=False)
+                iw, ih = pil_img.size
+                left = (iw - crop_w) // 2
+                top = (ih - crop_h) // 2
+                pil_img = pil_img.crop((left, top, left + crop_w, top + crop_h))
+            else:
+                arr = visualizations.get_crop_img_from_masks(
+                    self, crop_w, crop_h, single_mask=single_mask
+                )
+                pil_img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+        else:
+            pil_img = visualizations.get_crop_img(
+                self.cam.filepath, self.x, self.y, crop_w, crop_h
+            )
+            if not isinstance(pil_img, Image.Image):
+                pil_img = Image.fromarray(pil_img)
+            if angle_deg != 0.0:
+                orig_W, orig_H = pil_img.size
+                pil_img = pil_img.rotate(angle_deg, expand=True)
+                pil_img = self._inscribed_square_crop(pil_img, orig_W, orig_H, angle_deg)
+            draw = ImageDraw.Draw(pil_img)
+            cx, cy = pil_img.size[0] // 2, pil_img.size[1] // 2
+            draw.ellipse([cx - 8, cy - 8, cx + 8, cy + 8],
+                         fill=(255, 0, 0), outline=(0, 0, 0))
+
+        # Apply grey-out circle: prefer the stored circular-mask radius, fall back
+        # to the explicit circular_image_mask argument (pixels).
+        grey_r: int | None = None
+        if is_circular and self.pixel_scale is not None:
+            grey_r = int(self.mask.radius_m / self.pixel_scale)
+        elif circular_image_mask is not None:
+            grey_r = int(circular_image_mask)
+        if grey_r is not None:
+            cx, cy = pil_img.size[0] // 2, pil_img.size[1] // 2
+            alpha = Image.new("L", pil_img.size, 0)
+            ImageDraw.Draw(alpha).ellipse(
+                [cx - grey_r, cy - grey_r, cx + grey_r, cy + grey_r], fill=255
+            )
+            grey = Image.new("RGB", pil_img.size, (180, 180, 180))
+            pil_img = Image.composite(pil_img, grey, alpha)
+
+        return pil_img
+
+    @staticmethod
+    def _inscribed_square_crop(
+        img: "Image.Image",
+        orig_W: int,
+        orig_H: int,
+        angle_deg: float,
+    ) -> "Image.Image":
+        """Return the largest whitespace-free square crop of a rotated image."""
+        a_abs = abs(np.radians(angle_deg)) % (np.pi / 2)
+        cos_a, sin_a = np.cos(a_abs), np.sin(a_abs)
+        diff_cs = abs(cos_a - sin_a)
+        s = int(min(
+            min(orig_W, orig_H) / (cos_a + sin_a),
+            max(orig_W, orig_H) / max(diff_cs, 1e-8),
+        ))
+        rot_W, rot_H = img.size
+        left = (rot_W - s) // 2
+        top = (rot_H - s) // 2
+        return img.crop((left, top, left + s, top + s))
+
     def show(
         self,
         crop_w=1000,
         crop_h=1000,
         single_mask=False,
+        orient=False,
     ):
-        """
-        Display the image match and its attributes.
-        """
+        """Display the image match and its attributes."""
         print(f"Image match for camera {self.cam.cam_id} at {self.x}, {self.y}")
         print(f"Depth: {self.depth}, Relevance: {self.relevance}")
         if hasattr(self, "potentially_obstructed"):
@@ -2361,7 +2678,6 @@ class ImageMatch:
         if self.pixel_scale:
             print(f"Pixel scale: {self.pixel_scale}")
             print(f"Pixels per mm: {self.pixels_per_mm}")
-        # Print classification information if available
         if hasattr(self, "classification") and self.classification:
             cls = self.classification
             label = cls.get("label")
@@ -2393,30 +2709,12 @@ class ImageMatch:
                     )
                 except Exception:
                     pass
-        if getattr(self, "masks", None) is not None and len(self.masks) > 0:
-            cropped_img = visualizations.get_crop_img_from_masks(
-                self, crop_w, crop_h, single_mask=single_mask
-            )
-            # Convert BGR (OpenCV) to RGB for matplotlib
-            cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
-        else:
-            cropped_img = visualizations.get_crop_img(
-                self.cam.filepath, self.x, self.y, crop_w, crop_h
-            )
+        img = self.render(
+            crop_w=crop_w, crop_h=crop_h, single_mask=single_mask,
+            orient=orient,
+        )
 
-        # Display the image
-        plt.imshow(cropped_img)
-
-        # Highlight the center pixel in red
-        if isinstance(cropped_img, Image.Image):  # PIL image
-            center_x = cropped_img.size[0] // 2
-            center_y = cropped_img.size[1] // 2
-        else:  # numpy array
-            center_y, center_x = cropped_img.shape[:2]
-            center_x = center_x // 2
-            center_y = center_y // 2
-
-        plt.plot(center_x, center_y, "ro", markersize=8)
+        plt.imshow(np.array(img))
         plt.show()
 
 

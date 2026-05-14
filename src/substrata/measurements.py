@@ -675,12 +675,12 @@ def calc_gap_fraction(
         axis=-1,
     )
 
-    # Set circular imaging area (in red)
+    # Set circular imaging area (in dark gray)
     radius = resolution // 2
     image = np.zeros((resolution, resolution, 3), dtype=np.uint8)
     x, y = np.meshgrid(np.arange(resolution), np.arange(resolution))
     img_mask = (x - (radius)) ** 2 + (y - (radius)) ** 2 <= radius**2
-    image[img_mask] = [255, 0, 0]
+    image[img_mask] = [80, 80, 80]
     img_area = np.sum(img_mask)
 
     # Calculate the raw cover
@@ -721,7 +721,7 @@ def calc_gap_fraction(
         visualize_seeds = True
 
     diff = (1, 1, 1)
-    fill_color = (0, 0, 255)
+    fill_color = (0, 0, 128)
     for seed_point in seed_points_px:
         retval, image, _, _ = cv2.floodFill(
             image, None, seed_point, fill_color, diff, diff
@@ -732,7 +732,7 @@ def calc_gap_fraction(
 
     # Draw seed markers AFTER counting so they don't affect gapF_fill.
     # A high-contrast green cross with a thin black outline is used so the
-    # markers remain visible against the red sky, blue fill, and varied
+    # markers remain visible against the dark gray sky, navy fill, and varied
     # benthic colours.
     if visualize_seeds:
         marker_size = max(6, resolution // 25)
