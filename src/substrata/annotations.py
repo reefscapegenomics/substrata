@@ -796,24 +796,97 @@ class Annotations:
         subset.data = {}
         return subset
 
-    def get_point_cloud_by_radius(self, source_pcd: Any, radius: float) -> None:
+    def get_radius_from_2D_surface_area(self) -> None:
+        """Set each annotation's ``radius`` from its 2D surface area measurement.
+
+        Calls ``Annotation.get_radius_from_2D_surface_area()`` for every annotation
+        that has ``SA_in_cm2`` set.  Annotations without it are skipped with a
+        warning.  After this call, each annotation's ``self.radius`` is populated and
+        can be used by ``get_point_cloud_by_radius`` and
+        ``reduce_point_cloud_to_radius`` without passing an explicit radius.
+        """
+        missing_sa = []
+        for ann_id, ann in self.data.items():
+            if not ann.measurements.get("SA_in_cm2"):
+                missing_sa.append(ann_id)
+                continue
+            ann.get_radius_from_2D_surface_area()
+        if missing_sa:
+            logger.warning(
+                "SA_in_cm2 not set for the following annotations (skipped): %s",
+                ", ".join(str(ann_id) for ann_id in missing_sa),
+            )
+
+    def get_min_radius(self) -> float:
+        """Return the minimum ``radius`` across all annotations that have one set.
+
+        Returns:
+            Minimum radius in metres.
+
+        Raises:
+            ValueError: If no annotation has a radius set.
+        """
+        radii = [
+            r
+            for ann in self.data.values()
+            if (r := getattr(ann, "radius", None)) is not None
+        ]
+        if not radii:
+            raise ValueError("No annotation has a radius set")
+        return float(min(radii))
+
+    def get_max_radius(self) -> float:
+        """Return the maximum ``radius`` across all annotations that have one set.
+
+        Returns:
+            Maximum radius in metres.
+
+        Raises:
+            ValueError: If no annotation has a radius set.
+        """
+        radii = [
+            r
+            for ann in self.data.values()
+            if (r := getattr(ann, "radius", None)) is not None
+        ]
+        if not radii:
+            raise ValueError("No annotation has a radius set")
+        return float(max(radii))
+
+    def get_point_cloud_by_radius(
+        self,
+        source_pcd: Any,
+        radius: Optional[float] = None,
+        cylinder: bool = False,
+        radius_buffer: Optional[float] = None,
+    ) -> None:
         """Get a point cloud around each annotation within a radius.
 
         Args:
             source_pcd: Source point cloud.
-            radius: Radius for subsampling.
+            radius: Search radius in metres.  If ``None``, each annotation's
+                ``self.radius`` is used.  Call ``get_radius_from_2D_surface_area()``
+                beforehand to set per-annotation radii automatically.
+            cylinder: If True, use a vertical cylinder search (XY distance only,
+                Z unconstrained) instead of a 3D sphere.  Recommended for TPI;
+                use a radius >= TPI ``radius_outer``.
+            radius_buffer: Additional metres added to each annotation's effective
+                radius.  ``self.radius`` on each annotation is unaffected.
         """
         for ann in tqdm(
             self.data.values(), desc="Subsampling pointcloud for each annotation"
         ):
-            ann.simple_pcd = source_pcd.subsample_pointcloud_by_radius(
-                ann.coords, radius
+            ann.get_point_cloud_by_radius(
+                source_pcd,
+                radius=radius,
+                cylinder=cylinder,
+                radius_buffer=radius_buffer,
             )
 
     def load_undecimated_neighborhoods(
         self,
         ply_filepath: str,
-        radius: Union[float, List[float]],
+        radius: Optional[float] = None,
         scale_factor: float = 1.0,
         show_progress: bool = True,
         cylinder: bool = False,
@@ -831,8 +904,10 @@ class Annotations:
 
         Args:
             ply_filepath: Path to the undecimated PLY file.
-            radius: Real-world search radius in metres (float) or list of radii
-                (one per annotation).
+            radius: Real-world search radius in metres.  If ``None``, each
+                annotation's ``self.radius`` is used.  Call
+                ``get_radius_from_2D_surface_area()`` beforehand to populate
+                per-annotation radii automatically.
             scale_factor: Scale factor that converts model-space units to real-world
                 metres (real_distance = model_distance * scale_factor). The radius
                 is divided by this value before searching so that the result
@@ -846,7 +921,8 @@ class Annotations:
                 space and are then transformed to world space as normal.
 
         Raises:
-            ValueError: If radius is a list with length different from number of annotations.
+            ValueError: If ``radius`` is ``None`` and any annotation's
+                ``self.radius`` is not set.
         """
         from substrata import pointclouds
 
@@ -854,23 +930,29 @@ class Annotations:
             logger.warning("No annotations to process")
             return
 
-        # Collect coordinates in consistent order (by annotation ID)
-        # Store mapping from index to annotation ID
+        # Collect coordinates and per-annotation radii in consistent order
         ann_ids = sorted(self.data.keys())
         target_coords = [self.data[ann_id].orig_coords for ann_id in ann_ids]
 
-        # Convert real-world radius to model-space units
-        if scale_factor != 1.0:
-            if isinstance(radius, (list, tuple)):
-                radius = [r / scale_factor for r in radius]
-            else:
-                radius = radius / scale_factor
+        # Build a per-annotation radius list (always passed as list internally)
+        if radius is not None:
+            radii = [radius / scale_factor] * len(ann_ids)
+        else:
+            radii = []
+            for ann_id in ann_ids:
+                r = getattr(self.data[ann_id], "radius", None)
+                if r is None:
+                    raise ValueError(
+                        f"Annotation {ann_id}: no radius provided and "
+                        "self.radius is not set"
+                    )
+                radii.append(r / scale_factor)
 
         # Extract neighborhoods in a single pass
         neighborhoods = pointclouds.stream_extract_neighborhoods_ply(
             ply_filepath,
             target_coords,
-            radius,
+            radii,
             show_progress=show_progress,
             world_transform=self.world_transform,
             cylinder=cylinder,
@@ -910,6 +992,7 @@ class Annotations:
         import csv
 
         unmatched = []
+        matched = set()
         with open(filepath, newline="") as f:
             reader = csv.DictReader(f)
             if id_column not in reader.fieldnames:
@@ -949,56 +1032,55 @@ class Annotations:
                     except (ValueError, KeyError):
                         pass
 
+                matched.add(ann_id)
+
+        log = logger.warning if not matched else logger.info
+        log(
+            "Loaded measurements for %d/%d annotations from %s",
+            len(matched),
+            len(self.data),
+            filepath,
+        )
         if unmatched:
             logger.warning(
                 "The following CSV IDs had no matching annotation (skipped): %s",
                 ", ".join(unmatched),
             )
 
-    def reduce_point_cloud_based_on_SA(self) -> None:
-        """Reduce each annotation's simple_pcd to the radius derived from SA_in_cm2.
+    def reduce_point_cloud_to_radius(self) -> None:
+        """Filter each annotation's simple_pcd to retain only points within its radius.
 
-        For each annotation, filters simple_pcd to only retain points within the
-        radius determined by get_radius_from_2D_surface_area(). Annotations without
-        a SA_in_cm2 measurement are skipped and reported as a warning.
+        Delegates to ``Annotation.reduce_point_cloud_to_radius()`` for each
+        annotation.  Annotations whose ``self.radius`` is not set are skipped with a
+        warning.  Call ``get_radius_from_2D_surface_area()`` beforehand to populate
+        radii automatically from surface-area measurements.
         """
-        missing_sa = []
+        missing_radius = []
         for ann_id, ann in self.data.items():
-            if not ann.measurements.get("SA_in_cm2"):
-                missing_sa.append(ann_id)
+            if getattr(ann, "radius", None) is None:
+                missing_radius.append(ann_id)
                 continue
-            if ann.simple_pcd is None:
-                continue
-            radius = ann.get_radius_from_2D_surface_area()
-            distances_sq = np.sum(
-                (ann.simple_pcd.points - ann.orig_coords) ** 2, axis=1
-            )
-            mask = distances_sq <= radius**2
-            ann.simple_pcd.points = ann.simple_pcd.points[mask]
-            if hasattr(ann.simple_pcd, "colors"):
-                ann.simple_pcd.colors = ann.simple_pcd.colors[mask]
-            if hasattr(ann.simple_pcd, "normals"):
-                ann.simple_pcd.normals = ann.simple_pcd.normals[mask]
-            if hasattr(ann.simple_pcd, "labels"):
-                ann.simple_pcd.labels = ann.simple_pcd.labels[mask]
-
-        if missing_sa:
+            ann.reduce_point_cloud_to_radius()
+        if missing_radius:
             logger.warning(
-                "SA_in_cm2 not set for the following annotations (skipped): %s",
-                ", ".join(str(ann_id) for ann_id in missing_sa),
+                "radius not set for the following annotations (skipped): %s",
+                ", ".join(str(ann_id) for ann_id in missing_radius),
             )
 
     def measure_all(
-        self, measurement_func: Callable, *args: Any, **kwargs: Any
+        self, measurement_func: Union[Callable, str], *args: Any, **kwargs: Any
     ) -> None:
         """Conduct measurements for all annotations.
 
         Args:
-            measurement_func: Function to measure an annotation.
+            measurement_func: Function to measure an annotation, or its name
+                as a string (resolved from :mod:`substrata.measurements`).
             *args: Additional arguments.
             **kwargs: Additional keyword arguments.
         """
-        if measurement_func.__name__ in ["get_mask_surface_area"]:
+        if isinstance(measurement_func, str):
+            measurement_func = getattr(measurements, measurement_func)
+        if measurement_func.__name__ in ["get_mask_surface_area", "calc_tpi"]:
             # Do not parallelize (cannot pickle)
             results = {}
             for ann in tqdm(
@@ -1018,7 +1100,7 @@ class Annotations:
                     total=len(self.data),
                 )
             ):
-                results_list = Parallel(n_jobs=-1)(
+                results_list = Parallel(n_jobs=-1, max_nbytes=None)(
                     delayed(ann.measure)(measurement_func, *args, **kwargs)
                     for ann in self.data.values()
                 )
@@ -1052,6 +1134,12 @@ class Annotations:
                 self.data[id].measurements["plane_coeffs"] = output[3]
                 self.data[id].measurements["azimuth"] = output[4]
                 self.data[id].measurements["elevation_image"] = output[5]
+            elif measurement_func.__name__ == "calc_tpi":
+                self.data[id].measurements["tpi_abs"] = output[0]
+                self.data[id].measurements["std_annulus_z"] = output[1]
+                self.data[id].measurements["tpi_plane"] = output[2]
+                self.data[id].measurements["std_annulus_plane"] = output[3]
+                self.data[id].measurements["tpi_image"] = output[4]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
@@ -1286,6 +1374,7 @@ class Annotation:
         self.image_match = None  # selected image match for measurements
         self.image_matches = []
         self.classification = None
+        self.radius: Optional[float] = None
         self.simple_pcd = None
         self.meta_data = {}
         self.measurements = {}
@@ -1379,21 +1468,75 @@ class Annotation:
     def get_radius_from_2D_surface_area(self) -> float:
         """Calculate the radius in meters using the 2D surface area in cm².
 
+        Sets ``self.radius`` as a side effect so the value is available for
+        downstream methods such as ``get_point_cloud_by_radius`` and
+        ``reduce_point_cloud_to_radius``.
+
         Returns:
             Radius in meters.
         """
-        # Calculate radius in centimeters then convert to meters.
         radius_cm = np.sqrt(self.measurements["SA_in_cm2"] / np.pi)
-        return radius_cm / 100
+        self.radius = radius_cm / 100
+        return self.radius
 
-    def get_point_cloud_by_radius(self, source_pcd: Any, radius: float) -> None:
+    def get_point_cloud_by_radius(
+        self,
+        source_pcd: Any,
+        radius: Optional[float] = None,
+        cylinder: bool = False,
+        radius_buffer: Optional[float] = None,
+    ) -> None:
         """Get a point cloud for annotation by sampling a point cloud within a radius.
 
         Args:
             source_pcd: Source point cloud.
-            radius: Radius for subsampling.
+            radius: Search radius in metres.  If ``None``, ``self.radius`` is used.
+                Call ``get_radius_from_2D_surface_area()`` beforehand to set it
+                automatically from the surface-area measurement.
+            cylinder: If True, use a vertical cylinder search (XY distance only,
+                Z unconstrained) instead of a 3D sphere.
+            radius_buffer: Additional metres added to the effective radius before
+                sampling.  Useful when a larger neighbourhood is needed for
+                downstream analysis (e.g. TPI annulus); ``self.radius`` is
+                unaffected.
+
+        Raises:
+            ValueError: If ``radius`` is ``None`` and ``self.radius`` is not set.
         """
-        self.simple_pcd = source_pcd.subsample_pointcloud_by_radius(self.coords, radius)
+        if radius is None:
+            if self.radius is None:
+                raise ValueError(
+                    f"Annotation {self.id}: no radius provided and self.radius is not set"
+                )
+            radius = self.radius
+        effective_radius = radius + (radius_buffer or 0.0)
+        self.simple_pcd = source_pcd.subsample_pointcloud_by_radius(
+            self.coords, effective_radius, cylinder=cylinder
+        )
+
+    def reduce_point_cloud_to_radius(self) -> None:
+        """Filter simple_pcd to retain only points within ``self.radius``.
+
+        Applies a 3D sphere filter centred on ``self.orig_coords``.  Call
+        ``get_radius_from_2D_surface_area()`` beforehand to set ``self.radius``
+        automatically, or assign it directly.
+
+        Raises:
+            ValueError: If ``self.radius`` is not set.
+        """
+        if self.radius is None:
+            raise ValueError(f"Annotation {self.id}: self.radius is not set")
+        if self.simple_pcd is None:
+            return
+        distances_sq = np.sum((self.simple_pcd.points - self.orig_coords) ** 2, axis=1)
+        mask = distances_sq <= self.radius**2
+        self.simple_pcd.points = self.simple_pcd.points[mask]
+        if hasattr(self.simple_pcd, "colors") and self.simple_pcd.colors is not None:
+            self.simple_pcd.colors = self.simple_pcd.colors[mask]
+        if hasattr(self.simple_pcd, "normals") and self.simple_pcd.normals is not None:
+            self.simple_pcd.normals = self.simple_pcd.normals[mask]
+        if hasattr(self.simple_pcd, "labels") and self.simple_pcd.labels is not None:
+            self.simple_pcd.labels = self.simple_pcd.labels[mask]
 
     def get_hom_coords(self) -> np.ndarray:
         """Return the annotation coordinates in homogeneous format.
@@ -1635,6 +1778,26 @@ class Annotation:
                 plane_coeffs,
                 azimuth,
                 elevation_image,
+            ]
+        elif measurement_func.__name__ == "calc_tpi":
+            if "radius_inner" not in kwargs and getattr(self, "radius", None) is not None:
+                kwargs = {**kwargs, "radius_inner": self.radius}
+            if "center" not in kwargs:
+                kwargs = {**kwargs, "center": self.coords}
+            tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tpi_image = (
+                measurement_func(self.simple_pcd, *args, **kwargs)
+            )
+            self.measurements["tpi_abs"] = tpi_abs
+            self.measurements["std_annulus_z"] = std_annulus_z
+            self.measurements["tpi_plane"] = tpi_plane
+            self.measurements["std_annulus_plane"] = std_annulus_plane
+            self.measurements["tpi_image"] = tpi_image
+            return self.id, [
+                tpi_abs,
+                std_annulus_z,
+                tpi_plane,
+                std_annulus_plane,
+                tpi_image,
             ]
         else:
             logger.error("Measurement not recognized!")

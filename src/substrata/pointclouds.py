@@ -58,9 +58,7 @@ def _available_memory_bytes() -> int:
     except Exception:
         pass
     try:  # POSIX fallback (Linux/macOS): pages currently free.
-        return int(
-            os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        )
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
     except (ValueError, OSError, AttributeError):
         return _FALLBACK_AVAILABLE_BYTES
 
@@ -93,6 +91,7 @@ def _memory_safe_vertex_cap(
         fraction = OPEN3D_MEMORY_BUDGET_FRACTION
     peak_bpv = _o3d_peak_bytes_per_vertex(has_rgb, has_normals)
     return max(1, int((_available_memory_bytes() * fraction) // peak_bpv))
+
 
 # PLY scalar sizes (bytes) and struct codes
 ply_type_sizes = {
@@ -332,7 +331,8 @@ class PointCloud:
                 cap = min(OPEN3D_MAX_VERTICES, mem_cap)
                 if n_vertices > cap:
                     reason = (
-                        "RAM budget" if mem_cap < OPEN3D_MAX_VERTICES
+                        "RAM budget"
+                        if mem_cap < OPEN3D_MAX_VERTICES
                         else "Open3D int32 limit"
                     )
                     bpv = _o3d_bytes_per_vertex(has_rgb, has_normals)
@@ -444,7 +444,8 @@ class PointCloud:
             self.apply_transform(tm)
 
     def apply_color_correction(
-        self, correction: Dict[str, np.ndarray],
+        self,
+        correction: Dict[str, np.ndarray],
         chunk_size: int = 5_000_000,
     ) -> None:
         """Apply an affine colour correction to the point cloud.
@@ -885,13 +886,17 @@ class PointCloud:
         self.o3d_pcd = reduced_pcd
 
     def subsample_pointcloud_by_radius(
-        self, coords: np.ndarray, radius: float
+        self, coords: np.ndarray, radius: float, cylinder: bool = False
     ) -> "SimplePointCloud":
         """Subsample the pointcloud by a given radius.
 
         Args:
             coords: Coordinates to search around.
             radius: Search radius.
+            cylinder: If True, search within a vertical cylinder (XY distance
+                only, Z unconstrained) instead of a 3D sphere.  Use this when
+                downstream analysis depends on horizontal distance — e.g. TPI,
+                which compares elevations across a horizontal neighbourhood.
 
         Returns:
             SimplePointCloud with subsampled points.
@@ -899,11 +904,17 @@ class PointCloud:
         Raises:
             RuntimeError: If the pointcloud has <=1 points.
         """
-        if not hasattr(self, "o3d_pcd_tree"):
-            self.build_kd_tree()
-
-        # Query all points within `radius` of annotation
-        [k, idx, _] = self.o3d_pcd_tree.search_radius_vector_3d(coords, radius)
+        if cylinder:
+            if not hasattr(self, "o3d_pcd_tree_xy"):
+                self.build_kd_tree_xy()
+            coords_xy = np.array([coords[0], coords[1], 0.0])
+            [k, idx, _] = self.o3d_pcd_tree_xy.search_radius_vector_3d(
+                coords_xy, radius
+            )
+        else:
+            if not hasattr(self, "o3d_pcd_tree"):
+                self.build_kd_tree()
+            [k, idx, _] = self.o3d_pcd_tree.search_radius_vector_3d(coords, radius)
 
         if len(self.points) <= 1:
             logger.error(
@@ -1547,6 +1558,12 @@ class SimplePointCloud:
         o3d_pcd.normals = o3d.utility.Vector3dVector(self.normals)
         return o3d_pcd
 
+    def show(self):
+        """Show the point cloud using plotly for interactive 3D visualization."""
+        from substrata.visualizations import show
+
+        return show(self)
+
 
 def _parse_ply_header(fin):
     # returns (fmt, endian, n_vertices, vertex_props, record_size)
@@ -1705,9 +1722,7 @@ def _apply_color_correction_vertex_chunk(
             return float(val)
         if ptype in ("float", "float32", "double", "float64"):
             return float(val) * 255.0
-        raise ValueError(
-            f"Unsupported RGB property type for color correction: {ptype}"
-        )
+        raise ValueError(f"Unsupported RGB property type for color correction: {ptype}")
 
     def m255_to_sample(val: float, ptype: str) -> Union[int, float]:
         val = float(np.clip(val, 0.0, 255.0))
@@ -1715,9 +1730,7 @@ def _apply_color_correction_vertex_chunk(
             return int(round(val))
         if ptype in ("float", "float32", "double", "float64"):
             return val / 255.0
-        raise ValueError(
-            f"Unsupported RGB property type for color correction: {ptype}"
-        )
+        raise ValueError(f"Unsupported RGB property type for color correction: {ptype}")
 
     buf = bytearray(chunk)
     for i in range(n):
@@ -2153,7 +2166,9 @@ def stream_extract_neighborhoods_ply(
         # Determine scale factor for RGB: uchar/uint8 stored as 0-255, float as 0-1
         if has_rgb:
             rgb_prop_type = next(t for t, n in vprops if n == "red")
-            rgb_scale = 255.0 if rgb_prop_type in ("uchar", "uint8", "char", "int8") else 1.0
+            rgb_scale = (
+                255.0 if rgb_prop_type in ("uchar", "uint8", "char", "int8") else 1.0
+            )
 
         # Pre-allocate lists for each neighborhood
         neighborhoods = [[] for _ in target_coords]
@@ -2202,7 +2217,7 @@ def stream_extract_neighborhoods_ply(
                     # Compute squared distances (vectorized); cylinder uses XY only
                     if cylinder:
                         diff = coords_search[:, :2] - target_coord_s[:2]
-                        distances_sq = np.sum(diff ** 2, axis=1)
+                        distances_sq = np.sum(diff**2, axis=1)
                     else:
                         distances_sq = np.sum(
                             (coords_search - target_coord_s) ** 2, axis=1
@@ -2473,9 +2488,7 @@ def repair_ply_for_open3d(
 
     if verify:
         try:
-            verify_pcd = o3d.io.read_point_cloud(
-                output_path, print_progress=False
-            )
+            verify_pcd = o3d.io.read_point_cloud(output_path, print_progress=False)
             n_read = len(verify_pcd.points)
             if n_read == 0:
                 logger.warning(

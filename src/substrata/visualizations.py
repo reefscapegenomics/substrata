@@ -570,20 +570,24 @@ def _render_plane_view_on_ax(
     proj_u = delta @ u_axis
     proj_v = delta @ v_axis
 
-    corners_2d = np.array([
-        [0.0, 0.0],
-        [np.dot(tr - origin, u_axis), np.dot(tr - origin, v_axis)],
-        [np.dot(bl - origin, u_axis), np.dot(bl - origin, v_axis)],
-        [np.dot(br - origin, u_axis), np.dot(br - origin, v_axis)],
-    ])
+    corners_2d = np.array(
+        [
+            [0.0, 0.0],
+            [np.dot(tr - origin, u_axis), np.dot(tr - origin, v_axis)],
+            [np.dot(bl - origin, u_axis), np.dot(bl - origin, v_axis)],
+            [np.dot(br - origin, u_axis), np.dot(br - origin, v_axis)],
+        ]
+    )
     u_min, v_min = corners_2d.min(axis=0)
     u_max, v_max = corners_2d.max(axis=0)
     mu = (u_max - u_min) * margin_frac
     mv = (v_max - v_min) * margin_frac
 
     mask = (
-        (proj_u >= u_min - mu) & (proj_u <= u_max + mu)
-        & (proj_v >= v_min - mv) & (proj_v <= v_max + mv)
+        (proj_u >= u_min - mu)
+        & (proj_u <= u_max + mu)
+        & (proj_v >= v_min - mv)
+        & (proj_v <= v_max + mv)
     )
     proj_u = proj_u[mask]
     proj_v = proj_v[mask]
@@ -591,7 +595,11 @@ def _render_plane_view_on_ax(
 
     ax.set_aspect("equal")
     ax.scatter(
-        proj_u, proj_v, c=np.clip(cols, 0, 1), s=point_size, edgecolor="none",
+        proj_u,
+        proj_v,
+        c=np.clip(cols, 0, 1),
+        s=point_size,
+        edgecolor="none",
     )
 
     centres = np.asarray(patch_centers_3d, dtype=float)
@@ -658,46 +666,72 @@ def _render_comparison_grid_on_ax(
         pr = patch_results[idx]
         ref = np.clip(np.asarray(pr["ref_rgb_255"], dtype=float) / 255.0, 0, 1)
 
-        ax.add_patch(mpatches.Rectangle(
-            (col - 0.5, row - 0.5), 1.0, 1.0,
-            facecolor=ref, edgecolor="none",
-        ))
+        ax.add_patch(
+            mpatches.Rectangle(
+                (col - 0.5, row - 0.5),
+                1.0,
+                1.0,
+                facecolor=ref,
+                edgecolor="none",
+            )
+        )
 
         med = pr.get("median_rgb_0_1")
         if med is not None:
             meas = np.clip(np.asarray(med, dtype=float), 0, 1)
-            ax.add_patch(mpatches.Rectangle(
-                (col - 0.5 + inset, row - 0.5 + inset),
-                1.0 - 2 * inset, 1.0 - 2 * inset,
-                facecolor=meas, edgecolor="none",
-            ))
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (col - 0.5 + inset, row - 0.5 + inset),
+                    1.0 - 2 * inset,
+                    1.0 - 2 * inset,
+                    facecolor=meas,
+                    edgecolor="none",
+                )
+            )
         else:
-            ax.add_patch(mpatches.Rectangle(
-                (col - 0.5 + inset, row - 0.5 + inset),
-                1.0 - 2 * inset, 1.0 - 2 * inset,
-                facecolor="white", edgecolor="0.4", linewidth=0.5,
-            ))
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (col - 0.5 + inset, row - 0.5 + inset),
+                    1.0 - 2 * inset,
+                    1.0 - 2 * inset,
+                    facecolor="white",
+                    edgecolor="0.4",
+                    linewidth=0.5,
+                )
+            )
             x0 = col - 0.5 + inset
             y0 = row - 0.5 + inset
             s = 1.0 - 2 * inset
             ax.plot(
-                [x0, x0 + s], [y0, y0 + s],
-                color="0.4", linewidth=1.2, clip_on=True,
+                [x0, x0 + s],
+                [y0, y0 + s],
+                color="0.4",
+                linewidth=1.2,
+                clip_on=True,
             )
             ax.plot(
-                [x0 + s, x0], [y0, y0 + s],
-                color="0.4", linewidth=1.2, clip_on=True,
+                [x0 + s, x0],
+                [y0, y0 + s],
+                color="0.4",
+                linewidth=1.2,
+                clip_on=True,
             )
 
         if outlier_mask is not None and idx < len(outlier_mask) and outlier_mask[idx]:
             x0, y0 = col - 0.5, row - 0.5
             ax.plot(
-                [x0, x0 + 1], [y0, y0 + 1],
-                color="red", linewidth=2.5, clip_on=True,
+                [x0, x0 + 1],
+                [y0, y0 + 1],
+                color="red",
+                linewidth=2.5,
+                clip_on=True,
             )
             ax.plot(
-                [x0 + 1, x0], [y0, y0 + 1],
-                color="red", linewidth=2.5, clip_on=True,
+                [x0 + 1, x0],
+                [y0, y0 + 1],
+                color="red",
+                linewidth=2.5,
+                clip_on=True,
             )
 
 
@@ -741,15 +775,22 @@ def plot_colorchecker_card_summary(
         matplotlib Figure.
     """
     fig, (ax_plane, ax_grid) = plt.subplots(
-        1, 2, figsize=(width, height),
+        1,
+        2,
+        figsize=(width, height),
         gridspec_kw={"width_ratios": [3, 2]},
     )
 
     _render_plane_view_on_ax(
         ax_plane,
-        pcd_points, pcd_colors,
-        tl, tr, bl, br,
-        patch_centers_3d, patch_names,
+        pcd_points,
+        pcd_colors,
+        tl,
+        tr,
+        bl,
+        br,
+        patch_centers_3d,
+        patch_names,
         radius,
         title="Plane-normal view",
         point_size=point_size,
@@ -798,34 +839,60 @@ def _render_swatch_grid_on_ax(
             continue
         raw = np.asarray(colors_255[idx], dtype=float)
         if not np.all(np.isfinite(raw)):
-            ax.add_patch(mpatches.Rectangle(
-                (col - 0.5, row - 0.5), 1.0, 1.0,
-                facecolor="white", edgecolor="0.4", linewidth=0.5,
-            ))
-            ax.plot(
-                [col - 0.5, col + 0.5], [row - 0.5, row + 0.5],
-                color="0.4", linewidth=1.2,
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (col - 0.5, row - 0.5),
+                    1.0,
+                    1.0,
+                    facecolor="white",
+                    edgecolor="0.4",
+                    linewidth=0.5,
+                )
             )
             ax.plot(
-                [col + 0.5, col - 0.5], [row - 0.5, row + 0.5],
-                color="0.4", linewidth=1.2,
+                [col - 0.5, col + 0.5],
+                [row - 0.5, row + 0.5],
+                color="0.4",
+                linewidth=1.2,
+            )
+            ax.plot(
+                [col + 0.5, col - 0.5],
+                [row - 0.5, row + 0.5],
+                color="0.4",
+                linewidth=1.2,
             )
             ax.text(
-                col, row, patch_names[idx], ha="center", va="center",
-                fontsize=5, color="0.4",
+                col,
+                row,
+                patch_names[idx],
+                ha="center",
+                va="center",
+                fontsize=5,
+                color="0.4",
             )
             continue
         c = np.clip(raw / 255.0, 0, 1)
-        ax.add_patch(mpatches.Rectangle(
-            (col - 0.5, row - 0.5), 1.0, 1.0,
-            facecolor=c, edgecolor="grey", linewidth=0.3,
-        ))
+        ax.add_patch(
+            mpatches.Rectangle(
+                (col - 0.5, row - 0.5),
+                1.0,
+                1.0,
+                facecolor=c,
+                edgecolor="grey",
+                linewidth=0.3,
+            )
+        )
 
         lum = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
         txt_col = "white" if lum < 0.45 else "black"
         ax.text(
-            col, row, patch_names[idx], ha="center", va="center",
-            fontsize=5, color=txt_col,
+            col,
+            row,
+            patch_names[idx],
+            ha="center",
+            va="center",
+            fontsize=5,
+            color=txt_col,
         )
 
         if outlier_mask is not None and idx < len(outlier_mask) and outlier_mask[idx]:
@@ -874,14 +941,23 @@ def plot_color_correction_summary(
     ax_ref = fig.add_subplot(gs[0, 2])
 
     _render_swatch_grid_on_ax(
-        ax_meas, measured_rgb_255, patch_names,
-        outlier_mask=outlier_mask, title="Measured",
+        ax_meas,
+        measured_rgb_255,
+        patch_names,
+        outlier_mask=outlier_mask,
+        title="Measured",
     )
     _render_swatch_grid_on_ax(
-        ax_corr, corrected, patch_names, title="Corrected",
+        ax_corr,
+        corrected,
+        patch_names,
+        title="Corrected",
     )
     _render_swatch_grid_on_ax(
-        ax_ref, reference_rgb_255, patch_names, title="Reference",
+        ax_ref,
+        reference_rgb_255,
+        patch_names,
+        title="Reference",
     )
 
     channel_names = ["Red", "Green", "Blue"]
@@ -893,12 +969,23 @@ def plot_color_correction_summary(
         corr_ch = corrected[:, ch]
 
         ax.scatter(
-            ref_ch, meas_ch, s=30, alpha=0.4, color=channel_colors[ch],
-            label="Before", edgecolors="none",
+            ref_ch,
+            meas_ch,
+            s=30,
+            alpha=0.4,
+            color=channel_colors[ch],
+            label="Before",
+            edgecolors="none",
         )
         ax.scatter(
-            ref_ch, corr_ch, s=30, marker="D", color=channel_colors[ch],
-            label="After", edgecolors="black", linewidths=0.3,
+            ref_ch,
+            corr_ch,
+            s=30,
+            marker="D",
+            color=channel_colors[ch],
+            label="After",
+            edgecolors="black",
+            linewidths=0.3,
         )
 
         ax.plot([0, 255], [0, 255], "k--", linewidth=0.8, alpha=0.5)
@@ -957,7 +1044,11 @@ def plot_color_before_after(
     colors_after = corrected_255 / 255.0
 
     fig, (ax_before, ax_after) = plt.subplots(
-        1, 2, figsize=(width, height), sharex=True, sharey=True,
+        1,
+        2,
+        figsize=(width, height),
+        sharex=True,
+        sharey=True,
     )
     for ax, cols, label in [
         (ax_before, colors_before, "Before correction"),
@@ -965,7 +1056,11 @@ def plot_color_before_after(
     ]:
         ax.set_aspect("equal")
         ax.scatter(
-            pts[:, 0], pts[:, 1], c=cols, s=point_size, edgecolor="none",
+            pts[:, 0],
+            pts[:, 1],
+            c=cols,
+            s=point_size,
+            edgecolor="none",
         )
         ax.set_title(label, fontsize=10)
         ax.set_rasterized(True)
@@ -2100,6 +2195,7 @@ def _ann_pcd_camera_view(ann):
     try:
         from substrata.ortho import OrthoMap
         from PIL import ImageFilter
+
         if ann.simple_pcd is None or ann.image_match is None:
             return None
         cam_vec = ann.image_match.cam.vector
@@ -2128,13 +2224,17 @@ def _ann_pcd_top_view(ann, radius=None, up_vector=None, rotation=0):
     try:
         from substrata.ortho import OrthoMap
         from PIL import ImageFilter
+
         if ann.simple_pcd is None:
             return None
         view = OrthoMap(ann.simple_pcd, up_vector=up_vector, rotation=rotation)
         kwargs = dict(highlights=ann, point_size=15)
         if radius is not None:
-            kwargs.update(point_size_metres=radius * 2, point_color=None,
-                          point_outline=(255, 0, 0))
+            kwargs.update(
+                point_size_metres=radius * 2,
+                point_color=None,
+                point_outline=(255, 0, 0),
+            )
         img = view.show(**kwargs)
         n_pts = max(len(ann.simple_pcd.points), 1)
         raw = int(np.sqrt(view.width * view.height / n_pts) * 2.5)
@@ -2143,6 +2243,143 @@ def _ann_pcd_top_view(ann, radius=None, up_vector=None, rotation=0):
     except Exception as e:
         logger.warning("_ann_pcd_top_view failed for %s: %s", ann.id, e)
         return None
+
+
+def plot_measurements(
+    annotations,
+    measurements: Optional[List[str]] = None,
+    cols: int = 4,
+    width: int = 16,
+    height_per_row: int = 4,
+    title: Optional[str] = None,
+) -> Any:
+    """Box plots of numeric measurements grouped by Annotation.label.
+
+    Args:
+        annotations: Annotations container whose items each have a ``label``
+            attribute and a ``measurements`` dict.
+        measurements: Optional list of measurement keys to include. When None,
+            all numeric (scalar) keys are auto-detected (``_image`` keys are
+            always excluded).
+        cols: Maximum number of subplots per row.
+        width: Figure width in inches.
+        height_per_row: Height in inches per subplot row.
+        title: Optional overall figure title.
+
+    Returns:
+        matplotlib Figure.
+    """
+    import math
+
+    # --- 1. Collect numeric measurement keys ---
+    all_keys: set = set()
+    for ann in annotations.data.values():
+        for k, v in ann.measurements.items():
+            if "_image" in k:
+                continue
+            if np.isscalar(v) and not isinstance(v, (bool, str)):
+                all_keys.add(k)
+
+    if measurements is not None:
+        measurement_keys = [k for k in measurements if k in all_keys]
+    else:
+        measurement_keys = sorted(all_keys)
+
+    if not measurement_keys:
+        raise ValueError("No numeric measurements found in the provided Annotations.")
+
+    # --- 2. Collect values grouped by label ---
+    unique_labels = sorted(
+        {
+            getattr(ann, "label", None)
+            for ann in annotations.data.values()
+            if getattr(ann, "label", None) is not None
+        }
+    )
+
+    data: Dict[str, Dict[str, list]] = {
+        key: {label: [] for label in unique_labels} for key in measurement_keys
+    }
+    for ann in annotations.data.values():
+        label = getattr(ann, "label", None)
+        if label is None:
+            continue
+        for key in measurement_keys:
+            v = ann.measurements.get(key)
+            if v is not None and np.isscalar(v) and not isinstance(v, (bool, str)):
+                data[key][label].append(float(v))
+
+    # --- 3. Build subplot grid ---
+    n_plots = len(measurement_keys)
+    n_cols = min(cols, n_plots)
+    n_rows = math.ceil(n_plots / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(width, height_per_row * n_rows), squeeze=False
+    )
+
+    # Assign a distinct color per label
+    cmap_labels = plt.cm.tab10 if len(unique_labels) <= 10 else plt.cm.tab20
+    label_colors = {
+        label: cmap_labels(i / max(len(unique_labels) - 1, 1))
+        for i, label in enumerate(unique_labels)
+    }
+
+    rng = np.random.default_rng(0)
+
+    # --- 4. Draw box plots ---
+    for idx, key in enumerate(measurement_keys):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+
+        plot_data = [data[key][label] for label in unique_labels]
+        bp = ax.boxplot(
+            plot_data,
+            labels=unique_labels,
+            sym="",                 # suppress default fliers; we draw jitter instead
+            patch_artist=True,
+            medianprops=dict(color="black", linewidth=1.5),
+        )
+
+        for i, (label, box) in enumerate(zip(unique_labels, bp["boxes"])):
+            color = label_colors[label]
+            box.set(facecolor=(*color[:3], 0.25), edgecolor=color)
+            bp["whiskers"][2 * i].set_color(color)
+            bp["whiskers"][2 * i + 1].set_color(color)
+            bp["caps"][2 * i].set_color(color)
+            bp["caps"][2 * i + 1].set_color(color)
+
+            vals = plot_data[i]
+            n = len(vals)
+            if n > 0:
+                jitter = rng.uniform(-0.2, 0.2, size=n)
+                ax.scatter(
+                    np.full(n, i + 1) + jitter,
+                    vals,
+                    color=color,
+                    s=15,
+                    alpha=0.6,
+                    edgecolors="none",
+                    zorder=3,
+                )
+        tick_labels = [
+            f"{label}\nn={len(plot_data[i])}" for i, label in enumerate(unique_labels)
+        ]
+        ax.set_xticklabels(tick_labels)
+        ax.set_title(key, fontsize=9)
+        ax.tick_params(axis="x", labelsize=7, rotation=45 if len(unique_labels) > 4 else 0)
+        ax.tick_params(axis="y", labelsize=7)
+        ax.set_rasterized(True)
+
+    # Hide unused axes
+    for idx in range(n_plots, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].set_visible(False)
+
+    if title:
+        fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    return fig
 
 
 def save_measurement_visualizations_to_pdf(
@@ -2179,8 +2416,8 @@ def save_measurement_visualizations_to_pdf(
     usable_w = 297 - 2 * margin
     usable_h = 210 - 2 * margin
     row_h = usable_h / 3
-    label_gap = 3   # mm below an image before the text label
-    label_h = 4     # mm for a single text row
+    label_gap = 3  # mm below an image before the text label
+    label_h = 4  # mm for a single text row
 
     standard_order = [
         "gapF_image",
@@ -2225,25 +2462,31 @@ def save_measurement_visualizations_to_pdf(
 
         coords_str = (
             f"[{ann.coords[0]:.4f}, {ann.coords[1]:.4f}, {ann.coords[2]:.4f}]"
-            if ann.coords is not None else "N/A"
+            if ann.coords is not None
+            else "N/A"
         )
         orig_coords_str = (
             f"[{ann.orig_coords[0]:.4f}, {ann.orig_coords[1]:.4f}, {ann.orig_coords[2]:.4f}]"
-            if getattr(ann, "orig_coords", None) is not None else "N/A"
+            if getattr(ann, "orig_coords", None) is not None
+            else "N/A"
         )
 
         try:
-            n_pts = len(ann.simple_pcd.points) if getattr(ann, "simple_pcd", None) is not None else "N/A"
+            n_pts = (
+                len(ann.simple_pcd.points)
+                if getattr(ann, "simple_pcd", None) is not None
+                else "N/A"
+            )
         except Exception:
             n_pts = "N/A"
 
         meta_lines = [
-            ("ID",              str(ann.id) if ann.id else "N/A"),
-            ("Label",           str(ann.label) if getattr(ann, "label", None) else "N/A"),
-            ("Coords",          coords_str),
-            ("Orig coords",     orig_coords_str),
-            ("Depth",           depth_str),
-            ("Subsampled pts",  str(n_pts)),
+            ("ID", str(ann.id) if ann.id else "N/A"),
+            ("Label", str(ann.label) if getattr(ann, "label", None) else "N/A"),
+            ("Coords", coords_str),
+            ("Orig coords", orig_coords_str),
+            ("Depth", depth_str),
+            ("Subsampled pts", str(n_pts)),
         ]
         line_h = 6
         pdf.set_font("Arial", "B", size=7)
@@ -2312,9 +2555,7 @@ def save_measurement_visualizations_to_pdf(
                             ann.image_match.create_circular_masks([radius])
                         except Exception:
                             pass
-                crop_pil = ann.image_match.render(
-                    crop_w=1000, crop_h=1000, orient=True
-                )
+                crop_pil = ann.image_match.render(crop_w=1000, crop_h=1000, orient=True)
                 _pil_to_pdf(pdf, crop_pil, col2_x, r2_y, col_w, img_h2)
             except Exception as e:
                 logger.warning("Zoomed crop failed for %s: %s", ann.id, e)
@@ -2344,7 +2585,8 @@ def save_measurement_visualizations_to_pdf(
         ordered_img_keys += sorted(k for k in image_keys_all if k not in standard_order)
 
         scalar_meas = {
-            k: v for k, v in meas.items()
+            k: v
+            for k, v in meas.items()
             if "_image" not in k
             and v is not None
             and isinstance(v, (int, float, np.integer, np.floating))
@@ -2356,7 +2598,7 @@ def save_measurement_visualizations_to_pdf(
 
         if has_images or has_scalars:
             n_img_cols = len(ordered_img_keys)
-            n_r3_cols = n_img_cols + 1   # +1 for scalar column
+            n_r3_cols = n_img_cols + 1  # +1 for scalar column
             cell_w3 = usable_w / n_r3_cols
             img_h3 = row_h - label_gap - label_h
 
@@ -2365,10 +2607,14 @@ def save_measurement_visualizations_to_pdf(
                 img_val = meas[img_key]
                 try:
                     if isinstance(img_val, np.ndarray):
-                        arr = img_val if img_val.dtype == np.uint8 else (
-                            (np.clip(img_val, 0, 1) * 255).astype(np.uint8)
-                            if img_val.max() <= 1.0
-                            else img_val.astype(np.uint8)
+                        arr = (
+                            img_val
+                            if img_val.dtype == np.uint8
+                            else (
+                                (np.clip(img_val, 0, 1) * 255).astype(np.uint8)
+                                if img_val.max() <= 1.0
+                                else img_val.astype(np.uint8)
+                            )
                         )
                         pil_v = Image.fromarray(arr)
                     elif isinstance(img_val, Image.Image):
@@ -2384,7 +2630,9 @@ def save_measurement_visualizations_to_pdf(
                         pil_v = Image.fromarray(arr_rgb).rotate(90, expand=True)
                     _pil_to_pdf(pdf, pil_v, cx, r3_y, cell_w3, img_h3)
                 except Exception as e:
-                    logger.warning("Meas image %s failed for %s: %s", img_key, ann.id, e)
+                    logger.warning(
+                        "Meas image %s failed for %s: %s", img_key, ann.id, e
+                    )
                     _draw_placeholder(pdf, cx, r3_y, cell_w3, img_h3)
                 pdf.set_xy(cx + 2, r3_y + img_h3 + label_gap)
                 pdf.cell(cell_w3 - 4, label_h, img_key, ln=0)
@@ -4398,6 +4646,161 @@ def visualize_roughness(
                 "Install kaleido for image export: pip install kaleido"
             )
             return fig
+
+
+def visualize_tpi(
+    pcd,
+    tpi_abs,
+    tpi_plane,
+    output_filename=None,
+    max_output_points=50000,
+    width=1200,
+    height=500,
+    point_size=2,
+    interactive=False,
+    mean_tpi_abs=None,
+    mean_tpi_plane=None,
+    center=None,
+    radius_inner=0.0,
+    radius_outer=0.0,
+    colorscale_max=1.0,
+):
+    """Visualize TPI (absolute and plane-relative) for a point cloud.
+
+    Renders two side-by-side 2D top-down scatter plots: the left coloured by
+    TPI_abs and the right by TPI_plane.  Both use a diverging ``RdBu_r``
+    colormap with a fixed symmetric range of ``±colorscale_max`` metres.
+    Points with no annulus neighbours (NaN) are shown in light gray.  When
+    ``center`` is provided the focal point is marked with a star and the inner
+    and outer annulus radii are drawn as circles.
+
+    Args:
+        pcd: Point cloud with a ``.points`` attribute.
+        tpi_abs: Per-point absolute TPI array (N,), may contain NaN.
+        tpi_plane: Per-point plane-relative TPI array (N,), may contain NaN.
+        output_filename: Optional path to save the figure (png, jpg, pdf, svg).
+        max_output_points: Maximum number of points to render (decimated if
+            exceeded).
+        width: Figure width in pixels (at 100 dpi).
+        height: Figure height in pixels (at 100 dpi).
+        point_size: Scatter marker size (matplotlib ``s``).
+        interactive: If True and no output file, display interactively.
+        mean_tpi_abs: Pre-computed mean TPI_abs for the title (optional).
+        mean_tpi_plane: Pre-computed mean TPI_plane for the title (optional).
+        center: (3,) focal point.  If provided, a star marker and radius
+            circles are overlaid on each panel.
+        radius_inner: Inner annulus radius in metres (drawn as solid circle).
+        radius_outer: Outer annulus radius in metres (drawn as dashed circle).
+        colorscale_max: Half-range of the fixed symmetric colorscale in metres.
+
+    Returns:
+        matplotlib.figure.Figure | np.ndarray: Figure object when
+        ``interactive=True`` or ``output_filename`` is set; otherwise an
+        (H, W, 3) uint8 RGB array.
+    """
+    dpi = 100
+    pts = np.asarray(pcd.points, dtype=float)
+    tpi_abs = np.asarray(tpi_abs, dtype=float)
+    tpi_plane = np.asarray(tpi_plane, dtype=float)
+
+    if len(pts) > max_output_points:
+        rng = np.random.default_rng(seed=42)
+        idx = rng.choice(len(pts), size=max_output_points, replace=False)
+        pts = pts[idx]
+        tpi_abs = tpi_abs[idx]
+        tpi_plane = tpi_plane[idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(width / dpi, height / dpi), dpi=dpi)
+
+    panel_configs = [
+        (tpi_abs,   "Z relative to focal point (m)",                mean_tpi_abs,  "TPI_abs"),
+        (tpi_plane, "Z relative to annulus plane at focal point (m)", mean_tpi_plane, "TPI_plane"),
+    ]
+
+    for ax, (values, label, mean_val, tpi_name) in zip(axes, panel_configs):
+        val_str = f"{mean_val:.4f} m" if mean_val is not None else "N/A"
+        valid = ~np.isnan(values)
+
+        if np.any(~valid):
+            ax.scatter(
+                pts[~valid, 0],
+                pts[~valid, 1],
+                c="lightgray",
+                s=point_size,
+                rasterized=True,
+            )
+
+        if np.any(valid):
+            sc = ax.scatter(
+                pts[valid, 0],
+                pts[valid, 1],
+                c=values[valid],
+                cmap="RdBu_r",
+                vmin=-colorscale_max,
+                vmax=colorscale_max,
+                s=point_size,
+                rasterized=True,
+            )
+            plt.colorbar(sc, ax=ax, label=label, fraction=0.046, pad=0.04)
+
+        if center is not None:
+            cx, cy = float(center[0]), float(center[1])
+            if mean_val is not None and np.isfinite(mean_val):
+                ax.scatter(
+                    cx, cy,
+                    c=[mean_val],
+                    cmap="RdBu_r",
+                    vmin=-colorscale_max,
+                    vmax=colorscale_max,
+                    marker="*",
+                    s=200,
+                    zorder=5,
+                    edgecolors="black",
+                    linewidths=0.5,
+                )
+            else:
+                ax.scatter(cx, cy, c="black", marker="*", s=200, zorder=5)
+            if radius_inner > 0:
+                ax.add_patch(
+                    mpatches.Circle(
+                        (cx, cy), radius_inner, fill=False, color="black", lw=1
+                    )
+                )
+            if radius_outer > 0:
+                ax.add_patch(
+                    mpatches.Circle(
+                        (cx, cy), radius_outer, fill=False, color="black", lw=1, ls="--"
+                    )
+                )
+
+        ax.set_aspect("equal")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.set_title(f"{label}\n{tpi_name} (focal point) = {val_str}", fontsize=9)
+
+    fig.tight_layout()
+
+    if output_filename is not None:
+        ext = os.path.splitext(output_filename)[1].lower()
+        if ext == ".html":
+            logger.warning(
+                "HTML output is not supported for 2D TPI visualization; skipping."
+            )
+        else:
+            fig.savefig(output_filename, dpi=dpi, bbox_inches="tight")
+        return fig
+    elif interactive:
+        plt.show()
+        return fig
+    else:
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return np.array(img, dtype=np.uint8)
 
 
 def visualize_vector_dispersion(

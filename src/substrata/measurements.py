@@ -2,6 +2,7 @@
 import sys
 import random
 import copy
+from typing import Optional, Tuple
 
 # Third-Party Libraries
 import numpy as np
@@ -31,6 +32,7 @@ except ImportError:
 
 # Local Modules
 from substrata import cameras, pointclouds, visualizations, settings, geom
+from substrata.logging import logger
 
 
 def conduct_PCA(pcd, sort=True):
@@ -346,6 +348,172 @@ def calc_roughness(pcd):
     image = visualizations.visualize_roughness(pcd, interactive=False, ra=ra, rq=rq)
 
     return ra, rq, image
+
+
+def calc_tpi(
+    pcd,
+    center: Optional[np.ndarray] = None,
+    radius_inner: float = settings.DEFAULT_TPI_RADIUS_INNER,
+    radius_outer: Optional[float] = None,
+    annulus_width: Optional[float] = None,
+    generate_image: bool = True,
+    center_z_from_inner: bool = False,
+    voxel_size: Optional[float] = None,
+) -> Tuple[float, float, float, float, Optional[np.ndarray]]:
+    """Compute Topographic Position Index (TPI) for a point cloud (Weiss 2001).
+
+    TPI is computed at a single focal point (``center``) — the annotation
+    location.  The neighbourhood is the annulus in the horizontal (XY) plane
+    between ``radius_inner`` and the outer limit; Z is unconstrained (vertical
+    cylinder geometry).  The inner exclusion zone prevents the focal object
+    (e.g. the coral colony) from biasing the neighbourhood mean.
+
+    The outer limit is specified as **one** of:
+
+    - ``radius_outer`` — absolute distance from ``center``.
+    - ``annulus_width`` — fixed extension beyond ``radius_inner``
+      (outer limit = ``radius_inner + annulus_width``).
+
+    If neither is supplied, ``settings.DEFAULT_TPI_RADIUS_OUTER`` is used.
+
+    Two TPI variants are returned:
+
+    TPI_abs
+        ``z_center − mean(z_annulus)`` in the same units as the point cloud.
+    TPI_plane
+        Signed perpendicular distance of ``center`` from the best-fit plane of
+        the annulus points.  Corrects for sloping habitat.
+
+    Positive values indicate a crest / elevated position; negative indicate a
+    hollow / depressed position.
+
+    Args:
+        pcd: Point cloud with a ``.points`` attribute convertible to (N, 3).
+        center: (3,) focal point.  If ``None``, the XY centroid + mean Z of
+            the point cloud is used.
+        radius_inner: Inner radius of the annulus in metres.
+        radius_outer: Absolute outer radius.  Mutually exclusive with
+            ``annulus_width``.
+        annulus_width: Fixed extension beyond ``radius_inner``.  Mutually
+            exclusive with ``radius_outer``.
+        generate_image: If True (default), produce a visualisation image.
+        center_z_from_inner: If True, override focal Z with the mean Z of
+            points within ``radius_inner`` (the colony footprint), rather than
+            using ``center[2]`` directly.  More robust when the provided center
+            coordinate sits above or below the actual surface.
+        voxel_size: If set, voxel-average the annulus points before computing
+            any statistics.  Equalises the spatial weight of each region
+            regardless of local point density — useful for variable-density
+            photogrammetric clouds.  Has no effect when ``None`` (default).
+
+    Returns:
+        tpi_abs: Absolute TPI at the focal point.
+        std_annulus_z: Standard deviation of Z within the annulus (habitat
+            topographic heterogeneity).
+        tpi_plane: Plane-relative TPI at the focal point.
+        std_annulus_plane: Standard deviation of annulus-point distances from
+            the best-fit plane.
+        image: Visualisation image as an (H, W, 3) uint8 array, or ``None``.
+
+    Raises:
+        ValueError: If both ``radius_outer`` and ``annulus_width`` are given,
+            the point cloud has fewer than 2 points, or
+            ``radius_inner >= outer_radius``.
+    """
+    if radius_outer is not None and annulus_width is not None:
+        raise ValueError("Specify either radius_outer or annulus_width, not both")
+    if annulus_width is not None:
+        outer_radius = radius_inner + annulus_width
+    else:
+        outer_radius = (
+            radius_outer
+            if radius_outer is not None
+            else settings.DEFAULT_TPI_RADIUS_OUTER
+        )
+
+    pts = np.asarray(pcd.points, dtype=float)
+    if len(pts) < 2:
+        raise ValueError("Point cloud must have at least 2 points for TPI")
+    if radius_inner >= outer_radius:
+        raise ValueError("radius_inner must be less than the outer radius")
+
+    if center is None:
+        focal_xy = pts[:, :2].mean(axis=0)
+        focal_z = pts[:, 2].mean()
+    else:
+        center = np.asarray(center, dtype=float)
+        focal_xy = center[:2]
+        focal_z = center[2]
+
+    # Vectorised XY distances from focal point — O(N), no KDTree needed
+    dists_xy = np.linalg.norm(pts[:, :2] - focal_xy, axis=1)
+
+    if center_z_from_inner and radius_inner > 0:
+        inner_mask = dists_xy < radius_inner
+        if np.any(inner_mask):
+            focal_z = float(pts[inner_mask, 2].mean())
+
+    annulus_desc = (
+        f"annulus_width={annulus_width:.3f} m (outer={outer_radius:.3f} m)"
+        if annulus_width is not None
+        else f"radius_outer={outer_radius:.3f} m"
+    )
+    logger.info(
+        "calc_tpi: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s  n_pts=%d",
+        focal_xy[0],
+        focal_xy[1],
+        focal_z,
+        radius_inner,
+        annulus_desc,
+        len(pts),
+    )
+
+    annulus_mask = (dists_xy >= radius_inner) & (dists_xy <= outer_radius)
+
+    if not np.any(annulus_mask):
+        return np.nan, np.nan, np.nan, np.nan, None
+
+    annulus_pts = pts[annulus_mask]
+
+    if voxel_size is not None:
+        keys = np.floor(annulus_pts / voxel_size).astype(int)
+        _, inverse, counts = np.unique(
+            keys, axis=0, return_inverse=True, return_counts=True
+        )
+        voxel_sums = np.zeros((len(counts), 3))
+        np.add.at(voxel_sums, inverse, annulus_pts)
+        annulus_pts = voxel_sums / counts[:, np.newaxis]
+
+    annulus_mean_z = annulus_pts[:, 2].mean()
+    std_annulus_z = float(annulus_pts[:, 2].std())
+
+    tpi_abs = float(focal_z - annulus_mean_z)
+
+    # Best-fit plane of annulus via SVD; normal = last right-singular vector
+    centroid = annulus_pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(annulus_pts - centroid, full_matrices=False)
+    normal = vt[-1] / np.linalg.norm(vt[-1])
+    d = -normal @ centroid
+    focal_pt = np.array([focal_xy[0], focal_xy[1], focal_z])
+    tpi_plane = float(normal @ focal_pt + d)
+    std_annulus_plane = float(np.std(annulus_pts @ normal + d))
+
+    image = None
+    if generate_image:
+        vis_tpi_abs = pts[:, 2] - focal_z
+        vis_tpi_plane = pts @ normal + d - tpi_plane
+        image = visualizations.visualize_tpi(
+            pcd,
+            vis_tpi_abs,
+            vis_tpi_plane,
+            interactive=False,
+            mean_tpi_abs=tpi_abs,
+            mean_tpi_plane=tpi_plane,
+            center=focal_pt,
+            radius_inner=radius_inner,
+            radius_outer=outer_radius,
+        )
+    return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, image
 
 
 def get_fractal_dimension(pcd, iterations=10, plot=False):
