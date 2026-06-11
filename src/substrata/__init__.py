@@ -13,6 +13,11 @@ try:
 except Exception:  # pragma: no cover - robust fallback if tqdm is unavailable
     TqdmWarning = Warning  # type: ignore[assignment]
 
+# Under Sphinx autodoc_mock_imports, the import above succeeds but yields a
+# mock object (not a class), so guard before using it as a warning category.
+if not (isinstance(TqdmWarning, type) and issubclass(TqdmWarning, Warning)):
+    TqdmWarning = Warning  # type: ignore[assignment]
+
 warnings.filterwarnings(
     "ignore",
     message=".*IProgress not found.*",

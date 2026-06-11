@@ -27,7 +27,14 @@ extensions = [
 ]
 
 templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = [
+    '_build',
+    'Thumbs.db',
+    '.DS_Store',
+    # Heavy / non-tutorial notebooks kept out of the build (also gitignored).
+    'notebooks/notebook_mcav_sint.ipynb',
+    'notebooks/color_calibration.ipynb',
+]
 
 # Do not execute notebooks during doc builds (safer for RTD)
 nb_execution_mode = "off"
@@ -72,6 +79,14 @@ autodoc_mock_imports = [
     "alphashape",
     "shapely",
     "joblib",
+    "torch",
+    "IPython",
+    "PIL",
+    "sam2",
+    "psutil",
+    "plotly",
+    "fastai",
+    "fpdf",
     # Submodules occasionally imported directly
     "mpl_toolkits.mplot3d",
 ]
