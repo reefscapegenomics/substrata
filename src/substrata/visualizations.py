@@ -2431,6 +2431,9 @@ def save_measurement_visualizations_to_pdf(
         pdf.set_font("Arial", size=7)
         pdf.set_text_color(0, 0, 0)
 
+        # Use per-annotation radius when no global radius was supplied.
+        eff_radius = radius if radius is not None else getattr(ann, "radius", None)
+
         # ── Row 1: OrthoMap + metadata ────────────────────────────────────
         r1_y = margin
         ortho_w = usable_w * 3 / 4
@@ -2440,9 +2443,9 @@ def save_measurement_visualizations_to_pdf(
         if orthomap is not None:
             try:
                 ortho_kwargs = dict(highlights=ann, width=1200, height=600)
-                if radius is not None:
+                if eff_radius is not None:
                     ortho_kwargs.update(
-                        point_size_metres=radius * 2,
+                        point_size_metres=eff_radius * 2,
                         point_color=None,
                         point_outline=(255, 0, 0),
                     )
@@ -2512,11 +2515,11 @@ def save_measurement_visualizations_to_pdf(
         if ann_has_image_match:
             try:
                 highlight_radius = 50
-                if radius is not None:
+                if eff_radius is not None:
                     try:
                         ppm = ann.image_match.pixels_per_mm
                         if ppm is not None:
-                            highlight_radius = max(1, int(radius * 1000.0 * ppm))
+                            highlight_radius = max(1, int(eff_radius * 1000.0 * ppm))
                     except Exception:
                         pass
                 full_img = ann.image_match.cam.render(
@@ -2543,7 +2546,7 @@ def save_measurement_visualizations_to_pdf(
         col2_x = margin + col_w
         if ann_has_image_match:
             try:
-                if radius is not None:
+                if eff_radius is not None:
                     existing = getattr(ann.image_match, "mask", None)
                     already_circular = (
                         existing is not None
@@ -2552,7 +2555,7 @@ def save_measurement_visualizations_to_pdf(
                     )
                     if not already_circular:
                         try:
-                            ann.image_match.create_circular_masks([radius])
+                            ann.image_match.create_circular_masks([eff_radius])
                         except Exception:
                             pass
                 crop_pil = ann.image_match.render(crop_w=1000, crop_h=1000, orient=True)
@@ -2568,7 +2571,7 @@ def save_measurement_visualizations_to_pdf(
         # Col 3: top-down point cloud view
         col3_x = margin + 2 * col_w
         up_vec = getattr(orthomap, "_up_vector", None) if orthomap is not None else None
-        pcd_img = _ann_pcd_top_view(ann, radius=radius, up_vector=up_vec, rotation=90)
+        pcd_img = _ann_pcd_top_view(ann, radius=eff_radius, up_vector=up_vec, rotation=90)
         if pcd_img is not None:
             _pil_to_pdf(pdf, pcd_img, col3_x, r2_y, col_w, img_h2)
         else:
@@ -4660,6 +4663,8 @@ def visualize_tpi(
     interactive=False,
     mean_tpi_abs=None,
     mean_tpi_plane=None,
+    mean_tri_abs=None,
+    mean_tri_plane=None,
     center=None,
     radius_inner=0.0,
     radius_outer=0.0,
@@ -4687,6 +4692,9 @@ def visualize_tpi(
         interactive: If True and no output file, display interactively.
         mean_tpi_abs: Pre-computed mean TPI_abs for the title (optional).
         mean_tpi_plane: Pre-computed mean TPI_plane for the title (optional).
+        mean_tri_abs: Pre-computed TRI_abs for the left-panel title (optional).
+        mean_tri_plane: Pre-computed TRI_plane for the right-panel title
+            (optional).
         center: (3,) focal point.  If provided, a star marker and radius
             circles are overlaid on each panel.
         radius_inner: Inner annulus radius in metres (drawn as solid circle).
@@ -4713,12 +4721,13 @@ def visualize_tpi(
     fig, axes = plt.subplots(1, 2, figsize=(width / dpi, height / dpi), dpi=dpi)
 
     panel_configs = [
-        (tpi_abs,   "Z relative to focal point (m)",                mean_tpi_abs,  "TPI_abs"),
-        (tpi_plane, "Z relative to annulus plane at focal point (m)", mean_tpi_plane, "TPI_plane"),
+        (tpi_abs,   "Z relative to focal point (m)",                mean_tpi_abs,  "TPI_abs",   mean_tri_abs,   "TRI_abs"),
+        (tpi_plane, "Z relative to annulus plane at focal point (m)", mean_tpi_plane, "TPI_plane", mean_tri_plane, "TRI_plane"),
     ]
 
-    for ax, (values, label, mean_val, tpi_name) in zip(axes, panel_configs):
+    for ax, (values, label, mean_val, tpi_name, tri_val, tri_name) in zip(axes, panel_configs):
         val_str = f"{mean_val:.4f} m" if mean_val is not None else "N/A"
+        tri_str = f"{tri_val:.4f} m" if tri_val is not None else "N/A"
         valid = ~np.isnan(values)
 
         if np.any(~valid):
@@ -4763,20 +4772,25 @@ def visualize_tpi(
             if radius_inner > 0:
                 ax.add_patch(
                     mpatches.Circle(
-                        (cx, cy), radius_inner, fill=False, color="black", lw=1
+                        (cx, cy), radius_inner, fill=False, color="black", lw=1, ls="--"
                     )
                 )
             if radius_outer > 0:
                 ax.add_patch(
                     mpatches.Circle(
-                        (cx, cy), radius_outer, fill=False, color="black", lw=1, ls="--"
+                        (cx, cy), radius_outer, fill=False, color="black", lw=1
                     )
                 )
 
         ax.set_aspect("equal")
         ax.set_xlabel("X (m)")
         ax.set_ylabel("Y (m)")
-        ax.set_title(f"{label}\n{tpi_name} (focal point) = {val_str}", fontsize=9)
+        radii_str = f"r_inner={radius_inner:.3f} m  r_outer={radius_outer:.3f} m"
+        ax.set_title(
+            f"{label}\n{tpi_name} (focal point) = {val_str}\n"
+            f"{tri_name} (annulus) = {tri_str}\n{radii_str}",
+            fontsize=9,
+        )
 
     fig.tight_layout()
 

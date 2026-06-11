@@ -358,7 +358,7 @@ def calc_tpi_and_tri(
     annulus_width: Optional[float] = None,
     generate_image: bool = True,
     center_z_from_inner: bool = False,
-    voxel_size: Optional[float] = None,
+    raster_cell_size: Optional[float] = None,
 ) -> Tuple[float, float, float, float, float, float, Optional[np.ndarray]]:
     """Compute TPI and TRI for a point cloud (Weiss 2001; Wilson et al. 2007).
 
@@ -412,10 +412,12 @@ def calc_tpi_and_tri(
             points within ``radius_inner`` (the colony footprint), rather than
             using ``center[2]`` directly.  More robust when the provided center
             coordinate sits above or below the actual surface.
-        voxel_size: If set, voxel-average the annulus points before computing
-            any statistics.  Equalises the spatial weight of each region
-            regardless of local point density — useful for variable-density
-            photogrammetric clouds.  Has no effect when ``None`` (default).
+        raster_cell_size: If set, rasterize the neighbourhood in XY at this cell
+            size (metres) before computing any statistics.  Each cell contributes
+            one representative point (mean XYZ of all points within it),
+            equalising spatial weight regardless of local point density — useful
+            for variable-density photogrammetric clouds.  Has no effect when
+            ``None`` (default).
 
     Returns:
         tpi_abs: Absolute TPI at the focal point.
@@ -424,7 +426,7 @@ def calc_tpi_and_tri(
         tpi_plane: Plane-relative TPI at the focal point.
         std_annulus_plane: Standard deviation of annulus-point distances from
             the best-fit plane.
-        tri_wilson: Mean absolute Z-difference from focal point to annulus
+        tri_abs: Mean absolute Z-difference from focal point to annulus
             points (Wilson et al. 2007 TRI, adapted for point clouds).
         tri_plane: Mean absolute perpendicular distance of annulus points from
             the best-fit plane (slope-corrected TRI).
@@ -466,7 +468,17 @@ def calc_tpi_and_tri(
     if center_z_from_inner and radius_inner > 0:
         inner_mask = dists_xy < radius_inner
         if np.any(inner_mask):
-            focal_z = float(pts[inner_mask, 2].mean())
+            inner_pts = pts[inner_mask]
+            if raster_cell_size is not None:
+                inner_keys = np.floor(inner_pts[:, :2] / raster_cell_size).astype(int)
+                _, inner_inv, inner_counts = np.unique(
+                    inner_keys, axis=0, return_inverse=True, return_counts=True
+                )
+                inner_z_sums = np.zeros(len(inner_counts))
+                np.add.at(inner_z_sums, inner_inv, inner_pts[:, 2])
+                focal_z = float((inner_z_sums / inner_counts).mean())
+            else:
+                focal_z = float(inner_pts[:, 2].mean())
 
     annulus_desc = (
         f"annulus_width={annulus_width:.3f} m (outer={outer_radius:.3f} m)"
@@ -490,8 +502,8 @@ def calc_tpi_and_tri(
 
     annulus_pts = pts[annulus_mask]
 
-    if voxel_size is not None:
-        keys = np.floor(annulus_pts / voxel_size).astype(int)
+    if raster_cell_size is not None:
+        keys = np.floor(annulus_pts[:, :2] / raster_cell_size).astype(int)
         _, inverse, counts = np.unique(
             keys, axis=0, return_inverse=True, return_counts=True
         )
@@ -514,25 +526,48 @@ def calc_tpi_and_tri(
     std_annulus_plane = float(np.std(annulus_pts @ normal + d))
 
     # TRI: nearly free — reuses annulus_pts, normal, d already computed above
-    tri_wilson = float(np.abs(annulus_pts[:, 2] - focal_z).mean())
+    tri_abs = float(np.abs(annulus_pts[:, 2] - focal_z).mean())
     tri_plane = float(np.abs(annulus_pts @ normal + d).mean())
 
     image = None
     if generate_image:
-        vis_tpi_abs = pts[:, 2] - focal_z
-        vis_tpi_plane = pts @ normal + d - tpi_plane
-        image = visualizations.visualize_tpi(
-            pcd,
-            vis_tpi_abs,
-            vis_tpi_plane,
+        if raster_cell_size is not None:
+            # Show only the voxelized annulus points — not the dense background.
+            # Including the background causes visualize_tpi's random subsampling
+            # (max_output_points=50000) to discard most voxels, since they are
+            # vastly outnumbered by the original cloud (~300k pts vs ~2k voxels).
+            # The radius circles and star marker provide sufficient spatial context.
+            display_pcd = pointclouds.SimplePointCloud(annulus_pts)
+            vis_tpi_abs = annulus_pts[:, 2] - focal_z
+            vis_tpi_plane = annulus_pts @ normal + d - tpi_plane
+            # Scale marker size so each voxel dot fills its physical footprint.
+            # visualize_tpi renders height=500px at 100dpi over ~2*outer_radius m;
+            # ~65 % of the height is axes area after labels/padding.
+            # matplotlib scatter s is in pts² (1 pt = 100/72 px at 100 dpi).
+            px_per_m = (500 * 0.65) / (2 * outer_radius)
+            pt_diameter = raster_cell_size * px_per_m * (72 / 100)
+            vis_point_size = max(2, int(pt_diameter**2))
+        else:
+            display_pcd = pcd
+            vis_tpi_abs = pts[:, 2] - focal_z
+            vis_tpi_plane = pts @ normal + d - tpi_plane
+            vis_point_size = None
+        vis_kwargs = dict(
             interactive=False,
             mean_tpi_abs=tpi_abs,
             mean_tpi_plane=tpi_plane,
+            mean_tri_abs=tri_abs,
+            mean_tri_plane=tri_plane,
             center=focal_pt,
             radius_inner=radius_inner,
             radius_outer=outer_radius,
         )
-    return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_wilson, tri_plane, image
+        if vis_point_size is not None:
+            vis_kwargs["point_size"] = vis_point_size
+        image = visualizations.visualize_tpi(
+            display_pcd, vis_tpi_abs, vis_tpi_plane, **vis_kwargs
+        )
+    return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_abs, tri_plane, image
 
 
 def get_fractal_dimension(pcd, iterations=10, plot=False):

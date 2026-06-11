@@ -1139,7 +1139,7 @@ class Annotations:
                 self.data[id].measurements["std_annulus_z"] = output[1]
                 self.data[id].measurements["tpi_plane"] = output[2]
                 self.data[id].measurements["std_annulus_plane"] = output[3]
-                self.data[id].measurements["tri_wilson"] = output[4]
+                self.data[id].measurements["tri_abs"] = output[4]
                 self.data[id].measurements["tri_plane"] = output[5]
                 self.data[id].measurements["tpi_image"] = output[6]
 
@@ -1429,6 +1429,44 @@ class Annotation:
             pcd: Point cloud to draw as background.
         """
         visualizations.plot_positions(self, pcd, color=color, zoom=zoom)
+
+    def show_measurement_image(self, key: str, width: float = 12) -> None:
+        """Display a stored measurement image (e.g. ``tpi_image``).
+
+        Args:
+            key: Measurement key holding an (H, W, 3) image array.
+            width: Figure width in inches (height scales to aspect ratio).
+        """
+        import matplotlib.pyplot as plt
+
+        img = self.measurements.get(key)
+        if img is None:
+            logger.warning("No image found for '%s' on annotation %s", key, self.id)
+            return
+        h, w = img.shape[:2]
+        fig, ax = plt.subplots(figsize=(width, width * h / w))
+        ax.imshow(img)
+        ax.axis("off")
+        ax.set_title(f"{self.id} — {key}", fontsize=9)
+        plt.tight_layout()
+        plt.show()
+
+    def show_measurement_images(self, width: float = 12) -> None:
+        """Display all stored measurement images (keys ending in ``_image``).
+
+        Args:
+            width: Figure width in inches passed to each image.
+        """
+        image_keys = [
+            k
+            for k, v in self.measurements.items()
+            if k.endswith("_image") and v is not None
+        ]
+        if not image_keys:
+            logger.warning("No measurement images found on annotation %s", self.id)
+            return
+        for key in image_keys:
+            self.show_measurement_image(key, width=width)
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.
@@ -1786,14 +1824,14 @@ class Annotation:
                 kwargs = {**kwargs, "radius_inner": self.radius}
             if "center" not in kwargs:
                 kwargs = {**kwargs, "center": self.coords}
-            tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_wilson, tri_plane, tpi_image = (
+            tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_abs, tri_plane, tpi_image = (
                 measurement_func(self.simple_pcd, *args, **kwargs)
             )
             self.measurements["tpi_abs"] = tpi_abs
             self.measurements["std_annulus_z"] = std_annulus_z
             self.measurements["tpi_plane"] = tpi_plane
             self.measurements["std_annulus_plane"] = std_annulus_plane
-            self.measurements["tri_wilson"] = tri_wilson
+            self.measurements["tri_abs"] = tri_abs
             self.measurements["tri_plane"] = tri_plane
             self.measurements["tpi_image"] = tpi_image
             return self.id, [
@@ -1801,7 +1839,7 @@ class Annotation:
                 std_annulus_z,
                 tpi_plane,
                 std_annulus_plane,
-                tri_wilson,
+                tri_abs,
                 tri_plane,
                 tpi_image,
             ]
