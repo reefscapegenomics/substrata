@@ -2270,6 +2270,27 @@ class Camera:
         return os.path.join(*path_parts)
 
 
+class LocalMask:
+    """Lightweight mask compatible with the segmentation.py Mask class.
+
+    Must live at module level so that instances (held by annotations) remain
+    picklable when sent to joblib worker processes.
+
+    Args:
+        mask_vals: Binary mask array (uint8, non-zero inside the mask).
+        score: Confidence score of the mask.
+        logits: Optional raw logits associated with the mask.
+    """
+
+    def __init__(self, mask_vals: np.ndarray, score: float = 1.0, logits=None):
+        self.vals = mask_vals
+        self.score = score
+        self.logits = logits
+        self.area_in_px = cv2.countNonZero(mask_vals)
+        self.area_in_cm2 = None
+        self.radius_m = None  # set for circular masks only
+
+
 class ImageMatch:
     """Class that holds information about an image match."""
 
@@ -2434,15 +2455,6 @@ class ImageMatch:
 
         img_height, img_width = img.shape[:2]
 
-        # Create a Mask object compatible with segmentation.py Mask class
-        class LocalMask:
-            def __init__(self, mask_vals, score=1.0, logits=None):
-                self.vals = mask_vals
-                self.score = score
-                self.logits = logits
-                self.area_in_px = cv2.countNonZero(mask_vals)
-                self.area_in_cm2 = None
-
         # Create masks for each size
         mask_objects = []
         for idx, (width_m, height_m) in enumerate(mask_sizes):
@@ -2504,15 +2516,6 @@ class ImageMatch:
             raise ValueError(f"Cannot load image: {self.filepath}")
 
         img_height, img_width = img.shape[:2]
-
-        class LocalMask:
-            def __init__(self, mask_vals, score=1.0, logits=None):
-                self.vals = mask_vals
-                self.score = score
-                self.logits = logits
-                self.area_in_px = cv2.countNonZero(mask_vals)
-                self.area_in_cm2 = None
-                self.radius_m = None
 
         if not all(isinstance(r, (int, float)) for r in radii):
             raise ValueError("radii must be a list of scalar values (e.g. [0.1, 0.2])")
