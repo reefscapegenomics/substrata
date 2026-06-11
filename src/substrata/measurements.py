@@ -381,22 +381,32 @@ def calc_tpi_and_tri(
         ``z_center − mean(z_annulus)`` in the same units as the point cloud.
     TPI_plane
         Signed perpendicular distance of ``center`` from the best-fit plane of
-        the annulus points.  Corrects for sloping habitat.
+        the annulus points.  Corrects for sloping habitat.  The plane normal is
+        oriented to +Z so the sign is physically meaningful (see below).
 
     Positive TPI values indicate a crest / elevated position; negative indicate
     a hollow / depressed position.
 
     TRI variants (Wilson et al. 2007):
 
-    TRI_wilson
+    TRI_abs
         Mean absolute Z-difference between the focal point and all annulus
         points: ``mean(|z_annulus_i − z_center|)``.  Direct point-cloud analog
-        of the Wilson et al. bathymetric DEM formula; sensitive to slope.
+        of the Wilson et al. bathymetric DEM formula.  Caveat: Wilson's formula
+        assumes neighbours are the immediately adjacent DEM cells, where the
+        focal-to-neighbour height offset is negligible so only roughness
+        remains.  Here the annulus deliberately excludes the focal region and
+        spans a wide radius, so on sloping or pedestalled habitat this term also
+        absorbs the focal vertical offset — for a perfectly smooth annulus
+        offset by height H it returns ``≈ |H| = |TPI_abs|``, reflecting
+        topographic *position* as much as terrain *ruggedness*.  Prefer
+        ``TRI_plane`` for a slope/offset-free ruggedness measure.
     TRI_plane
         Mean absolute perpendicular distance of annulus points from the
-        best-fit plane: ``mean(|d_i|)``.  Slope-corrected ruggedness; same
-        formula as Ra (arithmetic mean roughness) but restricted to the annulus
-        neighbourhood rather than the full point cloud.
+        best-fit plane: ``mean(|d_i|)``.  Slope- and offset-corrected ruggedness
+        (residuals about the annulus plane); same formula as Ra (arithmetic mean
+        roughness) but restricted to the annulus neighbourhood rather than the
+        full point cloud.  Recommended ruggedness metric.
 
     Args:
         pcd: Point cloud with a ``.points`` attribute convertible to (N, 3).
@@ -419,17 +429,25 @@ def calc_tpi_and_tri(
             for variable-density photogrammetric clouds.  Has no effect when
             ``None`` (default).
 
+    The three plane-based outputs (``tpi_plane``, ``std_annulus_plane``,
+    ``tri_plane``) require at least 3 annulus points for a defined best-fit
+    plane; with fewer they are returned as ``NaN`` rather than computed from a
+    degenerate plane.  The point-based outputs (``tpi_abs``, ``std_annulus_z``,
+    ``tri_abs``) remain valid with a single annulus point.
+
     Returns:
         tpi_abs: Absolute TPI at the focal point.
         std_annulus_z: Standard deviation of Z within the annulus (habitat
             topographic heterogeneity).
-        tpi_plane: Plane-relative TPI at the focal point.
+        tpi_plane: Plane-relative TPI at the focal point.  ``NaN`` if the
+            annulus has fewer than 3 points.
         std_annulus_plane: Standard deviation of annulus-point distances from
-            the best-fit plane.
+            the best-fit plane.  ``NaN`` if the annulus has fewer than 3 points.
         tri_abs: Mean absolute Z-difference from focal point to annulus
             points (Wilson et al. 2007 TRI, adapted for point clouds).
         tri_plane: Mean absolute perpendicular distance of annulus points from
-            the best-fit plane (slope-corrected TRI).
+            the best-fit plane (slope-corrected TRI).  ``NaN`` if the annulus
+            has fewer than 3 points.
         image: Visualisation image as an (H, W, 3) uint8 array, or ``None``.
 
     Raises:
@@ -515,19 +533,33 @@ def calc_tpi_and_tri(
     std_annulus_z = float(annulus_pts[:, 2].std())
 
     tpi_abs = float(focal_z - annulus_mean_z)
-
-    # Best-fit plane of annulus via SVD; normal = last right-singular vector
-    centroid = annulus_pts.mean(axis=0)
-    _, _, vt = np.linalg.svd(annulus_pts - centroid, full_matrices=False)
-    normal = vt[-1] / np.linalg.norm(vt[-1])
-    d = -normal @ centroid
     focal_pt = np.array([focal_xy[0], focal_xy[1], focal_z])
-    tpi_plane = float(normal @ focal_pt + d)
-    std_annulus_plane = float(np.std(annulus_pts @ normal + d))
 
-    # TRI: nearly free — reuses annulus_pts, normal, d already computed above
+    # TRI_abs (Wilson): mean absolute Z-difference; valid with >=1 annulus point
     tri_abs = float(np.abs(annulus_pts[:, 2] - focal_z).mean())
-    tri_plane = float(np.abs(annulus_pts @ normal + d).mean())
+
+    # Plane-based metrics need >=3 annulus points for a defined best-fit plane;
+    # with fewer (e.g. after aggressive raster_cell_size voxelization) they
+    # degrade to NaN rather than being computed from a degenerate plane.
+    if len(annulus_pts) >= 3:
+        # Best-fit plane of annulus via SVD; normal = last right-singular vector
+        # (already unit-length, since SVD returns orthonormal rows).
+        centroid = annulus_pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(annulus_pts - centroid, full_matrices=False)
+        normal = vt[-1]
+        # Orient the normal to +Z so the signed tpi_plane is physically
+        # meaningful: positive = crest/elevated, negative = hollow/depressed.
+        # SVD's sign is otherwise arbitrary and not reproducible across inputs.
+        if normal[2] < 0:
+            normal = -normal
+        d = -normal @ centroid
+        tpi_plane = float(normal @ focal_pt + d)
+        std_annulus_plane = float(np.std(annulus_pts @ normal + d))
+        # TRI_plane: mean absolute residual about the annulus plane
+        tri_plane = float(np.abs(annulus_pts @ normal + d).mean())
+    else:
+        normal = None
+        tpi_plane = std_annulus_plane = tri_plane = np.nan
 
     image = None
     if generate_image:
@@ -538,8 +570,7 @@ def calc_tpi_and_tri(
             # vastly outnumbered by the original cloud (~300k pts vs ~2k voxels).
             # The radius circles and star marker provide sufficient spatial context.
             display_pcd = pointclouds.SimplePointCloud(annulus_pts)
-            vis_tpi_abs = annulus_pts[:, 2] - focal_z
-            vis_tpi_plane = annulus_pts @ normal + d - tpi_plane
+            display_pts = annulus_pts
             # Scale marker size so each voxel dot fills its physical footprint.
             # visualize_tpi renders height=500px at 100dpi over ~2*outer_radius m;
             # ~65 % of the height is axes area after labels/padding.
@@ -549,9 +580,15 @@ def calc_tpi_and_tri(
             vis_point_size = max(2, int(pt_diameter**2))
         else:
             display_pcd = pcd
-            vis_tpi_abs = pts[:, 2] - focal_z
-            vis_tpi_plane = pts @ normal + d - tpi_plane
+            display_pts = pts
             vis_point_size = None
+        vis_tpi_abs = display_pts[:, 2] - focal_z
+        if normal is not None:
+            vis_tpi_plane = display_pts @ normal + d - tpi_plane
+        else:
+            # Plane undefined (<3 annulus points): render the plane panel as
+            # NaN, which visualize_tpi displays as light-gray "no data" points.
+            vis_tpi_plane = np.full(len(display_pts), np.nan)
         vis_kwargs = dict(
             interactive=False,
             mean_tpi_abs=tpi_abs,

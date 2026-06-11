@@ -4754,6 +4754,11 @@ def visualize_tpi(
 
         if center is not None:
             cx, cy = float(center[0]), float(center[1])
+            # The star marks the focal point and is coloured by the TPI metric
+            # (focal vs. neighbourhood), distinct from the per-point colorbar
+            # scale of "Z relative to focal point"; label it so its colour is
+            # not misread as that scale (on which the focal point would be 0).
+            star_label = f"focal point (colour = {tpi_name})"
             if mean_val is not None and np.isfinite(mean_val):
                 ax.scatter(
                     cx, cy,
@@ -4766,9 +4771,12 @@ def visualize_tpi(
                     zorder=5,
                     edgecolors="black",
                     linewidths=0.5,
+                    label=star_label,
                 )
             else:
-                ax.scatter(cx, cy, c="black", marker="*", s=200, zorder=5)
+                ax.scatter(
+                    cx, cy, c="black", marker="*", s=200, zorder=5, label=star_label
+                )
             if radius_inner > 0:
                 ax.add_patch(
                     mpatches.Circle(
@@ -4781,6 +4789,7 @@ def visualize_tpi(
                         (cx, cy), radius_outer, fill=False, color="black", lw=1
                     )
                 )
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
 
         ax.set_aspect("equal")
         ax.set_xlabel("X (m)")
