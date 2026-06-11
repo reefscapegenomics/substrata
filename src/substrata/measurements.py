@@ -350,7 +350,7 @@ def calc_roughness(pcd):
     return ra, rq, image
 
 
-def calc_tpi(
+def calc_tpi_and_tri(
     pcd,
     center: Optional[np.ndarray] = None,
     radius_inner: float = settings.DEFAULT_TPI_RADIUS_INNER,
@@ -359,14 +359,13 @@ def calc_tpi(
     generate_image: bool = True,
     center_z_from_inner: bool = False,
     voxel_size: Optional[float] = None,
-) -> Tuple[float, float, float, float, Optional[np.ndarray]]:
-    """Compute Topographic Position Index (TPI) for a point cloud (Weiss 2001).
+) -> Tuple[float, float, float, float, float, float, Optional[np.ndarray]]:
+    """Compute TPI and TRI for a point cloud (Weiss 2001; Wilson et al. 2007).
 
-    TPI is computed at a single focal point (``center``) — the annotation
-    location.  The neighbourhood is the annulus in the horizontal (XY) plane
-    between ``radius_inner`` and the outer limit; Z is unconstrained (vertical
-    cylinder geometry).  The inner exclusion zone prevents the focal object
-    (e.g. the coral colony) from biasing the neighbourhood mean.
+    Both metrics share the same annulus neighbourhood in the horizontal (XY)
+    plane between ``radius_inner`` and the outer limit; Z is unconstrained
+    (vertical cylinder geometry).  The inner exclusion zone prevents the focal
+    object (e.g. the coral colony) from biasing the neighbourhood statistics.
 
     The outer limit is specified as **one** of:
 
@@ -376,7 +375,7 @@ def calc_tpi(
 
     If neither is supplied, ``settings.DEFAULT_TPI_RADIUS_OUTER`` is used.
 
-    Two TPI variants are returned:
+    TPI variants (Weiss 2001):
 
     TPI_abs
         ``z_center − mean(z_annulus)`` in the same units as the point cloud.
@@ -384,8 +383,20 @@ def calc_tpi(
         Signed perpendicular distance of ``center`` from the best-fit plane of
         the annulus points.  Corrects for sloping habitat.
 
-    Positive values indicate a crest / elevated position; negative indicate a
-    hollow / depressed position.
+    Positive TPI values indicate a crest / elevated position; negative indicate
+    a hollow / depressed position.
+
+    TRI variants (Wilson et al. 2007):
+
+    TRI_wilson
+        Mean absolute Z-difference between the focal point and all annulus
+        points: ``mean(|z_annulus_i − z_center|)``.  Direct point-cloud analog
+        of the Wilson et al. bathymetric DEM formula; sensitive to slope.
+    TRI_plane
+        Mean absolute perpendicular distance of annulus points from the
+        best-fit plane: ``mean(|d_i|)``.  Slope-corrected ruggedness; same
+        formula as Ra (arithmetic mean roughness) but restricted to the annulus
+        neighbourhood rather than the full point cloud.
 
     Args:
         pcd: Point cloud with a ``.points`` attribute convertible to (N, 3).
@@ -413,6 +424,10 @@ def calc_tpi(
         tpi_plane: Plane-relative TPI at the focal point.
         std_annulus_plane: Standard deviation of annulus-point distances from
             the best-fit plane.
+        tri_wilson: Mean absolute Z-difference from focal point to annulus
+            points (Wilson et al. 2007 TRI, adapted for point clouds).
+        tri_plane: Mean absolute perpendicular distance of annulus points from
+            the best-fit plane (slope-corrected TRI).
         image: Visualisation image as an (H, W, 3) uint8 array, or ``None``.
 
     Raises:
@@ -459,7 +474,7 @@ def calc_tpi(
         else f"radius_outer={outer_radius:.3f} m"
     )
     logger.info(
-        "calc_tpi: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s  n_pts=%d",
+        "calc_tpi_and_tri: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s  n_pts=%d",
         focal_xy[0],
         focal_xy[1],
         focal_z,
@@ -471,7 +486,7 @@ def calc_tpi(
     annulus_mask = (dists_xy >= radius_inner) & (dists_xy <= outer_radius)
 
     if not np.any(annulus_mask):
-        return np.nan, np.nan, np.nan, np.nan, None
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None
 
     annulus_pts = pts[annulus_mask]
 
@@ -498,6 +513,10 @@ def calc_tpi(
     tpi_plane = float(normal @ focal_pt + d)
     std_annulus_plane = float(np.std(annulus_pts @ normal + d))
 
+    # TRI: nearly free — reuses annulus_pts, normal, d already computed above
+    tri_wilson = float(np.abs(annulus_pts[:, 2] - focal_z).mean())
+    tri_plane = float(np.abs(annulus_pts @ normal + d).mean())
+
     image = None
     if generate_image:
         vis_tpi_abs = pts[:, 2] - focal_z
@@ -513,7 +532,7 @@ def calc_tpi(
             radius_inner=radius_inner,
             radius_outer=outer_radius,
         )
-    return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, image
+    return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_wilson, tri_plane, image
 
 
 def get_fractal_dimension(pcd, iterations=10, plot=False):

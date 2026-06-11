@@ -1080,7 +1080,7 @@ class Annotations:
         """
         if isinstance(measurement_func, str):
             measurement_func = getattr(measurements, measurement_func)
-        if measurement_func.__name__ in ["get_mask_surface_area", "calc_tpi"]:
+        if measurement_func.__name__ in ["get_mask_surface_area", "calc_tpi_and_tri"]:
             # Do not parallelize (cannot pickle)
             results = {}
             for ann in tqdm(
@@ -1134,12 +1134,14 @@ class Annotations:
                 self.data[id].measurements["plane_coeffs"] = output[3]
                 self.data[id].measurements["azimuth"] = output[4]
                 self.data[id].measurements["elevation_image"] = output[5]
-            elif measurement_func.__name__ == "calc_tpi":
+            elif measurement_func.__name__ == "calc_tpi_and_tri":
                 self.data[id].measurements["tpi_abs"] = output[0]
                 self.data[id].measurements["std_annulus_z"] = output[1]
                 self.data[id].measurements["tpi_plane"] = output[2]
                 self.data[id].measurements["std_annulus_plane"] = output[3]
-                self.data[id].measurements["tpi_image"] = output[4]
+                self.data[id].measurements["tri_wilson"] = output[4]
+                self.data[id].measurements["tri_plane"] = output[5]
+                self.data[id].measurements["tpi_image"] = output[6]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
@@ -1779,24 +1781,28 @@ class Annotation:
                 azimuth,
                 elevation_image,
             ]
-        elif measurement_func.__name__ == "calc_tpi":
+        elif measurement_func.__name__ == "calc_tpi_and_tri":
             if "radius_inner" not in kwargs and getattr(self, "radius", None) is not None:
                 kwargs = {**kwargs, "radius_inner": self.radius}
             if "center" not in kwargs:
                 kwargs = {**kwargs, "center": self.coords}
-            tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tpi_image = (
+            tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_wilson, tri_plane, tpi_image = (
                 measurement_func(self.simple_pcd, *args, **kwargs)
             )
             self.measurements["tpi_abs"] = tpi_abs
             self.measurements["std_annulus_z"] = std_annulus_z
             self.measurements["tpi_plane"] = tpi_plane
             self.measurements["std_annulus_plane"] = std_annulus_plane
+            self.measurements["tri_wilson"] = tri_wilson
+            self.measurements["tri_plane"] = tri_plane
             self.measurements["tpi_image"] = tpi_image
             return self.id, [
                 tpi_abs,
                 std_annulus_z,
                 tpi_plane,
                 std_annulus_plane,
+                tri_wilson,
+                tri_plane,
                 tpi_image,
             ]
         else:
