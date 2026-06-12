@@ -189,3 +189,49 @@ substrata images --transform
 substrata images --pdf-output imagematches.pdf
 ```
 
+## Classifier training
+
+Train a FastAI image classifier on crops generated from labelled annotations.
+The command collates the `label` column across all annotation CSVs matching a
+glob pattern, renders them on the CATAMI hierarchy from `classes.csv`, and uses
+the **bolded** tree entries as the training labels (it asks you to confirm).
+It then verifies each unique `cam_filepath` directory (falling back to the
+`site/site_depth/model/<final-folder>` convention under `--model-path`, or
+prompting for a substitution), writes a consolidated `training_annotations.csv`,
+generates `training_crops` / `validation_crops` / `test_crops` (80/10/10,
+assigned deterministically per annotation id), trains the model, and reports
+validation stats (printed and written to a `<split>_stats.pdf` with a
+per-class report, a row-normalised confusion matrix, and example classified
+crops per category — one row per category with a red border on misclassified
+examples). Crops are cut at the classifier's input resolution by default
+(`--crop-size`). Crop filenames encode the annotation id, source image, and
+pixel centre, so a changed annotation's stale crop is deleted and regenerated;
+emptied category folders are cleaned up, and a few example paths are shown
+before any deletion as a safeguard against pointing `--output` at the wrong
+directory.
+
+Crop generation runs in parallel (`--jobs`, default all cores).
+
+Usage: `substrata train [PATTERN] [--classes CSV] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+
+```bash
+# Collate *_slope_intercepts.csv in CWD, confirm labels, crop, and train
+substrata train
+
+# Custom pattern and only labels with an aggregated count of at least 50
+substrata train "*_ann.csv" --min-count 50
+
+# Point at separate model/output dirs and a bigger backbone
+substrata train --model-path /data/models --output /data/training \
+    --arch resnet50 --epochs 20
+
+# Re-run validation stats on an existing model (no training)
+substrata train --validate --model crop_classifier.pkl
+
+# Skip training; evaluate an existing model on the held-out test crops
+substrata train --test --model crop_classifier.pkl
+
+# Non-interactive (auto-confirm labels, deletions, path fallbacks)
+substrata train --yes
+```
+

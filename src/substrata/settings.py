@@ -1,3 +1,5 @@
+import re
+
 OUTPUT_FOLDER = "output"
 
 DEFAULT_INLIER_RANGE = 0.01
@@ -42,6 +44,54 @@ DEFAULT_PIXEL_REPROJECTION_THRESHOLD = 2
 DEFAULT_DEPTH_ACCURACY_THRESHOLD = 0.3
 FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD = 4.0
 FIREFISH_MIN_NUM_CAM_MATCHES = 100
+
+# --- Classifier training (substrata train) ------------------------------------
+TRAIN_DEFAULT_PATTERN = "*_slope_intercepts.csv"
+TRAIN_CLASSES_FILE = "classes.csv"
+TRAIN_IMAGE_SIZE = 224  # pixels; classifier input resolution (fastai item resize)
+# Default crop equals the classifier input, so crops are cut at the exact size
+# the model consumes (no down-scaling of a larger region).
+TRAIN_CROP_SIZE = TRAIN_IMAGE_SIZE  # pixels; square crop centred on (cam_x, cam_y)
+TRAIN_CROP_JPEG_QUALITY = 95
+TRAIN_CROP_JOBS = -1  # parallel workers for crop generation (-1 = all cores)
+TRAIN_DELETE_PREVIEW = 5  # example paths shown before deleting redundant crops
+# Tree entries with at least this many occurrences are shown; --min-count only
+# controls which shown entries are bolded (i.e. used as training labels).
+TRAIN_MIN_VISIBLE_COUNT = 1
+TRAIN_SPLIT = (80, 10, 10)  # train / validation / test percentages
+TRAIN_CROP_DIRS = ("training_crops", "validation_crops", "test_crops")
+TRAIN_DEFAULT_ARCH = "resnet34"
+TRAIN_DEFAULT_EPOCHS = 10
+TRAIN_DEFAULT_MODEL_FILE = "crop_classifier.pkl"
+TRAIN_ANNOTATIONS_FILE = "training_annotations.csv"
+TRAIN_CM_ANNOTATE_MAX = 25  # max classes for per-cell count labels on the matrix
+TRAIN_EXAMPLES_PER_CLASS = 10  # example crops shown per category in the PDF
+TRAIN_EXAMPLE_ROWS_PER_PAGE = 8  # category rows per example-images PDF page
+
+# Label-tree (CATAMI hierarchy) rendering and consolidated-CSV layout.
+TRAIN_LABEL_COLUMN = "label"
+TRAIN_LEVEL_COLUMNS = [f"CATAMI_LEVEL_{i}" for i in range(1, 8)]
+TRAIN_CROP_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+TRAIN_ANN_COLUMNS = [
+    "id",
+    "orig_x",
+    "orig_y",
+    "orig_z",
+    "label",
+    "label_conf",
+    "world_x",
+    "world_y",
+    "world_z",
+    "cam_filepath",
+    "cam_x",
+    "cam_y",
+    "depth",
+]
+
+# ANSI styling for bolded (training-label) entries in terminal tree output.
+TRAIN_BOLD = "\033[1m"
+TRAIN_RESET = "\033[0m"
+TRAIN_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 RGL_SCALEBARS = [
     ["target 3", "target 4", 0.500],

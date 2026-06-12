@@ -1611,6 +1611,132 @@ def handle_transform(args):
     print(f"Saved transformed annotations to {output_path}")
 
 
+def handle_train(args):
+    """Handle the 'train' command: collate labels, build crops, train/evaluate.
+
+    Pipeline:
+      1. Glob annotation CSVs and render the CATAMI label tree; the bolded
+         entries are the training labels (confirm with the user).
+      2. Verify/repair the unique ``cam_filepath`` directories.
+      3. Write a consolidated training annotations CSV (exact-match labels,
+         remapped paths, model-prefixed integer ids).
+      4. Incrementally sync train/validation/test crops (80/10/10).
+      5. Train a fastai classifier (skipped with --test/--validate).
+      6. Report stats on validation (default) or test (--test) crops.
+
+    ``--validate`` and ``--test`` both skip steps 1-5 and only re-run the
+    evaluation/reporting, on the validation and test crops respectively.
+
+    Args:
+        args: Parsed command-line arguments.
+    """
+    import glob
+
+    from substrata import classification
+
+    cwd = os.getcwd()
+    model_path = args.model_path or cwd
+    output_dir = args.output or cwd
+    classes_path = args.classes or os.path.join(cwd, settings.TRAIN_CLASSES_FILE)
+    pattern = args.pattern or settings.TRAIN_DEFAULT_PATTERN
+    crop_size = args.crop_size or settings.TRAIN_CROP_SIZE
+    model_file = args.model or os.path.join(
+        output_dir, settings.TRAIN_DEFAULT_MODEL_FILE
+    )
+    interactive = sys.stdin.isatty()
+    assume_yes = bool(getattr(args, "yes", False))
+
+    def _stats_pdf(split_folder):
+        return os.path.join(output_dir, f"{split_folder}_stats.pdf")
+
+    # --test / --validate: skip training and only re-run evaluation/reporting
+    # on the test or validation crops respectively.
+    eval_only = getattr(args, "test", False) or getattr(args, "validate", False)
+    if eval_only:
+        flag = "--test" if getattr(args, "test", False) else "--validate"
+        if getattr(args, "test", False):
+            split = settings.TRAIN_CROP_DIRS[2]  # test_crops
+        else:
+            split = settings.TRAIN_CROP_DIRS[1]  # validation_crops
+        if not os.path.isfile(model_file):
+            raise SystemExit(f"Model file not found for {flag}: {model_file}")
+        classification.report_classifier_stats(
+            model_file, output_dir, split, pdf_path=_stats_pdf(split)
+        )
+        return
+
+    if not os.path.isfile(classes_path):
+        raise SystemExit(f"Classes file not found: {classes_path}")
+
+    csv_files = sorted(
+        f
+        for f in glob.glob(os.path.join(model_path, pattern))
+        if os.path.basename(f) != os.path.basename(classes_path)
+    )
+    if not csv_files:
+        raise SystemExit(
+            f"No annotation CSVs match {pattern!r} in {model_path}."
+        )
+
+    # --- Step 1: label tree + training-label confirmation ---
+    lines, training_labels, _counts, _unknown = classification.build_label_tree(
+        classes_path, csv_files, args.min_count, args.tips_only
+    )
+    print("\n".join(lines))
+    if not training_labels:
+        raise SystemExit("No bolded training labels were derived; nothing to do.")
+    print(
+        f"\nThe {len(training_labels)} bolded entries above are the training "
+        "labels."
+    )
+    if not assume_yes:
+        if not interactive:
+            raise SystemExit(
+                "Confirmation required; re-run with --yes in non-interactive use."
+            )
+        ans = input("Proceed with these training labels? [y/N]: ").strip()
+        if ans.lower() not in ("y", "yes"):
+            raise SystemExit("Aborted.")
+
+    # --- Steps 2 & 3: verify paths and write consolidated annotations ---
+    ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
+    n_written, n_dropped = classification.collate_training_annotations(
+        csv_files, pattern, training_labels, ann_path, model_path,
+        prompt=(interactive and not assume_yes),
+    )
+    print(
+        f"\nWrote {n_written} training annotation(s) to {ann_path} "
+        f"({n_dropped} dropped for missing camera fields)."
+    )
+    if n_written == 0:
+        raise SystemExit("No usable training annotations; aborting.")
+
+    # --- Step 4: sync crops (80/10/10) ---
+    stats = classification.sync_crops(
+        ann_path, output_dir, crop_size,
+        delete_stale=True, prompt=(interactive and not assume_yes),
+        n_jobs=args.jobs,
+    )
+    print(
+        f"Crops: {stats['generated']} generated, "
+        f"{stats['skipped_existing']} already present, "
+        f"{stats['deleted']} deleted, "
+        f"{stats['removed_dirs']} empty folder(s) removed, "
+        f"{stats['failed']} failed."
+    )
+
+    # --- Step 5: train ---
+    classification.train_classifier(
+        output_dir, model_file, arch=args.arch, epochs=args.epochs
+    )
+
+    # --- Step 6: stats on the validation crops ---
+    valid_split = settings.TRAIN_CROP_DIRS[1]
+    classification.report_classifier_stats(
+        model_file, output_dir, valid_split, pdf_path=_stats_pdf(valid_split)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2413,6 +2539,120 @@ def main():
         help="Apply the inverse of the cumulative transforms (default: False).",
     )
 
+    # train
+    p_train = subparsers.add_parser(
+        "train",
+        help=(
+            "Train a FastAI crop classifier: collate labelled annotations "
+            "across CSVs, generate train/val/test crops, train, and report "
+            "stats."
+        ),
+    )
+    p_train.add_argument(
+        "pattern",
+        nargs="?",
+        default=settings.TRAIN_DEFAULT_PATTERN,
+        help=(
+            "Glob pattern of annotation CSVs to collate, matched inside "
+            f"--model-path. Default: {settings.TRAIN_DEFAULT_PATTERN!r}."
+        ),
+    )
+    p_train.add_argument(
+        "--classes",
+        type=str,
+        default=None,
+        help="Classes CSV path (default: classes.csv in CWD).",
+    )
+    p_train.add_argument(
+        "--model-path",
+        dest="model_path",
+        type=str,
+        default=None,
+        help=(
+            "Directory to glob annotation CSVs from and to use for camera "
+            "directory fallback (default: CWD)."
+        ),
+    )
+    p_train.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help=(
+            "Output directory for crops and the training annotations CSV "
+            "(default: CWD)."
+        ),
+    )
+    p_train.add_argument(
+        "--min-count",
+        dest="min_count",
+        type=int,
+        default=1,
+        help="Only display/train tree items with aggregated count >= this.",
+    )
+    p_train.add_argument(
+        "--tips_only",
+        action="store_true",
+        help="Only bold tip entries (do not bold heavy parent nodes).",
+    )
+    p_train.add_argument(
+        "--crop-size",
+        dest="crop_size",
+        type=int,
+        default=None,
+        help=(
+            "Square crop width/height in pixels centred on (cam_x, cam_y). "
+            f"Default: {settings.TRAIN_CROP_SIZE}."
+        ),
+    )
+    p_train.add_argument(
+        "--arch",
+        type=str,
+        default=settings.TRAIN_DEFAULT_ARCH,
+        help=f"torchvision architecture. Default: {settings.TRAIN_DEFAULT_ARCH}.",
+    )
+    p_train.add_argument(
+        "--epochs",
+        type=int,
+        default=settings.TRAIN_DEFAULT_EPOCHS,
+        help=f"Fine-tuning epochs. Default: {settings.TRAIN_DEFAULT_EPOCHS}.",
+    )
+    p_train.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "Exported learner .pkl path (also the load target with --test). "
+            f"Default: <output>/{settings.TRAIN_DEFAULT_MODEL_FILE}."
+        ),
+    )
+    p_train.add_argument(
+        "--jobs",
+        type=int,
+        default=settings.TRAIN_CROP_JOBS,
+        help=(
+            "Parallel workers for crop generation (-1 = all cores). "
+            f"Default: {settings.TRAIN_CROP_JOBS}."
+        ),
+    )
+    p_train.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "Skip training; load --model and re-run stats on the validation "
+            "crops."
+        ),
+    )
+    p_train.add_argument(
+        "--test",
+        action="store_true",
+        help="Skip training; load --model and report stats on the test crops.",
+    )
+    p_train.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmations (labels, deletions, paths).",
+    )
+
     args = parser.parse_args()
 
     handlers = {
@@ -2430,6 +2670,7 @@ def main():
         "images": handle_images,
         "camsync": handle_camsync,
         "transform": handle_transform,
+        "train": handle_train,
     }
     handlers[args.command](args)
 

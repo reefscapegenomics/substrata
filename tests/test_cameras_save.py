@@ -82,6 +82,7 @@ def _load_parse_xyz_from_cli() -> object:
     pc.PointCloud = object
     pc.decimate_ply_file = lambda *a, **k: None
     pc.ply_head = lambda *a, **k: None
+    pc.repair_ply_for_open3d = lambda *a, **k: None
     sys.modules["substrata.pointclouds"] = pc
 
     ini = types.ModuleType("substrata.initializer")
