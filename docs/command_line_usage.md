@@ -211,7 +211,11 @@ emptied category folders are cleaned up, and a few example paths are shown
 before any deletion as a safeguard against pointing `--output` at the wrong
 directory.
 
-Crop generation runs in parallel (`--jobs`, default all cores).
+Crop generation runs in parallel (`--jobs`, default all cores). Empty or
+unreadable crops (e.g. from a 0-byte/corrupt source image) are skipped at
+training/evaluation time with a warning of how many were ignored, so a single
+bad image can't crash the run; zero-byte crops are also regenerated on the
+next sync.
 
 By default the training labels are the highlighted (bolded) tree entries —
 controlled by `--min-count` / `--tips_only`. Alternatively, `--include-classes`

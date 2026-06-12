@@ -772,7 +772,11 @@ def plan_crops(
 def existing_crops(
     output_dir: str, crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
 ) -> Set[str]:
-    """Return the set of existing crop image paths under the crop folders."""
+    """Return the set of existing crop image paths under the crop folders.
+
+    Zero-byte files are treated as not present, so a previously botched (empty)
+    crop is regenerated on the next sync rather than lingering.
+    """
     found: Set[str] = set()
     for split_dir in crop_dirs:
         base = os.path.join(output_dir, split_dir)
@@ -780,9 +784,51 @@ def existing_crops(
             continue
         for root, _dirs, files in os.walk(base):
             for name in files:
-                if name.lower().endswith(settings.TRAIN_CROP_IMAGE_EXTS):
-                    found.add(os.path.join(root, name))
+                if not name.lower().endswith(settings.TRAIN_CROP_IMAGE_EXTS):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    if os.path.getsize(path) == 0:
+                        continue
+                except OSError:
+                    continue
+                found.add(path)
     return found
+
+
+def _is_unreadable_image(path: str) -> bool:
+    """Whether an image file is empty or cannot be decoded by PIL.
+
+    Used to skip corrupt/zero-byte crops (e.g. produced from a truncated or
+    0-byte source image) so they do not crash training/evaluation.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return True
+        with Image.open(path) as im:
+            im.verify()
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def filter_readable_images(files: List[Any]) -> Tuple[List[Any], List[Any]]:
+    """Partition image paths into (readable, unreadable).
+
+    Args:
+        files: Image file paths (str or path-like).
+
+    Returns:
+        Tuple ``(good, bad)`` preserving input order.
+    """
+    good: List[Any] = []
+    bad: List[Any] = []
+    for fp in tqdm(files, desc="Checking crops", unit="img"):
+        if _is_unreadable_image(str(fp)):
+            bad.append(fp)
+        else:
+            good.append(fp)
+    return good, bad
 
 
 def generate_crop(
@@ -812,13 +858,25 @@ def generate_crop(
         logger.warning("Source image not found, skipping crop: %s", cam_filepath)
         return False
     try:
+        if os.path.getsize(cam_filepath) == 0:
+            logger.warning("Source image is empty, skipping crop: %s", cam_filepath)
+            return False
+    except OSError:
+        return False
+    try:
         crop = get_crop_img(cam_filepath, cam_x, cam_y, crop_size, crop_size)
+        crop = crop.convert("RGB")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        crop.save(out_path, "JPEG", quality=settings.TRAIN_CROP_JPEG_QUALITY)
     except (OSError, ValueError) as e:
         logger.warning("Could not crop %s: %s", cam_filepath, e)
+        # Remove any partial/empty output so it is not treated as a valid crop.
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
         return False
-    crop = crop.convert("RGB")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    crop.save(out_path, "JPEG", quality=settings.TRAIN_CROP_JPEG_QUALITY)
     return True
 
 
@@ -978,7 +1036,15 @@ def train_classifier(
     def _items(path):
         # Only include train/validation folders; exclude the test folder.
         files = get_image_files(path, folders=[train_name, valid_name])
-        return files
+        # Drop empty/corrupt crops so a single bad image can't crash training.
+        good, bad = filter_readable_images(list(files))
+        if bad:
+            logger.warning(
+                "Ignoring %d empty/unreadable crop image(s) during training.",
+                len(bad),
+            )
+            print(f"Ignored {len(bad)} empty/unreadable crop image(s).")
+        return good
 
     dblock = DataBlock(
         blocks=(ImageBlock, CategoryBlock),
@@ -1184,6 +1250,17 @@ def report_classifier_stats(
     files = get_image_files(split_dir)
     if not files:
         raise SystemExit(f"No crops found under {split_dir}.")
+
+    # Drop empty/corrupt crops so a single bad image can't crash evaluation.
+    files, bad = filter_readable_images(list(files))
+    if bad:
+        logger.warning(
+            "Ignoring %d empty/unreadable crop image(s) during evaluation.",
+            len(bad),
+        )
+        print(f"Ignored {len(bad)} empty/unreadable crop image(s).")
+    if not files:
+        raise SystemExit(f"No readable crops under {split_dir}.")
 
     y_true: List[str] = []
     y_pred: List[str] = []

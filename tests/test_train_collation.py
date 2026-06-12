@@ -367,5 +367,55 @@ class TestSplitAndCrops(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestImageSafeguards(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        from PIL import Image
+        self._Image = Image
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _valid_jpg(self, name):
+        p = os.path.join(self.d, name)
+        self._Image.new("RGB", (32, 32), (10, 20, 30)).save(p, "JPEG")
+        return p
+
+    def _empty_file(self, name):
+        p = os.path.join(self.d, name)
+        open(p, "wb").close()  # zero bytes
+        return p
+
+    def test_is_unreadable_image(self):
+        good = self._valid_jpg("ok.jpg")
+        empty = self._empty_file("empty.jpg")
+        garbage = os.path.join(self.d, "garbage.jpg")
+        with open(garbage, "w") as f:
+            f.write("not an image")
+        self.assertFalse(cl._is_unreadable_image(good))
+        self.assertTrue(cl._is_unreadable_image(empty))
+        self.assertTrue(cl._is_unreadable_image(garbage))
+        self.assertTrue(cl._is_unreadable_image(os.path.join(self.d, "missing.jpg")))
+
+    def test_filter_readable_images(self):
+        good = self._valid_jpg("a.jpg")
+        empty = self._empty_file("b.jpg")
+        readable, bad = cl.filter_readable_images([good, empty])
+        self.assertEqual(readable, [good])
+        self.assertEqual(bad, [empty])
+
+    def test_existing_crops_skips_zero_byte(self):
+        train = os.path.join(self.d, cl.settings.TRAIN_CROP_DIRS[0], "CB")
+        os.makedirs(train)
+        good = os.path.join(train, "good_1_2.jpg")
+        self._Image.new("RGB", (16, 16), (0, 0, 0)).save(good, "JPEG")
+        empty = os.path.join(train, "empty_3_4.jpg")
+        open(empty, "wb").close()
+        found = cl.existing_crops(self.d)
+        self.assertIn(good, found)
+        self.assertNotIn(empty, found)  # zero-byte treated as not present
+
+
 if __name__ == "__main__":
     unittest.main()
