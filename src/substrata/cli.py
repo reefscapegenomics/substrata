@@ -1615,9 +1615,10 @@ def handle_train(args):
     """Handle the 'train' command: collate labels, build crops, train/evaluate.
 
     Pipeline:
-      1. Glob annotation CSVs and render the CATAMI label tree; the bolded
-         entries are the training labels (confirm with the user).
-      2. Verify/repair the unique ``cam_filepath`` directories.
+      1. Glob annotation CSVs from --csv-path and render the CATAMI label tree;
+         the bolded entries are the training labels (confirm with the user).
+      2. Verify the unique ``cam_filepath`` directories, falling back to the
+         --model-path convention only when a hard-coded directory is missing.
       3. Write a consolidated training annotations CSV (exact-match labels,
          remapped paths, model-prefixed integer ids).
       4. Incrementally sync train/validation/test crops (80/10/10).
@@ -1635,6 +1636,7 @@ def handle_train(args):
     from substrata import classification
 
     cwd = os.getcwd()
+    csv_path = args.csv_path or cwd
     model_path = args.model_path or cwd
     output_dir = args.output or cwd
     classes_path = args.classes or os.path.join(cwd, settings.TRAIN_CLASSES_FILE)
@@ -1670,19 +1672,30 @@ def handle_train(args):
 
     csv_files = sorted(
         f
-        for f in glob.glob(os.path.join(model_path, pattern))
+        for f in glob.glob(os.path.join(csv_path, pattern))
         if os.path.basename(f) != os.path.basename(classes_path)
     )
     if not csv_files:
         raise SystemExit(
-            f"No annotation CSVs match {pattern!r} in {model_path}."
+            f"No annotation CSVs match {pattern!r} in {csv_path}."
         )
 
     # --- Step 1: label tree + training-label confirmation ---
+    include_classes = getattr(args, "include_classes", None)
+    include_set = set(include_classes) if include_classes else None
     lines, training_labels, _counts, _unknown = classification.build_label_tree(
-        classes_path, csv_files, args.min_count, args.tips_only
+        classes_path, csv_files, args.min_count, args.tips_only,
+        include_labels=include_set,
     )
     print("\n".join(lines))
+    if include_set is not None:
+        missing = include_set - training_labels
+        if missing:
+            raise SystemExit(
+                "These --include-classes categories are not present in the "
+                f"tree: {', '.join(sorted(missing))}. "
+                "Check the labels above (the code in brackets) and retry."
+            )
     if not training_labels:
         raise SystemExit("No bolded training labels were derived; nothing to do.")
     print(
@@ -2554,7 +2567,7 @@ def main():
         default=settings.TRAIN_DEFAULT_PATTERN,
         help=(
             "Glob pattern of annotation CSVs to collate, matched inside "
-            f"--model-path. Default: {settings.TRAIN_DEFAULT_PATTERN!r}."
+            f"--csv-path. Default: {settings.TRAIN_DEFAULT_PATTERN!r}."
         ),
     )
     p_train.add_argument(
@@ -2564,13 +2577,23 @@ def main():
         help="Classes CSV path (default: classes.csv in CWD).",
     )
     p_train.add_argument(
+        "--csv-path",
+        dest="csv_path",
+        type=str,
+        default=None,
+        help=(
+            "Directory the annotation CSVs are matched in (default: CWD)."
+        ),
+    )
+    p_train.add_argument(
         "--model-path",
         dest="model_path",
         type=str,
         default=None,
         help=(
-            "Directory to glob annotation CSVs from and to use for camera "
-            "directory fallback (default: CWD)."
+            "Base directory used only to locate images via the standard path "
+            "convention when a CSV's cam_filepath directory is missing "
+            "(default: CWD)."
         ),
     )
     p_train.add_argument(
@@ -2593,6 +2616,19 @@ def main():
         "--tips_only",
         action="store_true",
         help="Only bold tip entries (do not bold heavy parent nodes).",
+    )
+    p_train.add_argument(
+        "--include-classes",
+        dest="include_classes",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Explicit list of category labels to train on (the codes shown in "
+            "brackets in the tree). Overrides --min-count/--tips_only: exactly "
+            "these are bolded and trained. Errors if any is absent from the "
+            "tree."
+        ),
     )
     p_train.add_argument(
         "--crop-size",

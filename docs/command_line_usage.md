@@ -193,11 +193,12 @@ substrata images --pdf-output imagematches.pdf
 
 Train a FastAI image classifier on crops generated from labelled annotations.
 The command collates the `label` column across all annotation CSVs matching a
-glob pattern, renders them on the CATAMI hierarchy from `classes.csv`, and uses
-the **bolded** tree entries as the training labels (it asks you to confirm).
-It then verifies each unique `cam_filepath` directory (falling back to the
-`site/site_depth/model/<final-folder>` convention under `--model-path`, or
-prompting for a substitution), writes a consolidated `training_annotations.csv`,
+glob pattern in `--csv-path` (default CWD), renders them on the CATAMI hierarchy
+from `classes.csv`, and uses the **bolded** tree entries as the training labels
+(it asks you to confirm). It then verifies each unique `cam_filepath` directory,
+and only when one is missing does it fall back to the
+`site/site_depth/model/<final-folder>` convention under `--model-path` (or
+prompt for a substitution), writes a consolidated `training_annotations.csv`,
 generates `training_crops` / `validation_crops` / `test_crops` (80/10/10,
 assigned deterministically per annotation id), trains the model, and reports
 validation stats (printed and written to a `<split>_stats.pdf` with a
@@ -212,7 +213,14 @@ directory.
 
 Crop generation runs in parallel (`--jobs`, default all cores).
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+By default the training labels are the highlighted (bolded) tree entries —
+controlled by `--min-count` / `--tips_only`. Alternatively, `--include-classes`
+takes an explicit list of category codes (the codes shown in brackets in the
+tree); those exact categories are then bolded and trained, overriding
+`--min-count` / `--tips_only`, and the command errors out if any requested code
+is absent from the tree.
+
+Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm labels, crop, and train
@@ -221,9 +229,12 @@ substrata train
 # Custom pattern and only labels with an aggregated count of at least 50
 substrata train "*_ann.csv" --min-count 50
 
-# Point at separate model/output dirs and a bigger backbone
-substrata train --model-path /data/models --output /data/training \
-    --arch resnet50 --epochs 20
+# Train on an explicit set of categories (codes from the tree brackets)
+substrata train --include-classes MAF_T MAENRC_C CSE
+
+# CSVs in one dir, image projects in another, output elsewhere, bigger backbone
+substrata train --csv-path /data/annotations --model-path /data/models \
+    --output /data/training --arch resnet50 --epochs 20
 
 # Re-run validation stats on an existing model (no training)
 substrata train --validate --model crop_classifier.pkl

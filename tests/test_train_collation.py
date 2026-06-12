@@ -178,6 +178,34 @@ class TestLabelTree(unittest.TestCase):
         self.assertEqual(unknown.get("ZZZ"), 2)
         self.assertEqual(counts.get("CB"), 1)
 
+    def test_include_labels_override_min_count(self):
+        # CM has 5 direct hits (would be a heavy parent by min_count), and CMA
+        # is a tip. include_labels should bold exactly {CB, CMA}, ignoring the
+        # count rules, and leave CM unbolded.
+        labels = ["CM"] * 5 + ["CMA", "CB"]
+        f = self._ann_file("m_ann.csv", labels)
+        lines, got, _c, _u = cl.build_label_tree(
+            self.classes, [f], min_count=1, include_labels={"CB", "CMA"}
+        )
+        self.assertEqual(got, {"CB", "CMA"})
+        # CM appears but is not bolded.
+        cm_lines = [ln for ln in lines if "[CM]" in ln and "[CMA]" not in ln]
+        self.assertEqual(len(cm_lines), 1)
+        self.assertNotIn(cl.settings.TRAIN_BOLD, cm_lines[0])
+        # CB is bolded.
+        cb_lines = [ln for ln in lines if "[CB]" in ln]
+        self.assertIn(cl.settings.TRAIN_BOLD, cb_lines[0])
+
+    def test_include_labels_missing_detectable(self):
+        # A requested label absent from the tree is not returned, so the caller
+        # (CLI) can detect the difference and error out.
+        f = self._ann_file("m_ann.csv", ["CB", "CMA"])
+        _l, got, _c, _u = cl.build_label_tree(
+            self.classes, [f], include_labels={"CB", "NOPE"}
+        )
+        self.assertEqual(got, {"CB"})
+        self.assertEqual({"CB", "NOPE"} - got, {"NOPE"})
+
 
 class TestModelName(unittest.TestCase):
     def test_strip_pattern_suffix(self):

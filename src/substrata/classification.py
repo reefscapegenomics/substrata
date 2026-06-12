@@ -326,15 +326,35 @@ def _is_bold(
     return is_tip_bold or is_heavy_parent
 
 
+def _node_is_bold(
+    node_label: str, has_visible_kids: bool, is_root: bool, direct_count: int,
+    total_count: int, min_count: int, tips_only: bool,
+    include_labels: Optional[Set[str]],
+) -> bool:
+    """Bolding decision for one node.
+
+    When ``include_labels`` is given, a node is bolded iff its label is in that
+    set (an explicit override of the count-based rules); otherwise the
+    :func:`_is_bold` tip/heavy-parent rule applies.
+    """
+    if include_labels is not None:
+        return node_label in include_labels
+    return _is_bold(
+        has_visible_kids, is_root, direct_count, total_count, min_count, tips_only
+    )
+
+
 def render(
     nodes: Dict, children: Dict, roots: List[str], direct: Dict, total: Dict,
     lines: List[str], min_count: int = 1, tips_only: bool = False,
+    include_labels: Optional[Set[str]] = None,
 ) -> None:
     """Append the CATAMI tree to ``lines``.
 
     All nodes with at least ``settings.TRAIN_MIN_VISIBLE_COUNT`` occurrences are
-    shown; ``min_count`` only determines which are bolded (see :func:`_is_bold`).
-    Bolded entries are the training labels.
+    shown. Which are bolded (i.e. training labels) is decided by
+    :func:`_node_is_bold`: by the ``min_count`` tip/heavy-parent rule, or - when
+    ``include_labels`` is given - exactly the labels in that set.
     """
     vis = settings.TRAIN_MIN_VISIBLE_COUNT
 
@@ -357,7 +377,9 @@ def render(
             count_str = f"{t}"
         label = node["cpc"] or code
         text = f"{node['name']} [{label}]: {count_str}"
-        if _is_bold(bool(kids), is_root, d, t, min_count, tips_only):
+        if _node_is_bold(
+            label, bool(kids), is_root, d, t, min_count, tips_only, include_labels
+        ):
             text = f"{settings.TRAIN_BOLD}{text}{settings.TRAIN_RESET}"
         lines.append(f"{prefix}{connector}{text}")
 
@@ -374,12 +396,15 @@ def render(
 def get_training_labels(
     nodes: Dict, children: Dict, roots: List[str], direct: Dict, total: Dict,
     min_count: int = 1, tips_only: bool = False,
+    include_labels: Optional[Set[str]] = None,
 ) -> Set[str]:
-    """Return the CPC codes of exactly the entries :func:`render` bolds.
+    """Return the labels of exactly the entries :func:`render` bolds.
 
     Walks the same visible tree as :func:`render` and collects the CPC code
-    of every bolded node (falling back to the species code when a node has no
-    CPC code). ``min_count`` gates bolding only, not visibility.
+    (falling back to the species code) of every bolded node. When
+    ``include_labels`` is given, the result is that set restricted to labels
+    that actually appear in the tree, so the caller can detect (and reject) any
+    requested category that is absent.
     """
     labels: Set[str] = set()
     vis = settings.TRAIN_MIN_VISIBLE_COUNT
@@ -390,8 +415,11 @@ def get_training_labels(
         kids = [c for c in children.get(code, []) if total.get(c, 0) >= vis]
         d = direct.get(code, 0)
         t = total.get(code, 0)
-        if _is_bold(bool(kids), is_root, d, t, min_count, tips_only):
-            labels.add(nodes[code]["cpc"] or code)
+        label = nodes[code]["cpc"] or code
+        if _node_is_bold(
+            label, bool(kids), is_root, d, t, min_count, tips_only, include_labels
+        ):
+            labels.add(label)
         for child in kids:
             walk(child)
 
@@ -403,7 +431,7 @@ def get_training_labels(
 
 def build_label_tree(
     classes_path: str, csv_files: List[str], min_count: int = 1,
-    tips_only: bool = False,
+    tips_only: bool = False, include_labels: Optional[Set[str]] = None,
 ) -> Tuple[List[str], Set[str], Counter, Counter]:
     """Render the CATAMI label tree and derive the training-label set.
 
@@ -416,6 +444,10 @@ def build_label_tree(
         min_count: Bold (i.e. select as a training label) only entries whose
             count reaches this; lower-count entries are still shown, unbolded.
         tips_only: Only bold tip entries (not heavy parents).
+        include_labels: Explicit set of labels to bold/train on. When given it
+            overrides ``min_count``/``tips_only``; the returned training-label
+            set is this restricted to labels present in the tree, so the caller
+            can detect any requested category that is absent.
 
     Returns:
         Tuple ``(lines, training_labels, counts, unknown)`` where ``lines`` is
@@ -439,7 +471,12 @@ def build_label_tree(
     lines.append(f"Total annotations counted: {sum(counts.values())}")
     lines.append(f"Distinct labels found: {len(counts)}")
     lines.append("")
-    if min_count > 1:
+    if include_labels is not None:
+        lines.append(
+            "Label occurrences on the CATAMI hierarchy "
+            "(bolded = --include-classes categories, used for training):"
+        )
+    elif min_count > 1:
         lines.append(
             "Label occurrences on the CATAMI hierarchy "
             f"(bolded = count >= {min_count}, used for training):"
@@ -447,7 +484,10 @@ def build_label_tree(
     else:
         lines.append("Label occurrences on the CATAMI hierarchy:")
     lines.append("")
-    render(nodes, children, roots, direct, total, lines, min_count, tips_only)
+    render(
+        nodes, children, roots, direct, total, lines, min_count, tips_only,
+        include_labels=include_labels,
+    )
 
     if unknown:
         lines.append("")
@@ -456,7 +496,8 @@ def build_label_tree(
             lines.append(f"  {label}: {n}")
 
     training_labels = get_training_labels(
-        nodes, children, roots, direct, total, min_count, tips_only
+        nodes, children, roots, direct, total, min_count, tips_only,
+        include_labels=include_labels,
     )
     return lines, training_labels, counts, unknown
 
