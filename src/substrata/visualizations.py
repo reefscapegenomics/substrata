@@ -4902,6 +4902,22 @@ def _estimate_cell_size(positions, fallback):
     return val if val > 0 else fallback
 
 
+def _interacting_label(fraction_interacting, z_colony):
+    """Title fragment reporting the height-weighted interacting fraction.
+
+    Returns an empty string when ``fraction_interacting`` is ``None`` (so the
+    title is unchanged for callers that do not pass it). The colony base level
+    ``z_colony`` is appended when available.
+    """
+    if fraction_interacting is None:
+        return ""
+    base = (
+        f", base z={z_colony:.2f} m"
+        if z_colony is not None and not np.isnan(z_colony) else ""
+    )
+    return f"\nfraction_interacting={fraction_interacting:.3f}{base}"
+
+
 def _draw_benthic_fraction_panel(
     ax, fig, intercepts, results, target_class, center, radius_inner,
     radius_outer, background_pcd, background_colors, weighted, point_size,
@@ -5095,6 +5111,8 @@ def visualize_benthic_fraction(
     bg_point_size=1.5,
     interactive=False,
     sample_weights=None,
+    fraction_interacting=None,
+    z_colony=None,
 ):
     """Top-down visualisation of a benthic-fraction sampling (see
     :func:`measurements.calc_benthic_fraction`).
@@ -5129,7 +5147,11 @@ def visualize_benthic_fraction(
         sample_weights: Optional ``{intercept_id: height weight in [0, 1]}``. When
             given, each ``target_class`` dot's black-outline thickness encodes its
             weight (clear outline = sand at/above the colony base, no outline =
-            well below it / excluded from the interaction cover).
+            well below it / excluded from ``fraction_interacting``).
+        fraction_interacting: Optional height-weighted interacting fraction to
+            report in the title (the ``fraction_interacting`` returned by
+            :func:`measurements.calc_benthic_fraction`).
+        z_colony: Optional colony base level (m) shown alongside it.
 
     Returns:
         matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
@@ -5148,7 +5170,8 @@ def visualize_benthic_fraction(
     )
     ax.set_title(
         f"Benthic fraction: {target_class}\n"
-        f"{stats['frac_label']}  (n_target={stats['n_target']}, "
+        f"{stats['frac_label']}{_interacting_label(fraction_interacting, z_colony)}"
+        f"  (n_target={stats['n_target']}, "
         f"n_classified={stats['n_classified']}, "
         f"n_unmatched={stats['n_unmatched']})\n"
         f"r_inner={radius_inner:.3f} m  r_outer={radius_outer:.3f} m"
@@ -5182,6 +5205,8 @@ def visualize_benthic_image_matches(
     output_filename=None,
     interactive=False,
     sample_weights=None,
+    fraction_interacting=None,
+    z_colony=None,
 ):
     """Side-by-side comparison of the benthic-fraction dots and their crops.
 
@@ -5228,6 +5253,9 @@ def visualize_benthic_image_matches(
         sample_weights: Optional ``{intercept_id: height weight in [0, 1]}``;
             scales each left-panel ``target_class`` dot's black-outline thickness
             (clear = sand at/above the colony base, none = excluded).
+        fraction_interacting: Optional height-weighted interacting fraction shown
+            in the left-panel title.
+        z_colony: Optional colony base level (m) shown alongside it.
 
     Returns:
         matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
@@ -5254,7 +5282,8 @@ def visualize_benthic_image_matches(
         if sample_weights is not None else ""
     )
     ax_l.set_title(
-        f"Classified samples\n{stats['frac_label']}  "
+        f"Classified samples\n{stats['frac_label']}"
+        f"{_interacting_label(fraction_interacting, z_colony)}  "
         f"(n_target={stats['n_target']}, n_classified={stats['n_classified']}, "
         f"n_unmatched={stats['n_unmatched']}){outline_note}",
         fontsize=9,

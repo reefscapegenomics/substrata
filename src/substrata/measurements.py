@@ -757,8 +757,8 @@ def _benthic_interaction_from_results(
             instead of the hard ``label == target_class`` indicator.
 
     Returns:
-        Tuple ``(interaction_cover, breakdown)``. ``interaction_cover`` is
-        ``Σ w·t / n_classified`` (``nan`` if nothing was classified or
+        Tuple ``(fraction_interacting, breakdown)``. ``fraction_interacting``
+        is ``Σ w·t / n_classified`` (``nan`` if nothing was classified or
         ``z_colony`` is ``nan``); ``breakdown`` has ``interaction_weight_sum``
         (``Σ w·t``), ``n_classified`` and ``z_colony``.
     """
@@ -978,12 +978,12 @@ def calc_benthic_fraction(
             :func:`_benthic_fraction_from_results`).
         colony_base_percentile: Percentile of the inner-footprint (within
             ``radius_inner``) Z used as the colony **base** level ``z_colony``
-            for the height-weighted ``interaction_cover`` (see
+            for the height-weighted ``fraction_interacting`` (see
             :func:`_colony_base_z`). Lower means a deeper base.
         base_falloff_depth: Depth (metres) below ``z_colony`` over which the
             per-sample height weight ramps **linearly** from 1 to 0; sand more
             than this far below the base does not count toward
-            ``interaction_cover``. ``0`` gives a strict at/above-base cutoff
+            ``fraction_interacting``. ``0`` gives a strict at/above-base cutoff
             (see :func:`_height_weight`).
         reprojection_threshold_discard: Image matches whose reprojection error
             exceeds this (metres) are treated as occluded and dropped. Raise it
@@ -1014,11 +1014,11 @@ def calc_benthic_fraction(
         ``n_matched``, ``n_classified``, ``n_target``, ``class_counts``,
         ``center``, ``radius_inner``, ``radius_outer`` and ``image`` (the
         dots view, or the combined comparison plot when ``show_image_matches``).
-        Also ``z_colony`` (colony base level), ``interaction_cover``
+        Also ``z_colony`` (colony base level), ``fraction_interacting``
         (height-weighted areal cover of ``target_class`` at/above the base,
         ``Σ w·t / n_classified``) and ``interaction_weight_sum`` (its
-        numerator). ``interaction_cover`` is the extra "interacting sand"
-        metric; the plain ``fraction`` is unchanged.
+        numerator). ``fraction_interacting`` is the extra "interacting sand"
+        variant of ``fraction``; the plain ``fraction`` is unchanged.
 
     Raises:
         ValueError: If both ``radius_outer`` and ``annulus_width`` are given,
@@ -1077,7 +1077,7 @@ def calc_benthic_fraction(
         "radius_inner": radius_inner,
         "radius_outer": outer_radius,
         "z_colony": float("nan"),
-        "interaction_cover": float("nan"),
+        "fraction_interacting": float("nan"),
         "interaction_weight_sum": 0.0,
         "image": None,
     }
@@ -1156,12 +1156,12 @@ def calc_benthic_fraction(
     sample_z = {
         aid: float(ann.coords[2]) for aid, ann in intercepts.data.items()
     }
-    interaction_cover, ibreak = _benthic_interaction_from_results(
+    fraction_interacting, ibreak = _benthic_interaction_from_results(
         results, sample_z, target_class, z_colony, base_falloff_depth,
         weight_by_probability,
     )
     result["z_colony"] = z_colony
-    result["interaction_cover"] = interaction_cover
+    result["fraction_interacting"] = fraction_interacting
     result["interaction_weight_sum"] = ibreak["interaction_weight_sum"]
     # Per-sample height weights drive the variable dot-outline in the plots.
     sample_weights = {
@@ -1172,11 +1172,11 @@ def calc_benthic_fraction(
     logger.info(
         "calc_benthic_fraction: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s"
         "  n_samples=%d  n_classified=%d  %s%s=%.4f  z_colony=%.3f"
-        "  interaction_cover=%.4f",
+        "  fraction_interacting=%.4f",
         cx, cy, focal_z, radius_inner, annulus_desc, len(xy_coords),
         breakdown["n_classified"],
         "weighted " if weight_by_probability else "",
-        f"fraction({target_class})", fraction, z_colony, interaction_cover,
+        f"fraction({target_class})", fraction, z_colony, fraction_interacting,
     )
 
     # The local neighbourhood (the "simple_pcd" around the colony) within the
@@ -1224,6 +1224,7 @@ def calc_benthic_fraction(
             background_pcd=neighborhood, background_colors=neigh_cols,
             focal_image_match=focal_im, cell_size=sample_spacing,
             sample_weights=sample_weights,
+            fraction_interacting=fraction_interacting, z_colony=z_colony,
         )
         # The combined plot is the single measurement image; show it on demand
         # via annotation.show_measurement_images().
@@ -1234,6 +1235,7 @@ def calc_benthic_fraction(
             radius_inner=radius_inner, radius_outer=outer_radius,
             background_pcd=neighborhood, background_colors=neigh_cols,
             weighted=weight_by_probability, sample_weights=sample_weights,
+            fraction_interacting=fraction_interacting, z_colony=z_colony,
         )
 
     return result

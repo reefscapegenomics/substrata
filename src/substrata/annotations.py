@@ -1166,8 +1166,8 @@ class Annotations:
                     result["n_classified"]
                 )
                 self.data[id].measurements["benthic_n_target"] = result["n_target"]
-                self.data[id].measurements["benthic_interaction_cover"] = (
-                    result["interaction_cover"]
+                self.data[id].measurements["benthic_fraction_interacting"] = (
+                    result["fraction_interacting"]
                 )
                 self.data[id].measurements["benthic_z_colony"] = result["z_colony"]
                 self.data[id].measurements["benthic_fraction_image"] = result["image"]
@@ -1890,8 +1890,8 @@ class Annotation:
             self.measurements["benthic_target_class"] = result["target_class"]
             self.measurements["benthic_n_classified"] = result["n_classified"]
             self.measurements["benthic_n_target"] = result["n_target"]
-            self.measurements["benthic_interaction_cover"] = (
-                result["interaction_cover"]
+            self.measurements["benthic_fraction_interacting"] = (
+                result["fraction_interacting"]
             )
             self.measurements["benthic_z_colony"] = result["z_colony"]
             self.measurements["benthic_fraction_image"] = result["image"]
