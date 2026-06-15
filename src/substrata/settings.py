@@ -12,6 +12,9 @@ DEFAULT_BENTHIC_RADIUS_INNER = 0.1  # metres; excludes the focal object
 DEFAULT_BENTHIC_RADIUS_OUTER = 0.5  # metres; outer limit of the sampled annulus
 DEFAULT_BENTHIC_SAMPLE_SPACING = 0.05  # metres; XY grid spacing of sample points
 DEFAULT_BENTHIC_INTERCEPT_RADIUS = 0.02  # metres; XY search radius for z-intercept
+# Height-weighted "interaction cover": colony base level + below-base weight falloff.
+DEFAULT_BENTHIC_BASE_PERCENTILE = 10  # percentile of inner-radius z = colony base level
+DEFAULT_BENTHIC_BASE_FALLOFF = 0.20  # m; depth below base where height weight reaches 0
 
 ANN_DEFAULT_COL_ORDER = {
     "id": 0,

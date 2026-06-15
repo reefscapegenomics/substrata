@@ -4905,9 +4905,18 @@ def _estimate_cell_size(positions, fallback):
 def _draw_benthic_fraction_panel(
     ax, fig, intercepts, results, target_class, center, radius_inner,
     radius_outer, background_pcd, background_colors, weighted, point_size,
-    bg_point_size, max_output_points, add_colorbar=True,
+    bg_point_size, max_output_points, add_colorbar=True, sample_weights=None,
+    max_outline_lw=1.8,
 ):
-    """Draw the classified-samples panel; return a stats dict for titling."""
+    """Draw the classified-samples panel; return a stats dict for titling.
+
+    When ``sample_weights`` (``{intercept_id: weight in [0, 1]}``) is given, each
+    classified ``target_class`` dot gets a **black outline whose thickness scales
+    with its height weight** (``lw = weight * max_outline_lw``): a clear outline
+    means the sample sits at/above the colony base (counts toward the interaction
+    cover) and no visible outline means it is well below it (excluded). With
+    ``sample_weights=None`` the panel keeps its previous fixed-outline look.
+    """
     if background_pcd is not None:
         bpts = np.asarray(background_pcd.points, dtype=float)
         bcols = None
@@ -4933,15 +4942,30 @@ def _draw_benthic_fraction_panel(
     cls_x = [x for _a, x, _y, _l, _p in items]
     cls_y = [y for _a, _x, y, _l, _p in items]
     cls_p = [p for _a, _x, _y, _l, p in items]
-    tgt = [(x, y) for _a, x, y, lab, _p in items if lab == target_class]
+
+    def _w(ann):
+        """Height weight for a sample, defaulting to 1.0 (full outline)."""
+        if not sample_weights:
+            return 1.0
+        val = sample_weights.get(getattr(ann, "id", None), 1.0)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return 1.0
+        return float(val)
+
+    tgt = [(x, y, _w(a)) for a, x, y, lab, _p in items if lab == target_class]
     oth = [(x, y) for _a, x, y, lab, _p in items if lab != target_class]
 
     mappable = None
     if weighted:
         if cls_x:
+            # Fill = P(target); outline thickness = height weight (when given).
+            if sample_weights is not None:
+                edge, lw = "black", [_w(a) * max_outline_lw for a, *_ in items]
+            else:
+                edge, lw = "0.35", 0.3
             mappable = ax.scatter(cls_x, cls_y, c=cls_p, cmap="Reds", vmin=0.0,
-                                  vmax=1.0, s=point_size, edgecolors="0.35",
-                                  linewidths=0.3, zorder=4)
+                                  vmax=1.0, s=point_size, edgecolors=edge,
+                                  linewidths=lw, zorder=4)
             if add_colorbar:
                 fig.colorbar(mappable, ax=ax, label=f"P({target_class})",
                              fraction=0.046, pad=0.04)
@@ -4951,9 +4975,15 @@ def _draw_benthic_fraction_panel(
                        c="black", s=point_size, linewidths=1.0, label="other",
                        zorder=4)
         if tgt:
+            # Outline thickness encodes the height weight (clear = at/above base,
+            # none = excluded); fixed 0.6 when no weights are supplied.
+            tgt_lw = (
+                [w * max_outline_lw for _x, _y, w in tgt]
+                if sample_weights is not None else 0.6
+            )
             ax.scatter([p[0] for p in tgt], [p[1] for p in tgt], marker="o",
                        facecolors="red", edgecolors="black", s=point_size,
-                       linewidths=0.6, label=str(target_class), zorder=5)
+                       linewidths=tgt_lw, label=str(target_class), zorder=5)
         if tgt or oth:
             ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
 
@@ -5064,6 +5094,7 @@ def visualize_benthic_fraction(
     point_size=45,
     bg_point_size=1.5,
     interactive=False,
+    sample_weights=None,
 ):
     """Top-down visualisation of a benthic-fraction sampling (see
     :func:`measurements.calc_benthic_fraction`).
@@ -5095,6 +5126,10 @@ def visualize_benthic_fraction(
         point_size: Scatter marker size for the sample points.
         bg_point_size: Scatter marker size for the background cloud points.
         interactive: If True and no output file, display interactively.
+        sample_weights: Optional ``{intercept_id: height weight in [0, 1]}``. When
+            given, each ``target_class`` dot's black-outline thickness encodes its
+            weight (clear outline = sand at/above the colony base, no outline =
+            well below it / excluded from the interaction cover).
 
     Returns:
         matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
@@ -5105,14 +5140,19 @@ def visualize_benthic_fraction(
     stats = _draw_benthic_fraction_panel(
         ax, fig, intercepts, results, target_class, center, radius_inner,
         radius_outer, background_pcd, background_colors, weighted, point_size,
-        bg_point_size, max_output_points,
+        bg_point_size, max_output_points, sample_weights=sample_weights,
+    )
+    outline_note = (
+        "\noutline thickness = height weight (thick = at/above colony base)"
+        if sample_weights is not None else ""
     )
     ax.set_title(
         f"Benthic fraction: {target_class}\n"
         f"{stats['frac_label']}  (n_target={stats['n_target']}, "
         f"n_classified={stats['n_classified']}, "
         f"n_unmatched={stats['n_unmatched']})\n"
-        f"r_inner={radius_inner:.3f} m  r_outer={radius_outer:.3f} m",
+        f"r_inner={radius_inner:.3f} m  r_outer={radius_outer:.3f} m"
+        f"{outline_note}",
         fontsize=9,
     )
     fig.tight_layout()
@@ -5141,6 +5181,7 @@ def visualize_benthic_image_matches(
     height=750,
     output_filename=None,
     interactive=False,
+    sample_weights=None,
 ):
     """Side-by-side comparison of the benthic-fraction dots and their crops.
 
@@ -5184,6 +5225,9 @@ def visualize_benthic_image_matches(
         height: Figure height in pixels (at 100 dpi).
         output_filename: Optional path to save the figure instead of returning.
         interactive: If True and no output file, display interactively.
+        sample_weights: Optional ``{intercept_id: height weight in [0, 1]}``;
+            scales each left-panel ``target_class`` dot's black-outline thickness
+            (clear = sand at/above the colony base, none = excluded).
 
     Returns:
         matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
@@ -5203,11 +5247,16 @@ def visualize_benthic_image_matches(
         ax_l, fig, intercepts, results, target_class, center, radius_inner,
         radius_outer, background_pcd, background_colors, weighted, point_size,
         bg_point_size, max_output_points, add_colorbar=False,
+        sample_weights=sample_weights,
+    )
+    outline_note = (
+        "\noutline thickness = height weight (thick = at/above colony base)"
+        if sample_weights is not None else ""
     )
     ax_l.set_title(
         f"Classified samples\n{stats['frac_label']}  "
         f"(n_target={stats['n_target']}, n_classified={stats['n_classified']}, "
-        f"n_unmatched={stats['n_unmatched']})",
+        f"n_unmatched={stats['n_unmatched']}){outline_note}",
         fontsize=9,
     )
     n_shown = _draw_image_match_panel(

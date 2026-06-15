@@ -684,6 +684,117 @@ def _benthic_fraction_from_results(
     return fraction, breakdown
 
 
+def _colony_base_z(
+    pts: np.ndarray, focal_xy: np.ndarray, radius_inner: float,
+    percentile: float,
+) -> float:
+    """Colony base level: a low percentile of the inner-footprint Z.
+
+    Estimates where the focal colony meets the substrate from the point-cloud
+    points within ``radius_inner`` of the focal XY (the colony footprint), using
+    a low percentile (default 10th) of their Z rather than a plane regression —
+    a deliberately simple, robust "base" against which surrounding sand height is
+    compared in :func:`calc_benthic_fraction`.
+
+    Args:
+        pts: (N, 3) point-cloud coordinates (world frame).
+        focal_xy: (2,) focal XY centre.
+        radius_inner: Inner (exclusion) radius in metres defining the footprint.
+        percentile: Percentile of footprint Z to use as the base (e.g. 10).
+
+    Returns:
+        The base Z, or ``nan`` if no points fall within ``radius_inner``.
+    """
+    if radius_inner <= 0:
+        return float("nan")
+    inner_mask = np.linalg.norm(pts[:, :2] - focal_xy, axis=1) < radius_inner
+    if not np.any(inner_mask):
+        return float("nan")
+    return float(np.percentile(pts[inner_mask, 2], percentile))
+
+
+def _height_weight(z: float, z_colony: float, falloff_depth: float) -> float:
+    """One-sided linear height weight for a sample at height ``z``.
+
+    Full weight (1.0) at or above the colony base ``z_colony``; below it the
+    weight ramps **linearly** down to 0 over ``falloff_depth`` metres, so sand
+    more than ``falloff_depth`` below the base does not count. A ``falloff_depth``
+    of 0 (or less) gives a strict ``z >= z_colony`` step.
+
+    Returns ``nan`` if ``z_colony`` is ``nan`` (undefined base).
+    """
+    if np.isnan(z_colony):
+        return float("nan")
+    if z >= z_colony:
+        return 1.0
+    if falloff_depth <= 0:
+        return 0.0
+    return float(np.clip(1.0 - (z_colony - z) / falloff_depth, 0.0, 1.0))
+
+
+def _benthic_interaction_from_results(
+    results: Dict[str, Optional[Dict[str, Any]]],
+    sample_z: Dict[str, float], target_class: str, z_colony: float,
+    falloff_depth: float, weight_by_probability: bool,
+) -> Tuple[float, Dict[str, Any]]:
+    """Height-weighted "interaction cover" of ``target_class`` over the annulus.
+
+    Like :func:`_benthic_fraction_from_results` but each sample's target
+    contribution is multiplied by a height weight (:func:`_height_weight`) so
+    that only ``target_class`` (e.g. sand) at or above the colony base counts
+    fully, with a linear falloff below it. The denominator is the whole annulus
+    (``n_classified``), so the result is directly comparable to the plain
+    benthic fraction.
+
+    Args:
+        results: ``{id: {"label", "probs", ...} | None}`` from
+            :meth:`Annotations.classify_image_matches`.
+        sample_z: ``{id: surface-intercept Z}`` for the sampled points.
+        target_class: Class label whose interacting cover is measured.
+        z_colony: Colony base Z (:func:`_colony_base_z`).
+        falloff_depth: Depth below the base over which the weight ramps to 0.
+        weight_by_probability: Multiply the height weight by ``P(target_class)``
+            instead of the hard ``label == target_class`` indicator.
+
+    Returns:
+        Tuple ``(interaction_cover, breakdown)``. ``interaction_cover`` is
+        ``Σ w·t / n_classified`` (``nan`` if nothing was classified or
+        ``z_colony`` is ``nan``); ``breakdown`` has ``interaction_weight_sum``
+        (``Σ w·t``), ``n_classified`` and ``z_colony``.
+    """
+    classified = [
+        (rid, r) for rid, r in results.items()
+        if r and (r.get("label") is not None)
+    ]
+    n_classified = len(classified)
+    breakdown = {
+        "interaction_weight_sum": 0.0,
+        "n_classified": n_classified,
+        "z_colony": z_colony,
+    }
+    if n_classified == 0 or np.isnan(z_colony):
+        return float("nan"), breakdown
+
+    weight_sum = 0.0
+    for rid, r in classified:
+        if weight_by_probability:
+            probs = r.get("probs") or {}
+            t = (
+                float(probs.get(target_class, 0.0)) if probs
+                else (1.0 if str(r["label"]) == target_class else 0.0)
+            )
+        else:
+            t = 1.0 if str(r["label"]) == target_class else 0.0
+        if t == 0.0:
+            continue
+        w = _height_weight(float(sample_z.get(rid, z_colony)), z_colony,
+                           falloff_depth)
+        weight_sum += w * t
+
+    breakdown["interaction_weight_sum"] = weight_sum
+    return weight_sum / n_classified, breakdown
+
+
 def _diagnose_benthic_matching(
     intercepts, cams, cam_list, pcd,
     reprojection_threshold_discard: float, reprojection_intercept_radius: float,
@@ -815,6 +926,8 @@ def calc_benthic_fraction(
     crop_size: Optional[int] = settings.TRAIN_CROP_SIZE,
     batch_size: int = 64,
     weight_by_probability: bool = False,
+    colony_base_percentile: float = settings.DEFAULT_BENTHIC_BASE_PERCENTILE,
+    base_falloff_depth: float = settings.DEFAULT_BENTHIC_BASE_FALLOFF,
     reprojection_threshold_discard: float = (
         settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD
     ),
@@ -863,6 +976,15 @@ def calc_benthic_fraction(
         weight_by_probability: Average ``P(target_class)`` over samples instead
             of counting hard predictions (see
             :func:`_benthic_fraction_from_results`).
+        colony_base_percentile: Percentile of the inner-footprint (within
+            ``radius_inner``) Z used as the colony **base** level ``z_colony``
+            for the height-weighted ``interaction_cover`` (see
+            :func:`_colony_base_z`). Lower means a deeper base.
+        base_falloff_depth: Depth (metres) below ``z_colony`` over which the
+            per-sample height weight ramps **linearly** from 1 to 0; sand more
+            than this far below the base does not count toward
+            ``interaction_cover``. ``0`` gives a strict at/above-base cutoff
+            (see :func:`_height_weight`).
         reprojection_threshold_discard: Image matches whose reprojection error
             exceeds this (metres) are treated as occluded and dropped. Raise it
             if good views are being discarded.
@@ -892,6 +1014,11 @@ def calc_benthic_fraction(
         ``n_matched``, ``n_classified``, ``n_target``, ``class_counts``,
         ``center``, ``radius_inner``, ``radius_outer`` and ``image`` (the
         dots view, or the combined comparison plot when ``show_image_matches``).
+        Also ``z_colony`` (colony base level), ``interaction_cover``
+        (height-weighted areal cover of ``target_class`` at/above the base,
+        ``Σ w·t / n_classified``) and ``interaction_weight_sum`` (its
+        numerator). ``interaction_cover`` is the extra "interacting sand"
+        metric; the plain ``fraction`` is unchanged.
 
     Raises:
         ValueError: If both ``radius_outer`` and ``annulus_width`` are given,
@@ -949,6 +1076,9 @@ def calc_benthic_fraction(
         "center": focal_pt,
         "radius_inner": radius_inner,
         "radius_outer": outer_radius,
+        "z_colony": float("nan"),
+        "interaction_cover": float("nan"),
+        "interaction_weight_sum": 0.0,
         "image": None,
     }
 
@@ -1018,13 +1148,35 @@ def calc_benthic_fraction(
     )
     result.update(fraction=fraction, **breakdown)
 
+    # Extra "interacting sand" metric: weight each target sample by its surface
+    # height relative to the colony base (p10 of the inner footprint), so only
+    # sand at/above the base counts fully (linear falloff below). The plain
+    # fraction above is left untouched.
+    z_colony = _colony_base_z(pts, focal_xy, radius_inner, colony_base_percentile)
+    sample_z = {
+        aid: float(ann.coords[2]) for aid, ann in intercepts.data.items()
+    }
+    interaction_cover, ibreak = _benthic_interaction_from_results(
+        results, sample_z, target_class, z_colony, base_falloff_depth,
+        weight_by_probability,
+    )
+    result["z_colony"] = z_colony
+    result["interaction_cover"] = interaction_cover
+    result["interaction_weight_sum"] = ibreak["interaction_weight_sum"]
+    # Per-sample height weights drive the variable dot-outline in the plots.
+    sample_weights = {
+        aid: _height_weight(z, z_colony, base_falloff_depth)
+        for aid, z in sample_z.items()
+    }
+
     logger.info(
         "calc_benthic_fraction: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s"
-        "  n_samples=%d  n_classified=%d  %s%s=%.4f",
+        "  n_samples=%d  n_classified=%d  %s%s=%.4f  z_colony=%.3f"
+        "  interaction_cover=%.4f",
         cx, cy, focal_z, radius_inner, annulus_desc, len(xy_coords),
         breakdown["n_classified"],
         "weighted " if weight_by_probability else "",
-        f"fraction({target_class})", fraction,
+        f"fraction({target_class})", fraction, z_colony, interaction_cover,
     )
 
     # The local neighbourhood (the "simple_pcd" around the colony) within the
@@ -1071,6 +1223,7 @@ def calc_benthic_fraction(
             radius_outer=outer_radius, weighted=weight_by_probability,
             background_pcd=neighborhood, background_colors=neigh_cols,
             focal_image_match=focal_im, cell_size=sample_spacing,
+            sample_weights=sample_weights,
         )
         # The combined plot is the single measurement image; show it on demand
         # via annotation.show_measurement_images().
@@ -1080,7 +1233,7 @@ def calc_benthic_fraction(
             intercepts, results, target_class, center=focal_pt,
             radius_inner=radius_inner, radius_outer=outer_radius,
             background_pcd=neighborhood, background_colors=neigh_cols,
-            weighted=weight_by_probability,
+            weighted=weight_by_probability, sample_weights=sample_weights,
         )
 
     return result
