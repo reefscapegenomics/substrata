@@ -424,30 +424,42 @@ class Annotations:
         classifier: Any,
         crop_size: Optional[Union[int, Tuple[int, int]]] = None,
         print_summary: bool = False,
+        batch_size: int = 64,
+        n_jobs: int = -1,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Classify all image matches for annotations that have them.
 
+        Runs a single batched inference pass over all matched crops
+        (:func:`classification.classify_image_matches_batch`) rather than a
+        per-image ``predict``, which is markedly faster (especially on GPU).
+        Crop loading is parallelised over ``n_jobs`` threads.
+
         Args:
             classifier: Loaded FastAI learner or path to a .pkl learner.
-            crop_size: Optional int (square) or (width, height) tuple for center crop.
+            crop_size: Optional int (square) or (width, height) tuple for the crop.
             print_summary: Whether to print classification category counts.
+            batch_size: Inference batch size.
+            n_jobs: Threads for parallel crop loading (-1 = all cores).
 
         Returns:
             Mapping of annotation IDs to classification results.
         """
-        results = {}
-        for ann in tqdm(self.data.values(), desc="Classifying image matches"):
-            if ann.image_match is not None:
-                try:
-                    result = ann.image_match.classify(classifier, crop_size)
-                    results[ann.id] = result
-                except Exception as e:
-                    logger.warning(
-                        f"Classification failed for annotation {ann.id}: {e}"
-                    )
-                    results[ann.id] = None
-            else:
-                results[ann.id] = None
+        from substrata import classification
+
+        matched = [
+            (ann.id, ann.image_match)
+            for ann in self.data.values()
+            if ann.image_match is not None
+        ]
+        batch = classification.classify_image_matches_batch(
+            [im for _id, im in matched], classifier, crop_size,
+            batch_size=batch_size, n_jobs=n_jobs,
+        )
+        results: Dict[str, Optional[Dict[str, Any]]] = {
+            ann.id: None for ann in self.data.values()
+        }
+        for (ann_id, _im), res in zip(matched, batch):
+            results[ann_id] = res
 
         # Print summary if requested
         if print_summary:
@@ -1080,8 +1092,10 @@ class Annotations:
         """
         if isinstance(measurement_func, str):
             measurement_func = getattr(measurements, measurement_func)
-        if measurement_func.__name__ in ["get_mask_surface_area", "calc_tpi_and_tri"]:
-            # Do not parallelize (cannot pickle)
+        if measurement_func.__name__ in [
+            "get_mask_surface_area", "calc_tpi_and_tri", "calc_benthic_fraction",
+        ]:
+            # Do not parallelize (cannot pickle the fastai learner / SAM model)
             results = {}
             for ann in tqdm(
                 self.data.values(),
@@ -1142,6 +1156,17 @@ class Annotations:
                 self.data[id].measurements["tri_abs"] = output[4]
                 self.data[id].measurements["tri_plane"] = output[5]
                 self.data[id].measurements["tpi_image"] = output[6]
+            elif measurement_func.__name__ == "calc_benthic_fraction" and output:
+                result = output[0]
+                self.data[id].measurements["benthic_fraction"] = result["fraction"]
+                self.data[id].measurements["benthic_target_class"] = (
+                    result["target_class"]
+                )
+                self.data[id].measurements["benthic_n_classified"] = (
+                    result["n_classified"]
+                )
+                self.data[id].measurements["benthic_n_target"] = result["n_target"]
+                self.data[id].measurements["benthic_fraction_image"] = result["image"]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
         """Save the annotations to a CSV file.
@@ -1843,6 +1868,26 @@ class Annotation:
                 tri_plane,
                 tpi_image,
             ]
+        elif measurement_func.__name__ == "calc_benthic_fraction":
+            # Unlike the simple_pcd-based measurements, this needs the full
+            # project pcd + cams + classifier (passed via *args); only the focal
+            # point (and optional inner radius) come from the annotation.
+            has_radius = getattr(self, "radius", None) is not None
+            if "radius_inner" not in kwargs and has_radius:
+                kwargs = {**kwargs, "radius_inner": self.radius}
+            if "center" not in kwargs:
+                kwargs = {**kwargs, "center": self.coords}
+            # Pass the annotation so its existing image_match (if any) is reused
+            # for the colony inset instead of recomputing an intercept/match.
+            if "focal_annotation" not in kwargs:
+                kwargs = {**kwargs, "focal_annotation": self}
+            result = measurement_func(*args, **kwargs)
+            self.measurements["benthic_fraction"] = result["fraction"]
+            self.measurements["benthic_target_class"] = result["target_class"]
+            self.measurements["benthic_n_classified"] = result["n_classified"]
+            self.measurements["benthic_n_target"] = result["n_target"]
+            self.measurements["benthic_fraction_image"] = result["image"]
+            return self.id, [result]
         else:
             logger.error("Measurement not recognized!")
         return self.id, None

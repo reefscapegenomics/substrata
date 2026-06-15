@@ -7,6 +7,12 @@ DEFAULT_TPI_RADIUS_INNER = 0.1  # metres; excludes focal object from neighbourho
 DEFAULT_TPI_RADIUS_OUTER = 0.5  # metres; outer limit of annulus neighbourhood
 CANOPY_COVER_POINT_SPACING = 0.01
 
+# calc_benthic_fraction: annulus neighbourhood + grid sampling of the surface.
+DEFAULT_BENTHIC_RADIUS_INNER = 0.1  # metres; excludes the focal object
+DEFAULT_BENTHIC_RADIUS_OUTER = 0.5  # metres; outer limit of the sampled annulus
+DEFAULT_BENTHIC_SAMPLE_SPACING = 0.05  # metres; XY grid spacing of sample points
+DEFAULT_BENTHIC_INTERCEPT_RADIUS = 0.02  # metres; XY search radius for z-intercept
+
 ANN_DEFAULT_COL_ORDER = {
     "id": 0,
     "orig_x": 1,
@@ -64,6 +70,11 @@ TRAIN_DEFAULT_ARCH = "resnet34"
 TRAIN_DEFAULT_EPOCHS = 10
 TRAIN_DEFAULT_MODEL_FILE = "crop_classifier.pkl"
 TRAIN_ANNOTATIONS_FILE = "training_annotations.csv"
+# Editable label->training-class map (selection + hierarchical collapse). Seeded
+# from the label tree, hand-tunable, and read by both training and evaluation.
+TRAIN_LABEL_MAP_FILE = "training_label_map.csv"
+TRAIN_SUMMARY_FILE = "training_summary.pdf"  # per-run settings + per-class counts
+TRAIN_SUMMARY_CLASSES_PER_PAGE = 40  # category bars per training-summary PDF page
 TRAIN_CM_ANNOTATE_MAX = 25  # max classes for per-cell count labels on the matrix
 TRAIN_EXAMPLES_PER_CLASS = 10  # example crops shown per category in the PDF
 TRAIN_EXAMPLE_ROWS_PER_PAGE = 8  # category rows per example-images PDF page

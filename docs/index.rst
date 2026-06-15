@@ -19,7 +19,8 @@ If you're new to substrata or want to quickly orient and scale a point cloud, st
 
 * :doc:`notebooks/scaling_and_orientation` - End-to-end scaling and orientation workflow
 * :doc:`notebooks/transferring_annotations` - Transfer annotations between datasets/projects
-* :doc:`notebooks/measurements_tpi_tri` - Topographic position index (TPI) and terrain ruggedness index (TRI)
+* :doc:`notebooks/measurements_tpi` - Topographic position index (TPI) and terrain ruggedness index (TRI)
+* :doc:`notebooks/measurements_benthic_fraction` - Benthic fraction: cover of a target benthic class around annotations, using the crop classifier
 
 You can also drive common workflows from the terminal; see :doc:`command_line_usage`.
 
@@ -42,7 +43,8 @@ documentation for all modules, classes, and functions.
 
    notebooks/scaling_and_orientation
    notebooks/transferring_annotations
-   notebooks/measurements_tpi_tri
+   notebooks/measurements_tpi
+   notebooks/measurements_benthic_fraction
 
 .. toctree::
    :maxdepth: 2

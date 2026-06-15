@@ -1622,7 +1622,8 @@ def handle_train(args):
       3. Write a consolidated training annotations CSV (exact-match labels,
          remapped paths, model-prefixed integer ids).
       4. Incrementally sync train/validation/test crops (80/10/10).
-      5. Train a fastai classifier (skipped with --test/--validate).
+      5. Train a fastai classifier (skipped with --test/--validate) and write a
+         training_summary.pdf (run settings + per-class crop counts + metrics).
       6. Report stats on validation (default) or test (--test) crops.
 
     ``--validate`` and ``--test`` both skip steps 1-5 and only re-run the
@@ -1645,6 +1646,9 @@ def handle_train(args):
     model_file = args.model or os.path.join(
         output_dir, settings.TRAIN_DEFAULT_MODEL_FILE
     )
+    map_path = getattr(args, "label_map", None) or os.path.join(
+        output_dir, settings.TRAIN_LABEL_MAP_FILE
+    )
     interactive = sys.stdin.isatty()
     assume_yes = bool(getattr(args, "yes", False))
 
@@ -1662,8 +1666,14 @@ def handle_train(args):
             split = settings.TRAIN_CROP_DIRS[1]  # validation_crops
         if not os.path.isfile(model_file):
             raise SystemExit(f"Model file not found for {flag}: {model_file}")
+        if not os.path.isfile(map_path):
+            raise SystemExit(
+                f"Label map not found for {flag}: {map_path}. Run "
+                "`substrata train` (or --prepare-only) first to create it."
+            )
+        label_map = classification.load_label_map(map_path)
         classification.report_classifier_stats(
-            model_file, output_dir, split, pdf_path=_stats_pdf(split)
+            model_file, output_dir, split, label_map, pdf_path=_stats_pdf(split)
         )
         return
 
@@ -1680,12 +1690,15 @@ def handle_train(args):
             f"No annotation CSVs match {pattern!r} in {csv_path}."
         )
 
-    # --- Step 1: label tree + training-label confirmation ---
+    # --- Step 1: label tree + seed collapse map ---
     include_classes = getattr(args, "include_classes", None)
     include_set = set(include_classes) if include_classes else None
-    lines, training_labels, _counts, _unknown = classification.build_label_tree(
-        classes_path, csv_files, args.min_count, args.tips_only,
-        include_labels=include_set,
+    lines, training_labels, counts, _unknown, collapse_map = (
+        classification.build_label_tree(
+            classes_path, csv_files, args.min_count, args.tips_only,
+            include_labels=include_set,
+            collapse=bool(getattr(args, "collapse", False)),
+        )
     )
     print("\n".join(lines))
     if include_set is not None:
@@ -1698,23 +1711,31 @@ def handle_train(args):
             )
     if not training_labels:
         raise SystemExit("No bolded training labels were derived; nothing to do.")
+
+    # Crops are generated for every visible label (independent of selection);
+    # selection + collapse live in the editable label map written below.
+    visible_labels = {
+        code for code, n in counts.items()
+        if n >= settings.TRAIN_MIN_VISIBLE_COUNT
+    }
     print(
-        f"\nThe {len(training_labels)} bolded entries above are the training "
-        "labels."
+        f"\nThe {len(training_labels)} bolded entries above seed the training "
+        f"classes; crops are generated for all {len(visible_labels)} visible "
+        "label(s)."
     )
     if not assume_yes:
         if not interactive:
             raise SystemExit(
                 "Confirmation required; re-run with --yes in non-interactive use."
             )
-        ans = input("Proceed with these training labels? [y/N]: ").strip()
-        if ans.lower() not in ("y", "yes"):
+        ans = input("Proceed (generate crops and seed the label map)? [y/N]: ")
+        if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("Aborted.")
 
     # --- Steps 2 & 3: verify paths and write consolidated annotations ---
     ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
     n_written, n_dropped = classification.collate_training_annotations(
-        csv_files, pattern, training_labels, ann_path, model_path,
+        csv_files, pattern, visible_labels, ann_path, model_path,
         prompt=(interactive and not assume_yes),
     )
     print(
@@ -1738,15 +1759,74 @@ def handle_train(args):
         f"{stats['failed']} failed."
     )
 
-    # --- Step 5: train ---
-    classification.train_classifier(
-        output_dir, model_file, arch=args.arch, epochs=args.epochs
+    # --- Step 4b: seed/merge the editable label map ---
+    # Crops exist for every visible label, but the map only lists labels that
+    # are actually selected for training (the collapse-map entries) so it isn't
+    # cluttered with blank rows for sub-min_count/excluded labels. A below-
+    # min_count child that collapses into a selected parent is still included.
+    # By default the map is re-seeded from the current selection flags; pass
+    # --keep-map to preserve an existing (hand-edited) map and only append new
+    # labels.
+    map_labels = {lab for lab in visible_labels if lab in collapse_map}
+    label_map = classification.merge_label_map(
+        map_path, map_labels, counts, collapse_map,
+        reseed=not bool(getattr(args, "keep_map", False)),
     )
+    training_classes = sorted(set(label_map.values()))
+    print(
+        f"\nLabel map: {map_path}\n"
+        f"  {len(label_map)} label(s) -> {len(training_classes)} training "
+        f"class(es): {', '.join(training_classes)}"
+    )
+
+    # --prepare-only: stop here so the map can be hand-tuned before training.
+    if getattr(args, "prepare_only", False):
+        print(
+            f"\nPrepared crops and label map. Edit {map_path} to tune the "
+            "selection/collapsing, then re-run `substrata train --keep-map` to "
+            "train on the edited map (plain `substrata train` re-seeds it)."
+        )
+        return
+
+    # --- Step 5: train ---
+    learn = classification.train_classifier(
+        output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs
+    )
+
+    # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
+    counts_by_split = classification.count_crops_by_class(output_dir, label_map)
+    info = [
+        ("Model architecture", args.arch),
+        ("Epochs", args.epochs),
+        ("Crop size (px)", crop_size),
+        ("Input size (px)", settings.TRAIN_IMAGE_SIZE),
+        ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
+        ("Selection: min_count", args.min_count),
+        ("Selection: tips_only", bool(args.tips_only)),
+        (
+            "Selection: include_classes",
+            " ".join(include_classes) if include_classes else "(none)",
+        ),
+        ("Selection: collapse", bool(getattr(args, "collapse", False))),
+        ("Map mode", "keep-map" if getattr(args, "keep_map", False) else "reseed"),
+        ("Annotation pattern", pattern),
+        ("CSV files scanned", len(csv_files)),
+        ("Training classes", len(training_classes)),
+        ("Label map", map_path),
+        ("Model output", model_file),
+    ]
+    summary_pdf = os.path.join(output_dir, settings.TRAIN_SUMMARY_FILE)
+    classification.write_training_summary_pdf(
+        summary_pdf, info, counts_by_split,
+        metrics=classification.final_metrics_from_learner(learn),
+    )
+    print(f"Wrote training summary: {summary_pdf}")
 
     # --- Step 6: stats on the validation crops ---
     valid_split = settings.TRAIN_CROP_DIRS[1]
     classification.report_classifier_stats(
-        model_file, output_dir, valid_split, pdf_path=_stats_pdf(valid_split)
+        model_file, output_dir, valid_split, label_map,
+        pdf_path=_stats_pdf(valid_split),
     )
 
 
@@ -2628,6 +2708,48 @@ def main():
             "brackets in the tree). Overrides --min-count/--tips_only: exactly "
             "these are bolded and trained. Errors if any is absent from the "
             "tree."
+        ),
+    )
+    p_train.add_argument(
+        "--collapse",
+        action="store_true",
+        help=(
+            "Fold non-selected descendants into their nearest selected parent "
+            "class when seeding the map. E.g. with --include-classes MAF, the "
+            "children MAFG/MAF_T are trained as MAF; without --collapse only "
+            "MAF itself is trained and its descendants are excluded."
+        ),
+    )
+    p_train.add_argument(
+        "--label-map",
+        dest="label_map",
+        type=str,
+        default=None,
+        help=(
+            "Editable label->training_class map CSV (selection + collapse). "
+            f"Default: <output>/{settings.TRAIN_LABEL_MAP_FILE}. Seeded from "
+            "the tree on first run; hand edits are preserved on re-runs."
+        ),
+    )
+    p_train.add_argument(
+        "--keep-map",
+        dest="keep_map",
+        action="store_true",
+        help=(
+            "Preserve the existing label map (append only newly-seen labels) "
+            "instead of re-seeding it from the current --min-count/--tips_only/"
+            "--include-classes/--collapse selection. Use this after hand-editing "
+            "the map (e.g. between --prepare-only and training)."
+        ),
+    )
+    p_train.add_argument(
+        "--prepare-only",
+        dest="prepare_only",
+        action="store_true",
+        help=(
+            "Generate crops and write/merge the label map, then stop before "
+            "training so the map can be hand-tuned; re-run `substrata train` "
+            "to train on the edited map."
         ),
     )
     p_train.add_argument(

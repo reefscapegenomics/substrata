@@ -2,7 +2,8 @@
 import sys
 import random
 import copy
-from typing import Optional, Tuple
+from collections import Counter
+from typing import Any, Dict, Optional, Tuple, Union
 
 # Third-Party Libraries
 import numpy as np
@@ -350,6 +351,38 @@ def calc_roughness(pcd):
     return ra, rq, image
 
 
+def _resolve_outer_radius(
+    radius_inner: float, radius_outer: Optional[float],
+    annulus_width: Optional[float], default_outer: float,
+) -> float:
+    """Resolve the annulus outer radius from the mutually-exclusive options.
+
+    Shared by the annulus-based measurements (:func:`calc_tpi_and_tri`,
+    :func:`calc_benthic_fraction`). The outer limit is ``radius_inner +
+    annulus_width`` when ``annulus_width`` is given, else ``radius_outer``, else
+    ``default_outer``.
+
+    Args:
+        radius_inner: Inner radius of the annulus in metres.
+        radius_outer: Absolute outer radius (mutually exclusive with
+            ``annulus_width``).
+        annulus_width: Fixed extension beyond ``radius_inner`` (mutually
+            exclusive with ``radius_outer``).
+        default_outer: Fallback outer radius when neither is supplied.
+
+    Returns:
+        The resolved outer radius in metres.
+
+    Raises:
+        ValueError: If both ``radius_outer`` and ``annulus_width`` are given.
+    """
+    if radius_outer is not None and annulus_width is not None:
+        raise ValueError("Specify either radius_outer or annulus_width, not both")
+    if annulus_width is not None:
+        return radius_inner + annulus_width
+    return radius_outer if radius_outer is not None else default_outer
+
+
 def calc_tpi_and_tri(
     pcd,
     center: Optional[np.ndarray] = None,
@@ -455,16 +488,9 @@ def calc_tpi_and_tri(
             the point cloud has fewer than 2 points, or
             ``radius_inner >= outer_radius``.
     """
-    if radius_outer is not None and annulus_width is not None:
-        raise ValueError("Specify either radius_outer or annulus_width, not both")
-    if annulus_width is not None:
-        outer_radius = radius_inner + annulus_width
-    else:
-        outer_radius = (
-            radius_outer
-            if radius_outer is not None
-            else settings.DEFAULT_TPI_RADIUS_OUTER
-        )
+    outer_radius = _resolve_outer_radius(
+        radius_inner, radius_outer, annulus_width, settings.DEFAULT_TPI_RADIUS_OUTER
+    )
 
     pts = np.asarray(pcd.points, dtype=float)
     if len(pts) < 2:
@@ -605,6 +631,459 @@ def calc_tpi_and_tri(
             display_pcd, vis_tpi_abs, vis_tpi_plane, **vis_kwargs
         )
     return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_abs, tri_plane, image
+
+
+def _benthic_fraction_from_results(
+    results: Dict[str, Optional[Dict[str, Any]]], target_class: str,
+    weight_by_probability: bool,
+) -> Tuple[float, Dict[str, Any]]:
+    """Aggregate classification results into a benthic fraction.
+
+    Considers only entries with a non-empty ``label`` (matched + classified).
+    Unweighted: ``count(label == target_class) / n_classified``. Weighted: the
+    mean of ``probs[target_class]`` over those samples (falling back to the hard
+    0/1 indicator for any sample lacking a ``probs`` map).
+
+    Args:
+        results: ``{id: {"label", "confidence", "probs", ...} | None}`` as
+            returned by :meth:`Annotations.classify_image_matches`.
+        target_class: Class label whose fraction is measured.
+        weight_by_probability: Average ``P(target_class)`` instead of counting.
+
+    Returns:
+        Tuple ``(fraction, breakdown)`` where ``breakdown`` has ``n_classified``,
+        ``n_target`` (hard count) and ``class_counts`` (label -> count).
+        ``fraction`` is ``nan`` when nothing was classified.
+    """
+    classified = [
+        r for r in results.values() if r and (r.get("label") is not None)
+    ]
+    class_counts = Counter(str(r["label"]) for r in classified)
+    n_classified = len(classified)
+    n_target = class_counts.get(target_class, 0)
+    breakdown = {
+        "n_classified": n_classified,
+        "n_target": n_target,
+        "class_counts": dict(class_counts),
+    }
+    if n_classified == 0:
+        return float("nan"), breakdown
+
+    if weight_by_probability:
+        probs_sum = 0.0
+        for r in classified:
+            probs = r.get("probs") or {}
+            if probs:
+                probs_sum += float(probs.get(target_class, 0.0))
+            else:
+                # No probability map: fall back to the hard indicator.
+                probs_sum += 1.0 if str(r["label"]) == target_class else 0.0
+        fraction = probs_sum / n_classified
+    else:
+        fraction = n_target / n_classified
+    return fraction, breakdown
+
+
+def _diagnose_benthic_matching(
+    intercepts, cams, cam_list, pcd,
+    reprojection_threshold_discard: float, reprojection_intercept_radius: float,
+    n_probe: int = 5,
+) -> None:
+    """Log why :func:`calc_benthic_fraction` failed to match sample points.
+
+    Matching is done in the world frame (the passed ``pcd`` is world-framed).
+    Probes a handful of intercepts to distinguish the common failure modes:
+    no (enabled) cameras; the cloud is not actually world-transformed (points
+    only project with the cameras' *original* poses); a frame/scale mismatch
+    (out of view either way); or the occlusion filter discarding in-view views
+    (too-strict ``discard`` threshold or a ray-cast that misses the surface).
+    Findings are emitted as a single ``logger.warning`` block.
+    """
+    lines = []
+    n_cams = len(cam_list)
+    n_enabled = sum(1 for c in cam_list if getattr(c, "enabled", True) is not False)
+    lines.append(f"cameras supplied: {n_cams} ({n_enabled} enabled)")
+    if n_enabled == 0:
+        lines.append("-> no enabled cameras; nothing can match.")
+        logger.warning(
+            "calc_benthic_fraction matching diagnostics:\n  " + "\n  ".join(lines)
+        )
+        return
+
+    pcd_wt = np.asarray(getattr(pcd, "world_transform", np.eye(4)), dtype=float)
+    cams_wt = np.asarray(getattr(cams, "world_transform", np.eye(4)), dtype=float)
+    wt_desc = "identity" if np.allclose(pcd_wt, np.eye(4)) else "non-identity"
+    lines.append(f"pcd.world_transform is {wt_desc}")
+    if not np.allclose(pcd_wt, cams_wt):
+        lines.append("pcd.world_transform != cams.world_transform (frames differ).")
+
+    # Probe a few points: how many cameras see them in the world frame (what we
+    # match in) vs the cameras' original poses (a sanity check on the cloud's
+    # frame). For intercepts coords == orig_coords (the same world-frame point).
+    probe = list(intercepts.data.values())[:n_probe]
+    inview_world = inview_orig = 0
+    for ann in probe:
+        for cam in cam_list:
+            if getattr(cam, "enabled", True) is False:
+                continue
+            if cam.get_pixel_coords(ann.coords)[0] is not None:
+                inview_world += 1
+            if cam.get_pixel_coords(
+                ann.coords, use_orig_coords=True
+            )[0] is not None:
+                inview_orig += 1
+    lines.append(
+        f"probe {len(probe)} pts x {n_enabled} cams in-view: "
+        f"world poses -> {inview_world}, original poses -> {inview_orig}"
+    )
+
+    if inview_world == 0 and inview_orig == 0:
+        ic = np.array([a.coords for a in probe], dtype=float)
+        cc = np.array(
+            [c.coords for c in cam_list if getattr(c, "coords", None) is not None],
+            dtype=float,
+        )
+        lines.append(
+            "points project out of view either way -> likely a frame/scale "
+            "mismatch between the point cloud and the cameras."
+        )
+        if len(ic) and len(cc):
+            lines.append(f"intercept XYZ min/max: {ic.min(0)} / {ic.max(0)}")
+            lines.append(f"camera   XYZ min/max: {cc.min(0)} / {cc.max(0)}")
+    elif inview_world == 0 and inview_orig > 0:
+        lines.append(
+            "points are in-view only with the cameras' ORIGINAL poses -> the "
+            "point cloud does not look world-transformed; pass the world-frame "
+            "pcd (the same one the cameras share)."
+        )
+    else:
+        # In-view in the world frame, yet nothing matched: the occlusion filter
+        # is responsible. Probe whether relaxing the discard threshold helps.
+        relaxed, errs = 0, []
+        for ann in probe:
+            saved, saved_list = ann.image_match, ann.image_matches
+            try:
+                ms = ann.get_image_matches(
+                    cam_list, max_cams=1, pcd=pcd, use_orig_coords=False,
+                    intercept_radius=reprojection_intercept_radius,
+                    reprojection_threshold_discard=float("inf"),
+                )
+                if ms:
+                    relaxed += 1
+                    if ms[0].reprojection_error is not None:
+                        errs.append(ms[0].reprojection_error)
+            except Exception:  # noqa: BLE001 - diagnostic probe only.
+                pass
+            finally:
+                ann.image_match, ann.image_matches = saved, saved_list
+        if relaxed and errs:
+            lines.append(
+                f"relaxing the occlusion threshold matched {relaxed}/{len(probe)} "
+                f"probe pts with reprojection errors ~{np.median(errs):.3f} m -> "
+                f"the discard threshold ({reprojection_threshold_discard} m) is "
+                "too strict; raise reprojection_threshold_discard."
+            )
+        elif relaxed:
+            lines.append(
+                f"relaxing the occlusion threshold matched {relaxed}/{len(probe)} "
+                "probe pts -> raise reprojection_threshold_discard."
+            )
+        else:
+            lines.append(
+                "in-view points yield no reprojection intercept even with the "
+                "threshold relaxed -> the occlusion ray misses the surface; "
+                "increase reprojection_intercept_radius (currently "
+                f"{reprojection_intercept_radius} m), or check the camera image "
+                "files exist."
+            )
+    logger.warning(
+        "calc_benthic_fraction matching diagnostics:\n  " + "\n  ".join(lines)
+    )
+
+
+def calc_benthic_fraction(
+    pcd,
+    cams,
+    classifier: Union[str, Any],
+    target_class: str,
+    center: Optional[np.ndarray] = None,
+    radius_inner: float = settings.DEFAULT_BENTHIC_RADIUS_INNER,
+    radius_outer: Optional[float] = None,
+    annulus_width: Optional[float] = None,
+    sample_spacing: float = settings.DEFAULT_BENTHIC_SAMPLE_SPACING,
+    intercept_search_radius: float = settings.DEFAULT_BENTHIC_INTERCEPT_RADIUS,
+    crop_size: Optional[int] = settings.TRAIN_CROP_SIZE,
+    batch_size: int = 64,
+    weight_by_probability: bool = False,
+    reprojection_threshold_discard: float = (
+        settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD
+    ),
+    reprojection_intercept_radius: float = (
+        settings.DEFAULT_INTERCEPT_SEARCH_RADIUS
+    ),
+    focal_annotation: Optional[Any] = None,
+    generate_image: bool = True,
+    show_image_matches: bool = False,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Fraction of the benthos around a focal point that is ``target_class``.
+
+    Mirrors :func:`calc_tpi_and_tri`'s annulus neighbourhood (``radius_inner`` +
+    ``radius_outer``/``annulus_width``; the inner radius excludes the focal
+    object). A regular XY grid at ``sample_spacing`` is laid over the annulus;
+    each cell is turned into a surface point via
+    :meth:`PointCloud.get_z_intercepts`, the best camera image that sees it is
+    found (:meth:`Annotation.get_image_matches`, in the **world frame** and
+    occlusion-filtered via ``pcd``) and classified with the crop classifier
+    (:meth:`Annotations.classify_image_matches` -> ``classify_image_match``).
+    The fraction of samples classified as ``target_class`` is then returned.
+    If no sample matches a camera image, :func:`_diagnose_benthic_matching`
+    logs the likely cause (coordinate frame, occlusion threshold, cameras).
+
+    Args:
+        pcd: Project ``PointCloud`` in the **world frame** (the same frame as
+            ``cams``, as the ``ProjectInitializer`` guarantees). Sample points
+            are taken from and matched against this world-frame cloud.
+        cams: ``Cameras`` container (or a list of ``Camera`` objects).
+        classifier: Loaded fastai learner or path to a ``.pkl`` learner; a path
+            is loaded once up front (not per sample).
+        target_class: Class label whose areal fraction is measured.
+        center: (3,) focal point. If ``None``, the XY centroid + mean Z of
+            ``pcd`` is used.
+        radius_inner: Inner radius of the sampled annulus in metres.
+        radius_outer: Absolute outer radius (mutually exclusive with
+            ``annulus_width``).
+        annulus_width: Fixed extension beyond ``radius_inner`` (mutually
+            exclusive with ``radius_outer``).
+        sample_spacing: XY grid spacing of sample points in metres.
+        intercept_search_radius: XY radius used to find each z-intercept.
+        crop_size: Square crop size for the classifier (defaults to the training
+            crop size).
+        batch_size: Inference batch size for the (batched) classification pass.
+        weight_by_probability: Average ``P(target_class)`` over samples instead
+            of counting hard predictions (see
+            :func:`_benthic_fraction_from_results`).
+        reprojection_threshold_discard: Image matches whose reprojection error
+            exceeds this (metres) are treated as occluded and dropped. Raise it
+            if good views are being discarded.
+        reprojection_intercept_radius: Ray-cast search radius (metres) for the
+            occlusion check; enlarge it if the ray misses the surface.
+        generate_image: If True, render a top-down visualisation into the
+            returned ``"image"``. When ``weight_by_probability`` is set, the
+            classified points are coloured by ``P(target_class)`` (red
+            intensity) rather than target/other markers.
+        focal_annotation: Optional source annotation (e.g. the colony being
+            measured). When given, its ``center`` (``coords``) and existing
+            ``image_match`` are reused — so ``show_image_matches`` fills the inner
+            circle with the colony crop without recomputing an intercept/match.
+            ``measure``/``measure_all`` pass the annotation automatically.
+        show_image_matches: Make the measurement ``"image"`` a side-by-side
+            comparison plot — the classified sample dots (left) next to each
+            sample's classifier-input crop placed at the same position, tiled
+            into a grid (right) — instead of the dots-only view, for
+            troubleshooting misclassification. It is not displayed inline — show
+            it with ``annotation.show_measurement_images()``.
+        debug: Always run and log the matching diagnostics (otherwise they run
+            only when nothing matched).
+
+    Returns:
+        Dict with ``fraction`` (``nan`` if nothing was classified),
+        ``target_class``, ``weighted``, ``n_samples``, ``n_intercepts``,
+        ``n_matched``, ``n_classified``, ``n_target``, ``class_counts``,
+        ``center``, ``radius_inner``, ``radius_outer`` and ``image`` (the
+        dots view, or the combined comparison plot when ``show_image_matches``).
+
+    Raises:
+        ValueError: If both ``radius_outer`` and ``annulus_width`` are given,
+            the point cloud is empty, or ``radius_inner >= outer_radius``.
+    """
+    from substrata import classification  # lazy: avoids fastai import at module load
+
+    outer_radius = _resolve_outer_radius(
+        radius_inner, radius_outer, annulus_width,
+        settings.DEFAULT_BENTHIC_RADIUS_OUTER,
+    )
+
+    pts = np.asarray(pcd.points, dtype=float)
+    if len(pts) == 0:
+        raise ValueError("Point cloud is empty")
+    if radius_inner >= outer_radius:
+        raise ValueError("radius_inner must be less than the outer radius")
+
+    if center is None and focal_annotation is not None:
+        center = getattr(focal_annotation, "coords", None)
+    if center is None:
+        focal_xy = pts[:, :2].mean(axis=0)
+        focal_z = float(pts[:, 2].mean())
+    else:
+        center = np.asarray(center, dtype=float)
+        focal_xy = center[:2]
+        focal_z = float(center[2])
+    focal_pt = np.array([focal_xy[0], focal_xy[1], focal_z])
+
+    # Regular XY grid over the annulus bounding box, kept to the annulus ring.
+    cx, cy = float(focal_xy[0]), float(focal_xy[1])
+    n_steps = int(np.floor(outer_radius / sample_spacing))
+    offsets = np.arange(-n_steps, n_steps + 1) * sample_spacing
+    gx, gy = np.meshgrid(cx + offsets, cy + offsets)
+    grid = np.column_stack([gx.ravel(), gy.ravel()])
+    r = np.linalg.norm(grid - [cx, cy], axis=1)
+    xy_coords = grid[(r >= radius_inner) & (r <= outer_radius)]
+
+    annulus_desc = (
+        f"annulus_width={annulus_width:.3f} m (outer={outer_radius:.3f} m)"
+        if annulus_width is not None
+        else f"radius_outer={outer_radius:.3f} m"
+    )
+
+    result: Dict[str, Any] = {
+        "fraction": float("nan"),
+        "target_class": target_class,
+        "weighted": weight_by_probability,
+        "n_samples": len(xy_coords),
+        "n_intercepts": 0,
+        "n_matched": 0,
+        "n_classified": 0,
+        "n_target": 0,
+        "class_counts": {},
+        "center": focal_pt,
+        "radius_inner": radius_inner,
+        "radius_outer": outer_radius,
+        "image": None,
+    }
+
+    if len(xy_coords) == 0:
+        logger.warning(
+            "calc_benthic_fraction: no grid samples in the annulus "
+            "(radius_inner=%.3f m, %s, spacing=%.3f m).",
+            radius_inner, annulus_desc, sample_spacing,
+        )
+        return result
+
+    # Load the learner once so it is not re-loaded per sample.
+    learn = classification.get_image_classifier(classifier) \
+        if isinstance(classifier, str) else classifier
+
+    # Sample the surface at each grid XY -> InterceptAnnotations. Align the
+    # container transform with the pcd so the annotation/pcd/cam frames agree
+    # (get_image_matches enforces this).
+    intercepts = pcd.get_z_intercepts(xy_coords, intercept_search_radius)
+    intercepts.world_transform = pcd.world_transform
+    result["n_intercepts"] = len(intercepts)
+    if len(intercepts) == 0:
+        logger.info(
+            "calc_benthic_fraction: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m"
+            "  %s  n_samples=%d  no surface intercepts.",
+            cx, cy, focal_z, radius_inner, annulus_desc, len(xy_coords),
+        )
+        return result
+
+    cam_list = list(cams.data.values()) if hasattr(cams, "data") else list(cams)
+    for ann in intercepts.data.values():
+        try:
+            # World-frame matching: the intercepts come from the world-frame pcd,
+            # so project with the world camera poses (use_orig_coords=False) to
+            # keep projection and the occlusion ray-cast in the same frame.
+            ann.get_image_matches(
+                cam_list, max_cams=1, pcd=pcd, use_orig_coords=False,
+                intercept_radius=reprojection_intercept_radius,
+                reprojection_threshold_discard=reprojection_threshold_discard,
+            )
+        except Exception as e:  # noqa: BLE001 - keep going; diagnosed below.
+            logger.debug("image match failed for intercept %s: %s", ann.id, e)
+    n_matched = sum(
+        1 for ann in intercepts.data.values() if ann.image_match is not None
+    )
+    result["n_matched"] = n_matched
+
+    # Troubleshooting: if nothing (or, in debug, regardless) matched, probe why.
+    if n_matched == 0 or debug:
+        _diagnose_benthic_matching(
+            intercepts, cams, cam_list, pcd,
+            reprojection_threshold_discard, reprojection_intercept_radius,
+        )
+    if n_matched == 0:
+        logger.warning(
+            "calc_benthic_fraction: 0/%d intercepts matched a camera image; "
+            "returning fraction=nan (see diagnostics above).",
+            len(intercepts),
+        )
+        return result
+
+    results = intercepts.classify_image_matches(
+        learn, crop_size, batch_size=batch_size
+    )
+    fraction, breakdown = _benthic_fraction_from_results(
+        results, target_class, weight_by_probability
+    )
+    result.update(fraction=fraction, **breakdown)
+
+    logger.info(
+        "calc_benthic_fraction: center=(%.3f, %.3f, %.3f)  radius_inner=%.3f m  %s"
+        "  n_samples=%d  n_classified=%d  %s%s=%.4f",
+        cx, cy, focal_z, radius_inner, annulus_desc, len(xy_coords),
+        breakdown["n_classified"],
+        "weighted " if weight_by_probability else "",
+        f"fraction({target_class})", fraction,
+    )
+
+    # The local neighbourhood (the "simple_pcd" around the colony) within the
+    # outer radius gives the visualisations the same colony-centred context as
+    # visualize_tpi rather than rendering the whole model, in true RGB colour.
+    neighborhood = neigh_cols = None
+    if generate_image or show_image_matches:
+        neigh_mask = np.linalg.norm(pts[:, :2] - focal_xy, axis=1) <= outer_radius
+        neighborhood = pointclouds.SimplePointCloud(pts[neigh_mask])
+        try:
+            cols = np.asarray(pcd.colors, dtype=float)
+            neigh_cols = cols[neigh_mask] if len(cols) == len(pts) else None
+        except Exception:  # noqa: BLE001 - colours are optional context.
+            neigh_cols = None
+
+    # The combined fraction-vs-crops comparison plot (when requested) becomes the
+    # measurement image; otherwise the standalone fraction view is used.
+    if show_image_matches:
+        # Use the colony's existing image match (from the source annotation) for
+        # the inner-circle inset; only compute one if it isn't already there.
+        focal_im = getattr(focal_annotation, "image_match", None)
+        if focal_im is None:
+            try:
+                focal_anns = pcd.get_z_intercepts(
+                    np.array([focal_xy]), intercept_search_radius
+                )
+                focal_anns.world_transform = pcd.world_transform
+                for fann in focal_anns.data.values():
+                    fann.get_image_matches(
+                        cam_list, max_cams=1, pcd=pcd, use_orig_coords=False,
+                        intercept_radius=reprojection_intercept_radius,
+                        reprojection_threshold_discard=(
+                            reprojection_threshold_discard
+                        ),
+                    )
+                fvals = list(focal_anns.data.values())
+                focal_im = fvals[0].image_match if fvals else None
+            except Exception as e:  # noqa: BLE001 - colony inset is best-effort.
+                logger.debug("focal image match failed: %s", e)
+
+        combined = visualizations.visualize_benthic_image_matches(
+            intercepts, results, target_class, crop_size,
+            center=focal_pt, radius_inner=radius_inner,
+            radius_outer=outer_radius, weighted=weight_by_probability,
+            background_pcd=neighborhood, background_colors=neigh_cols,
+            focal_image_match=focal_im, cell_size=sample_spacing,
+        )
+        # The combined plot is the single measurement image; show it on demand
+        # via annotation.show_measurement_images().
+        result["image"] = combined
+    elif generate_image:
+        result["image"] = visualizations.visualize_benthic_fraction(
+            intercepts, results, target_class, center=focal_pt,
+            radius_inner=radius_inner, radius_outer=outer_radius,
+            background_pcd=neighborhood, background_colors=neigh_cols,
+            weighted=weight_by_probability,
+        )
+
+    return result
 
 
 def get_fractal_dimension(pcd, iterations=10, plot=False):

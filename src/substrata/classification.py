@@ -48,10 +48,11 @@ def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
 
     Args:
         checkpoint: Path to the learner .pkl file.
-        device: Optional 'cuda' or 'cpu'. If None, auto-detect.
+        device: Optional 'cuda'/'mps'/'cpu'. If None, auto-detect (prefers
+            CUDA, then Apple MPS, then CPU).
 
     Returns:
-        Loaded FastAI Learner.
+        Loaded FastAI Learner placed on the selected device.
     """
     from fastai.vision.all import load_learner  # lazy heavy import
 
@@ -61,17 +62,38 @@ def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
     try:
         import torch  # lazy
 
-        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    except Exception:
+        if device is not None:
+            dev = device
+        elif torch.cuda.is_available():
+            dev = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            dev = "mps"
+        else:
+            dev = "cpu"
+    except Exception:  # noqa: BLE001 - torch import / probing failed.
         dev = device or "cpu"
 
-    # Load on CPU by default, then move if needed
-    learn = load_learner(checkpoint, cpu=True)
+    # load_learner(cpu=False) restores onto the default device; then move the
+    # model AND the dataloaders explicitly (a fastai Learner has no ``.to``, so
+    # the model must be moved via ``learn.model.to`` and batches via
+    # ``learn.dls.device`` — otherwise inference silently runs on the CPU).
+    learn = load_learner(checkpoint, cpu=(dev == "cpu"))
     if dev != "cpu":
         try:
-            learn.to(dev)  # type: ignore[attr-defined]
-        except Exception:
-            logger.warning("Could not move learner to device '%s'; using CPU.", dev)
+            learn.model = learn.model.to(dev)
+            if hasattr(learn.dls, "to"):
+                learn.dls.to(dev)
+            else:
+                learn.dls.device = dev
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Could not move learner to device '%s' (%s); using CPU.", dev, e
+            )
+            try:
+                learn.model = learn.model.to("cpu")
+                learn.dls.device = "cpu"
+            except Exception:  # noqa: BLE001
+                pass
     return learn
 
 
@@ -88,6 +110,155 @@ def _ensure_learner(classifier: Union[str, Any]):
     if isinstance(classifier, str):
         return get_image_classifier(classifier)
     return classifier
+
+
+def _crop_for_match(image_match, crop_size) -> Optional[Image.Image]:
+    """Return the classifier-input crop for an ImageMatch (or None on failure).
+
+    Crops centred on the matched pixel ``(image_match.x, image_match.y)`` at
+    ``crop_size`` (matching how training crops are cut); with ``crop_size=None``
+    uses the whole image. Shared by :func:`classify_image_match` and the batched
+    :func:`classify_image_matches_batch` so both feed the classifier the same
+    pixels.
+    """
+    fp = getattr(image_match, "filepath", None)
+    if not fp or not os.path.isfile(fp):
+        return None
+    try:
+        if crop_size is not None:
+            from substrata.visualizations import get_crop_img  # lazy heavy import
+
+            if isinstance(crop_size, int):
+                crop_w = crop_h = crop_size
+            else:
+                crop_w, crop_h = crop_size
+            return get_crop_img(
+                fp, image_match.x, image_match.y, crop_w, crop_h
+            ).convert("RGB")
+        return Image.open(fp).convert("RGB")
+    except (OSError, ValueError):
+        return None
+
+
+def _learner_device(learn) -> str:
+    """Best-effort device string for a fastai learner ('cuda', 'mps', 'cpu')."""
+    try:
+        param = next(learn.model.parameters())
+        return str(param.device).split(":")[0]
+    except Exception:  # noqa: BLE001
+        try:
+            return str(getattr(getattr(learn, "dls", None), "device", "unknown"))
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+
+def _result_from_probs(prob_list, vocab) -> Dict[str, Any]:
+    """Build the standard classification result dict from a probability vector."""
+    pred_idx = int(max(range(len(prob_list)), key=lambda i: prob_list[i]))
+    if vocab is not None and len(vocab) == len(prob_list):
+        probs_map = {str(vocab[i]): float(prob_list[i]) for i in range(len(vocab))}
+        label = str(vocab[pred_idx])
+        confidence = float(probs_map[label])
+    else:
+        probs_map = None
+        label = str(pred_idx)
+        confidence = float(prob_list[pred_idx])
+    return {
+        "label": label, "confidence": confidence,
+        "probs": probs_map, "pred_idx": pred_idx,
+    }
+
+
+def classify_image_matches_batch(
+    image_matches: List[Any], classifier: Union[str, Any],
+    crop_size: Optional[Union[int, Tuple[int, int]]] = None,
+    batch_size: int = 64, n_jobs: int = -1,
+) -> List[Optional[Dict[str, Any]]]:
+    """Classify many ImageMatches in batched GPU passes (fast path).
+
+    Crops each match centred on ``(x, y)`` (like :func:`classify_image_match`),
+    then runs a **single** ``learn.get_preds`` over all crops in batches of
+    ``batch_size`` instead of a per-image ``learn.predict``. fastai's
+    ``predict`` rebuilds a one-item dataloader on every call, so batching is
+    typically an order of magnitude faster (more on GPU). The crops are loaded
+    **in parallel** (``n_jobs`` threads) because decoding the full-resolution
+    source photos is usually the real bottleneck - far more than the forward
+    pass. Each match's ``.classification`` is set and a list of result dicts
+    aligned with ``image_matches`` is returned (``None`` where the crop or
+    inference failed). Falls back to per-image classification if batched
+    inference is unavailable.
+
+    Args:
+        image_matches: ImageMatch instances to classify.
+        classifier: Loaded fastai learner or path to a ``.pkl`` (loaded once).
+        crop_size: Crop size (int or ``(w, h)``); ``None`` uses the full image.
+        batch_size: Inference batch size.
+        n_jobs: Threads for parallel crop loading (-1 = all cores).
+
+    Returns:
+        List of result dicts (or ``None``) aligned with ``image_matches``.
+    """
+    results: List[Optional[Dict[str, Any]]] = [None] * len(image_matches)
+    if not image_matches:
+        return results
+    try:
+        learn = _ensure_learner(classifier)
+    except Exception as e:  # noqa: BLE001
+        logger.error(str(e))
+        return results
+
+    # Report the inference device so it is clear whether classification is
+    # GPU-accelerated (a CPU learner is the usual reason batching feels slow).
+    device = _learner_device(learn)
+    accel = "GPU" if device not in ("cpu", "unknown") else "CPU"
+    msg = (
+        f"Classifying {len(image_matches)} image match(es) on {device} "
+        f"({accel}, batch_size={batch_size})"
+    )
+    logger.info(msg)
+    print(msg)
+
+    # Load the crops in parallel (JPEG decode releases the GIL, so threads
+    # scale). Decoding the full-resolution source photos is the dominant cost,
+    # so this is the main speed lever - not the GPU forward pass. joblib
+    # preserves input order, keeping results aligned with image_matches.
+    from joblib import Parallel, delayed
+
+    from substrata.logging import tqdm_joblib
+
+    with tqdm_joblib(tqdm(
+        total=len(image_matches),
+        desc=f"Cropping image matches ({device})", unit="img",
+    )):
+        loaded = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_crop_for_match)(im, crop_size) for im in image_matches
+        )
+    crops, idx_map = [], []
+    for i, crop in enumerate(loaded):
+        if crop is not None:
+            crops.append(crop)
+            idx_map.append(i)
+    if not crops:
+        return results
+
+    vocab = getattr(getattr(learn, "dls", None), "vocab", None)
+    try:
+        # Single batched forward pass over all crops (order preserved).
+        dl = learn.dls.test_dl(crops, bs=batch_size)
+        probs, _ = learn.get_preds(dl=dl)
+        for pos, prob in zip(idx_map, probs.tolist()):
+            res = _result_from_probs(prob, vocab)
+            results[pos] = res
+            setattr(image_matches[pos], "classification", res)
+    except Exception as e:  # noqa: BLE001 - fall back to the per-image path.
+        logger.warning(
+            "Batched classification unavailable (%s); using per-image predict.", e
+        )
+        for pos in idx_map:
+            results[pos] = classify_image_match(
+                image_matches[pos], learn, crop_size
+            )
+    return results
 
 
 def classify_image_match(
@@ -129,9 +300,12 @@ def classify_image_match(
         return None
 
     try:
-        img = Image.open(image_match.filepath).convert("RGB")
-        if crop_size is not None:
-            img = _center_crop(img, crop_size)
+        # Crop centred on the matched pixel (image_match.x, image_match.y),
+        # matching how training crops are cut (generate_crop -> get_crop_img).
+        img = _crop_for_match(image_match, crop_size)
+        if img is None:
+            logger.error(f"Could not crop image: {image_match.filepath}")
+            return None
 
         pred_class, pred_idx, pred_probs = learn.predict(img)
 
@@ -429,10 +603,68 @@ def get_training_labels(
     return labels
 
 
+def get_label_collapse_map(
+    nodes: Dict, children: Dict, roots: List[str], direct: Dict, total: Dict,
+    min_count: int = 1, tips_only: bool = False,
+    include_labels: Optional[Set[str]] = None, collapse: bool = False,
+) -> Dict[str, str]:
+    """Map each visible label to the training class it collapses into.
+
+    Walks the same visible tree as :func:`render`/:func:`get_training_labels`,
+    carrying the nearest *bolded* ancestor down each branch. Keys and values are
+    CPC codes (the raw ``label`` values, which are also the crop folder names).
+
+    A bolded node always maps to itself (it is its own training class). A
+    *non-bolded* visible node is, by default, excluded (omitted from the map).
+    When ``collapse`` is True it instead folds into its nearest bolded ancestor
+    (if any) - so e.g. with ``include_labels={'MAF'}`` and ``collapse=True`` the
+    descendants ``MAFG``/``MAF_T`` are trained as ``MAF``; without ``collapse``
+    only ``MAF`` itself is trained and its descendants are excluded.
+
+    Args:
+        nodes, children, roots, direct, total: Label-tree structures from
+            :func:`load_classes` / :func:`subtree_totals`.
+        min_count: Bolding threshold (see :func:`_is_bold`).
+        tips_only: Only bold tip entries (not heavy parents).
+        include_labels: Explicit bolded set; when given it overrides the
+            count-based rules (see :func:`_node_is_bold`).
+        collapse: Fold non-bolded descendants into their nearest bolded
+            ancestor instead of excluding them.
+
+    Returns:
+        Mapping ``raw_label -> training_class`` for the non-excluded labels.
+    """
+    mapping: Dict[str, str] = {}
+    vis = settings.TRAIN_MIN_VISIBLE_COUNT
+
+    def walk(code, nearest_bold: Optional[str], is_root=False):
+        if total.get(code, 0) < vis:
+            return
+        kids = [c for c in children.get(code, []) if total.get(c, 0) >= vis]
+        d = direct.get(code, 0)
+        t = total.get(code, 0)
+        label = nodes[code]["cpc"] or code
+        if _node_is_bold(
+            label, bool(kids), is_root, d, t, min_count, tips_only, include_labels
+        ):
+            nearest_bold = label
+            mapping[label] = label
+        elif collapse and nearest_bold is not None:
+            mapping[label] = nearest_bold
+        for child in kids:
+            walk(child, nearest_bold)
+
+    for root in roots:
+        if total.get(root, 0) >= vis:
+            walk(root, None, is_root=True)
+    return mapping
+
+
 def build_label_tree(
     classes_path: str, csv_files: List[str], min_count: int = 1,
     tips_only: bool = False, include_labels: Optional[Set[str]] = None,
-) -> Tuple[List[str], Set[str], Counter, Counter]:
+    collapse: bool = False,
+) -> Tuple[List[str], Set[str], Counter, Counter, Dict[str, str]]:
     """Render the CATAMI label tree and derive the training-label set.
 
     Combines :func:`load_classes`, :func:`count_labels`, :func:`subtree_totals`,
@@ -448,12 +680,17 @@ def build_label_tree(
             overrides ``min_count``/``tips_only``; the returned training-label
             set is this restricted to labels present in the tree, so the caller
             can detect any requested category that is absent.
+        collapse: Fold non-selected descendants into their nearest selected
+            ancestor in the collapse map instead of excluding them (see
+            :func:`get_label_collapse_map`).
 
     Returns:
-        Tuple ``(lines, training_labels, counts, unknown)`` where ``lines`` is
-        the rendered tree (with ANSI bold styling), ``training_labels`` is the
-        set of bolded CPC codes, ``counts`` maps CPC code -> count, and
-        ``unknown`` maps unrecognised label -> count.
+        Tuple ``(lines, training_labels, counts, unknown, collapse_map)`` where
+        ``lines`` is the rendered tree (with ANSI bold styling),
+        ``training_labels`` is the set of bolded CPC codes, ``counts`` maps CPC
+        code -> count, ``unknown`` maps unrecognised label -> count, and
+        ``collapse_map`` (see :func:`get_label_collapse_map`) maps each
+        non-excluded raw label to the training class it collapses into.
     """
     nodes, children, roots = load_classes(classes_path)
     cpc_to_code = {n["cpc"]: code for code, n in nodes.items() if n["cpc"]}
@@ -499,7 +736,110 @@ def build_label_tree(
         nodes, children, roots, direct, total, min_count, tips_only,
         include_labels=include_labels,
     )
-    return lines, training_labels, counts, unknown
+    collapse_map = get_label_collapse_map(
+        nodes, children, roots, direct, total, min_count, tips_only,
+        include_labels=include_labels, collapse=collapse,
+    )
+    return lines, training_labels, counts, unknown, collapse_map
+
+
+# ---------------------------------------------------------------------------
+# Label map (selection + hierarchical collapse), decoupled from crops
+# ---------------------------------------------------------------------------
+#
+# Crops are generated for every *visible* raw label (folder named by the raw
+# label), independent of which categories are trained. Which labels are trained
+# and how they collapse lives in an editable CSV (``label,count,training_class``)
+# so changing the considered categories only re-reads this file and never
+# regenerates crops. A blank ``training_class`` means the label is excluded from
+# training. The file is seeded from the label tree (:func:`get_label_collapse_map`);
+# the CLI re-seeds it from the current selection flags by default, or preserves
+# hand edits and only appends new labels under ``--keep-map``
+# (:func:`merge_label_map`).
+
+_LABEL_MAP_COLUMNS = ("label", "count", "training_class")
+
+
+def write_label_map(
+    path: str, labels: Set[str], counts: Counter, collapse_map: Dict[str, str],
+) -> None:
+    """Write a fresh ``label,count,training_class`` map for ``labels``.
+
+    One row per label in ``labels`` (sorted), with the seed ``training_class``
+    taken from ``collapse_map`` (blank for any label not in it). Callers seed
+    only the selected/training labels, so the file stays free of blank rows for
+    excluded labels; a row can still be blanked by hand to drop that label. The
+    ``count`` column is an informational hint for hand-editing.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LABEL_MAP_COLUMNS)
+        for label in sorted(labels):
+            writer.writerow(
+                [label, counts.get(label, 0), collapse_map.get(label, "")]
+            )
+
+
+def load_label_map(path: str) -> Dict[str, str]:
+    """Read a label map, returning ``{raw_label: training_class}``.
+
+    Rows with a blank ``training_class`` are treated as excluded and omitted, so
+    the returned mapping contains only labels that participate in training.
+    """
+    mapping: Dict[str, str] = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            label = (row.get("label") or "").strip()
+            training_class = (row.get("training_class") or "").strip()
+            if label and training_class:
+                mapping[label] = training_class
+    return mapping
+
+
+def merge_label_map(
+    path: str, labels: Set[str], counts: Counter, collapse_map: Dict[str, str],
+    reseed: bool = False,
+) -> Dict[str, str]:
+    """Seed or update the on-disk label map and return the active mapping.
+
+    When the file does not exist (or ``reseed`` is True) it is written fresh
+    from ``collapse_map``. Otherwise existing rows are preserved verbatim
+    (keeping the user's hand edits) and only labels not already present are
+    appended with their seed mapping - so newly added annotation CSVs surface
+    their labels without clobbering prior edits.
+
+    Args:
+        path: Map CSV path.
+        labels: Visible raw labels that should be represented.
+        counts: Label -> count (for the informational ``count`` column).
+        collapse_map: Seed ``raw_label -> training_class`` mapping.
+        reseed: Overwrite any existing file from the seed mapping.
+
+    Returns:
+        The active ``{raw_label: training_class}`` mapping (excluded labels
+        omitted), as read back from disk.
+    """
+    if reseed or not os.path.isfile(path):
+        write_label_map(path, labels, counts, collapse_map)
+        return load_label_map(path)
+
+    with open(path, newline="") as f:
+        existing_rows = list(csv.DictReader(f))
+    known = {(r.get("label") or "").strip() for r in existing_rows}
+    new_labels = sorted(lab for lab in labels if lab not in known)
+    if new_labels:
+        with open(path, "a", newline="") as f:
+            writer = csv.writer(f)
+            for label in new_labels:
+                writer.writerow(
+                    [label, counts.get(label, 0), collapse_map.get(label, "")]
+                )
+        logger.info(
+            "Added %d new label(s) to %s (existing edits preserved).",
+            len(new_labels), path,
+        )
+    return load_label_map(path)
 
 
 # ---------------------------------------------------------------------------
@@ -617,20 +957,21 @@ def resolve_cam_dirs(
 
 
 def collate_training_annotations(
-    csv_files: List[str], pattern: str, training_labels: Set[str],
+    csv_files: List[str], pattern: str, keep_labels: Set[str],
     output_path: str, model_path: str, prompt: bool = True,
 ) -> Tuple[int, int]:
     """Write a consolidated training annotations CSV.
 
-    Keeps only rows whose ``label`` is exactly in ``training_labels``, rewrites
-    ``cam_filepath`` directories via :func:`resolve_cam_dirs`, prefixes
-    integer-only ``id`` values with the model name, and drops rows lacking the
-    camera fields needed to make a crop.
+    Keeps every row whose ``label`` is in ``keep_labels`` (the *visible* labels,
+    not just the trained ones - selection/collapse is applied later via the
+    label map), rewrites ``cam_filepath`` directories via
+    :func:`resolve_cam_dirs`, prefixes integer-only ``id`` values with the model
+    name, and drops rows lacking the camera fields needed to make a crop.
 
     Args:
         csv_files: Annotation CSV paths.
         pattern: Glob pattern used to derive the per-file model name.
-        training_labels: CPC codes to keep.
+        keep_labels: CPC codes to keep (typically the visible labels).
         output_path: Destination CSV path.
         model_path: Base directory for camera-directory fallback.
         prompt: Whether to prompt for unresolved camera directories.
@@ -649,7 +990,7 @@ def collate_training_annotations(
             reader = csv.DictReader(f)
             for row in reader:
                 label = (row.get("label") or "").strip()
-                if label not in training_labels:
+                if label not in keep_labels:
                     continue
                 cam_fp = (row.get("cam_filepath") or "").strip()
                 if cam_fp:
@@ -1002,8 +1343,169 @@ def _remove_empty_category_dirs(
 # ---------------------------------------------------------------------------
 
 
+def count_crops_by_class(
+    output_dir: str, label_map: Dict[str, str],
+    crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
+) -> Dict[str, Counter]:
+    """Tally crops per training class for each split.
+
+    Walks the crop split folders (named by the raw label), collapses each raw
+    label to its training class via ``label_map`` (raw labels absent from the
+    map are skipped, matching what training/evaluation use), and counts non-
+    empty image files.
+
+    Args:
+        output_dir: Base directory holding the crop folders.
+        label_map: ``raw_label -> training_class`` mapping.
+        crop_dirs: Folder names for the three splits.
+
+    Returns:
+        Mapping ``split_dir -> Counter(training_class -> count)``.
+    """
+    result: Dict[str, Counter] = {split: Counter() for split in crop_dirs}
+    for split in crop_dirs:
+        base = os.path.join(output_dir, split)
+        if not os.path.isdir(base):
+            continue
+        for raw_label in os.listdir(base):
+            cls = label_map.get(raw_label)
+            if cls is None:
+                continue
+            cat_dir = os.path.join(base, raw_label)
+            if not os.path.isdir(cat_dir):
+                continue
+            for name in os.listdir(cat_dir):
+                if not name.lower().endswith(settings.TRAIN_CROP_IMAGE_EXTS):
+                    continue
+                path = os.path.join(cat_dir, name)
+                try:
+                    if os.path.getsize(path) == 0:
+                        continue
+                except OSError:
+                    continue
+                result[split][cls] += 1
+    return result
+
+
+def final_metrics_from_learner(learn: Any) -> Dict[str, Any]:
+    """Best-effort extraction of the last-epoch metrics from a fastai learner.
+
+    Reads ``learn.recorder`` defensively (no fastai import needed) and returns a
+    ``{metric_name: value}`` dict for the final epoch, or ``{}`` if unavailable.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        rec = learn.recorder
+        names = [
+            n for n in getattr(rec, "metric_names", []) if n not in ("epoch", "time")
+        ]
+        values = list(getattr(rec, "values", []) or [])
+        if names and values:
+            for name, val in zip(names, values[-1]):
+                try:
+                    out[name] = round(float(val), 4)
+                except (TypeError, ValueError):
+                    out[name] = val
+    except Exception:  # noqa: BLE001 - summary is best-effort, never fatal
+        return {}
+    return out
+
+
+def write_training_summary_pdf(
+    pdf_path: str, info: List[Tuple[str, Any]], counts_by_split: Dict[str, Counter],
+    crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Render a training-run summary to a multi-page PDF.
+
+    Page 1 is a text summary of the run settings, the per-split crop totals and
+    (if given) the final metrics. The remaining pages show a horizontal stacked
+    bar chart of per-training-class crop counts (train/validation/test),
+    paginated ``settings.TRAIN_SUMMARY_CLASSES_PER_PAGE`` classes at a time and
+    sorted by total count.
+
+    Args:
+        pdf_path: Destination PDF path.
+        info: Ordered ``(label, value)`` rows of run settings to print.
+        counts_by_split: ``split_dir -> Counter(class -> count)`` (see
+            :func:`count_crops_by_class`).
+        crop_dirs: Folder names for the three splits (train/val/test order).
+        metrics: Optional ``{metric_name: value}`` from the final epoch.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import numpy as np
+
+    train_name, valid_name, test_name = crop_dirs
+    classes = sorted(
+        set().union(*[set(c) for c in counts_by_split.values()])
+        if counts_by_split else set(),
+        key=lambda c: (
+            -sum(counts_by_split.get(s, {}).get(c, 0) for s in crop_dirs), c
+        ),
+    )
+
+    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
+    with PdfPages(pdf_path) as pdf:
+        # Page 1: settings + totals + final metrics.
+        fig = plt.figure(figsize=(8.5, 11))
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+        fig.suptitle("Training summary", fontsize=12, y=0.98)
+        lines = [f"{k}: {v}" for k, v in info]
+        lines.append("")
+        lines.append("Crops per split:")
+        for split in crop_dirs:
+            tot = sum(counts_by_split.get(split, {}).values())
+            lines.append(f"  {split}: {tot}")
+        grand_total = sum(
+            sum(counts_by_split.get(s, {}).values()) for s in crop_dirs
+        )
+        lines.append(f"  total: {grand_total}")
+        if metrics:
+            lines.append("")
+            lines.append("Final-epoch metrics:")
+            for k, v in metrics.items():
+                lines.append(f"  {k}: {v}")
+        ax.text(
+            0.02, 0.96, "\n".join(lines), transform=ax.transAxes, va="top",
+            ha="left", family="monospace", fontsize=8,
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Remaining pages: per-class stacked bar chart of crop counts.
+        per_page = settings.TRAIN_SUMMARY_CLASSES_PER_PAGE
+        for start in range(0, len(classes), per_page):
+            page = classes[start:start + per_page]
+            tr = np.array([counts_by_split.get(train_name, {}).get(c, 0) for c in page])
+            va = np.array([counts_by_split.get(valid_name, {}).get(c, 0) for c in page])
+            te = np.array([counts_by_split.get(test_name, {}).get(c, 0) for c in page])
+            y = np.arange(len(page))
+            fig, ax = plt.subplots(figsize=(8.5, max(3, len(page) * 0.25 + 1)))
+            ax.barh(y, tr, color="#4c72b0", label=train_name)
+            ax.barh(y, va, left=tr, color="#dd8452", label=valid_name)
+            ax.barh(y, te, left=tr + va, color="#55a868", label=test_name)
+            ax.set_yticks(y)
+            ax.set_yticklabels(page, fontsize=6)
+            ax.invert_yaxis()  # largest class on top
+            ax.set_xlabel("Crops")
+            ax.set_title("Crops per training class")
+            ax.legend(fontsize=7, loc="lower right")
+            totals = tr + va + te
+            for i, t in enumerate(totals):
+                ax.text(t, i, f" {int(t)}", va="center", fontsize=6)
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+    logger.info("Wrote training summary PDF: %s", pdf_path)
+
+
 def train_classifier(
-    output_dir: str, model_path: str,
+    output_dir: str, model_path: str, label_map: Dict[str, str],
     arch: str = settings.TRAIN_DEFAULT_ARCH,
     epochs: int = settings.TRAIN_DEFAULT_EPOCHS,
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
@@ -1012,11 +1514,17 @@ def train_classifier(
 
     Builds a DataBlock over the training/validation crop folders (the test
     folder is excluded from items), fine-tunes the model, and exports the
-    learner to ``model_path``.
+    learner to ``model_path``. Crop folders are named by the *raw* label;
+    ``label_map`` collapses each raw label into its training class (via
+    ``get_y``) and crops whose raw label is excluded (absent from ``label_map``)
+    are dropped from the items, so changing the considered categories needs only
+    a different map - not regenerated crops.
 
     Args:
         output_dir: Base directory holding the crop folders.
         model_path: Destination ``.pkl`` path for the exported learner.
+        label_map: ``raw_label -> training_class`` mapping (excluded labels
+            absent); see :func:`get_label_collapse_map` / :func:`load_label_map`.
         arch: torchvision architecture name (e.g. ``resnet34``).
         epochs: Number of fine-tuning epochs.
         crop_dirs: Folder names for the three splits.
@@ -1036,6 +1544,8 @@ def train_classifier(
     def _items(path):
         # Only include train/validation folders; exclude the test folder.
         files = get_image_files(path, folders=[train_name, valid_name])
+        # Drop crops whose raw label is excluded from training (not in the map).
+        files = [f for f in files if parent_label(f) in label_map]
         # Drop empty/corrupt crops so a single bad image can't crash training.
         good, bad = filter_readable_images(list(files))
         if bad:
@@ -1046,10 +1556,14 @@ def train_classifier(
             print(f"Ignored {len(bad)} empty/unreadable crop image(s).")
         return good
 
+    def _get_y(o):
+        # Collapse the raw-label folder name into its training class.
+        return label_map[parent_label(o)]
+
     dblock = DataBlock(
         blocks=(ImageBlock, CategoryBlock),
         get_items=_items,
-        get_y=parent_label,
+        get_y=_get_y,
         splitter=GrandparentSplitter(
             train_name=train_name, valid_name=valid_name
         ),
@@ -1222,18 +1736,23 @@ def _write_stats_pdf(
 
 def report_classifier_stats(
     classifier: Union[str, Any], crops_dir: str, split_folder: str,
-    pdf_path: Optional[str] = None,
+    label_map: Dict[str, str], pdf_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Evaluate a classifier over a crop split folder and report stats.
 
     Prints overall accuracy, a per-class precision/recall/F1 report and the
-    confusion matrix, and optionally writes the same to a PDF.
+    confusion matrix, and optionally writes the same to a PDF. Crop folders are
+    named by the raw label; ``label_map`` collapses each into its training class
+    so evaluation classes match those the model was trained on, and crops whose
+    raw label is excluded (absent from ``label_map``) are skipped.
 
     Args:
         classifier: A loaded fastai Learner or a path to a ``.pkl`` learner.
         crops_dir: Base directory holding the crop folders.
         split_folder: Which split to evaluate (e.g. ``validation_crops`` or
             ``test_crops``).
+        label_map: ``raw_label -> training_class`` mapping (excluded labels
+            absent); see :func:`load_label_map`.
         pdf_path: Optional path to write a stats PDF to.
 
     Returns:
@@ -1250,6 +1769,18 @@ def report_classifier_stats(
     files = get_image_files(split_dir)
     if not files:
         raise SystemExit(f"No crops found under {split_dir}.")
+
+    # Skip crops whose raw label is excluded from training (not in the map);
+    # otherwise their collapsed true label would be undefined.
+    files = [
+        f for f in files
+        if os.path.basename(os.path.dirname(str(f))) in label_map
+    ]
+    if not files:
+        raise SystemExit(
+            f"No crops under {split_dir} match the label map "
+            "(all excluded). Check training_label_map.csv."
+        )
 
     # Drop empty/corrupt crops so a single bad image can't crash evaluation.
     files, bad = filter_readable_images(list(files))
@@ -1268,7 +1799,8 @@ def report_classifier_stats(
     examples: Dict[str, List[Tuple[str, str]]] = {}
     per_class = settings.TRAIN_EXAMPLES_PER_CLASS
     for fp in tqdm(files, desc=f"Evaluating {split_folder}", unit="crop"):
-        true_label = os.path.basename(os.path.dirname(str(fp)))
+        raw_label = os.path.basename(os.path.dirname(str(fp)))
+        true_label = label_map[raw_label]
         img = Image.open(str(fp)).convert("RGB")
         pred_class, _idx, _probs = learn.predict(img)
         y_true.append(true_label)

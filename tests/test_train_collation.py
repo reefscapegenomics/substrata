@@ -136,7 +136,7 @@ class TestLabelTree(unittest.TestCase):
         # CB, CMA, CMB are tips; CM is a parent (self count 0 -> not heavy);
         # A is a bare root leaf -> excluded.
         f = self._ann_file("m_ann.csv", ["CB", "CMA", "CMB", "A"])
-        _lines, labels, _c, _u = cl.build_label_tree(self.classes, [f])
+        _lines, labels, _c, _u, _m = cl.build_label_tree(self.classes, [f])
         self.assertEqual(labels, {"CB", "CMA", "CMB"})
 
     def test_heavy_parent_bolded_when_not_tips_only(self):
@@ -144,12 +144,12 @@ class TestLabelTree(unittest.TestCase):
         # plus children so it still has visible kids.
         labels = ["CM"] * 5 + ["CMA", "CMB"]
         f = self._ann_file("m_ann.csv", labels)
-        _l, got, _c, _u = cl.build_label_tree(
+        _l, got, _c, _u, _m = cl.build_label_tree(
             self.classes, [f], min_count=1, tips_only=False
         )
         self.assertIn("CM", got)
         # With tips_only, the heavy parent is NOT bolded.
-        _l, got2, _c, _u = cl.build_label_tree(
+        _l, got2, _c, _u, _m = cl.build_label_tree(
             self.classes, [f], min_count=1, tips_only=True
         )
         self.assertNotIn("CM", got2)
@@ -160,7 +160,7 @@ class TestLabelTree(unittest.TestCase):
         # still appear in the rendered tree (just unbolded).
         labels = ["CB"] + ["CMA"] * 5
         f = self._ann_file("m_ann.csv", labels)
-        lines, got, _c, _u = cl.build_label_tree(self.classes, [f], min_count=2)
+        lines, got, _c, _u, _m = cl.build_label_tree(self.classes, [f], min_count=2)
         self.assertIn("CMA", got)
         self.assertNotIn("CB", got)
         # CB row is still shown in the tree...
@@ -174,7 +174,9 @@ class TestLabelTree(unittest.TestCase):
 
     def test_unknown_labels_collected(self):
         f = self._ann_file("m_ann.csv", ["CB", "ZZZ", "ZZZ"])
-        _l, _labels, counts, unknown = cl.build_label_tree(self.classes, [f])
+        _l, _labels, counts, unknown, _m = cl.build_label_tree(
+            self.classes, [f]
+        )
         self.assertEqual(unknown.get("ZZZ"), 2)
         self.assertEqual(counts.get("CB"), 1)
 
@@ -184,7 +186,7 @@ class TestLabelTree(unittest.TestCase):
         # count rules, and leave CM unbolded.
         labels = ["CM"] * 5 + ["CMA", "CB"]
         f = self._ann_file("m_ann.csv", labels)
-        lines, got, _c, _u = cl.build_label_tree(
+        lines, got, _c, _u, _m = cl.build_label_tree(
             self.classes, [f], min_count=1, include_labels={"CB", "CMA"}
         )
         self.assertEqual(got, {"CB", "CMA"})
@@ -200,11 +202,95 @@ class TestLabelTree(unittest.TestCase):
         # A requested label absent from the tree is not returned, so the caller
         # (CLI) can detect the difference and error out.
         f = self._ann_file("m_ann.csv", ["CB", "CMA"])
-        _l, got, _c, _u = cl.build_label_tree(
+        _l, got, _c, _u, _m = cl.build_label_tree(
             self.classes, [f], include_labels={"CB", "NOPE"}
         )
         self.assertEqual(got, {"CB"})
         self.assertEqual({"CB", "NOPE"} - got, {"NOPE"})
+
+    def test_collapse_flag_folds_descendants(self):
+        f = self._ann_file("m_ann.csv", ["CM", "CM", "CMA", "CMB", "CB", "A"])
+        # Default: only the explicitly included CM is trained; its descendants
+        # CMA/CMB are NOT folded (excluded), and CB/A have no selected ancestor.
+        _l, _t, _c, _u, cmap = cl.build_label_tree(
+            self.classes, [f], include_labels={"CM"}
+        )
+        self.assertEqual(cmap.get("CM"), "CM")
+        self.assertNotIn("CMA", cmap)
+        self.assertNotIn("CMB", cmap)
+        self.assertNotIn("CB", cmap)
+        self.assertNotIn("A", cmap)
+        # With --collapse: CMA/CMB fold into CM; CB/A still excluded (no
+        # selected ancestor anywhere on their path).
+        _l, _t, _c, _u, cmap2 = cl.build_label_tree(
+            self.classes, [f], include_labels={"CM"}, collapse=True
+        )
+        self.assertEqual(cmap2.get("CM"), "CM")
+        self.assertEqual(cmap2.get("CMA"), "CM")
+        self.assertEqual(cmap2.get("CMB"), "CM")
+        self.assertNotIn("CB", cmap2)
+        self.assertNotIn("A", cmap2)
+
+
+class TestLabelMap(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.path = os.path.join(self.d, "training_label_map.csv")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _edit(self, label, training_class):
+        """Simulate a user hand-editing one row's training_class."""
+        with open(self.path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        for r in rows:
+            if r["label"] == label:
+                r["training_class"] = training_class
+        with open(self.path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(cl._LABEL_MAP_COLUMNS))
+            w.writeheader()
+            w.writerows(rows)
+
+    def test_seed_load_roundtrip_blank_excluded(self):
+        labels = {"CMA", "CMB", "CB"}
+        counts = {"CMA": 3, "CMB": 2, "CB": 1}
+        collapse = {"CMA": "CM", "CMB": "CM"}  # CB has no class -> excluded
+        cl.write_label_map(self.path, labels, counts, collapse)
+        # load_label_map omits the blank (excluded) CB row.
+        self.assertEqual(cl.load_label_map(self.path), {"CMA": "CM", "CMB": "CM"})
+        # ...but the file still lists CB (blank) as an editable row.
+        with open(self.path, newline="") as f:
+            rows = {r["label"]: r["training_class"] for r in csv.DictReader(f)}
+        self.assertEqual(rows["CB"], "")
+        self.assertEqual(rows["CMA"], "CM")
+
+    def test_merge_preserves_edits_and_appends_new(self):
+        cl.merge_label_map(
+            self.path, {"CMA", "CMB"}, {"CMA": 3, "CMB": 2},
+            {"CMA": "CM", "CMB": "CM"},
+        )
+        self._edit("CMA", "EDITED")  # user re-points CMA
+        # Second call sees a new label CB; existing edits must survive.
+        got = cl.merge_label_map(
+            self.path, {"CMA", "CMB", "CB"}, {"CMA": 3, "CMB": 2, "CB": 1},
+            {"CMA": "CM", "CMB": "CM"},  # CB seeds blank (excluded)
+        )
+        self.assertEqual(got["CMA"], "EDITED")  # edit preserved, not reseeded
+        self.assertEqual(got["CMB"], "CM")
+        self.assertNotIn("CB", got)  # CB appended blank -> excluded
+        with open(self.path, newline="") as f:
+            present = {r["label"] for r in csv.DictReader(f)}
+        self.assertEqual(present, {"CMA", "CMB", "CB"})  # CB row appended
+
+    def test_reseed_overwrites_edits(self):
+        cl.merge_label_map(self.path, {"CMA"}, {"CMA": 1}, {"CMA": "CM"})
+        self._edit("CMA", "EDITED")
+        got = cl.merge_label_map(
+            self.path, {"CMA"}, {"CMA": 1}, {"CMA": "CM"}, reseed=True
+        )
+        self.assertEqual(got["CMA"], "CM")  # reseed discards the edit
 
 
 class TestModelName(unittest.TestCase):
@@ -291,29 +377,35 @@ class TestCollate(unittest.TestCase):
             self.d, f"{self.model}_slope_intercepts.csv"
         )
         rows = [
-            # integer-only id, training label, has cam fields -> kept+prefixed
+            # integer-only id, kept label, has cam fields -> kept+prefixed
             _ann_row("0", "CB", f"{missing_dir}/IMG_1.jpg", "100", "200"),
-            # non-training label -> dropped
+            # label A is now a *visible* label too -> kept (selection/collapse
+            # is applied later via the label map, not here).
             _ann_row("1", "A", f"{missing_dir}/IMG_2.jpg", "10", "20"),
-            # training label but no cam fields -> dropped (missing cam)
+            # kept label but no cam fields -> dropped (missing cam)
             _ann_row("2", "CMA", "", "", ""),
             # already-prefixed id -> kept as-is
             _ann_row("ton_ko1_05m_20241005_9", "CMB",
                      f"{missing_dir}/IMG_3.jpg", "5", "6"),
+            # label not in keep_labels -> excluded entirely (no crop folder)
+            _ann_row("3", "CM", f"{missing_dir}/IMG_4.jpg", "7", "8"),
         ]
         _write_ann(csv_path, rows)
         out = os.path.join(self.d, "training_annotations.csv")
         n_written, n_dropped = cl.collate_training_annotations(
             [csv_path], "*_slope_intercepts.csv",
-            {"CB", "CMA", "CMB"}, out, self.d, prompt=False,
+            {"CB", "A", "CMA", "CMB"}, out, self.d, prompt=False,
         )
-        self.assertEqual(n_written, 2)
+        self.assertEqual(n_written, 3)  # CB, A, CMB (CM excluded)
         self.assertEqual(n_dropped, 1)  # CMA row had no cam fields
         with open(out, newline="") as f:
             written = list(csv.DictReader(f))
         ids = {r["id"] for r in written}
+        labels = {r["label"] for r in written}
         self.assertIn("ton_ko1_05m_20241005_0", ids)  # int id prefixed
+        self.assertIn("ton_ko1_05m_20241005_1", ids)  # visible non-bold kept
         self.assertIn("ton_ko1_05m_20241005_9", ids)  # already prefixed kept
+        self.assertNotIn("CM", labels)  # excluded label absent
         # cam_filepath remapped from /mnt/sdd/... to the convention dir.
         for r in written:
             self.assertTrue(r["cam_filepath"].startswith(self.imgdir))
@@ -365,6 +457,37 @@ class TestSplitAndCrops(unittest.TestCase):
             self.assertEqual(len(stale), 1)
         finally:
             tmp.cleanup()
+
+
+class TestCropCounts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, split, raw_label, name, size=10):
+        d = os.path.join(self.d, split, raw_label)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(b"x" * size)
+
+    def test_counts_collapse_and_skip_excluded(self):
+        # Two raw labels collapse into CM; CB is excluded (not in the map).
+        self._touch("training_crops", "CMA", "a.jpg")
+        self._touch("training_crops", "CMA", "b.jpg")
+        self._touch("training_crops", "CMB", "c.jpg")
+        self._touch("validation_crops", "CMA", "d.jpg")
+        self._touch("training_crops", "CMA", "empty.jpg", size=0)  # 0-byte skip
+        self._touch("training_crops", "CMA", "notes.txt")          # non-image
+        self._touch("training_crops", "CB", "x.jpg")               # excluded
+        label_map = {"CMA": "CM", "CMB": "CM"}
+        counts = cl.count_crops_by_class(self.d, label_map)
+        self.assertEqual(counts["training_crops"]["CM"], 3)  # a,b,c (not empty)
+        self.assertEqual(counts["validation_crops"]["CM"], 1)
+        self.assertEqual(counts["test_crops"]["CM"], 0)
+        self.assertNotIn("CB", counts["training_crops"])  # excluded label
 
 
 class TestImageSafeguards(unittest.TestCase):

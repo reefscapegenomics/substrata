@@ -4826,6 +4826,419 @@ def visualize_tpi(
         return np.array(img, dtype=np.uint8)
 
 
+def _benthic_finish(fig, dpi, output_filename, interactive):
+    """Save / show / rasterise a benthic figure (shared tail)."""
+    if output_filename is not None:
+        fig.savefig(output_filename, dpi=dpi, bbox_inches="tight")
+        return fig
+    elif interactive:
+        plt.show()
+        return fig
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    img = Image.open(buf)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return np.array(img, dtype=np.uint8)
+
+
+def _draw_annulus_context(ax, center, radius_inner, radius_outer, set_limits=True):
+    """Draw the focal star + inner/outer radius circles and set axis limits."""
+    ax.set_aspect("equal")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    if center is None:
+        return
+    cx, cy = float(center[0]), float(center[1])
+    ax.scatter(cx, cy, c="black", marker="*", s=180, zorder=6)
+    if radius_inner > 0:
+        ax.add_patch(mpatches.Circle(
+            (cx, cy), radius_inner, fill=False, color="black", lw=1, ls="--",
+            zorder=3,
+        ))
+    if radius_outer > 0:
+        ax.add_patch(mpatches.Circle(
+            (cx, cy), radius_outer, fill=False, color="black", lw=1, zorder=3,
+        ))
+    if set_limits and radius_outer > 0:
+        pad = radius_outer * 1.1
+        ax.set_xlim(cx - pad, cx + pad)
+        ax.set_ylim(cy - pad, cy + pad)
+
+
+def _classified_samples(intercepts, results, target_class):
+    """Yield (ann, x, y, label, p_target) for matched+classified samples.
+
+    Returns ``(items, n_unmatched)`` where each item is a tuple
+    ``(ann, x, y, label, p)``; ``n_unmatched`` counts samples with no
+    image-match/classification.
+    """
+    items, n_un = [], 0
+    for ann in intercepts.data.values():
+        res = results.get(ann.id)
+        if ann.image_match is None or not res or res.get("label") is None:
+            n_un += 1
+            continue
+        label = str(res["label"])
+        probs = res.get("probs") or {}
+        p = float(probs.get(target_class, 1.0 if label == target_class else 0.0))
+        items.append((ann, float(ann.coords[0]), float(ann.coords[1]), label, p))
+    return items, n_un
+
+
+def _estimate_cell_size(positions, fallback):
+    """Median nearest-neighbour spacing of ``positions`` (fallback if <2)."""
+    if len(positions) < 2:
+        return fallback
+    pts = np.asarray(positions, dtype=float)
+    if len(pts) > 400:
+        idx = np.random.default_rng(0).choice(len(pts), 400, replace=False)
+        pts = pts[idx]
+    d = np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    val = float(np.median(d.min(axis=1)))
+    return val if val > 0 else fallback
+
+
+def _draw_benthic_fraction_panel(
+    ax, fig, intercepts, results, target_class, center, radius_inner,
+    radius_outer, background_pcd, background_colors, weighted, point_size,
+    bg_point_size, max_output_points, add_colorbar=True,
+):
+    """Draw the classified-samples panel; return a stats dict for titling."""
+    if background_pcd is not None:
+        bpts = np.asarray(background_pcd.points, dtype=float)
+        bcols = None
+        if background_colors is not None:
+            bcols = np.asarray(background_colors, dtype=float)
+            if bcols.shape[0] != bpts.shape[0]:
+                bcols = None  # misaligned -> ignore
+        if len(bpts) > max_output_points:
+            rng = np.random.default_rng(seed=42)
+            idx = rng.choice(len(bpts), size=max_output_points, replace=False)
+            bpts = bpts[idx]
+            bcols = bcols[idx] if bcols is not None else None
+        if bcols is not None:
+            # Brighten the true colours so the overlaid markers read clearly.
+            bright = np.clip(bcols[:, :3] * 0.45 + 0.55, 0.0, 1.0)
+            ax.scatter(bpts[:, 0], bpts[:, 1], c=bright, s=bg_point_size,
+                       rasterized=True, zorder=0)
+        else:
+            ax.scatter(bpts[:, 0], bpts[:, 1], c="lightgray", s=bg_point_size,
+                       rasterized=True, zorder=0)
+
+    items, n_un = _classified_samples(intercepts, results, target_class)
+    cls_x = [x for _a, x, _y, _l, _p in items]
+    cls_y = [y for _a, _x, y, _l, _p in items]
+    cls_p = [p for _a, _x, _y, _l, p in items]
+    tgt = [(x, y) for _a, x, y, lab, _p in items if lab == target_class]
+    oth = [(x, y) for _a, x, y, lab, _p in items if lab != target_class]
+
+    mappable = None
+    if weighted:
+        if cls_x:
+            mappable = ax.scatter(cls_x, cls_y, c=cls_p, cmap="Reds", vmin=0.0,
+                                  vmax=1.0, s=point_size, edgecolors="0.35",
+                                  linewidths=0.3, zorder=4)
+            if add_colorbar:
+                fig.colorbar(mappable, ax=ax, label=f"P({target_class})",
+                             fraction=0.046, pad=0.04)
+    else:
+        if oth:
+            ax.scatter([p[0] for p in oth], [p[1] for p in oth], marker="x",
+                       c="black", s=point_size, linewidths=1.0, label="other",
+                       zorder=4)
+        if tgt:
+            ax.scatter([p[0] for p in tgt], [p[1] for p in tgt], marker="o",
+                       facecolors="red", edgecolors="black", s=point_size,
+                       linewidths=0.6, label=str(target_class), zorder=5)
+        if tgt or oth:
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
+
+    _draw_annulus_context(ax, center, radius_inner, radius_outer)
+
+    n_tgt, n_cls = len(tgt), len(items)
+    if weighted:
+        frac = (sum(cls_p) / len(cls_p)) if cls_p else float("nan")
+        frac_label = f"weighted fraction={frac:.3f}  (mean P({target_class}))"
+    else:
+        frac = (n_tgt / n_cls) if n_cls else float("nan")
+        frac_label = f"fraction={frac:.3f}"
+    return {
+        "n_target": n_tgt, "n_classified": n_cls, "n_unmatched": n_un,
+        "frac": frac, "frac_label": frac_label, "mappable": mappable,
+    }
+
+
+def _draw_image_match_panel(
+    ax, intercepts, results, target_class, crop_w, crop_h, weighted, cell_size,
+    center, radius_inner, radius_outer, focal_image_match=None, thumb_px=64,
+    border_lw=3.0,
+):
+    """Draw the per-sample crops as a non-overlapping grid; return n_shown.
+
+    Each crop is centred on the matched pixel (same as
+    :func:`classification.classify_image_match`) and drawn at its sample XY
+    position, sized to ``cell_size`` so neighbouring crops tile without
+    overlapping. The border encodes the classification (red = target / gray =
+    other, or red-intensity = ``P(target_class)`` when ``weighted`` — using the
+    **same ``Reds`` mapping as the dots panel**, so ``P=0`` is white). When a
+    ``focal_image_match`` is given its crop fills the inner circle to show the
+    colony being measured.
+    """
+    reds = plt.get_cmap("Reds")
+    items, _n_un = _classified_samples(intercepts, results, target_class)
+    if cell_size is None:
+        cell_size = _estimate_cell_size(
+            [(x, y) for _a, x, y, _l, _p in items],
+            (radius_outer or 1.0) / 8.0,
+        )
+    s = cell_size * 0.92
+
+    # Show the colony itself inside the inner circle (clipped to it), at the
+    # same display scale (px per metre) as the sample crops.
+    if focal_image_match is not None and center is not None and radius_inner > 0:
+        cx, cy = float(center[0]), float(center[1])
+        try:
+            colony_px = int(round(crop_w * (2 * radius_inner) / max(cell_size, 1e-6)))
+            colony_px = int(np.clip(colony_px, crop_w, 4000))
+            colony = get_crop_img(
+                focal_image_match.filepath, focal_image_match.x,
+                focal_image_match.y, colony_px, colony_px,
+            ).convert("RGB")
+            colony.thumbnail((400, 400))
+            art = ax.imshow(
+                np.asarray(colony),
+                extent=[cx - radius_inner, cx + radius_inner,
+                        cy - radius_inner, cy + radius_inner],
+                aspect="auto", zorder=1, interpolation="nearest",
+            )
+            art.set_clip_path(mpatches.Circle(
+                (cx, cy), radius_inner, transform=ax.transData,
+            ))
+        except (OSError, ValueError):
+            pass
+
+    n_shown = 0
+    for ann, x, y, label, p in items:
+        im = ann.image_match
+        try:
+            crop = get_crop_img(im.filepath, im.x, im.y, crop_w, crop_h)
+            crop = crop.convert("RGB")
+            crop.thumbnail((thumb_px, thumb_px))
+            thumb = np.asarray(crop)
+        except (OSError, ValueError):
+            continue
+        # Match the dots panel exactly: Reds(p) (P=0 -> white).
+        border = reds(p) if weighted else (
+            "red" if label == target_class else "0.5"
+        )
+        ax.imshow(thumb, extent=[x - s / 2, x + s / 2, y - s / 2, y + s / 2],
+                  aspect="auto", zorder=2, interpolation="nearest")
+        ax.add_patch(mpatches.Rectangle(
+            (x - s / 2, y - s / 2), s, s, fill=False, edgecolor=border,
+            lw=border_lw, zorder=5,
+        ))
+        n_shown += 1
+
+    _draw_annulus_context(ax, center, radius_inner, radius_outer)
+    return n_shown
+
+
+def visualize_benthic_fraction(
+    intercepts,
+    results,
+    target_class,
+    center=None,
+    radius_inner=0.0,
+    radius_outer=0.0,
+    background_pcd=None,
+    background_colors=None,
+    weighted=False,
+    output_filename=None,
+    max_output_points=50000,
+    width=700,
+    height=600,
+    point_size=45,
+    bg_point_size=1.5,
+    interactive=False,
+):
+    """Top-down visualisation of a benthic-fraction sampling (see
+    :func:`measurements.calc_benthic_fraction`).
+
+    Mirrors :func:`visualize_tpi`'s colony-centred top-down view: the local
+    neighbourhood point cloud (the ``simple_pcd`` around the colony) in its
+    **true (brightened) RGB colours** as small context dots, the focal point as
+    a star and the inner/outer annulus radii as circles. The classified sample
+    points are overlaid: with ``weighted=False`` ``target_class`` as **red
+    circles** and others as **black crosses**; with ``weighted=True`` each as a
+    circle whose **red intensity encodes** ``P(target_class)`` (with a colour
+    bar).
+
+    Args:
+        intercepts: ``Annotations`` of the sampled ``InterceptAnnotation``s.
+        results: ``{id: classification_dict | None}`` from
+            :meth:`Annotations.classify_image_matches`.
+        target_class: Class label highlighted as the target.
+        center: (3,) focal point (star + radius circles drawn when given).
+        radius_inner: Inner annulus radius in metres (dashed circle).
+        radius_outer: Outer annulus radius in metres (solid circle).
+        background_pcd: Local neighbourhood point cloud (colony ``simple_pcd``).
+        background_colors: Optional (N, 3) per-point RGB in [0, 1].
+        weighted: Colour classified points by ``P(target_class)``.
+        output_filename: Optional path to save the figure instead of returning.
+        max_output_points: Max background points to render (decimated above).
+        width: Figure width in pixels (at 100 dpi).
+        height: Figure height in pixels (at 100 dpi).
+        point_size: Scatter marker size for the sample points.
+        bg_point_size: Scatter marker size for the background cloud points.
+        interactive: If True and no output file, display interactively.
+
+    Returns:
+        matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
+        or ``output_filename`` is set; otherwise an (H, W, 3) uint8 RGB array.
+    """
+    dpi = 100
+    fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+    stats = _draw_benthic_fraction_panel(
+        ax, fig, intercepts, results, target_class, center, radius_inner,
+        radius_outer, background_pcd, background_colors, weighted, point_size,
+        bg_point_size, max_output_points,
+    )
+    ax.set_title(
+        f"Benthic fraction: {target_class}\n"
+        f"{stats['frac_label']}  (n_target={stats['n_target']}, "
+        f"n_classified={stats['n_classified']}, "
+        f"n_unmatched={stats['n_unmatched']})\n"
+        f"r_inner={radius_inner:.3f} m  r_outer={radius_outer:.3f} m",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    return _benthic_finish(fig, dpi, output_filename, interactive)
+
+
+def visualize_benthic_image_matches(
+    intercepts,
+    results,
+    target_class,
+    crop_size,
+    center=None,
+    radius_inner=0.0,
+    radius_outer=0.0,
+    weighted=False,
+    background_pcd=None,
+    background_colors=None,
+    focal_image_match=None,
+    cell_size=None,
+    thumb_px=64,
+    border_lw=3.0,
+    max_output_points=50000,
+    point_size=45,
+    bg_point_size=1.5,
+    width=1500,
+    height=750,
+    output_filename=None,
+    interactive=False,
+):
+    """Side-by-side comparison of the benthic-fraction dots and their crops.
+
+    Left panel: the :func:`visualize_benthic_fraction` view (classified sample
+    dots over the colony point cloud). Right panel, **same size and same axis
+    extent**: each sample's classifier-input crop (centred on the matched pixel
+    ``(image_match.x, image_match.y)`` — the exact crop
+    :func:`classification.classify_image_match` uses) placed at the **same XY
+    position** as its dot, resized to ``cell_size`` so the crops tile into a
+    non-overlapping grid. Each crop has a thick border encoding the
+    classification: ``weighted=False`` -> **red** for ``target_class`` / **gray**
+    for other; ``weighted=True`` -> border **red intensity** = ``P(target_class)``.
+
+    This makes it easy to compare, point for point, the fraction map against the
+    actual image content the classifier judged — telling a classifier error (the
+    crop clearly shows the target but is mislabelled) from a method error (the
+    crop is not on the sampled feature).
+
+    Args:
+        intercepts: ``Annotations`` of the sampled intercepts with
+            ``.image_match`` populated.
+        results: ``{id: classification_dict | None}`` (carries ``probs``).
+        target_class: Target class label.
+        crop_size: Classifier crop size in pixels (int or ``(w, h)``).
+        center: (3,) focal point.
+        radius_inner: Inner annulus radius in metres (dashed circle).
+        radius_outer: Outer annulus radius in metres (solid circle).
+        weighted: Encode ``P(target_class)`` as the dot/border red intensity.
+        background_pcd: Local neighbourhood point cloud for the left panel.
+        background_colors: Optional (N, 3) per-point RGB in [0, 1].
+        focal_image_match: Optional ImageMatch of the colony itself; its crop
+            fills the right panel's inner circle.
+        cell_size: Grid cell size (metres) for the crops; defaults to the median
+            sample spacing so crops tile without overlap.
+        thumb_px: Downscaled crop thumbnail size in pixels.
+        border_lw: Crop border line width.
+        max_output_points: Max background points to render (decimated above).
+        point_size: Left-panel sample marker size.
+        bg_point_size: Background cloud point size.
+        width: Figure width in pixels (at 100 dpi).
+        height: Figure height in pixels (at 100 dpi).
+        output_filename: Optional path to save the figure instead of returning.
+        interactive: If True and no output file, display interactively.
+
+    Returns:
+        matplotlib.figure.Figure | np.ndarray: Figure when ``interactive=True``
+        or ``output_filename`` is set; otherwise an (H, W, 3) uint8 RGB array.
+    """
+    if isinstance(crop_size, int):
+        crop_w = crop_h = crop_size
+    else:
+        crop_w, crop_h = crop_size
+    dpi = 100
+    fig, (ax_l, ax_r) = plt.subplots(
+        1, 2, figsize=(width / dpi, height / dpi), dpi=dpi,
+    )
+    # Draw without a per-axes colour bar so the two panels stay the same size;
+    # a single colour bar spanning both is added afterwards (weighted mode).
+    stats = _draw_benthic_fraction_panel(
+        ax_l, fig, intercepts, results, target_class, center, radius_inner,
+        radius_outer, background_pcd, background_colors, weighted, point_size,
+        bg_point_size, max_output_points, add_colorbar=False,
+    )
+    ax_l.set_title(
+        f"Classified samples\n{stats['frac_label']}  "
+        f"(n_target={stats['n_target']}, n_classified={stats['n_classified']}, "
+        f"n_unmatched={stats['n_unmatched']})",
+        fontsize=9,
+    )
+    n_shown = _draw_image_match_panel(
+        ax_r, intercepts, results, target_class, crop_w, crop_h, weighted,
+        cell_size, center, radius_inner, radius_outer,
+        focal_image_match=focal_image_match, thumb_px=thumb_px,
+        border_lw=border_lw,
+    )
+    border_desc = (
+        f"border intensity = P({target_class}) (white = 0)" if weighted
+        else f"red = {target_class}, gray = other"
+    )
+    ax_r.set_title(
+        f"Image-match crops fed to the classifier ({n_shown} shown)\n"
+        f"{border_desc}",
+        fontsize=9,
+    )
+    if weighted and stats.get("mappable") is not None:
+        # Steal equally from both axes so they remain the same height.
+        fig.colorbar(stats["mappable"], ax=[ax_l, ax_r],
+                     label=f"P({target_class})", fraction=0.046, pad=0.04)
+    fig.suptitle(
+        f"Benthic fraction: {target_class}  "
+        f"(r_inner={radius_inner:.3f} m, r_outer={radius_outer:.3f} m)",
+        fontsize=11,
+    )
+    if not (weighted and stats.get("mappable") is not None):
+        fig.tight_layout()
+    return _benthic_finish(fig, dpi, output_filename, interactive)
+
+
 def visualize_vector_dispersion(
     pcd,
     output_filename=None,

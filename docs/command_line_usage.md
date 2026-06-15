@@ -194,59 +194,91 @@ substrata images --pdf-output imagematches.pdf
 Train a FastAI image classifier on crops generated from labelled annotations.
 The command collates the `label` column across all annotation CSVs matching a
 glob pattern in `--csv-path` (default CWD), renders them on the CATAMI hierarchy
-from `classes.csv`, and uses the **bolded** tree entries as the training labels
-(it asks you to confirm). It then verifies each unique `cam_filepath` directory,
-and only when one is missing does it fall back to the
-`site/site_depth/model/<final-folder>` convention under `--model-path` (or
-prompt for a substitution), writes a consolidated `training_annotations.csv`,
-generates `training_crops` / `validation_crops` / `test_crops` (80/10/10,
-assigned deterministically per annotation id), trains the model, and reports
-validation stats (printed and written to a `<split>_stats.pdf` with a
-per-class report, a row-normalised confusion matrix, and example classified
-crops per category — one row per category with a red border on misclassified
-examples). Crops are cut at the classifier's input resolution by default
-(`--crop-size`). Crop filenames encode the annotation id, source image, and
-pixel centre, so a changed annotation's stale crop is deleted and regenerated;
-emptied category folders are cleaned up, and a few example paths are shown
-before any deletion as a safeguard against pointing `--output` at the wrong
-directory.
+from `classes.csv`, and shows which entries are **bolded** (the seed training
+classes). It then verifies each unique `cam_filepath` directory, and only when
+one is missing does it fall back to the `site/site_depth/model/<final-folder>`
+convention under `--model-path` (or prompt for a substitution), writes a
+consolidated `training_annotations.csv`, and generates `training_crops` /
+`validation_crops` / `test_crops` (80/10/10, assigned deterministically per
+annotation id). Finally it trains the model and reports validation stats
+(printed and written to a `<split>_stats.pdf` with a per-class report, a
+row-normalised confusion matrix, and example classified crops per category —
+one row per category with a red border on misclassified examples). The training
+run itself is also captured in a separate `training_summary.pdf` (the run
+settings, the per-training-class crop counts across the train/validation/test
+splits, and the final-epoch metrics) — kept separate from the evaluation PDF
+because `--validate` / `--test` can be re-run without training. Crops are cut
+at the classifier's input resolution by default (`--crop-size`). Crop filenames
+encode the annotation id, source image, and pixel centre, so a changed
+annotation's stale crop is deleted and regenerated; emptied category folders are
+cleaned up, and a few example paths are shown before any deletion as a safeguard
+against pointing `--output` at the wrong directory.
 
-Crop generation runs in parallel (`--jobs`, default all cores). Empty or
-unreadable crops (e.g. from a 0-byte/corrupt source image) are skipped at
-training/evaluation time with a warning of how many were ignored, so a single
-bad image can't crash the run; zero-byte crops are also regenerated on the
-next sync.
+**Crops are decoupled from category selection.** Folders are named by the
+*raw* label and crops are generated for every label *visible* in the tree —
+not just the trained ones — so changing which categories you consider no longer
+regenerates or deletes crops. Crop generation runs in parallel (`--jobs`,
+default all cores). Empty or unreadable crops (e.g. from a 0-byte/corrupt source
+image) are skipped at training/evaluation time with a warning of how many were
+ignored, so a single bad image can't crash the run; zero-byte crops are also
+regenerated on the next sync.
 
-By default the training labels are the highlighted (bolded) tree entries —
-controlled by `--min-count` / `--tips_only`. Alternatively, `--include-classes`
-takes an explicit list of category codes (the codes shown in brackets in the
-tree); those exact categories are then bolded and trained, overriding
-`--min-count` / `--tips_only`, and the command errors out if any requested code
-is absent from the tree.
+**Selection and collapsing live in an editable label map.** A
+`training_label_map.csv` (`--label-map` to relocate it; default in `--output`)
+holds one `label,count,training_class` row per *selected* label (the map is not
+cluttered with the sub-threshold/excluded labels, even though their crops still
+exist on disk). It is *seeded* from the bolded tree; blanking a row's
+`training_class` by hand excludes that label. The seeding
+is controlled by `--min-count` / `--tips_only`, or by
+`--include-classes` (an explicit list of category codes from the tree brackets,
+which overrides `--min-count` / `--tips_only` and errors if any code is absent).
+By default only the selected codes themselves are trained; add `--collapse` to
+fold each selected class's non-selected descendants into it — e.g.
+`--include-classes MAF --collapse` trains `MAFG`, `MAF_T`, … as `MAF`, whereas
+without `--collapse` only `MAF` itself is trained and its descendants are
+excluded. By default each run re-seeds the map from the current selection flags,
+so changing `--include-classes` / `--collapse` / `--min-count` takes effect
+immediately. Pass `--keep-map` to instead preserve an existing (hand-edited) map
+and only append newly-seen labels. Both training and `--validate` / `--test`
+read this map, so evaluation always uses the same classes as training.
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+To hand-tune before training, run `--prepare-only`: it generates the crops and
+seeds the map, then **stops**. Edit `training_label_map.csv` (re-point a label to
+another class, or blank one to exclude it), then re-run `substrata train
+--keep-map` to train on the edited map (a plain `substrata train` would re-seed
+it and discard your edits).
+
+Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--collapse] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
-# Collate *_slope_intercepts.csv in CWD, confirm labels, crop, and train
+# Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
 substrata train
 
-# Custom pattern and only labels with an aggregated count of at least 50
+# Two-step: prepare crops + seed the label map, edit it, then train
+substrata train --include-classes MAF_T MAENRC_C CSE --prepare-only
+$EDITOR training_label_map.csv   # re-point / collapse / exclude labels
+substrata train --keep-map       # trains on the edited map (edits preserved)
+
+# Train parent classes, folding their sub-categories in (MAFG/MAF_T -> MAF)
+substrata train --include-classes MAF MAEN --collapse
+
+# Custom pattern; seed the map from labels with an aggregated count >= 50
 substrata train "*_ann.csv" --min-count 50
 
-# Train on an explicit set of categories (codes from the tree brackets)
-substrata train --include-classes MAF_T MAENRC_C CSE
+# Keep a hand-edited map, only appending labels from newly added CSVs
+substrata train --keep-map
 
 # CSVs in one dir, image projects in another, output elsewhere, bigger backbone
 substrata train --csv-path /data/annotations --model-path /data/models \
     --output /data/training --arch resnet50 --epochs 20
 
-# Re-run validation stats on an existing model (no training)
+# Re-run validation stats on an existing model (reads the same label map)
 substrata train --validate --model crop_classifier.pkl
 
 # Skip training; evaluate an existing model on the held-out test crops
 substrata train --test --model crop_classifier.pkl
 
-# Non-interactive (auto-confirm labels, deletions, path fallbacks)
+# Non-interactive (auto-confirm, deletions, path fallbacks)
 substrata train --yes
 ```
 
