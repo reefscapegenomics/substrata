@@ -956,10 +956,39 @@ def resolve_cam_dirs(
     return mapping
 
 
+def confidence_passes(
+    raw: str, min_conf: float, strict: bool = False,
+) -> bool:
+    """Return whether a ``label_conf`` value clears the ``min_conf`` threshold.
+
+    An empty (or non-numeric) ``label_conf`` is *included by default*; with
+    ``strict`` it is instead treated as ``0`` and so excluded whenever
+    ``min_conf`` is above zero.
+
+    Args:
+        raw: The raw ``label_conf`` cell (may be empty/None).
+        min_conf: Minimum confidence to keep.
+        strict: Treat an empty/non-numeric confidence as ``0`` rather than
+            keeping it.
+
+    Returns:
+        True if the annotation should be kept.
+    """
+    raw = (raw or "").strip()
+    if raw == "":
+        return min_conf <= 0 if strict else True
+    try:
+        return float(raw) >= min_conf
+    except ValueError:
+        # A non-numeric confidence behaves like an empty value.
+        return min_conf <= 0 if strict else True
+
+
 def collate_training_annotations(
     csv_files: List[str], pattern: str, keep_labels: Set[str],
     output_path: str, model_path: str, prompt: bool = True,
-) -> Tuple[int, int]:
+    min_conf: Optional[float] = None, conf_strict: bool = False,
+) -> Tuple[int, int, int]:
     """Write a consolidated training annotations CSV.
 
     Keeps every row whose ``label`` is in ``keep_labels`` (the *visible* labels,
@@ -968,6 +997,10 @@ def collate_training_annotations(
     :func:`resolve_cam_dirs`, prefixes integer-only ``id`` values with the model
     name, and drops rows lacking the camera fields needed to make a crop.
 
+    When ``min_conf`` is given, rows whose ``label_conf`` is below it are
+    dropped first; an empty ``label_conf`` is kept by default (or treated as
+    ``0`` when ``conf_strict`` is set). See :func:`confidence_passes`.
+
     Args:
         csv_files: Annotation CSV paths.
         pattern: Glob pattern used to derive the per-file model name.
@@ -975,13 +1008,17 @@ def collate_training_annotations(
         output_path: Destination CSV path.
         model_path: Base directory for camera-directory fallback.
         prompt: Whether to prompt for unresolved camera directories.
+        min_conf: If set, minimum ``label_conf`` to keep a row.
+        conf_strict: Treat an empty ``label_conf`` as ``0`` (excluded when
+            ``min_conf`` > 0) instead of keeping it.
 
     Returns:
-        Tuple ``(n_written, n_dropped_missing_cam)``.
+        Tuple ``(n_written, n_dropped_missing_cam, n_dropped_low_conf)``.
     """
     # First pass: collect kept rows and the unique camera directories per file.
     kept: List[Dict[str, str]] = []
     dir_mapping: Dict[str, str] = {}
+    n_dropped_conf = 0
     for path in csv_files:
         model_name = model_name_from_filename(path, pattern)
         file_dirs: Set[str] = set()
@@ -991,6 +1028,11 @@ def collate_training_annotations(
             for row in reader:
                 label = (row.get("label") or "").strip()
                 if label not in keep_labels:
+                    continue
+                if min_conf is not None and not confidence_passes(
+                    row.get("label_conf"), min_conf, conf_strict
+                ):
+                    n_dropped_conf += 1
                     continue
                 cam_fp = (row.get("cam_filepath") or "").strip()
                 if cam_fp:
@@ -1038,7 +1080,7 @@ def collate_training_annotations(
                 row.get("depth", ""),
             ])
             n_written += 1
-    return n_written, n_dropped
+    return n_written, n_dropped, n_dropped_conf
 
 
 def split_for_id(ann_id: str, split: Tuple[int, int, int]) -> int:

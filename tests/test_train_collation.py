@@ -110,9 +110,9 @@ def _write_ann(path, rows):
             w.writerow(r)
 
 
-def _ann_row(ann_id, label, cam_filepath="", cam_x="", cam_y=""):
+def _ann_row(ann_id, label, cam_filepath="", cam_x="", cam_y="", label_conf=""):
     return [
-        ann_id, "0", "0", "0", label, "",
+        ann_id, "0", "0", "0", label, label_conf,
         "1", "2", "3", cam_filepath, cam_x, cam_y, "",
     ]
 
@@ -392,12 +392,13 @@ class TestCollate(unittest.TestCase):
         ]
         _write_ann(csv_path, rows)
         out = os.path.join(self.d, "training_annotations.csv")
-        n_written, n_dropped = cl.collate_training_annotations(
+        n_written, n_dropped, n_dropped_conf = cl.collate_training_annotations(
             [csv_path], "*_slope_intercepts.csv",
             {"CB", "A", "CMA", "CMB"}, out, self.d, prompt=False,
         )
         self.assertEqual(n_written, 3)  # CB, A, CMB (CM excluded)
         self.assertEqual(n_dropped, 1)  # CMA row had no cam fields
+        self.assertEqual(n_dropped_conf, 0)  # no confidence filter active
         with open(out, newline="") as f:
             written = list(csv.DictReader(f))
         ids = {r["id"] for r in written}
@@ -409,6 +410,71 @@ class TestCollate(unittest.TestCase):
         # cam_filepath remapped from /mnt/sdd/... to the convention dir.
         for r in written:
             self.assertTrue(r["cam_filepath"].startswith(self.imgdir))
+
+
+class TestConfidencePasses(unittest.TestCase):
+    def test_empty_kept_by_default(self):
+        self.assertTrue(cl.confidence_passes("", 0.8))
+        self.assertTrue(cl.confidence_passes(None, 0.8))
+
+    def test_empty_treated_as_zero_when_strict(self):
+        self.assertFalse(cl.confidence_passes("", 0.8, strict=True))
+        # A zero threshold keeps everything, even strict empties.
+        self.assertTrue(cl.confidence_passes("", 0.0, strict=True))
+
+    def test_numeric_threshold(self):
+        self.assertTrue(cl.confidence_passes("0.9", 0.8))
+        self.assertTrue(cl.confidence_passes("0.8", 0.8))  # boundary inclusive
+        self.assertFalse(cl.confidence_passes("0.5", 0.8))
+
+    def test_non_numeric_behaves_like_empty(self):
+        self.assertTrue(cl.confidence_passes("high", 0.8))
+        self.assertFalse(cl.confidence_passes("high", 0.8, strict=True))
+
+
+class TestCollateConfidence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.model = "ton_ko1_05m_20241005"
+        self.last = f"{self.model}.photos"
+        self.imgdir = cl.convention_dir_for_model(self.d, self.model, self.last)
+        os.makedirs(self.imgdir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _collate(self, **kwargs):
+        img = os.path.join(self.imgdir, "IMG.jpg")
+        rows = [
+            _ann_row("0", "CB", img, "1", "2", label_conf="0.9"),
+            _ann_row("1", "CB", img, "3", "4", label_conf="0.5"),
+            _ann_row("2", "CB", img, "5", "6", label_conf=""),  # empty
+        ]
+        csv_path = os.path.join(self.d, f"{self.model}_slope_intercepts.csv")
+        _write_ann(csv_path, rows)
+        out = os.path.join(self.d, "training_annotations.csv")
+        return cl.collate_training_annotations(
+            [csv_path], "*_slope_intercepts.csv", {"CB"}, out, self.d,
+            prompt=False, **kwargs,
+        )
+
+    def test_min_conf_keeps_empty(self):
+        # 0.9 kept, 0.5 dropped, empty kept by default.
+        n_written, _n_dropped, n_conf = self._collate(min_conf=0.8)
+        self.assertEqual(n_written, 2)
+        self.assertEqual(n_conf, 1)
+
+    def test_min_conf_strict_drops_empty(self):
+        # 0.9 kept, 0.5 dropped, empty treated as 0 -> dropped.
+        n_written, _n_dropped, n_conf = self._collate(conf_strict=True, min_conf=0.8)
+        self.assertEqual(n_written, 1)
+        self.assertEqual(n_conf, 2)
+
+    def test_no_filter_keeps_all(self):
+        n_written, _n_dropped, n_conf = self._collate()
+        self.assertEqual(n_written, 3)
+        self.assertEqual(n_conf, 0)
 
 
 class TestSplitAndCrops(unittest.TestCase):

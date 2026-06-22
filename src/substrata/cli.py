@@ -1733,14 +1733,29 @@ def handle_train(args):
             raise SystemExit("Aborted.")
 
     # --- Steps 2 & 3: verify paths and write consolidated annotations ---
+    # --min_conf keeps empty label_conf rows; --min_conf_strict treats empty
+    # as 0. They are mutually exclusive (enforced by argparse).
+    min_conf = getattr(args, "min_conf", None)
+    conf_strict = getattr(args, "min_conf_strict", None)
+    if conf_strict is not None:
+        min_conf, conf_is_strict = conf_strict, True
+    else:
+        conf_is_strict = False
     ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
-    n_written, n_dropped = classification.collate_training_annotations(
-        csv_files, pattern, visible_labels, ann_path, model_path,
-        prompt=(interactive and not assume_yes),
+    n_written, n_dropped, n_dropped_conf = (
+        classification.collate_training_annotations(
+            csv_files, pattern, visible_labels, ann_path, model_path,
+            prompt=(interactive and not assume_yes),
+            min_conf=min_conf, conf_strict=conf_is_strict,
+        )
+    )
+    conf_note = (
+        f", {n_dropped_conf} dropped below confidence {min_conf}"
+        if min_conf is not None else ""
     )
     print(
         f"\nWrote {n_written} training annotation(s) to {ann_path} "
-        f"({n_dropped} dropped for missing camera fields)."
+        f"({n_dropped} dropped for missing camera fields{conf_note})."
     )
     if n_written == 0:
         raise SystemExit("No usable training annotations; aborting.")
@@ -1808,6 +1823,11 @@ def handle_train(args):
             " ".join(include_classes) if include_classes else "(none)",
         ),
         ("Selection: collapse", bool(getattr(args, "collapse", False))),
+        (
+            "Selection: min_conf",
+            "(none)" if min_conf is None
+            else f"{min_conf}{' (strict)' if conf_is_strict else ''}",
+        ),
         ("Map mode", "keep-map" if getattr(args, "keep_map", False) else "reseed"),
         ("Annotation pattern", pattern),
         ("CSV files scanned", len(csv_files)),
@@ -2718,6 +2738,31 @@ def main():
             "class when seeding the map. E.g. with --include-classes MAF, the "
             "children MAFG/MAF_T are trained as MAF; without --collapse only "
             "MAF itself is trained and its descendants are excluded."
+        ),
+    )
+    conf_group = p_train.add_mutually_exclusive_group()
+    conf_group.add_argument(
+        "--min_conf",
+        dest="min_conf",
+        type=float,
+        default=None,
+        metavar="CONF",
+        help=(
+            "Only train on annotations whose label_conf is >= this value. "
+            "Annotations with an empty (no value) label_conf are included by "
+            "default. Mutually exclusive with --min_conf_strict."
+        ),
+    )
+    conf_group.add_argument(
+        "--min_conf_strict",
+        dest="min_conf_strict",
+        type=float,
+        default=None,
+        metavar="CONF",
+        help=(
+            "Like --min_conf, but treats an empty (no value) label_conf as 0, "
+            "so such annotations are excluded whenever CONF > 0. Mutually "
+            "exclusive with --min_conf."
         ),
     )
     p_train.add_argument(

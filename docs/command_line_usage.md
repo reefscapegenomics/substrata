@@ -242,13 +242,22 @@ immediately. Pass `--keep-map` to instead preserve an existing (hand-edited) map
 and only append newly-seen labels. Both training and `--validate` / `--test`
 read this map, so evaluation always uses the same classes as training.
 
+**Filtering by annotation confidence.** Pass `--min_conf VALUE` to train only on
+annotations whose `label_conf` is `>= VALUE`. Annotations with an *empty* (no
+value) `label_conf` are **included by default**. Use `--min_conf_strict VALUE`
+for the same threshold but treating an empty `label_conf` as `0`, so those
+annotations are excluded whenever `VALUE > 0`. The two flags are mutually
+exclusive. The confidence filter is applied while collating, and the number of
+annotations dropped below the threshold is reported alongside those dropped for
+missing camera fields.
+
 To hand-tune before training, run `--prepare-only`: it generates the crops and
 seeds the map, then **stops**. Edit `training_label_map.csv` (re-point a label to
 another class, or blank one to exclude it), then re-run `substrata train
 --keep-map` to train on the edited map (a plain `substrata train` would re-seed
 it and discard your edits).
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--collapse] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
@@ -264,6 +273,12 @@ substrata train --include-classes MAF MAEN --collapse
 
 # Custom pattern; seed the map from labels with an aggregated count >= 50
 substrata train "*_ann.csv" --min-count 50
+
+# Only train on annotations with label_conf >= 0.8 (empty label_conf kept)
+substrata train --min_conf 0.8
+
+# Same, but treat an empty label_conf as 0 so those annotations are excluded
+substrata train --min_conf_strict 0.8
 
 # Keep a hand-edited map, only appending labels from newly added CSVs
 substrata train --keep-map
