@@ -70,6 +70,7 @@ documents all modules, classes, and functions.
    :caption: Getting Started
 
    installation
+   getting_started
    command_line_usage
 
 .. toctree::
