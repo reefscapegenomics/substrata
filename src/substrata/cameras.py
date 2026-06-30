@@ -289,9 +289,9 @@ class Cameras:
 
     def apply_transform(self, transform_matrix):
         """Alias for transform_coords for compatibility.
-        f
-                Args:
-                    transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+
+        Args:
+            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
         self.transform_coords(transform_matrix)
 
@@ -1600,11 +1600,12 @@ class Camera:
         """Derive a grouping label from the camera's filepath.
 
         Rule:
+
         - Use the name of the immediate containing folder by default.
         - If that folder name contains a '.', use the text after the first '.'
-          as the group name (e.g., "20241008.auv→ "auv")
+          as the group name (e.g., "20241008.auv" -> "auv").
         - Further split the group by prefixing with the first part of the filename
-          if there is an underscore in the filename (e.g., "PR_20250608.jpg" → "PR").
+          if there is an underscore in the filename (e.g., "PR_20250608.jpg" -> "PR").
         """
         try:
             folder = os.path.basename(os.path.dirname(self.filepath))

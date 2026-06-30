@@ -3166,12 +3166,14 @@ def show_classified_grid_cells(
 
 
 def show_intercept_point(intercept_point):
-    """
-    Create a 3D scatter plot visualizing candidate points and key markers.
+    """Create a 3D scatter plot visualizing candidate points and key markers.
+
     Candidate points are colored by their Z value, and the following are
     plotted:
-        - The query coordinate as a black square,
-        - The computed intercept as a green square.
+
+    - The query coordinate as a black square,
+    - The computed intercept as a green square.
+
     A dashed line connects the query and selected point, and a 3D
     cylinder (centered at the query XY) represents the search radius.
     """
@@ -5127,7 +5129,7 @@ def visualize_benthic_fraction(
     bar).
 
     Args:
-        intercepts: ``Annotations`` of the sampled ``InterceptAnnotation``s.
+        intercepts: ``Annotations`` of the sampled ``InterceptAnnotation`` objects.
         results: ``{id: classification_dict | None}`` from
             :meth:`Annotations.classify_image_matches`.
         target_class: Class label highlighted as the target.

@@ -21,6 +21,20 @@ substrata decimate --input cur_sna_20m_20200303.ply --output cur_sna_20m_2020030
 substrata decimate --ply input.ply -n 10000000
 ```
 
+## PLY repair (Open3D-compatible rewrite)
+
+Rewrite a PLY in a strict Open3D-compatible form (float32 xyz, optional `uchar` RGB, optional float32 normals). Extra vertex properties and non-finite rows are dropped. By default the input is renamed to `<input>_old.ply` and the repaired file is written in its place.
+
+Usage: `substrata repair [--input PLY] [--output PLY] [--local]`
+
+```bash
+# Repair in place (original kept as <input>_old.ply)
+substrata repair --input pointcloud.ply
+
+# Write the repaired copy to an explicit path (input left untouched)
+substrata repair --input pointcloud.ply --output pointcloud_fixed.ply
+```
+
 ## PLY file preview (head)
 
 Show the first N vertex rows from a PLY file.
@@ -81,6 +95,27 @@ substrata orient
 
 # With explicit PLY path
 substrata orient --input pointcloud.ply
+```
+
+## Color calibration
+
+Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and optionally store the affine color correction (matrix + offset) in the project YAML. The PLY is always loaded in full when `--input` is given (never stream-decimated).
+
+Usage: `substrata colors [--input PLY] [--markers CSV] [--output_pdf PDF] [-n N] [--save_yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata colors
+
+# Save the affine colour_correction into the project YAML
+substrata colors --save_yaml
+
+# Stream-sample the default YAML PLY to N vertices for a faster QC pass
+substrata colors -n 10000000
+
+# Omit specific ColorChecker cards from the fit (by 0-based index or by name)
+substrata colors --exclude-index 0 --exclude-index 3
+substrata colors --exclude-name top-left
 ```
 
 ## FireFish alignment
@@ -187,6 +222,46 @@ substrata images --transform
 
 # Specify output PDF
 substrata images --pdf-output imagematches.pdf
+```
+
+## Camera time-sync (camsync)
+
+Copy camera centers/transforms from a *pose-source* sensor (e.g. a GoPro) to an *updated-target* sensor (e.g. a macro camera) using EXIF time matching. Per-camera poses are written to the cameras meta JSON only — the `.cams.xml` is not modified (it is read for sensor calibration). The relative timing of the two sensors can be given manually (`--time-offset` / `--pose-time`) or estimated automatically (`--auto-time` / `--auto-xyz` / `--auto-offsets`); auto modes print a detailed report and prompt before saving unless you pass `--yes`.
+
+Usage: `substrata camsync [--pose-source ID] [--updated-target ID] [--pose-date DATES] [--target-date DATES] [--time-offset SEC | --pose-time TIMESTAMP] [--xyz X,Y,Z] [--auto-time] [--auto-xyz] [--auto-offsets] [--spatial-max-dist M] [--min-spatial-pairs N] [--yes]`
+
+```bash
+# Interactive: lists sensors and prompts for source/target and timing
+substrata camsync
+
+# Sync macro (sensor 1) to GoPro (sensor 0) with a known time offset
+substrata camsync --pose-source 0 --updated-target 1 --time-offset 12.5
+
+# Anchor timing by matching the earliest target image to a pose-source timestamp
+substrata camsync -s 0 -u 1 --pose-time "2020-03-03 14:21:07"
+
+# Estimate both the time offset and the pose-local xyz offset automatically
+substrata camsync -s 0 -u 1 --auto-offsets --yes
+
+# Add a fixed offset (meters) in the pose-source camera frame when copying pose
+substrata camsync -s 0 -u 1 --time-offset 12.5 --xyz 0,0.12,0
+```
+
+## Transform annotations
+
+Load annotations from a CSV, apply one or more transforms (entered interactively) to each annotation's `orig_coords`, and save the result. With `--inverse` the cumulative transform is inverted before being applied.
+
+Usage: `substrata transform INPUT [--output CSV] [--no_header] [--ignore_header] [--inverse]`
+
+```bash
+# Transform annotations; prompts for the transform matrix/matrices
+substrata transform annotations.csv
+
+# Write to an explicit output path
+substrata transform annotations.csv --output annotations_world.csv
+
+# Apply the inverse of the entered transform(s)
+substrata transform annotations.csv --inverse
 ```
 
 ## Classifier training

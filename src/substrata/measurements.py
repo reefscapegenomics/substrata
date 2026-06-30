@@ -298,15 +298,15 @@ def calc_roughness(pcd):
     perpendicular to the plane.
 
     Definitions
-    ----------
+    -----------
     Ra : arithmetical mean roughness
         The mean of the absolute perpendicular distances from all points
-        to the best-fitting plane (mean(|d_i|)). This is the classic
+        to the best-fitting plane (``mean(|d_i|)``). This is the classic
         "average height" roughness measure. Same as get_dev_rugosity.
 
     Rq : root mean square roughness
         The square root of the mean of squared perpendicular distances
-        (sqrt(mean(d_i^2))). This is more sensitive to larger
+        (``sqrt(mean(d_i^2))``). This is more sensitive to larger
         deviations than Ra and is the standard RMS roughness metric used
         in surface metrology.
 
@@ -410,36 +410,34 @@ def calc_tpi_and_tri(
 
     TPI variants (Weiss 2001):
 
-    TPI_abs
-        ``z_center − mean(z_annulus)`` in the same units as the point cloud.
-    TPI_plane
-        Signed perpendicular distance of ``center`` from the best-fit plane of
-        the annulus points.  Corrects for sloping habitat.  The plane normal is
-        oriented to +Z so the sign is physically meaningful (see below).
+    - ``TPI_abs``: ``z_center - mean(z_annulus)`` in the same units as the
+      point cloud.
+    - ``TPI_plane``: Signed perpendicular distance of ``center`` from the
+      best-fit plane of the annulus points.  Corrects for sloping habitat.  The
+      plane normal is oriented to +Z so the sign is physically meaningful (see
+      below).
 
     Positive TPI values indicate a crest / elevated position; negative indicate
     a hollow / depressed position.
 
     TRI variants (Wilson et al. 2007):
 
-    TRI_abs
-        Mean absolute Z-difference between the focal point and all annulus
-        points: ``mean(|z_annulus_i − z_center|)``.  Direct point-cloud analog
-        of the Wilson et al. bathymetric DEM formula.  Caveat: Wilson's formula
-        assumes neighbours are the immediately adjacent DEM cells, where the
-        focal-to-neighbour height offset is negligible so only roughness
-        remains.  Here the annulus deliberately excludes the focal region and
-        spans a wide radius, so on sloping or pedestalled habitat this term also
-        absorbs the focal vertical offset — for a perfectly smooth annulus
-        offset by height H it returns ``≈ |H| = |TPI_abs|``, reflecting
-        topographic *position* as much as terrain *ruggedness*.  Prefer
-        ``TRI_plane`` for a slope/offset-free ruggedness measure.
-    TRI_plane
-        Mean absolute perpendicular distance of annulus points from the
-        best-fit plane: ``mean(|d_i|)``.  Slope- and offset-corrected ruggedness
-        (residuals about the annulus plane); same formula as Ra (arithmetic mean
-        roughness) but restricted to the annulus neighbourhood rather than the
-        full point cloud.  Recommended ruggedness metric.
+    - ``TRI_abs``: Mean absolute Z-difference between the focal point and all
+      annulus points: ``mean(|z_annulus_i - z_center|)``.  Direct point-cloud
+      analog of the Wilson et al. bathymetric DEM formula.  Caveat: Wilson's
+      formula assumes neighbours are the immediately adjacent DEM cells, where
+      the focal-to-neighbour height offset is negligible so only roughness
+      remains.  Here the annulus deliberately excludes the focal region and
+      spans a wide radius, so on sloping or pedestalled habitat this term also
+      absorbs the focal vertical offset — for a perfectly smooth annulus
+      offset by height H it returns ``≈ |H| = |TPI_abs|``, reflecting
+      topographic *position* as much as terrain *ruggedness*.  Prefer
+      ``TRI_plane`` for a slope/offset-free ruggedness measure.
+    - ``TRI_plane``: Mean absolute perpendicular distance of annulus points from
+      the best-fit plane: ``mean(|d_i|)``.  Slope- and offset-corrected
+      ruggedness (residuals about the annulus plane); same formula as Ra
+      (arithmetic mean roughness) but restricted to the annulus neighbourhood
+      rather than the full point cloud.  Recommended ruggedness metric.
 
     Args:
         pcd: Point cloud with a ``.points`` attribute convertible to (N, 3).
@@ -462,31 +460,37 @@ def calc_tpi_and_tri(
             for variable-density photogrammetric clouds.  Has no effect when
             ``None`` (default).
 
-    The three plane-based outputs (``tpi_plane``, ``std_annulus_plane``,
-    ``tri_plane``) require at least 3 annulus points for a defined best-fit
-    plane; with fewer they are returned as ``NaN`` rather than computed from a
-    degenerate plane.  The point-based outputs (``tpi_abs``, ``std_annulus_z``,
-    ``tri_abs``) remain valid with a single annulus point.
-
     Returns:
-        tpi_abs: Absolute TPI at the focal point.
-        std_annulus_z: Standard deviation of Z within the annulus (habitat
-            topographic heterogeneity).
-        tpi_plane: Plane-relative TPI at the focal point.  ``NaN`` if the
-            annulus has fewer than 3 points.
-        std_annulus_plane: Standard deviation of annulus-point distances from
-            the best-fit plane.  ``NaN`` if the annulus has fewer than 3 points.
-        tri_abs: Mean absolute Z-difference from focal point to annulus
-            points (Wilson et al. 2007 TRI, adapted for point clouds).
-        tri_plane: Mean absolute perpendicular distance of annulus points from
-            the best-fit plane (slope-corrected TRI).  ``NaN`` if the annulus
-            has fewer than 3 points.
-        image: Visualisation image as an (H, W, 3) uint8 array, or ``None``.
+        A tuple ``(tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane,
+        tri_abs, tri_plane, image)`` where:
+
+        - ``tpi_abs``: Absolute TPI at the focal point.
+        - ``std_annulus_z``: Standard deviation of Z within the annulus
+          (habitat topographic heterogeneity).
+        - ``tpi_plane``: Plane-relative TPI at the focal point.  ``NaN`` if the
+          annulus has fewer than 3 points.
+        - ``std_annulus_plane``: Standard deviation of annulus-point distances
+          from the best-fit plane.  ``NaN`` if the annulus has fewer than 3
+          points.
+        - ``tri_abs``: Mean absolute Z-difference from focal point to annulus
+          points (Wilson et al. 2007 TRI, adapted for point clouds).
+        - ``tri_plane``: Mean absolute perpendicular distance of annulus points
+          from the best-fit plane (slope-corrected TRI).  ``NaN`` if the annulus
+          has fewer than 3 points.
+        - ``image``: Visualisation image as an (H, W, 3) uint8 array, or
+          ``None``.
 
     Raises:
         ValueError: If both ``radius_outer`` and ``annulus_width`` are given,
             the point cloud has fewer than 2 points, or
             ``radius_inner >= outer_radius``.
+
+    Note:
+        The three plane-based outputs (``tpi_plane``, ``std_annulus_plane``,
+        ``tri_plane``) require at least 3 annulus points for a defined best-fit
+        plane; with fewer they are returned as ``NaN`` rather than computed from
+        a degenerate plane.  The point-based outputs (``tpi_abs``,
+        ``std_annulus_z``, ``tri_abs``) remain valid with a single annulus point.
     """
     outer_radius = _resolve_outer_radius(
         radius_inner, radius_outer, annulus_width, settings.DEFAULT_TPI_RADIUS_OUTER
@@ -1874,10 +1878,12 @@ def get_distance_to_closest_point(points, point):
 
 
 def calc_scale_factor(annotations, scalebars):
-    """
-    Calculate scale factor from annotations and scalebars
-    e.g. scalebars = [['target 5', 'target 6', 0.500],
-                      ['target 7', 'target 8', 0.499]]
+    """Calculate scale factor from annotations and scalebars.
+
+    Example::
+
+        scalebars = [['target 5', 'target 6', 0.500],
+                     ['target 7', 'target 8', 0.499]]
     """
     scale_factors = []
     for scalebar in scalebars:
@@ -1949,16 +1955,19 @@ def create_xy_grid_cells_with_spread_filter(
     min_proportion=0.5,
     require_adjacent=True,
 ):
-    """
-    Create 2D grid cells from a point cloud and filter each cell if it does
-    not exhibit a sufficient spread of points over the cell. Additionally,
-    optionally filter out cells that do not belong to the main connected set,
-    where connectivity is defined by sharing at least one edge.
+    """Create 2D grid cells from a point cloud, filtered by point spread.
+
+    Each cell is dropped if it does not exhibit a sufficient spread of points
+    over the cell. Additionally, optionally filter out cells that do not belong
+    to the main connected set, where connectivity is defined by sharing at least
+    one edge.
+
     Also prints statistics:
-      (1) original grid squares,
-      (2) after spread filtering,
-      (3) after connected component filtering,
-      and the total surface area of (3).
+
+    1. original grid squares,
+    2. after spread filtering,
+    3. after connected component filtering,
+    4. and the total surface area of (3).
     """
     # Extract x-y coordinates and colors.
     pcd_points = np.asarray(pcd.points)[:, :2]

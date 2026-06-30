@@ -144,9 +144,9 @@ class PointCloud:
         world_transform: cumulative transformation matrix
         transforms: list of all applied transformations
         filepath: path to the pointcloud file
-        points: point coordinates (refers to o3d_pcd.points)
-        normals: point normals (refers to o3d_pcd.normals)
-        colors: point colors (refers to o3d_pcd.colors)
+
+    The ``points``, ``normals``, and ``colors`` properties expose the
+    corresponding ``o3d_pcd`` attributes directly.
     """
 
     def __init__(
@@ -1194,7 +1194,7 @@ class PointCloud:
 
         return None  # No intercept found
 
-    def principal_axis(self, plane: str = "xy") -> "Vector":
+    def principal_axis(self, plane: str = "xy") -> "geom.Vector":
         """Return the first PCA eigen-vector projected into the chosen plane.
 
         Args:
@@ -1225,7 +1225,7 @@ class PointCloud:
 
         return geom.Vector(v_proj)
 
-    def principal_axis_xy_2D(self) -> "Vector":
+    def principal_axis_xy_2D(self) -> "geom.Vector":
         """Return the dominant PCA eigen-vector in XY-space.
 
         The method:
