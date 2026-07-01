@@ -1677,16 +1677,27 @@ def handle_metashape_export(args):
     Args:
         args: Parsed CLI arguments.
     """
-    psx = os.path.abspath(os.path.expanduser(args.psx))
-    if not os.path.isfile(psx):
-        raise SystemExit(f"Metashape project not found: {psx}")
+    from substrata.metashape_scripts import export_project as mse
 
-    exe = _find_metashape_executable(getattr(args, "metashape", None))
-
+    # By default the current directory is the project folder and the project is
+    # <foldername>.psx inside it; exported files are written alongside it.
     output_dir = os.path.abspath(
         os.path.expanduser(args.output_dir) if args.output_dir else os.getcwd()
     )
-    project_id = args.id or _default_metashape_id(psx)
+    if getattr(args, "psx", None):
+        psx = os.path.abspath(os.path.expanduser(args.psx))
+        project_id = args.id or mse.default_project_id(psx)
+    else:
+        project_id = args.id or os.path.basename(os.path.normpath(output_dir))
+        psx = os.path.join(output_dir, f"{project_id}.psx")
+
+    if not os.path.isfile(psx):
+        raise SystemExit(
+            f"Metashape project not found: {psx}\n"
+            "Pass --psx, or run inside a folder containing <foldername>.psx."
+        )
+
+    exe = _find_metashape_executable(getattr(args, "metashape", None))
 
     script_path = os.path.join(
         os.path.dirname(__file__), "metashape_scripts", "export_project.py"
@@ -1723,33 +1734,31 @@ def handle_metashape_export(args):
             "See the output above for details."
         )
 
-    folder = os.path.join(output_dir, project_id)
-    if not os.path.isdir(folder):
-        raise SystemExit(
-            f"Export reported success but project folder is missing: {folder}"
-        )
-
-    # Finish the folder in the conda env: build a starter YAML (paths only;
-    # scale/orientation stay absent until `substrata orient`).
-    init = ProjectInitializer(path=folder)
-    yaml_path = os.path.join(folder, f"{project_id}.yaml")
+    # Finish the folder in the conda env: build a starter YAML pointing at the
+    # files just written (scale/orientation stay at defaults until
+    # `substrata orient`). Set paths explicitly from the known export layout so
+    # it is correct even when --id differs from the folder name.
+    paths = mse.project_layout(output_dir, project_id)
+    init = ProjectInitializer(path=output_dir)
+    init.id = project_id
+    if os.path.isfile(paths["ply"]):
+        init.ply_filepath = paths["ply"]
+    if os.path.isfile(paths["cams_xml"]):
+        init.cams_xml_filepath = paths["cams_xml"]
+    if os.path.isfile(paths["meta_json"]):
+        init.cams_meta_json_filepath = paths["meta_json"]
+    if os.path.isfile(paths["markers"]):
+        init.markers_filepath = paths["markers"]
+    yaml_path = os.path.join(output_dir, f"{project_id}.yaml")
     init.save_config_to_yaml(yaml_path)
     print(f"Wrote starter project YAML: {yaml_path}")
 
     print(
-        "\nProject folder ready: "
-        f"{folder}\nNext steps (run from inside the folder):\n"
+        "\nProject files ready in: "
+        f"{output_dir}\nNext steps (run from this folder):\n"
         "  substrata decimate      # optional: make <id>_dec50M.ply\n"
         "  substrata orient        # compute scale + world_transform"
     )
-
-
-def _default_metashape_id(psx_path: str) -> str:
-    """Return the default project id: the ``.psx`` basename without extension."""
-    base = os.path.basename(os.path.normpath(psx_path))
-    if base.lower().endswith(".psx"):
-        base = base[: -len(".psx")]
-    return base
 
 
 def handle_train(args):
@@ -2057,8 +2066,11 @@ def main():
         "--psx",
         dest="psx",
         type=str,
-        required=True,
-        help="Path to the Metashape project file (.psx).",
+        default=None,
+        help=(
+            "Path to the Metashape project file (.psx). Default: "
+            "<foldername>.psx in the output directory."
+        ),
     )
     p_meta.add_argument(
         "-o",
@@ -2066,7 +2078,10 @@ def main():
         dest="output_dir",
         type=str,
         default=None,
-        help="Parent directory for the <id> project folder (default: CWD).",
+        help=(
+            "Directory to write the project files into (default: CWD). Files are "
+            "written directly here, not into an <id> subfolder."
+        ),
     )
     p_meta.add_argument(
         "--id",

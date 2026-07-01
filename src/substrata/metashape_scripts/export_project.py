@@ -6,14 +6,15 @@ This script runs under **Metashape's bundled Python** and imports only
 :mod:`Metashape` plus the standard library -- it must never import
 ``substrata`` (its heavy dependencies are not installable in Metashape's
 interpreter). It is invoked by the ``substrata metashape-export`` CLI command,
-but can also be run directly, e.g.::
+but can also be run directly, e.g. from inside the project folder::
 
-    metashape.sh -platform offscreen -r export_project.py \\
-        --psx /path/to/cur_sna_20m_20200303.psx --output-dir /data/projects
+    cd cur_sna_20m_20200303   # contains cur_sna_20m_20200303.psx
+    metashape.sh -platform offscreen -r export_project.py
 
-It writes a folder named ``<id>`` (default: the ``.psx`` basename) containing
-the files a substrata project expects, all in **raw chunk-local coordinates**
-(no CRS/transform applied); substrata computes scale and orientation later:
+By default the current directory is the project folder and the project is
+``<foldername>.psx`` inside it; the exported files are written **alongside** it
+(not into a subfolder), all in **raw chunk-local coordinates** (no
+CRS/transform applied), so substrata computes scale and orientation later:
 
 - ``<id>.cams.xml``     -- ``chunk.exportCameras`` (sensor calibration + cameras)
 - ``<id>.meta.json``    -- per-camera path/center/transform (keyed by camera key)
@@ -49,21 +50,24 @@ def default_project_id(psx_path: str) -> str:
 def project_layout(output_dir: str, project_id: str) -> dict:
     """Return the on-disk paths substrata expects for a project ``<id>``.
 
+    Files are written **directly** into ``output_dir`` (the project folder is the
+    output folder itself), matching substrata's convention of a directory named
+    ``<id>`` containing ``<id>.*`` files.
+
     Args:
-        output_dir: Parent directory that will contain the ``<id>`` folder.
-        project_id: Project id (folder name and filename stem).
+        output_dir: Directory the files are written into (the project folder).
+        project_id: Project id (filename stem).
 
     Returns:
         Mapping with keys ``folder``, ``cams_xml``, ``meta_json``, ``markers``
         and ``ply``.
     """
-    folder = os.path.join(output_dir, project_id)
     return {
-        "folder": folder,
-        "cams_xml": os.path.join(folder, f"{project_id}.cams.xml"),
-        "meta_json": os.path.join(folder, f"{project_id}.meta.json"),
-        "markers": os.path.join(folder, f"{project_id}_markers.csv"),
-        "ply": os.path.join(folder, f"{project_id}.ply"),
+        "folder": output_dir,
+        "cams_xml": os.path.join(output_dir, f"{project_id}.cams.xml"),
+        "meta_json": os.path.join(output_dir, f"{project_id}.meta.json"),
+        "markers": os.path.join(output_dir, f"{project_id}_markers.csv"),
+        "ply": os.path.join(output_dir, f"{project_id}.ply"),
     }
 
 
@@ -257,15 +261,28 @@ def main(argv=None) -> None:
 
     import Metashape as ms
 
-    if not os.path.isfile(args.psx):
-        print(f"Error: project file {args.psx} does not exist", file=sys.stderr)
+    # Resolve the project folder, id and .psx path. By default the current
+    # directory is the project folder and the project is <foldername>.psx inside
+    # it (substrata's <id>/<id>.* naming convention).
+    output_dir = os.path.abspath(args.output_dir or os.getcwd())
+    if args.psx:
+        psx = args.psx
+        project_id = args.id or default_project_id(psx)
+    else:
+        project_id = args.id or os.path.basename(os.path.normpath(output_dir))
+        psx = os.path.join(output_dir, f"{project_id}.psx")
+
+    if not os.path.isfile(psx):
+        print(
+            f"Error: project file {psx} does not exist (pass --psx or run in a "
+            "folder containing <foldername>.psx)",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    if not args.psx.lower().endswith(".psx"):
+    if not psx.lower().endswith(".psx"):
         print("Error: project file must have a .psx extension", file=sys.stderr)
         sys.exit(1)
 
-    project_id = args.id or default_project_id(args.psx)
-    output_dir = args.output_dir or os.getcwd()
     paths = project_layout(output_dir, project_id)
 
     existing = [
@@ -284,10 +301,10 @@ def main(argv=None) -> None:
 
     os.makedirs(paths["folder"], exist_ok=True)
 
-    print(f"Opening project (read-only): {args.psx}")
+    print(f"Opening project (read-only): {psx}")
     doc = ms.Document()
     try:
-        doc.open(args.psx, read_only=True)
+        doc.open(psx, read_only=True)
     except Exception as e:  # noqa: BLE001
         print(f"Error opening project: {e}", file=sys.stderr)
         sys.exit(1)
@@ -309,12 +326,20 @@ def main(argv=None) -> None:
 def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--psx", required=True, help="Path to the Metashape project (.psx)."
+        "--psx",
+        default=None,
+        help=(
+            "Path to the Metashape project (.psx). Default: "
+            "<output-dir>/<foldername>.psx."
+        ),
     )
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Parent directory for the <id> project folder (default: CWD).",
+        help=(
+            "Directory to write the project files into (default: CWD). Files are "
+            "written directly here, not into an <id> subfolder."
+        ),
     )
     parser.add_argument(
         "--id",

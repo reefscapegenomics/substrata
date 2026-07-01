@@ -23,28 +23,32 @@ substrata decimate --ply input.ply -n 10000000
 
 ## Metashape project export
 
-Initialize a substrata project folder directly from an Agisoft Metashape project (`.psx`). This writes a folder named `<id>` containing the point cloud (`<id>.ply`), camera calibration/poses (`<id>.cams.xml`, `<id>.meta.json`), markers (`<id>_markers.csv`), and a starter project file (`<id>.yaml`) — everything in raw chunk-local coordinates. Scale and orientation are left for `substrata orient` (or `substrata firefish`) to compute afterward.
+Initialize a substrata project directly from an Agisoft Metashape project (`.psx`). This writes the point cloud (`<id>.ply`), camera calibration/poses (`<id>.cams.xml`, `<id>.meta.json`), markers (`<id>_markers.csv`), and a starter project file (`<id>.yaml`) — everything in raw chunk-local coordinates. Scale and orientation are left for `substrata orient` (or `substrata firefish`) to compute afterward.
+
+Like the other commands, it follows substrata's folder convention: with no arguments it treats the current directory (named `<id>`) as the project folder, exports from `<id>.psx` inside it, and writes all the files alongside it. The common workflow is simply to `cd` into the project folder and run it with no arguments.
 
 The export itself must run inside Metashape's own bundled Python (`substrata` and its dependencies cannot be installed there), so this command shells out to the Metashape executable and runs a packaged export script under it. Metashape must be installed locally. The executable is resolved from `--metashape`, then the `METASHAPE_EXE` environment variable, then common install locations.
 
-Usage: `substrata metashape-export --psx PSX [-o OUTPUT_DIR] [--id ID] [--chunk CHUNK] [--metashape PATH] [--overwrite]`
+Usage: `substrata metashape-export [--psx PSX] [-o OUTPUT_DIR] [--id ID] [--chunk CHUNK] [--metashape PATH] [--overwrite]`
 
 ```bash
-# Auto-detect Metashape; write <psx-basename>/ into the current directory
-substrata metashape-export --psx cur_sna_20m_20200303.psx
-
-# Explicit output directory and Metashape launcher
-substrata metashape-export --psx project.psx -o /data/projects \
-    --metashape ~/tools/metashape-pro/metashape.sh
-
-# Choose a specific chunk (by label or 0-based index) and a custom project id
-substrata metashape-export --psx survey.psx --chunk "dense_chunk" --id cur_sna_20m_20200303
-
-# Re-run and overwrite an existing project folder
-substrata metashape-export --psx project.psx --overwrite
-
-# Typical next steps (run from inside the new project folder)
+# Common usage: run inside the project folder (uses <foldername>.psx)
 cd cur_sna_20m_20200303
+substrata metashape-export
+
+# Explicit project file and Metashape launcher
+substrata metashape-export --psx project.psx --metashape ~/tools/metashape-pro/metashape.sh
+
+# Write into a different output directory
+substrata metashape-export --psx /data/raw/survey.psx -o /data/projects/cur_sna_20m_20200303
+
+# Choose a specific chunk (by label or 0-based index)
+substrata metashape-export --chunk "dense_chunk"
+
+# Re-run and overwrite existing exported files
+substrata metashape-export --overwrite
+
+# Typical next steps (in the same folder)
 substrata decimate   # optional: make <id>_dec50M.ply
 substrata orient     # compute scale + world_transform
 ```

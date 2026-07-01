@@ -88,20 +88,13 @@ class TestExportProjectHelpers(unittest.TestCase):
         self.assertEqual(self.mod.default_project_id("/a/b/foo/"), "foo")
 
     def test_project_layout_paths(self):
+        # Files are written directly into output_dir (no <id> subfolder).
         layout = self.mod.project_layout("/out", "proj")
-        self.assertEqual(layout["folder"], os.path.join("/out", "proj"))
-        self.assertEqual(
-            layout["cams_xml"], os.path.join("/out", "proj", "proj.cams.xml")
-        )
-        self.assertEqual(
-            layout["meta_json"], os.path.join("/out", "proj", "proj.meta.json")
-        )
-        self.assertEqual(
-            layout["markers"], os.path.join("/out", "proj", "proj_markers.csv")
-        )
-        self.assertEqual(
-            layout["ply"], os.path.join("/out", "proj", "proj.ply")
-        )
+        self.assertEqual(layout["folder"], "/out")
+        self.assertEqual(layout["cams_xml"], os.path.join("/out", "proj.cams.xml"))
+        self.assertEqual(layout["meta_json"], os.path.join("/out", "proj.meta.json"))
+        self.assertEqual(layout["markers"], os.path.join("/out", "proj_markers.csv"))
+        self.assertEqual(layout["ply"], os.path.join("/out", "proj.ply"))
 
     def test_build_meta_dict_structure(self):
         cams = {
@@ -165,11 +158,6 @@ class TestCliMetashapeHelpers(unittest.TestCase):
             f.write("#!/bin/sh\n")
         os.chmod(path, 0o755)
         return path
-
-    def test_default_metashape_id(self):
-        self.assertEqual(
-            self.cli._default_metashape_id("/x/cur_sna_20m.psx"), "cur_sna_20m"
-        )
 
     def test_explicit_flag_wins(self):
         with tempfile.TemporaryDirectory() as d:
