@@ -96,6 +96,42 @@ class TestExportProjectHelpers(unittest.TestCase):
         self.assertEqual(layout["markers"], os.path.join("/out", "proj_markers.csv"))
         self.assertEqual(layout["ply"], os.path.join("/out", "proj.ply"))
 
+    def test_plan_exports_skips_existing(self):
+        paths = self.mod.project_layout("/out", "proj")
+        present = {paths["cams_xml"], paths["meta_json"]}  # cameras already done
+
+        def exists(p):
+            return p in present
+
+        to_run, skipped = self.mod.plan_exports(
+            ["cameras", "markers", "ply"], paths, overwrite=False, exists=exists
+        )
+        self.assertEqual(to_run, ["markers", "ply"])
+        self.assertEqual([s[0] for s in skipped], ["cameras"])
+        self.assertEqual(skipped[0][1], [paths["cams_xml"], paths["meta_json"]])
+
+    def test_plan_exports_overwrite_runs_all(self):
+        paths = self.mod.project_layout("/out", "proj")
+        to_run, skipped = self.mod.plan_exports(
+            ["cameras", "markers", "ply"],
+            paths,
+            overwrite=True,
+            exists=lambda p: True,  # everything exists, but overwrite wins
+        )
+        self.assertEqual(to_run, ["cameras", "markers", "ply"])
+        self.assertEqual(skipped, [])
+
+    def test_plan_exports_none_exist_runs_all(self):
+        paths = self.mod.project_layout("/out", "proj")
+        to_run, skipped = self.mod.plan_exports(
+            ["cameras", "markers", "ply"],
+            paths,
+            overwrite=False,
+            exists=lambda p: False,
+        )
+        self.assertEqual(to_run, ["cameras", "markers", "ply"])
+        self.assertEqual(skipped, [])
+
     def test_build_meta_dict_structure(self):
         cams = {
             "7": {

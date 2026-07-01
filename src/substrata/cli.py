@@ -1722,6 +1722,9 @@ def handle_metashape_export(args):
         cmd += ["--chunk", str(args.chunk)]
     if getattr(args, "overwrite", False):
         cmd += ["--overwrite"]
+    metadata_only = bool(getattr(args, "metadata_only", False))
+    if metadata_only:
+        cmd += ["--metadata-only"]
 
     print("Running Metashape export:\n  " + " ".join(cmd))
     try:
@@ -1734,14 +1737,38 @@ def handle_metashape_export(args):
             "See the output above for details."
         )
 
+    paths = mse.project_layout(output_dir, project_id)
+
+    # Decimate the exported point cloud to <id>_dec50M.ply. Decimation needs
+    # open3d (unavailable in Metashape's Python), so it runs here in the conda
+    # env. Skipped for --metadata-only or when no full PLY was produced.
+    dec_ply_path = os.path.join(output_dir, f"{project_id}_dec50M.ply")
+    overwrite = bool(getattr(args, "overwrite", False))
+    if not metadata_only and os.path.isfile(paths["ply"]):
+        if os.path.isfile(dec_ply_path) and not overwrite:
+            print(
+                f"Skipping decimation: {dec_ply_path} already exists "
+                "(use --overwrite)."
+            )
+        else:
+            print(f"Decimating point cloud -> {dec_ply_path}")
+            decimate_ply_file(
+                input_path=paths["ply"],
+                output_path=dec_ply_path,
+                target_points=50_000_000,
+                show_progress=True,
+            )
+
     # Finish the folder in the conda env: build a starter YAML pointing at the
     # files just written (scale/orientation stay at defaults until
     # `substrata orient`). Set paths explicitly from the known export layout so
-    # it is correct even when --id differs from the folder name.
-    paths = mse.project_layout(output_dir, project_id)
+    # it is correct even when --id differs from the folder name. Prefer the
+    # decimated PLY (matching ProjectInitializer's default preference).
     init = ProjectInitializer(path=output_dir)
     init.id = project_id
-    if os.path.isfile(paths["ply"]):
+    if os.path.isfile(dec_ply_path):
+        init.ply_filepath = dec_ply_path
+    elif os.path.isfile(paths["ply"]):
         init.ply_filepath = paths["ply"]
     if os.path.isfile(paths["cams_xml"]):
         init.cams_xml_filepath = paths["cams_xml"]
@@ -1755,8 +1782,7 @@ def handle_metashape_export(args):
 
     print(
         "\nProject files ready in: "
-        f"{output_dir}\nNext steps (run from this folder):\n"
-        "  substrata decimate      # optional: make <id>_dec50M.ply\n"
+        f"{output_dir}\nNext step (run from this folder):\n"
         "  substrata orient        # compute scale + world_transform"
     )
 
@@ -2108,10 +2134,22 @@ def main():
         ),
     )
     p_meta.add_argument(
+        "--metadata-only",
+        dest="metadata_only",
+        action="store_true",
+        help=(
+            "Skip the point cloud: export cameras + markers only (no .ply, no "
+            "decimation)."
+        ),
+    )
+    p_meta.add_argument(
         "--overwrite",
         dest="overwrite",
         action="store_true",
-        help="Overwrite existing output files in the project folder.",
+        help=(
+            "Overwrite existing outputs instead of skipping them (applies to "
+            "exported files and the decimated PLY)."
+        ),
     )
 
     # repair (re-emit a PLY that Open3D can parse, e.g. Metashape exports)

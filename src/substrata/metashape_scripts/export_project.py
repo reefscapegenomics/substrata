@@ -102,6 +102,42 @@ def format_marker_row(key, x, y, z, label) -> str:
 MARKERS_HEADER = "id,x,y,z,label"
 
 
+# Output file(s) written by each export type (keys into ``project_layout``).
+EXPORT_OUTPUTS = {
+    "cameras": ("cams_xml", "meta_json"),
+    "markers": ("markers",),
+    "ply": ("ply",),
+}
+
+
+def plan_exports(exports, paths, overwrite, exists=os.path.exists):
+    """Split requested exports into those to run vs. those to skip.
+
+    An export type is skipped (unless ``overwrite``) when any of its output
+    files already exist, so a re-run fills in only the missing pieces.
+
+    Args:
+        exports: Iterable of export type names (subset of ``EXPORT_OUTPUTS``).
+        paths: Layout mapping from :func:`project_layout`.
+        overwrite: If True, nothing is skipped.
+        exists: Predicate used to test file existence (injectable for tests).
+
+    Returns:
+        Tuple ``(to_run, skipped)`` where ``to_run`` is a list of export type
+        names and ``skipped`` is a list of ``(type, [existing_paths])`` tuples.
+    """
+    to_run = []
+    skipped = []
+    for e in exports:
+        targets = [paths[k] for k in EXPORT_OUTPUTS[e]]
+        existing = [t for t in targets if exists(t)]
+        if existing and not overwrite:
+            skipped.append((e, existing))
+        else:
+            to_run.append(e)
+    return to_run, skipped
+
+
 # --------------------------------------------------------------------------- #
 # Metashape-dependent helpers
 # --------------------------------------------------------------------------- #
@@ -285,19 +321,21 @@ def main(argv=None) -> None:
 
     paths = project_layout(output_dir, project_id)
 
-    existing = [
-        p
-        for k, p in paths.items()
-        if k != "folder" and os.path.exists(p)
-    ]
-    if existing and not args.overwrite:
-        joined = "\n  ".join(existing)
+    exports = list(args.export)
+    if args.metadata_only:
+        exports = [e for e in exports if e != "ply"]
+
+    to_run, skipped = plan_exports(exports, paths, args.overwrite)
+    for etype, existing in skipped:
+        joined = ", ".join(existing)
         print(
-            "Error: output files already exist (pass --overwrite to replace):"
-            f"\n  {joined}",
+            f"Skipping {etype}: output already exists (use --overwrite): "
+            f"{joined}",
             file=sys.stderr,
         )
-        sys.exit(1)
+    if not to_run:
+        print("Nothing to export (all requested outputs already exist).")
+        return
 
     os.makedirs(paths["folder"], exist_ok=True)
 
@@ -312,12 +350,11 @@ def main(argv=None) -> None:
     chunk = _select_chunk(doc, args.chunk)
     print(f"Exporting chunk {chunk.label!r} -> {paths['folder']}")
 
-    exports = args.export
-    if "cameras" in exports:
+    if "cameras" in to_run:
         export_cameras(chunk, paths)
-    if "markers" in exports:
+    if "markers" in to_run:
         export_markers(chunk, paths)
-    if "ply" in exports:
+    if "ply" in to_run:
         export_ply_point_cloud(chunk, paths)
 
     print(f"Export completed: {paths['folder']}")
@@ -359,9 +396,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="Which outputs to write (default: all).",
     )
     parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Skip the point cloud (.ply) export; write cameras + markers only.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing output files.",
+        help="Overwrite existing output files instead of skipping them.",
     )
     return parser.parse_args(argv)
 
