@@ -21,6 +21,34 @@ substrata decimate --input cur_sna_20m_20200303.ply --output cur_sna_20m_2020030
 substrata decimate --ply input.ply -n 10000000
 ```
 
+## Metashape project export
+
+Initialize a substrata project folder directly from an Agisoft Metashape project (`.psx`). This writes a folder named `<id>` containing the point cloud (`<id>.ply`), camera calibration/poses (`<id>.cams.xml`, `<id>.meta.json`), markers (`<id>_markers.csv`), and a starter project file (`<id>.yaml`) — everything in raw chunk-local coordinates. Scale and orientation are left for `substrata orient` (or `substrata firefish`) to compute afterward.
+
+The export itself must run inside Metashape's own bundled Python (`substrata` and its dependencies cannot be installed there), so this command shells out to the Metashape executable and runs a packaged export script under it. Metashape must be installed locally. The executable is resolved from `--metashape`, then the `METASHAPE_EXE` environment variable, then common install locations.
+
+Usage: `substrata metashape-export --psx PSX [-o OUTPUT_DIR] [--id ID] [--chunk CHUNK] [--metashape PATH] [--overwrite]`
+
+```bash
+# Auto-detect Metashape; write <psx-basename>/ into the current directory
+substrata metashape-export --psx cur_sna_20m_20200303.psx
+
+# Explicit output directory and Metashape launcher
+substrata metashape-export --psx project.psx -o /data/projects \
+    --metashape ~/tools/metashape-pro/metashape.sh
+
+# Choose a specific chunk (by label or 0-based index) and a custom project id
+substrata metashape-export --psx survey.psx --chunk "dense_chunk" --id cur_sna_20m_20200303
+
+# Re-run and overwrite an existing project folder
+substrata metashape-export --psx project.psx --overwrite
+
+# Typical next steps (run from inside the new project folder)
+cd cur_sna_20m_20200303
+substrata decimate   # optional: make <id>_dec50M.ply
+substrata orient     # compute scale + world_transform
+```
+
 ## PLY repair (Open3D-compatible rewrite)
 
 Rewrite a PLY in a strict Open3D-compatible form (float32 xyz, optional `uchar` RGB, optional float32 normals). Extra vertex properties and non-finite rows are dropped. By default the input is renamed to `<input>_old.ply` and the repaired file is written in its place.

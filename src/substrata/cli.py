@@ -4,6 +4,7 @@ import ast
 from collections import Counter
 import os
 import re
+import subprocess
 import sys
 
 # Third-Party Libraries
@@ -1611,6 +1612,146 @@ def handle_transform(args):
     print(f"Saved transformed annotations to {output_path}")
 
 
+def _find_metashape_executable(explicit: str | None) -> str:
+    """Resolve the Metashape executable path.
+
+    Resolution order: an explicit ``--metashape`` value, then the
+    ``METASHAPE_EXE`` environment variable, then a probe of common install
+    locations.
+
+    Args:
+        explicit: Value of ``--metashape`` (or None).
+
+    Returns:
+        Path to an executable Metashape binary/launcher.
+
+    Raises:
+        SystemExit: If no usable executable can be found.
+    """
+
+    def _usable(path: str | None) -> str | None:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        return None
+
+    if explicit is not None:
+        resolved = _usable(explicit)
+        if resolved is None:
+            raise SystemExit(
+                f"--metashape path is not an executable file: {explicit!r}"
+            )
+        return resolved
+
+    env_exe = os.environ.get("METASHAPE_EXE")
+    resolved = _usable(env_exe)
+    if resolved is not None:
+        return resolved
+
+    home = os.path.expanduser("~")
+    candidates = [
+        "/Applications/MetashapePro.app/Contents/MacOS/MetashapePro",
+        os.path.join(home, "tools", "metashape-pro", "metashape.sh"),
+        os.path.join(home, "metashape-pro", "metashape.sh"),
+        "/opt/metashape-pro/metashape.sh",
+        "/usr/local/bin/metashape.sh",
+    ]
+    for cand in candidates:
+        resolved = _usable(cand)
+        if resolved is not None:
+            return resolved
+
+    raise SystemExit(
+        "Could not locate the Metashape executable. Pass --metashape "
+        "/path/to/metashape.sh, set the METASHAPE_EXE environment variable, or "
+        "install Metashape to a standard location."
+    )
+
+
+def handle_metashape_export(args):
+    """Export a substrata project folder from a Metashape ``.psx`` project.
+
+    Shells out to Metashape's bundled Python to run the packaged
+    ``metashape_scripts/export_project.py`` (which imports only Metashape +
+    stdlib), then writes a starter ``<id>.yaml`` using the project initializer.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    psx = os.path.abspath(os.path.expanduser(args.psx))
+    if not os.path.isfile(psx):
+        raise SystemExit(f"Metashape project not found: {psx}")
+
+    exe = _find_metashape_executable(getattr(args, "metashape", None))
+
+    output_dir = os.path.abspath(
+        os.path.expanduser(args.output_dir) if args.output_dir else os.getcwd()
+    )
+    project_id = args.id or _default_metashape_id(psx)
+
+    script_path = os.path.join(
+        os.path.dirname(__file__), "metashape_scripts", "export_project.py"
+    )
+    if not os.path.isfile(script_path):
+        raise SystemExit(f"Bundled export script missing: {script_path}")
+
+    cmd = [
+        exe,
+        "-platform",
+        "offscreen",
+        "-r",
+        script_path,
+        "--psx",
+        psx,
+        "--output-dir",
+        output_dir,
+        "--id",
+        project_id,
+    ]
+    if getattr(args, "chunk", None) is not None:
+        cmd += ["--chunk", str(args.chunk)]
+    if getattr(args, "overwrite", False):
+        cmd += ["--overwrite"]
+
+    print("Running Metashape export:\n  " + " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as e:
+        raise SystemExit(f"Failed to launch Metashape executable {exe!r}: {e}")
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(
+            f"Metashape export failed (exit code {e.returncode}). "
+            "See the output above for details."
+        )
+
+    folder = os.path.join(output_dir, project_id)
+    if not os.path.isdir(folder):
+        raise SystemExit(
+            f"Export reported success but project folder is missing: {folder}"
+        )
+
+    # Finish the folder in the conda env: build a starter YAML (paths only;
+    # scale/orientation stay absent until `substrata orient`).
+    init = ProjectInitializer(path=folder)
+    yaml_path = os.path.join(folder, f"{project_id}.yaml")
+    init.save_config_to_yaml(yaml_path)
+    print(f"Wrote starter project YAML: {yaml_path}")
+
+    print(
+        "\nProject folder ready: "
+        f"{folder}\nNext steps (run from inside the folder):\n"
+        "  substrata decimate      # optional: make <id>_dec50M.ply\n"
+        "  substrata orient        # compute scale + world_transform"
+    )
+
+
+def _default_metashape_id(psx_path: str) -> str:
+    """Return the default project id: the ``.psx`` basename without extension."""
+    base = os.path.basename(os.path.normpath(psx_path))
+    if base.lower().endswith(".psx"):
+        base = base[: -len(".psx")]
+    return base
+
+
 def handle_train(args):
     """Handle the 'train' command: collate labels, build crops, train/evaluate.
 
@@ -1901,6 +2042,61 @@ def main():
             "Apply color_correction from the project YAML while writing the output "
             "PLY (requires `substrata colors -s` or equivalent). No second load."
         ),
+    )
+
+    # metashape-export (initialize a substrata project folder from a .psx)
+    p_meta = subparsers.add_parser(
+        "metashape-export",
+        help=(
+            "Export a substrata project folder (<id>.ply/.cams.xml/.meta.json/"
+            "_markers.csv + starter <id>.yaml) from a Metashape .psx by shelling "
+            "out to Metashape's bundled Python."
+        ),
+    )
+    p_meta.add_argument(
+        "--psx",
+        dest="psx",
+        type=str,
+        required=True,
+        help="Path to the Metashape project file (.psx).",
+    )
+    p_meta.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        type=str,
+        default=None,
+        help="Parent directory for the <id> project folder (default: CWD).",
+    )
+    p_meta.add_argument(
+        "--id",
+        dest="id",
+        type=str,
+        default=None,
+        help="Project id / folder name (default: .psx basename).",
+    )
+    p_meta.add_argument(
+        "--chunk",
+        dest="chunk",
+        type=str,
+        default=None,
+        help="Chunk label or 0-based index to export (default: active/first).",
+    )
+    p_meta.add_argument(
+        "--metashape",
+        dest="metashape",
+        type=str,
+        default=None,
+        help=(
+            "Path to the Metashape executable/launcher. Falls back to "
+            "$METASHAPE_EXE, then common install locations."
+        ),
+    )
+    p_meta.add_argument(
+        "--overwrite",
+        dest="overwrite",
+        action="store_true",
+        help="Overwrite existing output files in the project folder.",
     )
 
     # repair (re-emit a PLY that Open3D can parse, e.g. Metashape exports)
@@ -2860,6 +3056,7 @@ def main():
 
     handlers = {
         "decimate": handle_decimate,
+        "metashape-export": handle_metashape_export,
         "repair": handle_repair,
         "head": handle_head,
         "scalebars": handle_scalebars,
