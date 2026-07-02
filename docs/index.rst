@@ -13,6 +13,19 @@ annotations) that substrata loads, scales, orients, and measures as one unit.
 From there you can derive terrain and ecology metrics, transfer annotations
 between overlapping reconstructions, and generate QC reports.
 
+Two ways to use substrata
+-------------------------
+
+You can work with substrata in either of two ways, and mix them freely on the
+same project:
+
+* **As a command-line tool** — run ``substrata <subcommand>`` from inside a
+  project directory for simplified, high-level access to the common workflows.
+  See :doc:`command_line_usage`.
+* **As a Python package** — ``from substrata import *`` gives direct access to
+  the classes and functions for use in scripts or Jupyter notebooks. See
+  :doc:`getting_started` and the :doc:`api`.
+
 What you can do with substrata
 ------------------------------
 
@@ -71,6 +84,7 @@ documents all modules, classes, and functions.
 
    installation
    getting_started
+   projects
    command_line_usage
 
 .. toctree::
