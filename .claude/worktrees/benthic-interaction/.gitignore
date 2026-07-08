@@ -1,0 +1,20 @@
+example_data/
+*.egg-info/
+build/
+dist/
+__pycache__/
+sandbox/
+src/substrata/__pycache__/
+*.pdf
+
+# OS / editor cruft
+.DS_Store
+
+# Sphinx / Jupyter build output
+docs/_build/
+.ipynb_checkpoints/
+
+# Heavy / non-tutorial notebooks and stray notebook outputs
+docs/notebooks/notebook_mcav_sint.ipynb
+docs/notebooks/color_calibration.ipynb
+docs/notebooks/test.*

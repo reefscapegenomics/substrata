@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(conda run -n substrata python -c ' *)",
+      "Bash(ls -la /Users/pbongaerts/Github/substrata && echo \"---\" && ls -la /Volumes/ubuntu_home/Github/substrata 2>/dev/null | head -5)",
+      "Read(//Users/pbongaerts/Github/substrata/**)",
+      "Bash(conda run *)"
+    ]
+  }
+}
