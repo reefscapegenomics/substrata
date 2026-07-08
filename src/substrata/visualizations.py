@@ -2943,10 +2943,68 @@ def show_grid_cells(
     return plt
 
 
+def _ann_label(ann):
+    """Return the classification label for an annotation, or None.
+
+    Prefers the classifier result (``ann.image_match.classification['label']``)
+    and falls back to the plain ``ann.label`` (e.g. the ``label`` column of a
+    loaded annotations CSV). Empty strings are treated as missing.
+    """
+    im = getattr(ann, "image_match", None)
+    cls = getattr(im, "classification", None)
+    if isinstance(cls, dict) and cls.get("label") is not None:
+        return str(cls["label"])
+    lbl = getattr(ann, "label", None)
+    return str(lbl) if lbl not in (None, "") else None
+
+
+def _grid_bboxes_from_annotations(annotations, cell_size=None):
+    """Build a regular grid of cell bboxes covering the annotation XY extent.
+
+    Args:
+        annotations: An `Annotations` instance.
+        cell_size (float | None): Side length of each square cell. If None, it
+            is estimated under a one-annotation-per-cell assumption as
+            ``sqrt(width * height / n)``.
+
+    Returns:
+        List of bboxes, each ([x_min, y_min], [x_max, y_max]).
+    """
+    from substrata import measurements
+
+    coords = np.asarray(annotations.coords, dtype=float)
+    if coords.size == 0:
+        return []
+    xy = coords[:, :2]
+    min_x, min_y = xy.min(axis=0)
+    max_x, max_y = xy.max(axis=0)
+    width = float(max_x - min_x)
+    height = float(max_y - min_y)
+
+    if cell_size is None:
+        # One-per-cell assumption: cell area ~ total area / n_points.
+        cell_size = float(np.sqrt(max(width * height, 1e-9) / max(len(xy), 1)))
+
+    cs = float(cell_size)
+    # Snap the extent outward to whole multiples of the cell size so the overall
+    # box divides evenly (subdivide_boxes requires this).
+    x0 = np.floor(min_x / cs) * cs
+    y0 = np.floor(min_y / cs) * cs
+    x1 = np.ceil(max_x / cs) * cs
+    y1 = np.ceil(max_y / cs) * cs
+    # Guard against a degenerate (zero-width) axis.
+    if x1 - x0 < cs:
+        x1 = x0 + cs
+    if y1 - y0 < cs:
+        y1 = y0 + cs
+    return measurements.subdivide_boxes(([x0, y0], [x1, y1]), cs)
+
+
 def show_classified_grid_cells(
-    pcd,
-    bboxes,
     annotations,
+    bboxes=None,
+    pcd=None,
+    cell_size=None,
     show_points=False,
     point_size=1,
     title=None,
@@ -2956,28 +3014,44 @@ def show_classified_grid_cells(
     """
     Show a 2D plot with grid cells colored by majority classification.
 
-    Given a point cloud, a list of grid cell bounding boxes, and an
-    `Annotations` object, determine for each cell which annotations fall
-    within the cell bounds and color the cell based on the majority
-    classification label from `annotation.image_match.classification['label']`.
+    Given an `Annotations` object, determine for each grid cell which
+    annotations fall within the cell bounds and color the cell based on the
+    majority label (from `annotation.image_match.classification['label']` when
+    a classifier has run, otherwise the plain `annotation.label`).
+
+    The grid cells can be supplied explicitly via `bboxes`. If `bboxes` is None,
+    a regular grid is built over the annotation XY extent using `cell_size`
+    (auto-estimated as ``sqrt(area / n)`` when `cell_size` is also None). Note
+    that annotation coordinates must already be in the frame in which the grid
+    is axis-aligned (e.g. the orientation used to generate the intercepts).
 
     - Cells with no classified annotations are colored gray.
     - Grid cell outlines are not drawn; only the filled cell color is shown.
 
     Args:
-        pcd: Point cloud (SimplePointCloud or PointCloud).
-        bboxes: List of bounding boxes, where each item is
-            (min_corner[x, y], max_corner[x, y]). A single bbox can also be
-            passed as ((x_min, y_min), (x_max, y_max)).
         annotations: An `Annotations` instance.
-        show_points (bool): If True, scatter the XY points as a background.
+        bboxes: Optional list of bounding boxes, where each item is
+            (min_corner[x, y], max_corner[x, y]). A single bbox can also be
+            passed as ((x_min, y_min), (x_max, y_max)). If None, the grid is
+            derived from the annotation coordinates.
+        pcd: Optional point cloud (SimplePointCloud or PointCloud) used only for
+            the optional background scatter.
+        cell_size (float | None): Side length of each grid cell when `bboxes` is
+            not given. Ignored when `bboxes` is supplied.
+        show_points (bool): If True and `pcd` is given, scatter the XY points as
+            a background.
         point_size (int): Marker size for background points when shown.
         title (str | None): Optional title for the plot.
         label_colors (dict | None): Optional mapping {label: matplotlib color}.
 
     Returns:
-        matplotlib.pyplot: The pyplot module for further manipulation or display.
+        matplotlib.figure.Figure: The figure for further manipulation, display,
+        or saving.
     """
+    # Build the grid from the annotations when no bboxes are supplied.
+    if bboxes is None:
+        bboxes = _grid_bboxes_from_annotations(annotations, cell_size)
+
     # Normalize bboxes input: accept a single bbox as well
     if (
         isinstance(bboxes, (list, tuple))
@@ -2994,7 +3068,8 @@ def show_classified_grid_cells(
         bboxes = [bboxes]
 
     # Decimate if required (and ensure PointCloud format)
-    pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
+    if pcd is not None:
+        pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
 
     fig = plt.figure(figsize=(12, 5))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
@@ -3003,7 +3078,7 @@ def show_classified_grid_cells(
     ax_right = fig.add_subplot(gs[0, 1])
 
     # Optional background points in grayscale
-    if show_points and len(pcd.points) > 0:
+    if show_points and pcd is not None and len(pcd.points) > 0:
         plot_cols = np.full(
             (pcd.points.shape[0], 3), 0.6, dtype=float
         )  # Default to grayscale
@@ -3019,12 +3094,11 @@ def show_classified_grid_cells(
     # Build default label color mapping if not provided
     if label_colors is None:
         # Collect labels present in annotations
-        labels = []
-        for ann in annotations.data.values():
-            im = getattr(ann, "image_match", None)
-            cls = getattr(im, "classification", None)
-            if isinstance(cls, dict) and "label" in cls and cls["label"] is not None:
-                labels.append(str(cls["label"]))
+        labels = [
+            lbl
+            for lbl in (_ann_label(ann) for ann in annotations.data.values())
+            if lbl is not None
+        ]
         unique_labels = sorted(set(labels))
         cmap = plt.cm.get_cmap("tab20", max(1, len(unique_labels)))
         label_colors = {lbl: cmap(i) for i, lbl in enumerate(unique_labels)}
@@ -3037,14 +3111,8 @@ def show_classified_grid_cells(
             if (min_corner[0] <= x < max_corner[0]) and (
                 min_corner[1] <= y < max_corner[1]
             ):
-                im = getattr(ann, "image_match", None)
-                cls = getattr(im, "classification", None)
-                if isinstance(cls, dict):
-                    lbl = cls.get("label", None)
-                else:
-                    lbl = None
+                lbl = _ann_label(ann)
                 if lbl is not None:
-                    lbl = str(lbl)
                     counts[lbl] = counts.get(lbl, 0) + 1
         if not counts:
             return None
@@ -3056,7 +3124,7 @@ def show_classified_grid_cells(
     # Draw filled rectangles for each bbox colored by majority label
     labels_present = set()
     label_counts_by_cell = {}
-    print(f"Drawing {len(bboxes)} bounding boxes")
+    logger.debug("Drawing %d bounding boxes", len(bboxes))
     for i, bbox in enumerate(bboxes):
         min_corner, max_corner = bbox
         label = majority_label_for_bbox(min_corner, max_corner)
@@ -3096,8 +3164,12 @@ def show_classified_grid_cells(
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
-            print(
-                f"Setting axis limits: X=[{x_min:.2f}, {x_max:.2f}], Y=[{y_min:.2f}, {y_max:.2f}]"
+            logger.debug(
+                "Setting axis limits: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
+                x_min,
+                x_max,
+                y_min,
+                y_max,
             )
             ax_left.set_xlim(x_min, x_max)
             ax_left.set_ylim(y_min, y_max)
@@ -3150,7 +3222,7 @@ def show_classified_grid_cells(
         ax_right.set_title("Cells per class")
         ax_right.margins(x=0.05)
 
-    # Tight layout and return pyplot
+    # Tight layout and return the figure
     plt.tight_layout()
 
     # Match right plot area height to left plot area height
@@ -3162,7 +3234,7 @@ def show_classified_grid_cells(
         )
     except Exception:
         pass
-    return plt
+    return fig
 
 
 def show_intercept_point(intercept_point):

@@ -226,6 +226,28 @@ substrata intercepts --slope
 substrata intercepts --search-radius 0.01
 ```
 
+## Intercepts plot
+
+Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. The grid is built from a single cell size over the annotation extent. For slope intercepts, pass the orientation (4×4 `world_transform`) that was used at generation time via `--yaml` (e.g. the sibling `<id>_slope_intercepts.yaml` written by `intercepts --slope`) so the grid is axis-aligned. Without it, the coordinates are used as-is (fine for top-down intercepts).
+
+Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--output PNG] [--title STR]`
+
+```bash
+# Plot slope intercepts, applying the generation orientation
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 0.2
+
+# Coarser grid (majority vote per larger cell)
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 1.0
+
+# Auto-detect the project's files from the current directory
+substrata intercepts-plot
+
+# Custom output path
+substrata intercepts-plot --intercepts topdown_intercepts.csv --output /tmp/grid.png
+```
+
 ## Point cloud alignment
 
 Register a source PLY to a target PLY and print the alignment transform.

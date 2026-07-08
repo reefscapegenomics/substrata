@@ -1011,6 +1011,42 @@ def handle_intercepts(args):
         intercepts.save(csv_path)
 
 
+def handle_intercepts_plot(args):
+    from substrata import visualizations
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+
+    # Orientation (4x4) used when the intercepts were generated. Prefer a custom
+    # YAML (e.g. the sibling <id>_slope_intercepts.yaml written by `intercepts
+    # --slope`), else fall back to the project's own world_transform.
+    if getattr(args, "yaml", None):
+        transform = ProjectInitializer(yaml=args.yaml).world_transform
+    else:
+        transform = init.world_transform
+    if np.allclose(transform, np.eye(4)):
+        print(
+            "Warning: orientation transform is identity; the grid may be warped "
+            "for slope intercepts (pass --yaml with the generation world_transform)."
+        )
+
+    ann_path = args.annotations or init.annotations_filepath
+    if not ann_path:
+        raise SystemExit("intercepts-plot requires an annotations/intercepts file")
+
+    # Load in the original frame, then apply the orientation exactly once so the
+    # grid becomes axis-aligned (transform_coords compounds, so do not re-apply).
+    anns = Annotations(ann_path, orig_coords_only=True)
+    anns.apply_transform(transform)
+
+    fig = visualizations.show_classified_grid_cells(
+        anns, cell_size=args.grid_size, title=getattr(args, "title", None)
+    )
+    out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")
+    fig.savefig(out)
+    print(f"Saved intercepts plot to {out}")
+
+
 def handle_align(args):
     from substrata.pointclouds import PointCloud
 
@@ -2647,6 +2683,62 @@ def main():
         help="Reset all paths to local (relative to project path).",
     )
 
+    # intercepts-plot
+    p_intercepts_plot = subparsers.add_parser(
+        "intercepts-plot",
+        help=(
+            "Plot a saved intercepts CSV as a grid colored by majority label "
+            "(no bounding boxes needed; grid built from a cell size)."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--annotations",
+        "--intercepts",
+        dest="annotations",
+        type=str,
+        default=None,
+        help="Optional intercepts/annotations CSV path (overrides initializer).",
+    )
+    p_intercepts_plot.add_argument(
+        "--yaml",
+        "--config",
+        dest="yaml",
+        type=str,
+        default=None,
+        help=(
+            "Optional project YAML holding the world_transform (orientation) used "
+            "to generate the intercepts, e.g. <id>_slope_intercepts.yaml."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--grid-size",
+        dest="grid_size",
+        type=float,
+        default=0.2,
+        help="Grid cell size in meters (default: 0.2).",
+    )
+    p_intercepts_plot.add_argument(
+        "--output",
+        "-o",
+        dest="output",
+        type=str,
+        default=None,
+        help="Optional output PNG path (default: <intercepts_stem>_grid.png).",
+    )
+    p_intercepts_plot.add_argument(
+        "--title",
+        dest="title",
+        type=str,
+        default=None,
+        help="Optional plot title.",
+    )
+    p_intercepts_plot.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
+
     # images
     p_images = subparsers.add_parser(
         "images",
@@ -3119,6 +3211,7 @@ def main():
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,
+        "intercepts-plot": handle_intercepts_plot,
         "align": handle_align,
         "images": handle_images,
         "camsync": handle_camsync,
