@@ -1052,6 +1052,19 @@ def handle_intercepts_plot(args):
     anns = Annotations(ann_path, orig_coords_only=True)
     anns.apply_transform(transform)
 
+    # Optionally load the project point cloud for the background scatter. Apply
+    # the same orientation as the annotations so the points stay aligned with
+    # the axis-aligned grid. If it cannot be loaded, warn and continue without.
+    pcd = None
+    pcd_path = init.ply_filepath
+    if pcd_path:
+        try:
+            pcd = PointCloud(pcd_path, max_points=getattr(args, "points", None))
+            pcd.apply_transform(transform)
+        except Exception as exc:  # noqa: BLE001 - background scatter is optional
+            print(f"Warning: could not load point cloud {pcd_path}: {exc}")
+            pcd = None
+
     # If the YAML carries the exact generation grid, replay those cells at the
     # requested cell size (aligned to the true origin); else derive a grid from
     # the annotation extent.
@@ -1068,7 +1081,9 @@ def handle_intercepts_plot(args):
     fig = visualizations.show_classified_grid_cells(
         anns,
         bboxes=bboxes,
+        pcd=pcd,
         cell_size=args.grid_size,
+        show_points=getattr(args, "show_points", True),
         title=getattr(args, "title", None),
     )
     out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")
@@ -2760,6 +2775,25 @@ def main():
         type=str,
         default=None,
         help="Optional plot title.",
+    )
+    p_intercepts_plot.add_argument(
+        "--hide-points",
+        dest="show_points",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not scatter the project point cloud as a background behind the "
+            "grid cells (the scatter is shown by default when a point cloud is "
+            "found)."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--points",
+        "-n",
+        dest="points",
+        type=int,
+        default=None,
+        help="Optional cap on the number of point-cloud points loaded for scatter.",
     )
     p_intercepts_plot.add_argument(
         "--local",

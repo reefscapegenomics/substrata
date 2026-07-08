@@ -230,7 +230,9 @@ substrata intercepts --search-radius 0.01
 
 Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. For slope intercepts, pass the orientation (4×4 `world_transform`) that was used at generation time via `--yaml` (e.g. the sibling `<id>_slope_intercepts.yaml` written by `intercepts --slope`) so the grid is axis-aligned. Without it, the coordinates are used as-is (fine for top-down intercepts). When the YAML also carries the exact generation grid (`grid_bbox` + `grid_cell_size`, written since this feature was added), those cells are replayed exactly; otherwise the grid is derived from the annotation extent at `--grid-size`.
 
-Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--output PNG] [--title STR]`
+When the project point cloud can be found, it is loaded and oriented with the same transform as the annotations and scattered as a background behind the grid cells by default; pass `--hide-points` to disable that (use `--points`/`-n` to cap how many points are loaded).
+
+Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--output PNG] [--title STR] [--hide-points] [--points N]`
 
 ```bash
 # Plot slope intercepts, applying the generation orientation
@@ -243,6 +245,12 @@ substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv
 
 # Auto-detect the project's files from the current directory
 substrata intercepts-plot
+
+# Cap the background scatter at 2M points (scatter is on by default)
+substrata intercepts-plot --points 2000000
+
+# Disable the background point-cloud scatter
+substrata intercepts-plot --hide-points
 
 # Custom output path
 substrata intercepts-plot --intercepts topdown_intercepts.csv --output /tmp/grid.png
