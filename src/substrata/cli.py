@@ -994,6 +994,13 @@ def handle_intercepts(args):
             "world_transform": init.pcd.world_transform.tolist(),
             "slope_normal": [float(x) for x in slope_normal],
             "slope_elevation_deg": float(slope_elev),
+            # Exact generation grid, so intercepts-plot can replay the same cells
+            # (rather than re-deriving them from the point extent).
+            "grid_bbox": [
+                [float(optimal_bbox[0][0]), float(optimal_bbox[0][1])],
+                [float(optimal_bbox[1][0]), float(optimal_bbox[1][1])],
+            ],
+            "grid_cell_size": float(args.box_size),
         }
         with open(yaml_path, "w") as f:
             yaml.safe_dump(payload, f)
@@ -1012,17 +1019,23 @@ def handle_intercepts(args):
 
 
 def handle_intercepts_plot(args):
-    from substrata import visualizations
+    from substrata import measurements, visualizations
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
-    # Orientation (4x4) used when the intercepts were generated. Prefer a custom
-    # YAML (e.g. the sibling <id>_slope_intercepts.yaml written by `intercepts
-    # --slope`), else fall back to the project's own world_transform.
+    # Read the generation YAML (world_transform + optional exact grid). Prefer a
+    # custom YAML (e.g. the sibling <id>_slope_intercepts.yaml written by
+    # `intercepts --slope`), else fall back to the project's own world_transform.
+    transform = None
+    grid_bbox = None
     if getattr(args, "yaml", None):
-        transform = ProjectInitializer(yaml=args.yaml).world_transform
-    else:
+        with open(args.yaml) as f:
+            cfg = yaml.safe_load(f) or {}
+        if cfg.get("world_transform") is not None:
+            transform = np.array(cfg["world_transform"], dtype=float)
+        grid_bbox = cfg.get("grid_bbox")
+    if transform is None:
         transform = init.world_transform
     if np.allclose(transform, np.eye(4)):
         print(
@@ -1039,8 +1052,24 @@ def handle_intercepts_plot(args):
     anns = Annotations(ann_path, orig_coords_only=True)
     anns.apply_transform(transform)
 
+    # If the YAML carries the exact generation grid, replay those cells at the
+    # requested cell size (aligned to the true origin); else derive a grid from
+    # the annotation extent.
+    bboxes = None
+    if grid_bbox is not None:
+        try:
+            bboxes = measurements.subdivide_boxes(grid_bbox, args.grid_size)
+        except ValueError:
+            print(
+                f"Warning: grid_bbox is not divisible by --grid-size {args.grid_size}; "
+                "deriving the grid from the annotation extent instead."
+            )
+
     fig = visualizations.show_classified_grid_cells(
-        anns, cell_size=args.grid_size, title=getattr(args, "title", None)
+        anns,
+        bboxes=bboxes,
+        cell_size=args.grid_size,
+        title=getattr(args, "title", None),
     )
     out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")
     fig.savefig(out)
