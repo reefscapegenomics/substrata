@@ -1516,6 +1516,8 @@ class OrthoGrid:
         title: Optional[str] = None,
         label_colors: Optional[dict] = None,
         figsize: Tuple[float, float] = (18, 7.5),
+        robust: bool = False,
+        robust_percentiles: Tuple[float, float] = (2.0, 98.0),
     ):
         """Render the grid as a matplotlib Figure with a side panel.
 
@@ -1615,21 +1617,18 @@ class OrthoGrid:
             vmax = vmin + 1e-6
         return vmin, vmax
 
-    def _show_continuous(
-        self, ax_left, ax_right, cmap, plt, robust=False,
-        robust_percentiles=(2.0, 98.0),
-    ) -> None:
-        """Colormapped raster + value histogram."""
     def _report_values(self) -> np.ndarray:
         """Finite per-cell values inside the reporting area (continuous mode)."""
         return self.values[self.report_mask & ~np.isnan(self.values)]
 
-    def _continuous_scale(self, cmap=None):
+    def _continuous_scale(self, cmap=None, robust=False,
+                          robust_percentiles=(2.0, 98.0)):
         """Return ``(cmap_obj, norm)`` for continuous modes.
 
-        vmin/vmax are taken from the reporting-area cells (falling back to all
-        finite cells) so the colour scale focuses on the reported region.
-        Shared by :meth:`_show_continuous` and the animation module.
+        vmin/vmax come from the reporting-area cells (falling back to all finite
+        cells) so the colour scale focuses on the reported region; ``robust``
+        clips them to ``robust_percentiles`` via :meth:`_scale_limits`. Shared
+        by :meth:`_show_continuous` and the animation module.
         """
         import matplotlib.pyplot as plt
 
@@ -1638,12 +1637,6 @@ class OrthoGrid:
         rep = self._report_values()
         scale_src = rep if rep.size else finite
         vmin, vmax = self._scale_limits(scale_src, robust, robust_percentiles)
-        if scale_src.size:
-            vmin, vmax = float(scale_src.min()), float(scale_src.max())
-        else:
-            vmin, vmax = 0.0, 1.0
-        if vmin == vmax:
-            vmax = vmin + 1e-6
         return plt.get_cmap(cmap or "viridis"), plt.Normalize(vmin=vmin, vmax=vmax)
 
     def _resolve_label_colors(self, label_colors=None):
@@ -1667,10 +1660,13 @@ class OrthoGrid:
             }
         return label_colors, labels_present
 
-    def _show_continuous(self, ax_left, ax_right, cmap, plt) -> None:
+    def _show_continuous(
+        self, ax_left, ax_right, cmap, plt, robust=False,
+        robust_percentiles=(2.0, 98.0),
+    ) -> None:
         """Colormapped raster + value histogram."""
         vals = self.values
-        cmap_obj, norm = self._continuous_scale(cmap)
+        cmap_obj, norm = self._continuous_scale(cmap, robust, robust_percentiles)
         rgba = cmap_obj(norm(vals))
         rgba[np.isnan(vals)] = (0.0, 0.0, 0.0, 0.0)
         ax_left.imshow(rgba, extent=self.extent, origin="lower", zorder=1)
@@ -1690,7 +1686,7 @@ class OrthoGrid:
             ax_right.hist(rep, bins=bins, color="0.5", edgecolor="0.3")
         if robust and rep.size:
             # Match the histogram window to the (clipped) colour scale.
-            ax_right.set_xlim(vmin, vmax)
+            ax_right.set_xlim(norm.vmin, norm.vmax)
         ax_right.set_xlabel(self._value_label())
         ax_right.set_ylabel("Cell count")
 
