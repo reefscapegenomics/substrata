@@ -1236,6 +1236,7 @@ def handle_intercepts_plot(args):
     animate_ortho_grid(
         grid,
         gif_out,
+        sweep=getattr(args, "animation_order", "columns"),
         show_pcd=show_pcd,
         title=title,
         label_colors=mpl_label_colors,
@@ -3010,6 +3011,19 @@ def main():
             "single 'OTHER' category; add an 'OTHER #hex' row to set its colour "
             "(default #999999). Applies to the grid, the animation, and the "
             "positions plot."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--animation-order",
+        dest="animation_order",
+        choices=("columns", "rows", "scan", "random", "spiral", "categories"),
+        default="columns",
+        help=(
+            "Order in which the animated GIF fills its cells (default: "
+            "columns). 'rows' = top-to-bottom raster; 'scan' = columns with a "
+            "moving scan line; 'random' = cells pop in in random order; "
+            "'spiral' = expand outward from the centre; 'categories' = one "
+            "label group at a time, most dominant first (~1s per category)."
         ),
     )
     p_intercepts_plot.add_argument(

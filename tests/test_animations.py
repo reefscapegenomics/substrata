@@ -110,6 +110,50 @@ class TestRevealOrder(unittest.TestCase):
         col = rt[:, 0]
         self.assertTrue(np.all(np.diff(col) < 0))
 
+    def test_alternative_orders_are_valid_fractions(self):
+        # rows / random / spiral each assign every cell a distinct fraction in
+        # (0, 1] with max == 1 (so the final frame completes).
+        for fn in (anim._reveal_t_rows, anim._reveal_t_random,
+                   anim._reveal_t_spiral):
+            rt = fn(5, 3)
+            self.assertEqual(rt.shape, (3, 5))
+            self.assertEqual(len(np.unique(rt)), 15, fn.__name__)
+            self.assertGreater(rt.min(), 0.0)
+            self.assertAlmostEqual(rt.max(), 1.0)
+
+    def test_rows_are_top_to_bottom(self):
+        rt = anim._reveal_t_rows(5, 3)
+        # Whole top row reveals before the whole bottom row.
+        self.assertLess(rt[2, :].max(), rt[0, :].min())
+
+    def test_random_is_deterministic(self):
+        np.testing.assert_array_equal(anim._reveal_t_random(5, 3),
+                                      anim._reveal_t_random(5, 3))
+
+    def test_spiral_expands_from_centre(self):
+        rt = anim._reveal_t_spiral(5, 3)
+        self.assertLess(rt[1, 2], rt[0, 0])   # centre before a corner
+
+    def test_categories_dominant_first_equal_slices(self):
+        grid = _label_grid()   # coral x2 (dominant), algae x1, sand x1
+        rt, k = anim._reveal_t_categories(grid, grid.present, grid.report_mask)
+        self.assertEqual(k, 3)
+        labels = grid.cell_labels
+
+        def mean_t(lbl):
+            vals = [rt[j, i] for j in range(grid.ny) for i in range(grid.nx)
+                    if grid.present[j, i] and labels[j, i] == lbl]
+            return float(np.mean(vals))
+        # Dominant class reveals earliest.
+        self.assertLess(mean_t("coral"), mean_t("algae"))
+        self.assertLess(mean_t("coral"), mean_t("sand"))
+        # Each category occupies an equal 1/k slice: the dominant class fits in
+        # the first third, and the last cell of all reaches 1.0.
+        coral = [rt[j, i] for j in range(grid.ny) for i in range(grid.nx)
+                 if grid.present[j, i] and labels[j, i] == "coral"]
+        self.assertLessEqual(max(coral), 1.0 / k + 1e-9)
+        self.assertAlmostEqual(rt[grid.present].max(), 1.0)
+
 
 class TestWriterSelection(unittest.TestCase):
     def test_gif_and_bad(self):
@@ -161,7 +205,21 @@ class TestAnimateOutputs(unittest.TestCase):
         with self.assertRaises(ValueError):
             anim.animate_ortho_grid(_label_grid(),
                                     os.path.join(self.tmp, "x.gif"),
-                                    sweep="rows")
+                                    sweep="zigzag")
+
+    def test_all_sweeps_write_gifs(self):
+        for mode in ("columns", "rows", "scan", "random", "spiral",
+                     "categories"):
+            out = os.path.join(self.tmp, f"{mode}.gif")
+            anim.animate_ortho_grid(_label_grid(), out, sweep=mode,
+                                    duration=0.4, fps=5)
+            self.assertTrue(os.path.getsize(out) > 0, mode)
+
+    def test_categories_requires_label_grid(self):
+        grid = ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=0.5)
+        with self.assertRaises(ValueError):
+            anim.animate_ortho_grid(grid, os.path.join(self.tmp, "x.gif"),
+                                    sweep="categories")
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires ffmpeg")
     def test_mp4_written(self):

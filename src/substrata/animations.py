@@ -46,6 +46,100 @@ def _reveal_t(nx: int, ny: int) -> np.ndarray:
     return (order + 1).astype(float) / float(max(nx * ny, 1))
 
 
+def _order_to_reveal_t(order: np.ndarray) -> np.ndarray:
+    """Turn an integer reveal *order* (0 = first) into reveal fractions in (0, 1].
+
+    The smallest order reveals at ``1/N`` (so a ``p=0`` frame is empty) and the
+    largest at ``1.0`` (the final frame is complete), matching :func:`_reveal_t`.
+    """
+    n = order.size
+    return (order.astype(float) + 1.0) / float(max(n, 1))
+
+
+def _reveal_t_rows(nx: int, ny: int) -> np.ndarray:
+    """Raster reveal: top→bottom, each row left→right (image-scanline order)."""
+    i = np.arange(nx)[None, :]
+    j = np.arange(ny)[:, None]
+    row_from_top = (ny - 1) - j              # 0 at the top
+    order = row_from_top * nx + i            # (ny, nx), row-major, top-first
+    return _order_to_reveal_t(order)
+
+
+def _reveal_t_random(nx: int, ny: int, seed: int = 0) -> np.ndarray:
+    """Random reveal: cells pop in in a shuffled order (deterministic per seed).
+
+    Reads as many parallel predictions streaming in and completing at different
+    times.
+    """
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(nx * ny).reshape(ny, nx)
+    return _order_to_reveal_t(order)
+
+
+def _reveal_t_spiral(nx: int, ny: int) -> np.ndarray:
+    """Radial reveal: expand outward from the lattice centre (angle tie-break).
+
+    Gives the impression of analysis rippling out across the scene.
+    """
+    j = np.arange(ny)[:, None]
+    i = np.arange(nx)[None, :]
+    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    radius = np.hypot(i - cx, j - cy)
+    angle = np.arctan2(j - cy, i - cx)       # -pi..pi, rotational tie-break
+    key = radius * (2.0 * np.pi + 1.0) + (angle + np.pi)
+    order = key.ravel().argsort().argsort().reshape(ny, nx)  # dense ranks
+    return _order_to_reveal_t(order)
+
+
+def _reveal_t_categories(grid, present, report, force_nodata_last: bool = True):
+    """Reveal one label group at a time, most dominant → least dominant.
+
+    Dominance is the number of *reported* cells of each label (matching the side
+    bar chart). Each category gets an equal share of the fill; within a category
+    its cells sweep in column-major (top-first) order so the class "scans in".
+
+    Args:
+        grid: The :class:`~substrata.ortho.OrthoGrid` (label mode).
+        present: ``(ny, nx)`` bool mask of occupied cells.
+        report: ``(ny, nx)`` bool mask of cells inside the reporting area.
+        force_nodata_last: Reveal the "No data" (unclassified) group last
+            regardless of its size.
+
+    Returns:
+        Tuple ``(reveal_t, n_categories)``.
+    """
+    ny, nx = grid.ny, grid.nx
+    cells: dict = {}
+    report_counts: dict = {}
+    for j in range(ny):
+        for i in range(nx):
+            if not present[j, i]:
+                continue
+            lbl = grid.cell_labels[j, i]
+            cat = lbl if lbl is not None else "No data"
+            cells.setdefault(cat, []).append((j, i))
+            if report[j, i]:
+                report_counts[cat] = report_counts.get(cat, 0) + 1
+
+    def dominance(cat):
+        # Most reported cells first; break ties on total occupancy, then name.
+        return (-report_counts.get(cat, 0), -len(cells[cat]), str(cat))
+
+    ordered = sorted(cells.keys(), key=dominance)
+    if force_nodata_last and "No data" in ordered:
+        ordered = [c for c in ordered if c != "No data"] + ["No data"]
+
+    k = max(1, len(ordered))
+    reveal_t = np.ones((ny, nx), dtype=float)
+    for rank, cat in enumerate(ordered):
+        # Column-major, top-first within the category (like the columns sweep).
+        members = sorted(cells[cat], key=lambda ji: (ji[1], (ny - 1) - ji[0]))
+        m = len(members)
+        for idx, (j, i) in enumerate(members):
+            reveal_t[j, i] = (rank + (idx + 1) / m) / k
+    return reveal_t, k
+
+
 def _writer_for(output_path: str, fps: int):
     """Return a matplotlib animation writer chosen by file extension."""
     from matplotlib.animation import PillowWriter, FFMpegWriter
@@ -108,22 +202,34 @@ def animate_ortho_grid(
     figsize: Tuple[float, float] = (18, 7.5),
     end_hold: float = 0.5,
     loop: bool = False,
+    seconds_per_category: Optional[float] = None,
 ) -> str:
     """Animate an :class:`~substrata.ortho.OrthoGrid` filling in, and save it.
 
     Shows the whole plot (faded point cloud + empty grid) and then gradually
-    fills the grid cells column-by-column (left→right, each column top→bottom),
-    with the side panel (label bar chart or value histogram) growing as cells
-    appear. Works for label grids (``value_by="label"``) and continuous grids
-    (``"z"``/``"count"``/``"density"``).
+    fills the grid cells in the order set by *sweep*, with the side panel (label
+    bar chart or value histogram) growing as cells appear. Works for label grids
+    (``value_by="label"``) and continuous grids (``"z"``/``"count"``/``"density"``).
 
     Args:
         grid: An :class:`~substrata.ortho.OrthoGrid`.
         output_path: Destination file; ``.gif`` (Pillow) or ``.mp4`` (ffmpeg).
         duration: Total fill time in seconds (default
-            ``settings.DEFAULT_ANIM_DURATION``). The end hold is added on top.
+            ``settings.DEFAULT_ANIM_DURATION``; for ``sweep="categories"`` it
+            defaults to ~1s per category instead). The end hold is added on top.
         fps: Frames per second (default ``settings.DEFAULT_ANIM_FPS``).
-        sweep: Reveal order. Only ``"columns"`` is supported in v1.
+        sweep: Reveal order — one of:
+
+            * ``"columns"`` (default): left→right, each column top→bottom.
+            * ``"rows"``: top→bottom raster (image-scanline order).
+            * ``"scan"``: same reveal as ``"columns"`` plus a moving vertical
+              scan line, evoking a sensor sweeping the scene live.
+            * ``"random"``: cells pop in in a shuffled order, like many
+              predictions streaming in and completing at different times.
+            * ``"spiral"``: expand radially outward from the centre.
+            * ``"categories"`` (label grids only): reveal one label group at a
+              time, most dominant → least dominant, "detecting" each class in
+              turn. Defaults to ~1s per category (see *seconds_per_category*).
         show_pcd: Draw the whole point cloud (faded) behind the grid and widen
             the view to its full extent (as :meth:`OrthoGrid.show`).
         cmap: Colormap for continuous modes (default viridis).
@@ -133,6 +239,9 @@ def animate_ortho_grid(
         end_hold: Seconds to hold the fully-filled frame at the end.
         loop: If True the GIF loops forever; if False (default) it plays once
             and stops on the final (full) frame. Only affects GIF output.
+        seconds_per_category: For ``sweep="categories"`` with no explicit
+            *duration*, seconds allotted to each label group (default
+            ``settings.DEFAULT_ANIM_SECONDS_PER_CATEGORY``). Ignored otherwise.
 
     Returns:
         ``output_path``.
@@ -143,12 +252,13 @@ def animate_ortho_grid(
 
     from substrata import settings
 
-    if duration is None:
-        duration = getattr(settings, "DEFAULT_ANIM_DURATION", 5.0)
     if fps is None:
         fps = getattr(settings, "DEFAULT_ANIM_FPS", 15)
-    if sweep != "columns":
-        raise ValueError(f"unsupported sweep {sweep!r}; only 'columns' in v1")
+    valid_sweeps = ("columns", "rows", "scan", "random", "spiral", "categories")
+    if sweep not in valid_sweeps:
+        raise ValueError(
+            f"unsupported sweep {sweep!r}; choose from {valid_sweeps}"
+        )
     # Validate the output target up front so a bad path / missing ffmpeg fails
     # before we build the (potentially expensive) figure and animation.
     writer = _writer_for(output_path, fps)
@@ -157,10 +267,40 @@ def animate_ortho_grid(
 
     is_label = grid.value_by == "label"
     ny, nx = grid.ny, grid.nx
-    reveal_t = _reveal_t(nx, ny)
     present = grid.present
     report = grid.report_mask
     extent = grid.extent
+
+    # Per-cell reveal fraction in (0, 1], selected by `sweep`. Everything
+    # downstream (growing bars, cell fills, the optional scan line) keys off it.
+    n_categories = None
+    if sweep in ("columns", "scan"):
+        reveal_t = _reveal_t(nx, ny)
+    elif sweep == "rows":
+        reveal_t = _reveal_t_rows(nx, ny)
+    elif sweep == "random":
+        reveal_t = _reveal_t_random(nx, ny)
+    elif sweep == "spiral":
+        reveal_t = _reveal_t_spiral(nx, ny)
+    else:  # "categories"
+        if not is_label:
+            raise ValueError(
+                "sweep='categories' requires a label grid (value_by='label')"
+            )
+        reveal_t, n_categories = _reveal_t_categories(grid, present, report)
+
+    # Resolve the fill duration. In 'categories' mode default to ~1s per label
+    # group (dominant → least) unless the caller passed an explicit duration.
+    if duration is None:
+        if sweep == "categories":
+            spc = seconds_per_category
+            if spc is None:
+                spc = getattr(
+                    settings, "DEFAULT_ANIM_SECONDS_PER_CATEGORY", 1.0
+                )
+            duration = max(1, n_categories) * spc
+        else:
+            duration = getattr(settings, "DEFAULT_ANIM_DURATION", 5.0)
 
     fig = plt.figure(figsize=figsize)
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1.35])
@@ -241,6 +381,15 @@ def animate_ortho_grid(
         ))
     if title is not None:
         ax_left.set_title(title)
+
+    # Optional moving scan line that tracks the (column) reveal frontier and
+    # trails the classified cells behind it — a "sensor sweeping live" cue.
+    scanline = None
+    if sweep == "scan":
+        scanline = ax_left.axvline(
+            extent[0], color="#00e5ff", linewidth=2.0, alpha=0.9, zorder=4,
+        )
+
     # Match OrthoGrid.show()'s layout: reserve room for the legend below the
     # left panel and make the right (count) panel the same height as the
     # equal-aspect left panel.
@@ -267,7 +416,13 @@ def animate_ortho_grid(
             p = f / (n_frames - 1)
         im.set_data(cell_rgba(present & (reveal_t <= p)))
         draw_side(p)
-        return [im, *bars]
+        artists = [im, *bars]
+        if scanline is not None:
+            xf = extent[0] + p * (extent[1] - extent[0])
+            scanline.set_xdata([xf, xf])
+            scanline.set_visible(p < 1.0)   # hide once the fill completes
+            artists.append(scanline)
+        return artists
 
     anim = FuncAnimation(
         fig, update, frames=total_frames,

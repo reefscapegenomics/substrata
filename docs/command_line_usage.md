@@ -248,7 +248,9 @@ OTHER  #999999
 - `--fit-grid` (recommended, point-cloud independent): recovers the generation lattice directly from the intercepts by scanning the sub-cell origin offset for the best one-point-per-cell alignment (`measurements.get_bboxes_from_intercepts`). Robust and needs no point cloud. A small residual of empty cells remains — the irreducible effect of the intercept search radius nudging points across cell boundaries.
 - `--box-length`/`--box-width` (matching the values used by `intercepts`): reconstruct the exact generation grid by re-running the same deterministic optimal-box search on the point cloud and subdividing at `--grid-size`. This only reproduces the generation grid if it sees a bit-identical point cloud, so omit `--points` (decimation shifts the recovered box); `--fit-grid` is usually the safer choice. Use `--position [x,y]` to skip the box search when the box position was set manually, and `--step-size` to match a non-default search resolution.
 
-Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--label-colors FILE] [--title STR] [--hide-points] [--points N]`
+The animated GIF fills its cells column-by-column by default; `--animation-order` picks a different reveal order — `rows` (top-to-bottom raster), `scan` (columns with a moving scan line), `random` (cells pop in in random order), `spiral` (expand outward from the centre), or `categories` (reveal one label group at a time, most dominant first, ~1s per category — label grids only).
+
+Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--label-colors FILE] [--animation-order ORDER] [--title STR] [--hide-points] [--points N]`
 
 ```bash
 # Plot slope intercepts, applying the generation orientation
@@ -283,6 +285,9 @@ substrata intercepts-plot --intercepts topdown_intercepts.csv --output /tmp/grid
 
 # Manual label colors (unlisted labels collapse into OTHER)
 substrata intercepts-plot --fit-grid --label-colors label_colors.txt
+
+# Animate the GIF one label group at a time (dominant first, ~1s per category)
+substrata intercepts-plot --fit-grid --animation-order categories
 ```
 
 ## Point cloud alignment
