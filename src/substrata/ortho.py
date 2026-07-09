@@ -1490,7 +1490,7 @@ class OrthoGrid:
         show_pcd: bool = True,
         title: Optional[str] = None,
         label_colors: Optional[dict] = None,
-        figsize: Tuple[int, int] = (12, 5),
+        figsize: Tuple[float, float] = (18, 7.5),
     ):
         """Render the grid as a matplotlib Figure with a side panel.
 
@@ -1516,7 +1516,7 @@ class OrthoGrid:
         import matplotlib.patches as mpatches
 
         fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
+        gs = fig.add_gridspec(1, 2, width_ratios=[3, 1.35])
         ax_left = fig.add_subplot(gs[0, 0])
         ax_left.set_aspect("equal")
         ax_right = fig.add_subplot(gs[0, 1])
@@ -1552,7 +1552,7 @@ class OrthoGrid:
         if title is not None:
             ax_left.set_title(title)
 
-        plt.tight_layout()
+        fig.tight_layout(w_pad=0.5)
         try:
             left_pos = ax_left.get_position()
             right_pos = ax_right.get_position()
@@ -1563,11 +1563,22 @@ class OrthoGrid:
             pass
         return fig
 
-    def _show_continuous(self, ax_left, ax_right, cmap, plt) -> None:
-        """Colormapped raster + value histogram."""
+    def _report_values(self) -> np.ndarray:
+        """Finite per-cell values inside the reporting area (continuous mode)."""
+        return self.values[self.report_mask & ~np.isnan(self.values)]
+
+    def _continuous_scale(self, cmap=None):
+        """Return ``(cmap_obj, norm)`` for continuous modes.
+
+        vmin/vmax are taken from the reporting-area cells (falling back to all
+        finite cells) so the colour scale focuses on the reported region.
+        Shared by :meth:`_show_continuous` and the animation module.
+        """
+        import matplotlib.pyplot as plt
+
         vals = self.values
         finite = vals[~np.isnan(vals)]
-        rep = vals[self.report_mask & ~np.isnan(vals)]
+        rep = self._report_values()
         scale_src = rep if rep.size else finite
         if scale_src.size:
             vmin, vmax = float(scale_src.min()), float(scale_src.max())
@@ -1575,9 +1586,33 @@ class OrthoGrid:
             vmin, vmax = 0.0, 1.0
         if vmin == vmax:
             vmax = vmin + 1e-6
+        return plt.get_cmap(cmap or "viridis"), plt.Normalize(vmin=vmin, vmax=vmax)
 
-        cmap_obj = plt.get_cmap(cmap or "viridis")
-        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    def _resolve_label_colors(self, label_colors=None):
+        """Return ``(label_colors, labels_present)`` for label mode.
+
+        Assigns a distinct ``tab20`` colour per present label unless an explicit
+        map is supplied. Shared by :meth:`_show_label` and the animation module
+        so the two produce identical colours.
+        """
+        import matplotlib.pyplot as plt
+
+        labels_present = sorted(
+            {lbl for lbl in self.cell_labels.ravel() if lbl is not None}
+        )
+        if label_colors is None:
+            label_colors = self.label_colors
+        if label_colors is None:
+            cmap = plt.get_cmap("tab20")
+            label_colors = {
+                lbl: cmap(i % 20) for i, lbl in enumerate(labels_present)
+            }
+        return label_colors, labels_present
+
+    def _show_continuous(self, ax_left, ax_right, cmap, plt) -> None:
+        """Colormapped raster + value histogram."""
+        vals = self.values
+        cmap_obj, norm = self._continuous_scale(cmap)
         rgba = cmap_obj(norm(vals))
         rgba[np.isnan(vals)] = (0.0, 0.0, 0.0, 0.0)
         ax_left.imshow(rgba, extent=self.extent, origin="lower", zorder=1)
@@ -1591,6 +1626,7 @@ class OrthoGrid:
             fraction=0.046, pad=0.10, label=self._value_label(),
         )
 
+        rep = self._report_values()
         if rep.size:
             bins = int(np.clip(np.sqrt(rep.size), 5, 30))
             ax_right.hist(rep, bins=bins, color="0.5", edgecolor="0.3")
@@ -1599,16 +1635,7 @@ class OrthoGrid:
 
     def _show_label(self, ax_left, ax_right, label_colors, plt, mpatches) -> None:
         """Label-filled cells + per-label count bar chart."""
-        labels_present = sorted(
-            {lbl for lbl in self.cell_labels.ravel() if lbl is not None}
-        )
-        if label_colors is None:
-            label_colors = self.label_colors
-        if label_colors is None:
-            cmap = plt.get_cmap("tab20")
-            label_colors = {
-                lbl: cmap(i % 20) for i, lbl in enumerate(labels_present)
-            }
+        label_colors, labels_present = self._resolve_label_colors(label_colors)
 
         no_data = (0.7, 0.7, 0.7)
         rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
@@ -1635,7 +1662,7 @@ class OrthoGrid:
             mpatches.Patch(facecolor=no_data, edgecolor="none", label="No data")
         )
         ax_left.legend(
-            handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.05),
+            handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.16),
             ncol=min(len(handles), 6), frameon=False,
         )
 
