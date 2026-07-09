@@ -1129,7 +1129,7 @@ def handle_intercepts_plot(args):
             f"{grid.info.get('multi')} multi-occupancy."
         )
     fig = grid.show(
-        show_context=getattr(args, "show_points", True),
+        show_pcd=getattr(args, "show_points", True),
         title=getattr(args, "title", None),
     )
     out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")

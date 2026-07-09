@@ -184,6 +184,22 @@ class TestOrthoGridShow(unittest.TestCase):
         fig = og.show(title="labels")
         self.assertEqual(type(fig).__name__, "Figure")
 
+    def test_show_pcd_widens_view_to_full_cloud(self):
+        # Annotations occupy only the [0,1] corner; the cloud spans [0,4].
+        pc = _ramp_pc()
+        anns = _Container([_Ann([0.3, 0.3, 0.0], "coral"),
+                           _Ann([0.6, 0.6, 0.0], "algae")])
+        og = ortho.OrthoGrid(annotations=anns, pcd=pc, value_by="label",
+                             cell_size=0.5)
+        # Grid lattice covers only the annotation corner.
+        self.assertLess(og.extent[1], 1.5)
+        # show_pcd=True widens the axes to the full cloud extent (~4).
+        ax = og.show(show_pcd=True).axes[0]
+        self.assertGreater(ax.get_xlim()[1], 3.5)
+        # show_pcd=False clips to the grid extent.
+        ax2 = og.show(show_pcd=False).axes[0]
+        self.assertLess(ax2.get_xlim()[1], 1.5)
+
 
 def _count_color(img, rgb):
     arr = np.asarray(img)

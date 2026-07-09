@@ -1254,37 +1254,47 @@ class OrthoGrid:
         return [self.x0, self.x0 + self.nx * cs,
                 self.y0, self.y0 + self.ny * cs]
 
-    def _draw_context(self, ax) -> None:
-        """Draw a faded grayscale OrthoMap of ``pcd`` behind the grid."""
+    def _draw_context(self, ax) -> Optional[list]:
+        """Draw a faded grayscale OrthoMap of ``pcd`` behind the grid.
+
+        Returns the full point-cloud extent ``[x0, x1, y0, y1]`` that was
+        drawn (so the caller can widen the axes to it), or ``None`` when no
+        point cloud is available.
+        """
         if self.pcd is None:
-            return
+            return None
         try:
             om = OrthoMap(self.pcd, up_vector=self._up_vector)
         except Exception:  # pragma: no cover - context is best-effort
-            return
+            return None
         gray = np.asarray(om.image, dtype=float).mean(axis=2) / 255.0
         ext = [om.origin[0], om.origin[0] + om.width * om.resolution,
                om.origin[1], om.origin[1] + om.height * om.resolution]
         ax.imshow(gray, cmap="gray", extent=ext, origin="upper",
                   alpha=0.4, zorder=0, vmin=0.0, vmax=1.0)
+        return ext
 
     def show(
         self,
         cmap: Optional[str] = None,
-        show_context: bool = True,
+        show_pcd: bool = True,
         title: Optional[str] = None,
         label_colors: Optional[dict] = None,
         figsize: Tuple[int, int] = (12, 5),
     ):
         """Render the grid as a matplotlib Figure with a side panel.
 
-        Left: the colormapped raster (continuous) or label-filled cells; the
-        reporting bbox is outlined. Right: a histogram of report-cell values
-        (continuous) or a bar chart of per-label cell counts (label mode).
+        Left: the whole point cloud (faded grayscale) with the grid cells
+        overlaid — the colormapped raster (continuous) or label-filled cells;
+        the reporting bbox is outlined. Right: a histogram of report-cell
+        values (continuous) or a bar chart of per-label cell counts (label
+        mode).
 
         Args:
             cmap: Matplotlib colormap for continuous modes (default viridis).
-            show_context: Draw a faded grayscale ``pcd`` behind the grid.
+            show_pcd: Show the entire point cloud (faded grayscale) behind the
+                grid and widen the view to its full extent. Set ``False`` to
+                show only the grid (clipped to the grid extent).
             title: Optional left-panel title.
             label_colors: Optional ``{label: color}`` map (label mode).
             figsize: Figure size in inches.
@@ -1301,15 +1311,21 @@ class OrthoGrid:
         ax_left.set_aspect("equal")
         ax_right = fig.add_subplot(gs[0, 1])
 
-        if show_context:
-            self._draw_context(ax_left)
+        pcd_extent = self._draw_context(ax_left) if show_pcd else None
 
         if self.value_by == "label":
             self._show_label(ax_left, ax_right, label_colors, plt, mpatches)
         else:
             self._show_continuous(ax_left, ax_right, cmap, plt)
 
+        # View the full point cloud (union of its extent and the grid) when the
+        # cloud is shown; otherwise clip to the grid extent.
         ext = self.extent
+        if pcd_extent is not None:
+            ext = [
+                min(ext[0], pcd_extent[0]), max(ext[1], pcd_extent[1]),
+                min(ext[2], pcd_extent[2]), max(ext[3], pcd_extent[3]),
+            ]
         ax_left.set_xlim(ext[0], ext[1])
         ax_left.set_ylim(ext[2], ext[3])
 
