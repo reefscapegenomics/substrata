@@ -512,8 +512,8 @@ class OrthoMap:
                 outline=outline,
             )
 
+    @staticmethod
     def _resolve_marker_style(
-        self,
         coords: np.ndarray,
         labels: list,
         groups: list,
@@ -1518,6 +1518,17 @@ class OrthoGrid:
         figsize: Tuple[float, float] = (18, 7.5),
         robust: bool = False,
         robust_percentiles: Tuple[float, float] = (2.0, 98.0),
+        highlights: Optional[
+            Union["Annotation", "Annotations", List[np.ndarray], np.ndarray]
+        ] = None,
+        color_by: Optional[str] = "auto",
+        fill_by_group: bool = False,
+        point_size: float = 5,
+        point_size_metres: Optional[float] = None,
+        point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
+        point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
+        point_shape: str = "circle",
+        highlight_label_colors: Optional[dict] = None,
     ):
         """Render the grid as a matplotlib Figure with a side panel.
 
@@ -1541,6 +1552,31 @@ class OrthoGrid:
                 Default ``False`` (exact min/max).
             robust_percentiles: ``(low, high)`` percentiles used when
                 ``robust=True``.
+            highlights: Optional annotation points to scatter over the map, in
+                every mode. Accepts an ``Annotation``, an ``Annotations`` /
+                ``Cameras`` container (any object with a ``.data`` mapping of
+                items exposing ``.coords`` and optionally ``.label``/``.group``),
+                an ``(N, 3)`` array, or a list of 3-vectors — same as
+                :meth:`OrthoMap.show`.
+            color_by: Per-point marker colouring. ``"auto"`` (default) colours
+                by label when the highlights carry any labels — matching
+                ``Annotations.show(pcd, color=True)`` — otherwise falls back to
+                *point_color*. ``"label"`` forces a distinct ``tab20`` colour per
+                label; ``"z"`` maps height through ``bwr``; ``None`` forces a
+                single *point_color*.
+            fill_by_group: Draw markers filled/hollow by the even/odd index of
+                their ``group``.
+            point_size: Marker radius in display points (ignored when
+                *point_size_metres* is set).
+            point_size_metres: Marker diameter in metres — drawn to scale in the
+                map's coordinates (takes precedence over *point_size*).
+            point_color: RGB fill for markers (``None`` for hollow), unless
+                *color_by* assigns per-point colours.
+            point_outline: RGB marker outline (``None`` to disable).
+            point_shape: ``"circle"`` or ``"square"``.
+            highlight_label_colors: Optional ``{label: (r, g, b)}`` map for
+                *color_by="label"* (distinct from *label_colors*, which colours
+                the cells in label mode).
 
         Returns:
             matplotlib.figure.Figure.
@@ -1584,6 +1620,15 @@ class OrthoGrid:
                 )
             )
 
+        if highlights is not None:
+            self._draw_highlights(
+                ax_left, mpatches, highlights,
+                color_by=color_by, fill_by_group=fill_by_group,
+                point_size=point_size, point_size_metres=point_size_metres,
+                point_color=point_color, point_outline=point_outline,
+                point_shape=point_shape, label_colors=highlight_label_colors,
+            )
+
         if title is not None:
             ax_left.set_title(title)
 
@@ -1597,6 +1642,71 @@ class OrthoGrid:
         except Exception:  # pragma: no cover
             pass
         return fig
+
+    def _draw_highlights(
+        self, ax, mpatches, highlights, color_by="auto", fill_by_group=False,
+        point_size=5, point_size_metres=None,
+        point_color=(255, 0, 0), point_outline=(0, 0, 0),
+        point_shape="circle", label_colors=None,
+    ) -> None:
+        """Scatter annotation points over the map (``ax``), styled like OrthoMap.
+
+        Reuses ``OrthoMap._extract_highlights`` / ``_resolve_marker_style`` for
+        coords and per-point colours, projects them into the grid frame via
+        ``self.rotation``, and draws with matplotlib. ``point_size_metres`` draws
+        markers to scale in map coordinates; otherwise ``point_size`` is a
+        display-point radius.
+        """
+        coords, labels, groups = OrthoMap._extract_highlights(highlights)
+        if len(coords) == 0:
+            return
+        # "auto": colour by label when any labels are present (like
+        # Annotations.show(color=True)), else use the fixed point_color.
+        if color_by == "auto":
+            color_by = "label" if any(lb is not None for lb in labels) else None
+        xy = (self.rotation @ coords.T).T[:, :2]
+
+        x0, x1, y0, y1 = self.extent
+        oob = (
+            (xy[:, 0] < x0) | (xy[:, 0] > x1)
+            | (xy[:, 1] < y0) | (xy[:, 1] > y1)
+        )
+        if oob.any():
+            logger.warning(
+                "%d highlight(s) outside the grid extent", int(oob.sum())
+            )
+
+        fills, outlines = OrthoMap._resolve_marker_style(
+            coords, labels, groups, color_by, label_colors, fill_by_group,
+            point_color, point_outline,
+        )
+
+        def _mpl(col):
+            return "none" if col is None else tuple(c / 255.0 for c in col[:3])
+
+        fills = [_mpl(c) for c in fills]
+        outlines = [_mpl(c) for c in outlines]
+
+        if point_size_metres is not None:
+            r = point_size_metres / 2.0
+            for (px, py), fc, ec in zip(xy, fills, outlines):
+                if point_shape == "square":
+                    patch = mpatches.Rectangle(
+                        (px - r, py - r), point_size_metres, point_size_metres,
+                        facecolor=fc, edgecolor=ec, linewidth=1.0, zorder=4,
+                    )
+                else:
+                    patch = mpatches.Circle(
+                        (px, py), r, facecolor=fc, edgecolor=ec,
+                        linewidth=1.0, zorder=4,
+                    )
+                ax.add_patch(patch)
+        else:
+            marker = "s" if point_shape == "square" else "o"
+            ax.scatter(
+                xy[:, 0], xy[:, 1], marker=marker, s=(2.0 * point_size) ** 2,
+                facecolors=fills, edgecolors=outlines, linewidths=1.0, zorder=4,
+            )
 
     @staticmethod
     def _scale_limits(scale_src, robust, pct):

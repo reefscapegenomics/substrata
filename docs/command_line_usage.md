@@ -232,12 +232,23 @@ Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority ann
 
 When the project point cloud can be found, it is loaded and oriented with the same transform as the annotations and scattered as a background behind the grid cells by default; pass `--hide-points` to disable that (use `--points`/`-n` to cap how many points are loaded).
 
+Each run writes three artifacts sharing the same width (1800 px): the static grid PNG (`<stem>_grid.png`, or `--output`), an animated GIF of the grid filling in cell by cell (`<stem>_grid.gif`), and a positions plot of the annotation markers over the point-cloud ortho map (`<stem>_positions.png`, rendered as `annotations.show(pcd, color=True)`). The positions plot is skipped with a warning when no point cloud is available.
+
+**Manual label colors (`--label-colors`):** supply a plain text file with one `label #hexcolor` per line (the label is everything before the last whitespace token, so labels may contain spaces) to override the automatic `tab20` palette. Any label not listed collapses into a single `OTHER` category; add an `OTHER #hex` row to set its color (default `#999999`). The colors apply consistently to the grid cells/legend, the animation, and the positions markers. Example file:
+
+```
+Coral  #e6194b
+Sand   #f0e442
+Algae  #3cb44b
+OTHER  #999999
+```
+
 **Older intercepts files without a saved `grid_bbox`:** because each intercept is sampled at a random position *within* its generation cell, deriving a fresh grid from the annotation extent phase-misaligns with the generation grid and produces spurious empty ("No data") cells (and doubled-up cells). Two recovery options:
 
 - `--fit-grid` (recommended, point-cloud independent): recovers the generation lattice directly from the intercepts by scanning the sub-cell origin offset for the best one-point-per-cell alignment (`measurements.get_bboxes_from_intercepts`). Robust and needs no point cloud. A small residual of empty cells remains — the irreducible effect of the intercept search radius nudging points across cell boundaries.
 - `--box-length`/`--box-width` (matching the values used by `intercepts`): reconstruct the exact generation grid by re-running the same deterministic optimal-box search on the point cloud and subdividing at `--grid-size`. This only reproduces the generation grid if it sees a bit-identical point cloud, so omit `--points` (decimation shifts the recovered box); `--fit-grid` is usually the safer choice. Use `--position [x,y]` to skip the box search when the box position was set manually, and `--step-size` to match a non-default search resolution.
 
-Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--title STR] [--hide-points] [--points N]`
+Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--label-colors FILE] [--title STR] [--hide-points] [--points N]`
 
 ```bash
 # Plot slope intercepts, applying the generation orientation
@@ -269,6 +280,9 @@ substrata intercepts-plot --hide-points
 
 # Custom output path
 substrata intercepts-plot --intercepts topdown_intercepts.csv --output /tmp/grid.png
+
+# Manual label colors (unlisted labels collapse into OTHER)
+substrata intercepts-plot --fit-grid --label-colors label_colors.txt
 ```
 
 ## Point cloud alignment

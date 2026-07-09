@@ -121,13 +121,25 @@ class Annotations:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
-    def show(self, pcd: Any, color=False) -> Any:
+    def show(
+        self,
+        pcd: Any,
+        color=False,
+        label_colors: Optional[Dict[str, Any]] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ) -> Any:
         """Show annotation positions over a point-cloud ortho map.
 
         Args:
             pcd: Point cloud to draw as background.
             color: Draw the background in true colour when True; otherwise
                 (default) desaturate it to grey.
+            label_colors: Optional explicit ``{label: (r, g, b)}`` map
+                (0-255 RGB), overriding the automatic ``tab20`` per-label
+                colours.
+            width: Optional display width in pixels (aspect preserved).
+            height: Optional display height in pixels (aspect preserved).
 
         Returns:
             PIL.Image.Image: Top-down ortho map with annotation markers
@@ -139,19 +151,34 @@ class Annotations:
             highlights=self,
             color_by="label",
             grayscale=not color,
+            label_colors=label_colors,
+            width=width,
+            height=height,
         )
 
-    def show_position(self, pcd: Any, color=False) -> Any:
+    def show_position(
+        self,
+        pcd: Any,
+        color=False,
+        label_colors: Optional[Dict[str, Any]] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ) -> Any:
         """Alias of :meth:`show` — annotation positions over an ortho map.
 
         Args:
             pcd: Point cloud to draw as background.
             color: See :meth:`show`.
+            label_colors: See :meth:`show`.
+            width: See :meth:`show`.
+            height: See :meth:`show`.
 
         Returns:
             PIL.Image.Image: The rendered ortho map.
         """
-        return self.show(pcd, color=color)
+        return self.show(
+            pcd, color=color, label_colors=label_colors, width=width, height=height
+        )
 
     def append(self, annotation: "Annotation") -> None:
         if annotation.id in self.data:

@@ -50,6 +50,82 @@ def _get_output_filepath(init: ProjectInitializer, postfix: str):
     return os.path.join(init.path or os.getcwd(), f"{init.id}_{postfix}")
 
 
+def _parse_hex_color(s: str):
+    """Parse ``#rrggbb`` (or ``rrggbb``) into a 0-255 ``(r, g, b)`` tuple."""
+    h = s.strip().lstrip("#")
+    if len(h) != 6:
+        raise SystemExit(f"Invalid hex colour {s!r}; expected 6 hex digits.")
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        raise SystemExit(f"Invalid hex colour {s!r}; expected 6 hex digits.")
+
+
+def _load_label_colors(path: str):
+    """Load a manual label-colour file (``label  #hexcolor`` per line).
+
+    The label is everything up to the last whitespace-separated token, so
+    labels may contain spaces. Blank lines and ``#``-only comment lines are
+    skipped. A row whose label is ``OTHER`` (case-insensitive) sets the
+    catch-all colour for labels not otherwise listed (default ``#999999``).
+
+    Returns:
+        Tuple ``(allowed, pil_colors, mpl_colors)`` where ``allowed`` is the
+        set of listed labels (excluding ``OTHER``); ``pil_colors`` maps each
+        label plus ``"OTHER"`` to a 0-255 ``(r, g, b)`` tuple (for the PIL
+        ``OrthoMap`` path); and ``mpl_colors`` maps them to 0-1 tuples (for
+        the matplotlib ``OrthoGrid``/animation paths).
+    """
+    other_rgb = (0x99, 0x99, 0x99)
+    pil_colors = {}
+    allowed = []
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            # Skip blanks and full-line comments (a data line is "label #hex",
+            # whose label never starts with "#").
+            if not line or line.startswith("#"):
+                continue
+            parts = line.rsplit(None, 1)
+            if len(parts) != 2:
+                raise SystemExit(
+                    f"Invalid label-colour line {raw!r}; expected 'label #hex'."
+                )
+            label, hexcode = parts[0].strip(), parts[1]
+            rgb = _parse_hex_color(hexcode)
+            if label.upper() == "OTHER":
+                other_rgb = rgb
+                continue
+            pil_colors[label] = rgb
+            allowed.append(label)
+    pil_colors["OTHER"] = other_rgb
+    mpl_colors = {
+        lbl: tuple(c / 255.0 for c in rgb) for lbl, rgb in pil_colors.items()
+    }
+    return set(allowed), pil_colors, mpl_colors
+
+
+def _collapse_labels(anns, allowed):
+    """Reassign every annotation whose label is not in *allowed* to ``OTHER``.
+
+    Mutates ``anns`` in place so the grid majority-vote, its legend, the
+    animation, and the positions markers all agree. Mirrors ``_resolve_label``
+    in ``ortho`` (classifier result preferred, then ``ann.label``).
+    """
+    for ann in anns.data.values():
+        im = getattr(ann, "image_match", None)
+        cls = getattr(im, "classification", None)
+        if isinstance(cls, dict) and cls.get("label") is not None:
+            eff = str(cls["label"])
+        else:
+            lbl = getattr(ann, "label", None)
+            eff = str(lbl) if lbl not in (None, "") else None
+        if eff not in allowed:
+            ann.label = ann.classification = "OTHER"
+            if isinstance(cls, dict):
+                cls["label"] = "OTHER"
+
+
 def _parse_xyz_csv(s: str) -> list[float]:
     """Parse ``x,y,z`` into three floats."""
     parts = [p.strip() for p in s.split(",") if p.strip() != ""]
@@ -1053,6 +1129,17 @@ def handle_intercepts_plot(args):
     anns = Annotations(ann_path, orig_coords_only=True)
     anns.apply_transform(transform)
 
+    # Optional manual label colours. Any label not listed collapses into a
+    # single "OTHER" category (done before building the grid so the grid,
+    # animation, and positions plot all share the same labels/colours).
+    pil_label_colors = None
+    mpl_label_colors = None
+    if getattr(args, "label_colors", None):
+        allowed, pil_label_colors, mpl_label_colors = _load_label_colors(
+            args.label_colors
+        )
+        _collapse_labels(anns, allowed)
+
     # Optionally load the project point cloud for the background scatter. Apply
     # the same orientation as the annotations so the points stay aligned with
     # the axis-aligned grid. If it cannot be loaded, warn and continue without.
@@ -1128,13 +1215,55 @@ def handle_intercepts_plot(args):
             f"{grid.info.get('ny')} cells, {grid.info.get('empty')} empty / "
             f"{grid.info.get('multi')} multi-occupancy."
         )
+    show_pcd = getattr(args, "show_points", True)
+    title = getattr(args, "title", None)
     fig = grid.show(
-        show_pcd=getattr(args, "show_points", True),
-        title=getattr(args, "title", None),
+        show_pcd=show_pcd,
+        title=title,
+        label_colors=mpl_label_colors,
     )
     out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")
-    fig.savefig(out)
+    fig.savefig(out, dpi=100)
     print(f"Saved intercepts plot to {out}")
+
+    # Match the other outputs to the grid figure's width (default 1800 px).
+    target_w = int(round(fig.get_size_inches()[0] * fig.dpi))
+
+    # Animated GIF of the grid filling in (same name, .gif extension).
+    from substrata.animations import animate_ortho_grid
+
+    gif_out = os.path.splitext(out)[0] + ".gif"
+    animate_ortho_grid(
+        grid,
+        gif_out,
+        show_pcd=show_pcd,
+        title=title,
+        label_colors=mpl_label_colors,
+        loop=True,
+    )
+    print(f"Saved intercepts animation to {gif_out}")
+
+    # Positions plot exactly as annotations.show(pcd, color=True) renders it,
+    # named "<stem>_positions.png" and matched to the grid width. Requires the
+    # point cloud (the ortho map is rendered from it).
+    stem = os.path.splitext(out)[0]
+    if stem.endswith("_grid"):
+        stem = stem[: -len("_grid")]
+    pos_out = stem + "_positions.png"
+    if grid.pcd is not None:
+        img = grid.annotations.show(
+            grid.pcd,
+            color=True,
+            label_colors=pil_label_colors,
+            width=target_w,
+        )
+        img.save(pos_out)
+        print(f"Saved annotation positions to {pos_out}")
+    else:
+        print(
+            "Warning: no point cloud available; skipping the positions plot "
+            f"({pos_out})."
+        )
 
 
 def handle_align(args):
@@ -2868,6 +2997,20 @@ def main():
         type=str,
         default=None,
         help="Optional output PNG path (default: <intercepts_stem>_grid.png).",
+    )
+    p_intercepts_plot.add_argument(
+        "--label-colors",
+        "--label-colours",
+        dest="label_colors",
+        type=str,
+        default=None,
+        help=(
+            "Optional file of manual label colours, one 'label #hexcolor' per "
+            "line (e.g. 'Coral  #e6194b'). Labels not listed collapse into a "
+            "single 'OTHER' category; add an 'OTHER #hex' row to set its colour "
+            "(default #999999). Applies to the grid, the animation, and the "
+            "positions plot."
+        ),
     )
     p_intercepts_plot.add_argument(
         "--title",

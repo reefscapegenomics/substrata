@@ -10,3 +10,48 @@ Requires-Dist: numpy>=1.22
 # substrata
 
 [![Docs](https://readthedocs.org/projects/substrata/badge/?version=latest)](https://substrata.readthedocs.io/en/latest/)
+
+**substrata** is a Python package for 3-D geometry and point-cloud handling,
+built for coral-reef photogrammetry workflows. It turns the outputs of a
+structure-from-motion pipeline — dense point clouds, camera poses, and image
+annotations — into scaled, georeferenced models that you can measure and
+analyze.
+
+## Features
+
+- **Point clouds** — load, decimate, and stream very large PLY files without
+  holding them in memory (backed by Open3D).
+- **Cameras** — read Metashape camera poses and sensors, match images, extract
+  video frames, and time-sync cameras with depth logs.
+- **Annotations** — manage labeled features (e.g. individual corals) or generate
+  random/stratified point annotations, and move between 2-D image annotations
+  and 3-D coordinates to transfer annotations across overlapping reconstructions.
+- **Scaling & orientation** — recover real-world scale from scalebars and orient
+  a reconstruction into a world coordinate frame.
+- **Measurements** — terrain and ecology metrics: TPI/TRI, rugosity, fractal
+  dimension, surface area, gap fraction, and depth regression.
+- **Visualization** — composite views and QC report PDFs.
+
+A command-line tool (`substrata`) drives the most common workflows directly from
+a project directory.
+
+## Installation
+
+substrata depends on several native libraries (Open3D, OpenCV, PyTorch) that are
+installed with conda:
+
+```bash
+git clone https://github.com/reefscapegenomics/substrata.git
+cd substrata
+conda env create -f environment.yml
+conda activate substrata
+python -m pip install -e .
+```
+
+See the [installation guide](https://substrata.readthedocs.io/en/latest/installation.html)
+for details.
+
+## Documentation
+
+Full documentation — tutorials, command-line usage, and the API reference — is
+hosted at [substrata.readthedocs.io](https://substrata.readthedocs.io/en/latest/).

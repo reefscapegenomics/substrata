@@ -478,5 +478,80 @@ class TestOrthoGridShowRobust(unittest.TestCase):
         self.assertAlmostEqual(xhi, vmax, places=6)
 
 
+class TestOrthoGridHighlights(unittest.TestCase):
+    def _grid(self, **kw):
+        return ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0, **kw)
+
+    def _anns(self):
+        return _Container([_Ann([0.5, 0.5, 0.2], "a"),
+                           _Ann([2.5, 2.5, 0.6], "b")])
+
+    def test_scatter_added(self):
+        fig = self._grid().show(show_pcd=False, highlights=self._anns())
+        self.assertGreaterEqual(len(fig.axes[0].collections), 1)
+
+    def test_auto_colours_by_label(self):
+        # No color_by given: labelled points auto-colour by label (2 labels).
+        fig = self._grid().show(show_pcd=False, highlights=self._anns())
+        fc = fig.axes[0].collections[-1].get_facecolors()
+        uniq = {tuple(np.round(c, 3)) for c in fc}
+        self.assertGreaterEqual(len(uniq), 2)
+
+    def test_unlabelled_points_single_colour(self):
+        # No labels -> auto falls back to a single point_color.
+        pts = np.array([[0.5, 0.5, 0.0], [2.5, 2.5, 0.0]])
+        fig = self._grid().show(show_pcd=False, highlights=pts)
+        fc = fig.axes[0].collections[-1].get_facecolors()
+        uniq = {tuple(np.round(c, 3)) for c in fc}
+        self.assertEqual(len(uniq), 1)
+
+    def test_color_by_none_forces_single_colour(self):
+        # Explicit color_by=None ignores labels -> single colour.
+        fig = self._grid().show(
+            show_pcd=False, highlights=self._anns(), color_by=None
+        )
+        fc = fig.axes[0].collections[-1].get_facecolors()
+        uniq = {tuple(np.round(c, 3)) for c in fc}
+        self.assertEqual(len(uniq), 1)
+
+    def test_color_by_label_distinct(self):
+        fig = self._grid().show(
+            show_pcd=False, highlights=self._anns(), color_by="label"
+        )
+        fc = fig.axes[0].collections[-1].get_facecolors()
+        uniq = {tuple(np.round(c, 3)) for c in fc}
+        self.assertGreaterEqual(len(uniq), 2)
+
+    def test_point_size_metres_uses_patches(self):
+        import matplotlib.patches as mpatches
+        fig = self._grid().show(
+            show_pcd=False, highlights=self._anns(), point_size_metres=0.5,
+        )
+        circles = [p for p in fig.axes[0].patches
+                   if isinstance(p, mpatches.Circle)]
+        self.assertEqual(len(circles), 2)
+        fig2 = self._grid().show(
+            show_pcd=False, highlights=self._anns(),
+            point_size_metres=0.5, point_shape="square",
+        )
+        rects = [p for p in fig2.axes[0].patches
+                 if isinstance(p, mpatches.Rectangle)]
+        self.assertGreaterEqual(len(rects), 2)
+
+    def test_out_of_bounds_warns(self):
+        anns = _Container([_Ann([100.0, 100.0, 0.0], "x")])
+        with self.assertLogs("substrata.ortho", level="WARNING") as cm:
+            self._grid().show(show_pcd=False, highlights=anns)
+        self.assertTrue(
+            any("outside the grid extent" in m for m in cm.output)
+        )
+
+    def test_overlay_in_label_mode(self):
+        anns = _Container([_Ann([0.5, 0.5, 0.0], "coral")])
+        og = ortho.OrthoGrid(annotations=anns, value_by="label", cell_size=1.0)
+        fig = og.show(show_pcd=False, highlights=anns)
+        self.assertGreaterEqual(len(fig.axes[0].collections), 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
