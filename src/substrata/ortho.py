@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Standard Library
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 # Third-Party Libraries
 import numpy as np
@@ -822,6 +822,20 @@ def _resolve_label(ann) -> Optional[str]:
     return str(lbl) if lbl not in (None, "") else None
 
 
+def _optional_point_array(pcd, attr: str) -> Optional[np.ndarray]:
+    """Return ``pcd.<attr>`` as an ``(N, k)`` array, or ``None`` if absent/empty.
+
+    Point clouds may lack colours or normals; open3d exposes them as
+    (possibly empty) buffers. Duck-typed so ``ortho`` needs no point-cloud
+    import.
+    """
+    try:
+        arr = np.asarray(getattr(pcd, attr))
+    except Exception:  # pragma: no cover - attribute missing or unconvertible
+        return None
+    return arr if arr.size else None
+
+
 class OrthoGrid:
     """A metre-cell grid over a point cloud, reduced to a value per cell.
 
@@ -831,6 +845,9 @@ class OrthoGrid:
     - ``value_by="z"``   — height (DEM); ``agg`` in mean/median/max/min.
     - ``value_by="count"`` / ``"density"`` — points per cell / per m².
     - ``value_by="label"`` — majority annotation label per cell.
+    - ``value_by="custom"`` — run a :mod:`substrata.measurements` function
+      (``measurement``) on each cell's own points and take one output scalar
+      (``metric``); e.g. ``measurement=calc_roughness, metric="Ra"``.
 
     The lattice spans the full extent of the reduced data ("grid everywhere").
     A single ``bbox`` (or a set of ``intercepts`` from which one is derived)
@@ -853,6 +870,17 @@ class OrthoGrid:
         info: Diagnostics dict (populated when built from intercepts).
     """
 
+    # Default output key per recognised measurement for ``value_by="custom"``.
+    # Keyed by ``measurement.__name__``; used when *metric* is not given.
+    _CUSTOM_METRIC_DEFAULTS = {
+        "calc_roughness": "Ra",
+        "get_dev_rugosity": "dev_rug",
+        "get_vector_dispersion": "vector_disp",
+        "get_plane_angles": "theta",
+        "get_rgb_stats": "luminance",
+        "calc_tpi_and_tri": "tpi_abs",
+    }
+
     def __init__(
         self,
         pcd=None,
@@ -864,14 +892,19 @@ class OrthoGrid:
         intercepts=None,
         up_vector: Optional[Union[List[float], np.ndarray]] = None,
         label_colors: Optional[dict] = None,
+        measurement: Optional[Callable] = None,
+        metric: Optional[str] = None,
+        neighborhood_scale: float = 1.0,
+        value_label: Optional[str] = None,
     ) -> None:
         """Build the grid and reduce every cell.
 
         Args:
-            pcd: Point cloud (for ``z``/``count``/``density`` and the context
-                background).
+            pcd: Point cloud (for ``z``/``count``/``density``/``custom`` and the
+                context background).
             annotations: Annotations (required for ``value_by="label"``).
-            value_by: ``"z"`` | ``"count"`` | ``"density"`` | ``"label"``.
+            value_by: ``"z"`` | ``"count"`` | ``"density"`` | ``"label"`` |
+                ``"custom"``.
             agg: Aggregation for ``value_by="z"`` — mean/median/max/min.
             cell_size: Cell side in metres (default
                 ``settings.DEFAULT_ORTHO_CELL_SIZE``).
@@ -882,19 +915,64 @@ class OrthoGrid:
                 :meth:`_fit_grid_from_intercepts`.
             up_vector: Projection up (default top-down z).
             label_colors: Optional ``{label: rgb}`` map for label mode.
+            measurement: For ``value_by="custom"`` — a measurement function from
+                :mod:`substrata.measurements` (e.g. ``calc_roughness``). It is
+                run on each cell's own points (a ``SimplePointCloud`` built from
+                the points that fall in the cell) via
+                :meth:`substrata.annotations.Annotation.measure`, and the scalar
+                named by *metric* becomes the cell value. Only measurements that
+                operate on the neighbourhood cloud are supported (roughness,
+                dev-rugosity, vector-dispersion, plane-angles, RGB stats, TPI/
+                TRI); camera-/model-based ones (gap fraction, mask surface area,
+                benthic fraction) are not.
+            metric: Which output key of *measurement* to use as the cell value
+                (e.g. ``"Ra"`` or ``"Rq"`` for ``calc_roughness``). Defaults to a
+                sensible per-measurement key.
+            neighborhood_scale: For ``value_by="custom"`` — widen the per-cell
+                sampling window to a square of side
+                ``cell_size * neighborhood_scale`` centred on the cell (``1.0``
+                = exactly the cell; ``2.0`` = a 2×2-cell square). Must be
+                ``>= 1.0``. Larger values borrow neighbouring points for a more
+                robust fit on sparse grids.
+            value_label: Optional colorbar/axis label (defaults to *metric* in
+                custom mode).
         """
         if bbox is not None and intercepts is not None:
             raise ValueError("Provide either bbox or intercepts, not both")
-        if value_by not in ("z", "count", "density", "label"):
+        if value_by not in ("z", "count", "density", "label", "custom"):
             raise ValueError(f"invalid value_by: {value_by!r}")
         if agg not in ("mean", "median", "max", "min"):
             raise ValueError(f"invalid agg: {agg!r}")
+
+        if value_by == "custom":
+            if pcd is None:
+                raise ValueError("value_by='custom' requires a point cloud (pcd)")
+            if not callable(measurement):
+                raise ValueError(
+                    "value_by='custom' requires a callable measurement function"
+                )
+            if neighborhood_scale < 1.0:
+                raise ValueError("neighborhood_scale must be >= 1.0")
+            if metric is None:
+                metric = self._CUSTOM_METRIC_DEFAULTS.get(
+                    getattr(measurement, "__name__", None)
+                )
+                if metric is None:
+                    raise ValueError(
+                        "metric could not be inferred for measurement "
+                        f"{getattr(measurement, '__name__', measurement)!r}; "
+                        "pass metric explicitly"
+                    )
 
         self.value_by = value_by
         self.agg = agg
         self.pcd = pcd
         self.annotations = annotations
         self.label_colors = label_colors
+        self.measurement = measurement
+        self.metric = metric
+        self.neighborhood_scale = float(neighborhood_scale)
+        self.value_label = value_label
         self.info: dict = {}
 
         if cell_size is None:
@@ -916,9 +994,17 @@ class OrthoGrid:
 
         # Projected point coordinates (rotated frame).
         pts_xy = pts_z = None
+        self._world_points = self._world_colors = self._world_normals = None
         if pcd is not None and len(np.asarray(pcd.points)):
-            proj = (self.rotation @ np.asarray(pcd.points, dtype=float).T).T
+            world_pts = np.asarray(pcd.points, dtype=float)
+            proj = (self.rotation @ world_pts.T).T
             pts_xy, pts_z = proj[:, :2], proj[:, 2]
+            if value_by == "custom":
+                # Keep the world-frame arrays so per-cell neighbourhoods can be
+                # sliced out for the measurement (see _reduce_custom).
+                self._world_points = world_pts
+                self._world_colors = _optional_point_array(pcd, "colors")
+                self._world_normals = _optional_point_array(pcd, "normals")
 
         # Projected annotation coordinates + labels.
         ann_src = annotations if annotations is not None else intercepts
@@ -980,6 +1066,8 @@ class OrthoGrid:
         self.cell_labels = None
         if value_by == "label":
             self._reduce_label(ann_xy, ann_labels)
+        elif value_by == "custom":
+            self._reduce_custom(pts_xy, pts_z)
         else:
             self._reduce_continuous(pts_xy, pts_z)
         self._build_report_mask()
@@ -1040,6 +1128,126 @@ class OrthoGrid:
             self.values[self.present] = self.counts[self.present] / area
         else:  # value_by == "z"
             self._reduce_z(flat, z, nx, ny)
+
+    def _reduce_custom(self, pts_xy, pts_z) -> None:
+        """Run ``self.measurement`` on each cell's points into ``self.values``.
+
+        Every occupied cell's own points — optionally widened to a square
+        window of side ``cell_size * neighborhood_scale`` centred on the cell —
+        are wrapped in a ``SimplePointCloud`` and handed to the measurement
+        function (via a synthetic ``Annotation``); the scalar named by
+        ``self.metric`` becomes the cell value. Cells that fail (too few points,
+        etc.) are left ``NaN``.
+        """
+        ny, nx = self.ny, self.nx
+        self.counts = np.zeros((ny, nx), dtype=np.int64)
+        self.values = np.full((ny, nx), np.nan, dtype=float)
+        if pts_xy is None or len(pts_xy) == 0:
+            self.present = self.counts > 0
+            return
+
+        ix, iy, ok = self._cell_index(pts_xy)
+        idx_all = np.nonzero(ok)[0]  # parent point indices that fall in-grid
+        ix, iy = ix[ok], iy[ok]
+        flat = iy * nx + ix
+        np.add.at(self.counts.ravel(), flat, 1)
+        self.present = self.counts > 0
+
+        # Group parent point indices by flat cell id (single sort).
+        order = np.argsort(flat, kind="stable")
+        flat_sorted, idx_sorted = flat[order], idx_all[order]
+        uniq, first, counts = np.unique(
+            flat_sorted, return_index=True, return_counts=True
+        )
+        cell_members = {
+            int(u): idx_sorted[f:f + c] for u, f, c in zip(uniq, first, counts)
+        }
+
+        cs = self.cell_size
+        half = cs * self.neighborhood_scale / 2.0
+        r = int(np.ceil(half / cs - 0.5)) if self.neighborhood_scale > 1.0 else 0
+
+        occ = np.argwhere(self.present)
+        fails = 0
+        for jy, jx in tqdm(
+            occ,
+            desc="OrthoGrid custom ({})".format(
+                getattr(self.measurement, "__name__", "measurement")
+            ),
+            disable=len(occ) == 0,
+        ):
+            jy, jx = int(jy), int(jx)
+            cx = self.x0 + (jx + 0.5) * cs
+            cy = self.y0 + (jy + 0.5) * cs
+            own = cell_members.get(jy * nx + jx)
+            if r == 0:
+                member_idx = own
+            else:
+                member_idx = self._window_members(
+                    cell_members, jy, jx, r, nx, ny, pts_xy, cx, cy, half
+                )
+            z_cell = (
+                float(np.mean(pts_z[own])) if own is not None and len(own) else 0.0
+            )
+            center_world = self.rotation.T @ np.array([cx, cy, z_cell])
+            try:
+                self.values[jy, jx] = self._measure_cell(member_idx, center_world)
+            except Exception as exc:  # keep going; a bad cell is just NaN
+                fails += 1
+                logger.debug("custom cell (%d,%d) failed: %s", jx, jy, exc)
+        if fails:
+            logger.warning(
+                "value_by='custom': %d/%d cells failed the measurement",
+                fails, len(occ),
+            )
+
+    @staticmethod
+    def _window_members(cell_members, jy, jx, r, nx, ny, pts_xy, cx, cy, half):
+        """Parent point indices inside the square window around cell (jy, jx).
+
+        Gathers candidates from the surrounding ``(2r+1)²`` bin block, then
+        applies an exact Chebyshev-distance mask so the window is precisely a
+        square of half-side ``half`` centred on ``(cx, cy)``.
+        """
+        parts = [
+            cell_members[by * nx + bx]
+            for by in range(max(0, jy - r), min(ny, jy + r + 1))
+            for bx in range(max(0, jx - r), min(nx, jx + r + 1))
+            if (by * nx + bx) in cell_members
+        ]
+        if not parts:
+            return None
+        cand = np.concatenate(parts)
+        pxy = pts_xy[cand]
+        keep = (np.abs(pxy[:, 0] - cx) <= half) & (np.abs(pxy[:, 1] - cy) <= half)
+        return cand[keep]
+
+    def _measure_cell(self, idx, center_world):
+        """Measure one cell's neighbourhood, returning the ``self.metric`` scalar.
+
+        Builds a ``SimplePointCloud`` from the parent cloud's ``idx`` points
+        (world frame) and runs ``self.measurement`` through a synthetic
+        ``Annotation`` so the measurement's output-key mapping is reused.
+        Returns ``NaN`` when there are no points or the metric is absent.
+        """
+        if idx is None or len(idx) == 0:
+            return np.nan
+        from substrata import pointclouds
+        from substrata.annotations import Annotation
+
+        colors = None if self._world_colors is None else self._world_colors[idx]
+        normals = None if self._world_normals is None else self._world_normals[idx]
+        simple = pointclouds.SimplePointCloud(
+            self._world_points[idx], colors, normals
+        )
+        ann = Annotation(coords=np.asarray(center_world, dtype=float))
+        # Half the cell diagonal — a sensible inner radius for location-anchored
+        # measurements (e.g. TPI); unused by neighbourhood-only measurements.
+        ann.radius = self.cell_size * np.sqrt(2.0) / 2.0
+        ann.simple_pcd = simple
+        ann.measure(self.measurement, generate_image=False)
+        val = ann.measurements.get(self.metric)
+        return float(val) if val is not None else np.nan
 
     def _reduce_z(self, flat, z, nx, ny) -> None:
         """Per-cell z aggregation into ``self.values``."""
@@ -1241,6 +1449,8 @@ class OrthoGrid:
     # ------------------------------------------------------------------
 
     def _value_label(self) -> str:
+        if self.value_by == "custom":
+            return self.value_label or self.metric or "value"
         return {
             "z": "z (m)",
             "count": "count",
@@ -1409,8 +1619,11 @@ class OrthoGrid:
 
         sm = plt.cm.ScalarMappable(cmap=cmap_obj, norm=norm)
         sm.set_array([])
+        # Horizontal colorbar beneath the map (left-to-right), so the left plot
+        # keeps the full column width — matching the label-mode layout.
         ax_left.figure.colorbar(
-            sm, ax=ax_left, fraction=0.046, pad=0.04, label=self._value_label()
+            sm, ax=ax_left, orientation="horizontal", location="bottom",
+            fraction=0.046, pad=0.10, label=self._value_label(),
         )
 
         rep = self._report_values()
