@@ -1065,9 +1065,18 @@ def handle_intercepts_plot(args):
             print(f"Warning: could not load point cloud {pcd_path}: {exc}")
             pcd = None
 
-    # If the YAML carries the exact generation grid, replay those cells at the
-    # requested cell size (aligned to the true origin); else derive a grid from
-    # the annotation extent.
+    # Determine the grid cells, in order of preference:
+    #   1. The exact generation grid stored in the YAML (grid_bbox), replayed at
+    #      the requested cell size and aligned to the true origin.
+    #   2. Reconstruct the generation grid by re-running the same deterministic
+    #      box search as `intercepts` on the oriented point cloud (for older
+    #      files that predate grid_bbox). Requires --box-length/--box-width and
+    #      the point cloud. This reproduces the exact cells because
+    #      find_optimal_box_position is a pure histogram/convolution over the
+    #      same points, so the sub-cell-jittered intercepts land back in their
+    #      own cells (avoiding the phantom "No data" cells from a re-derived,
+    #      phase-misaligned grid).
+    #   3. Otherwise derive a grid from the annotation extent.
     bboxes = None
     if grid_bbox is not None:
         try:
@@ -1077,6 +1086,61 @@ def handle_intercepts_plot(args):
                 f"Warning: grid_bbox is not divisible by --grid-size {args.grid_size}; "
                 "deriving the grid from the annotation extent instead."
             )
+
+    # Fit the grid directly from the intercepts (point-cloud independent): scan
+    # the sub-cell origin offset for the best one-point-per-cell alignment. This
+    # is the most robust option for older files lacking grid_bbox.
+    if bboxes is None and getattr(args, "fit_grid", False):
+        bboxes, info = measurements.get_bboxes_from_intercepts(
+            anns, args.grid_size, return_info=True
+        )
+        print(
+            f"Fitted grid from intercepts: {info.get('nx')}x{info.get('ny')} cells, "
+            f"offset {info.get('offset')}, {info.get('empty')} empty / "
+            f"{info.get('multi')} multi-occupancy."
+        )
+
+    if (
+        bboxes is None
+        and getattr(args, "box_length", None)
+        and getattr(args, "box_width", None)
+    ):
+        if pcd is None:
+            print(
+                "Warning: --box-length/--box-width given but no point cloud could "
+                "be loaded; falling back to the annotation extent for the grid."
+            )
+        else:
+            if getattr(args, "points", None):
+                print(
+                    "Warning: the point cloud was decimated (--points); the "
+                    "reconstructed box may shift relative to generation. Omit "
+                    "--points for an exact grid reconstruction."
+                )
+            if getattr(args, "position", None):
+                # Manual top-left [x, y] (mirrors `intercepts --position`).
+                pos = ast.literal_eval(args.position)
+                x_tl, y_tl = float(pos[0]), float(pos[1])
+                optimal_bbox = [
+                    [x_tl, y_tl],
+                    [x_tl + args.box_length, y_tl + args.box_width],
+                ]
+            else:
+                optimal_bbox = measurements.find_optimal_box_position(
+                    pcd,
+                    box_length=args.box_length,
+                    box_width=args.box_width,
+                    step_size=getattr(args, "step_size", 0.1),
+                    vis=False,
+                )
+            try:
+                bboxes = measurements.subdivide_boxes(optimal_bbox, args.grid_size)
+            except ValueError:
+                print(
+                    f"Warning: reconstructed box is not divisible by --grid-size "
+                    f"{args.grid_size}; deriving the grid from the annotation "
+                    "extent instead."
+                )
 
     fig = visualizations.show_classified_grid_cells(
         anns,
@@ -2760,6 +2824,60 @@ def main():
         type=float,
         default=0.2,
         help="Grid cell size in meters (default: 0.2).",
+    )
+    p_intercepts_plot.add_argument(
+        "--fit-grid",
+        dest="fit_grid",
+        action="store_true",
+        help=(
+            "Recover the generation grid directly from the intercepts (no point "
+            "cloud needed) by fitting the sub-cell origin for the best "
+            "one-point-per-cell alignment. Most robust option for older files "
+            "without a saved grid_bbox."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--box-length",
+        dest="box_length",
+        type=float,
+        default=None,
+        help=(
+            "Reconstruct the exact generation grid (for older intercepts files "
+            "without a saved grid_bbox) by re-running the optimal-box search on "
+            "the point cloud with this rectangle length in meters. Requires "
+            "--box-width. Must match the value used by `intercepts`."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--box-width",
+        dest="box_width",
+        type=float,
+        default=None,
+        help=(
+            "Rectangle width in meters for grid reconstruction (see "
+            "--box-length). Must match the value used by `intercepts`."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--position",
+        dest="position",
+        type=str,
+        default=None,
+        help=(
+            "Manual top-left [x,y] for grid reconstruction (skips the optimal-box "
+            "search); mirrors `intercepts --position`. Use only with "
+            "--box-length/--box-width."
+        ),
+    )
+    p_intercepts_plot.add_argument(
+        "--step-size",
+        dest="step_size",
+        type=float,
+        default=0.1,
+        help=(
+            "Grid resolution in meters for the optimal-box search during "
+            "reconstruction (default: 0.1; match `intercepts`)."
+        ),
     )
     p_intercepts_plot.add_argument(
         "--output",

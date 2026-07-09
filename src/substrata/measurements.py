@@ -173,7 +173,7 @@ def get_best_fit_plane_ransac(
     return a, b, c, d, inliers_idx
 
 
-def get_plane_angles(pcd, vis=False):
+def get_plane_angles(pcd, vis=False, generate_image=True):
     """Calculate orientation angles for the best-fit plane of a point cloud.
 
     The plane normal is aligned with the point cloud normals by
@@ -183,6 +183,9 @@ def get_plane_angles(pcd, vis=False):
     Args:
         pcd: Point cloud object with ``.points`` (and optionally ``.normals``).
         vis: If True, show an interactive 3-D visualisation of the elevation.
+        generate_image: If True (default), also render a static elevation-angle
+            QC image (via plotly/Kaleido). Set False to skip that expensive
+            render and return ``None`` for the image (e.g. batch runs).
 
     Returns:
         tuple: A 6-element tuple containing:
@@ -231,9 +234,11 @@ def get_plane_angles(pcd, vis=False):
     if vis:
         visualizations.visualize_elevation_angle(pcd, [a, b, c, d], interactive=True)
 
-    image = visualizations.visualize_elevation_angle(
-        pcd, [a, b, c, d], interactive=False
-    )
+    image = None
+    if generate_image:
+        image = visualizations.visualize_elevation_angle(
+            pcd, [a, b, c, d], interactive=False
+        )
 
     return (
         theta_deg,
@@ -289,7 +294,7 @@ def get_dev_rugosity(pcd):
     return dev_rugosity
 
 
-def calc_roughness(pcd):
+def calc_roughness(pcd, generate_image=True):
     """
     Compute plane-detrended roughness (Ra, Rq) for a point cloud.
 
@@ -345,8 +350,14 @@ def calc_roughness(pcd):
     ra = float(dist.mean())
     rq = float(np.sqrt((dist**2).mean()))
 
-    # Pass ra and rq to avoid recalculating in visualize_roughness
-    image = visualizations.visualize_roughness(pcd, interactive=False, ra=ra, rq=rq)
+    # The QC image is an expensive plotly/Kaleido render; skip it unless asked
+    # for (e.g. batch runs via measure_all default to metrics only).
+    image = None
+    if generate_image:
+        # Pass ra and rq to avoid recalculating in visualize_roughness
+        image = visualizations.visualize_roughness(
+            pcd, interactive=False, ra=ra, rq=rq
+        )
 
     return ra, rq, image
 
@@ -1283,14 +1294,15 @@ def get_fractal_dimension(pcd, iterations=10, plot=False):
     return slope
 
 
-def get_vector_dispersion(geom):
+def get_vector_dispersion(geom, generate_image=True):
     """
     Function to get the vector normal dispersion of a geometry (either
     PointCloud or Mesh). Adapted from Young et al., 2017.
 
     Returns the dispersion scalar and a static visualization image (numpy array),
     same pattern as calc_roughness. Only PointCloud-like geometry is visualized;
-    for TriangleMesh, the image is None.
+    for TriangleMesh, the image is None. When ``generate_image`` is False the
+    (expensive plotly/Kaleido) image is skipped and returned as None.
     """
     if isinstance(
         geom,
@@ -1317,7 +1329,8 @@ def get_vector_dispersion(geom):
 
     image = None
     if (
-        isinstance(
+        generate_image
+        and isinstance(
             geom,
             (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
         )
@@ -1584,22 +1597,21 @@ def calc_gap_fraction(
     raw_cover = len(np.unique(cover_pixels, axis=0))
     gapF_raw = (img_area - raw_cover) / img_area
 
-    # Map the points(/colors) to the image pixels
+    # Map the points(/colors) to the image pixels. Vectorized so this scales to
+    # the full point cloud without a Python-level per-point loop (which made
+    # this the runtime bottleneck for large clouds).
     if color_output:
         rgb_colors = (np.asarray(pcd.colors)[points_to_keep] * 255).astype(np.uint8)
-        # Calculate the norms to be able to determine closest points
+        # For each pixel keep the colour of the point closest to the centre. We
+        # scatter-assign in order of decreasing distance so the nearest point
+        # (smallest norm) is written last and therefore wins per pixel.
         norms = np.linalg.norm(trans_points, axis=1)
-        mapping = -np.ones((resolution, resolution), dtype=int)
-        # Iterate over the points
-        for i in range(len(trans_points)):
-            # Update color if this mapped point is closer to the center
-            mapped_id = mapping[cover_pixels[i][0], cover_pixels[i][1]]
-            if mapped_id == -1 or norms[i] < norms[mapped_id]:
-                mapping[cover_pixels[i][0], cover_pixels[i][1]] = i
-                image[cover_pixels[i][0], cover_pixels[i][1]] = rgb_colors[i]
+        order = np.argsort(-norms, kind="stable")
+        image_flat = image.reshape(-1, 3)
+        flat_idx = cover_pixels[:, 0] * resolution + cover_pixels[:, 1]
+        image_flat[flat_idx[order]] = rgb_colors[order]
     else:
-        for i in range(len(trans_points)):
-            image[cover_pixels[i][0], cover_pixels[i][1]] = [255, 255, 255]
+        image[cover_pixels[:, 0], cover_pixels[:, 1]] = [255, 255, 255]
 
     # Apply floodFill algorithm to calculate center gap fraction.
     # By default, use a centre point and an "upslope" point; otherwise convert
@@ -2228,6 +2240,157 @@ def subdivide_boxes(bboxes, new_cell_size, tol=1e-9):
                 new_boxes.append(([new_x_min, new_y_min], [new_x_max, new_y_max]))
 
     return new_boxes
+
+
+def get_bboxes_from_intercepts(
+    intercepts,
+    cell_size,
+    offset_step=None,
+    trim_sparse_edges=True,
+    edge_min_fraction=0.25,
+    return_info=False,
+):
+    """Recover the generation grid cells directly from a set of intercepts.
+
+    Intercepts generated by ``intercepts`` place one (sub-cell-jittered) point
+    per grid cell. When the exact generation grid (``grid_bbox``) was not saved,
+    re-deriving a grid from the point extent phase-misaligns with the generation
+    lattice, smearing each cell's single point into its neighbours (producing
+    spurious empty "No data" cells and doubled-up cells). This function instead
+    recovers the lattice from the intercepts themselves — independent of the
+    point cloud — by scanning the sub-cell origin offset and picking the phase
+    that maximises the number of cells containing exactly one point (i.e. the
+    best one-point-per-cell fit).
+
+    The intercept coordinates must already be in the frame in which the grid is
+    axis-aligned (e.g. after applying the generation ``world_transform``).
+
+    Args:
+        intercepts: An ``Annotations`` instance (uses each annotation's
+            ``coords``) or an array-like of shape ``(N, 2)`` / ``(N, 3)`` of XY
+            (or XYZ) coordinates.
+        cell_size (float): Grid cell side length in the intercept frame (the
+            generation cell size, e.g. ``0.2``).
+        offset_step (float | None): Resolution of the sub-cell origin scan. Finer
+            steps fit the phase more precisely at the cost of speed. Defaults to
+            ``cell_size / 50``.
+        trim_sparse_edges (bool): If True (default), trim contiguous outer
+            columns/rows whose occupancy is below ``edge_min_fraction`` of the
+            perpendicular dimension. A single edge intercept nudged past a cell
+            boundary (by the intercept search radius) otherwise spawns a whole
+            near-empty border line of "No data" cells; trimming removes that
+            framing artifact while leaving the interior untouched.
+        edge_min_fraction (float): Occupancy fraction below which an outer
+            column/row is considered a sparse-edge artifact and trimmed (default
+            0.25). Only applied when ``trim_sparse_edges`` is True.
+        return_info (bool): If True, also return a dict with the fitted origin,
+            grid dimensions and occupancy diagnostics.
+
+    Returns:
+        list: Grid cell bboxes, each ``([x_min, y_min], [x_max, y_max])`` (same
+        format as :func:`subdivide_boxes`). If ``return_info`` is True, returns
+        ``(bboxes, info)``.
+    """
+    if hasattr(intercepts, "data"):
+        xy = np.array(
+            [np.asarray(a.coords, dtype=float)[:2] for a in intercepts.data.values()]
+        )
+    else:
+        xy = np.asarray(intercepts, dtype=float)[:, :2]
+
+    if xy.size == 0:
+        return ([], {}) if return_info else []
+
+    cs = float(cell_size)
+    step = offset_step if offset_step is not None else cs / 50.0
+    x, y = xy[:, 0], xy[:, 1]
+    x_lo, y_lo = x.min(), y.min()
+
+    def _evaluate(ox, oy):
+        # Origin so the first cell contains the minimum point and the lattice
+        # phase equals (ox, oy).
+        x0 = np.floor((x_lo - ox) / cs) * cs + ox
+        y0 = np.floor((y_lo - oy) / cs) * cs + oy
+        ix = np.floor((x - x0) / cs).astype(np.int64)
+        iy = np.floor((y - y0) / cs).astype(np.int64)
+        nx = int(ix.max()) + 1
+        ny = int(iy.max()) + 1
+        # Unique cell key (ny bounded and small; use a safe large multiplier).
+        _, counts = np.unique(ix * (ny + 1) + iy, return_counts=True)
+        singles = int((counts == 1).sum())
+        return singles, (x0, y0, nx, ny, len(counts))
+
+    best = None
+    offsets = np.arange(0.0, cs, step)
+    for ox in offsets:
+        for oy in offsets:
+            singles, meta = _evaluate(ox, oy)
+            # Maximise single-occupancy cells (the clean 1-per-cell fit).
+            if best is None or singles > best[0]:
+                best = (singles, ox, oy, meta)
+
+    _, ox, oy, (x0, y0, nx, ny, _) = best
+
+    # Occupancy per column / row at the fitted origin.
+    ix = np.floor((x - x0) / cs).astype(np.int64)
+    iy = np.floor((y - y0) / cs).astype(np.int64)
+    occ_cells = set(zip(ix.tolist(), iy.tolist()))
+    col_occ = np.zeros(nx, dtype=int)
+    row_occ = np.zeros(ny, dtype=int)
+    for ci, cj in occ_cells:
+        col_occ[ci] += 1
+        row_occ[cj] += 1
+
+    # Trim contiguous sparse outer columns/rows (edge-outlier framing artifacts).
+    i_lo, i_hi, j_lo, j_hi = 0, nx - 1, 0, ny - 1
+    if trim_sparse_edges and occ_cells:
+        col_thr = edge_min_fraction * ny
+        row_thr = edge_min_fraction * nx
+        while i_lo < i_hi and col_occ[i_lo] < col_thr:
+            i_lo += 1
+        while i_hi > i_lo and col_occ[i_hi] < col_thr:
+            i_hi -= 1
+        while j_lo < j_hi and row_occ[j_lo] < row_thr:
+            j_lo += 1
+        while j_hi > j_lo and row_occ[j_hi] < row_thr:
+            j_hi -= 1
+
+    gnx, gny = i_hi - i_lo + 1, j_hi - j_lo + 1
+
+    # Occupancy diagnostics within the (possibly trimmed) grid.
+    in_grid = (ix >= i_lo) & (ix <= i_hi) & (iy >= j_lo) & (iy <= j_hi)
+    _, counts = np.unique(ix[in_grid] * (ny + 1) + iy[in_grid], return_counts=True)
+    occupied = len(counts)
+    singles = int((counts == 1).sum())
+    empty = gnx * gny - occupied
+    logger.info(
+        "get_bboxes_from_intercepts: %d intercepts -> %dx%d grid (%d cells), "
+        "offset (%.4f, %.4f); %d single-occupancy, %d empty, %d multi "
+        "(trimmed %d cols / %d rows)",
+        len(xy), gnx, gny, gnx * gny, ox, oy, singles, empty, occupied - singles,
+        (nx - gnx), (ny - gny),
+    )
+
+    bboxes = [
+        ([x0 + i * cs, y0 + j * cs], [x0 + (i + 1) * cs, y0 + (j + 1) * cs])
+        for i in range(i_lo, i_hi + 1)
+        for j in range(j_lo, j_hi + 1)
+    ]
+    if return_info:
+        info = {
+            "origin": (float(x0 + i_lo * cs), float(y0 + j_lo * cs)),
+            "offset": (float(ox), float(oy)),
+            "nx": gnx,
+            "ny": gny,
+            "n_cells": gnx * gny,
+            "single_occupancy": singles,
+            "empty": empty,
+            "multi": occupied - singles,
+            "trimmed_cols": nx - gnx,
+            "trimmed_rows": ny - gny,
+        }
+        return bboxes, info
+    return bboxes
 
 
 def generate_random_xy_points_within_cells(bboxes, points_per_cell, z_value=0):

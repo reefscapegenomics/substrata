@@ -1578,15 +1578,20 @@ def plot_positions(
     color=False,
     show_x_z=False,
     show_z=False,
+    show_legend=False,
     zoom=None,
 ):
     """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and optionally X–Z views.
 
     - Background shows a grayscale decimated point cloud if provided.
       If color=True and the point cloud has colors, use those instead.
-    - Markers are colored by Z (bwr colormap) if show_z=True, otherwise in red.
+    - Markers are colored by Z (bwr colormap) if show_z=True; else by their
+      annotation label (distinct colour per label) when labels are available
+      (e.g. an Annotations input); otherwise in red.
     - If items have a `group` attribute, groups are encoded as filled (even index)
-      vs hollow (odd index) and a legend is shown.
+      vs hollow (odd index).
+    - Group/label legends are only drawn when show_legend=True, placed to the
+      right of the plot so they never overlap the points.
 
     Args:
         positions: One of:
@@ -1605,6 +1610,8 @@ def plot_positions(
         show_x_z: If True, show X–Z plot in addition to X–Y (default False).
         show_z: If True, color markers by Z coordinate with colorbar (default False).
             If False, all markers are colored red.
+        show_legend: If True, draw the group and/or label legend(s) to the right
+            of the plot (default False).
         zoom: Optional zoom level (only used for single Annotation). If provided,
             limits the view to a zoom x zoom meter area centered on the annotation.
             For example, zoom=1 shows a 1x1m area, zoom=2 shows a 2x2m area.
@@ -1643,7 +1650,8 @@ def plot_positions(
             if arr.ndim == 2 and arr.shape[1] >= 3:
                 coords = arr[:, :3]
                 groups = [None] * len(coords)
-                return coords, groups
+                labels = [None] * len(coords)
+                return coords, groups, labels
         except Exception:
             pass
 
@@ -1653,14 +1661,16 @@ def plot_positions(
                 items = list(pos.data.values())
                 coords = []
                 groups = []
+                labels = []
                 for it in items:
                     if hasattr(it, "coords") and it.coords is not None:
                         c = np.asarray(it.coords, dtype=float)
                         if c.shape[0] >= 3:
                             coords.append(c[:3])
                             groups.append(getattr(it, "group", None))
+                            labels.append(_ann_label(it))
                 if coords:
-                    return np.vstack(coords), groups
+                    return np.vstack(coords), groups, labels
             except Exception:
                 pass
 
@@ -1668,14 +1678,16 @@ def plot_positions(
         try:
             coords = []
             groups = []
+            labels = []
             for it in list(pos):
                 if hasattr(it, "coords") and it.coords is not None:
                     c = np.asarray(it.coords, dtype=float)
                     if c.shape[0] >= 3:
                         coords.append(c[:3])
                         groups.append(getattr(it, "group", None))
+                        labels.append(_ann_label(it))
             if coords:
-                return np.vstack(coords), groups
+                return np.vstack(coords), groups, labels
         except Exception:
             pass
 
@@ -1685,7 +1697,7 @@ def plot_positions(
             "iterable of items with .coords."
         )
 
-    coords, groups = _normalize_positions(positions)
+    coords, groups, labels = _normalize_positions(positions)
     if coords.size == 0:
         raise ValueError("No positions with coords provided.")
 
@@ -1693,6 +1705,15 @@ def plot_positions(
     valid_groups = [g for g in groups if g is not None]
     unique_groups = sorted(set(valid_groups))
     group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(unique_groups)}
+
+    # Prepare label → colour mapping (distinct colour per label). Used when
+    # labels are available (e.g. Annotations) and Z-colouring is not requested;
+    # unlabeled points fall back to grey.
+    unique_labels = sorted({lab for lab in labels if lab is not None})
+    color_by_label = bool(unique_labels) and not show_z
+    if color_by_label:
+        lcmap = plt.cm.get_cmap("tab20", max(1, len(unique_labels)))
+        label_colors = {lab: lcmap(i) for i, lab in enumerate(unique_labels)}
 
     # Prepare color mapping by Z coordinate (blue→red) if show_z is True
     z_vals = np.array(coords[:, 2], dtype=float)
@@ -1761,9 +1782,11 @@ def plot_positions(
         xs = np.asarray(coords[:, x_idx], dtype=float)
         ys = np.asarray(coords[:, y_idx], dtype=float)
         # Draw hollow vs filled by group
-        for x, y, g, z in zip(xs, ys, groups, z_vals):
+        for x, y, g, z, lab in zip(xs, ys, groups, z_vals, labels):
             if show_z and cmap is not None and norm is not None:
                 col = cmap(norm(z))
+            elif color_by_label:
+                col = label_colors.get(lab, (0.7, 0.7, 0.7))
             else:
                 col = "red"
             filled = group_to_fill.get(g, True)
@@ -1828,41 +1851,60 @@ def plot_positions(
             cbar = fig.colorbar(sm, ax=ax_top, fraction=0.046, pad=0.04)
         cbar.set_label("Z (m)")
 
-    # Group legend (if groups present)
-    if unique_groups:
+    # Legends: groups (filled/hollow) and/or labels (colour), only when
+    # requested. Placed outside the axes on the right so they never overlap the
+    # plotted points; stacked vertically when both are present.
+    if show_legend:
         from matplotlib.lines import Line2D
 
-        handles = []
-        for g in unique_groups:
-            if group_to_fill[g]:
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        marker="o",
-                        color="w",
-                        label=str(g),
-                        markerfacecolor="black",
-                        markeredgecolor="black",
-                        markersize=8,
-                        linewidth=0,
-                    )
+        axis_legends = []
+
+        if unique_groups:
+            group_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="black" if group_to_fill[g] else "none",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
                 )
-            else:
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        marker="o",
-                        color="w",
-                        label=str(g),
-                        markerfacecolor="none",
-                        markeredgecolor="black",
-                        markersize=8,
-                        linewidth=0,
-                    )
+                for g in unique_groups
+            ]
+            axis_legends.append(("Groups", group_handles))
+
+        if color_by_label:
+            label_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(lab),
+                    markerfacecolor=label_colors[lab],
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
                 )
-        ax_top.legend(handles=handles, title="Groups", loc="upper right", frameon=False)
+                for lab in unique_labels
+            ]
+            axis_legends.append(("Labels", label_handles))
+
+        for i, (leg_title, handles) in enumerate(axis_legends):
+            leg = ax_top.legend(
+                handles=handles,
+                title=leg_title,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0 - i * 0.5),
+                frameon=False,
+                borderaxespad=0.0,
+            )
+            # Keep all but the last legend by re-adding as a persistent artist.
+            if i < len(axis_legends) - 1:
+                ax_top.add_artist(leg)
 
     if title:
         fig.suptitle(title)
@@ -2363,11 +2405,14 @@ def plot_measurements(
                     zorder=3,
                 )
         tick_labels = [
-            f"{label}\nn={len(plot_data[i])}" for i, label in enumerate(unique_labels)
+            f"{label} (n={len(plot_data[i])})"
+            for i, label in enumerate(unique_labels)
         ]
-        ax.set_xticklabels(tick_labels)
+        # Fully vertical (90°) x-tick labels so class names stay legible when
+        # there are many of them.
+        ax.set_xticklabels(tick_labels, rotation=90, ha="center", va="top")
         ax.set_title(key, fontsize=9)
-        ax.tick_params(axis="x", labelsize=7, rotation=45 if len(unique_labels) > 4 else 0)
+        ax.tick_params(axis="x", labelsize=7)
         ax.tick_params(axis="y", labelsize=7)
         ax.set_rasterized(True)
 
@@ -3006,10 +3051,11 @@ def show_classified_grid_cells(
     pcd=None,
     cell_size=None,
     show_points=False,
+    show_full_plot=False,
     point_size=1,
     title=None,
     label_colors=None,
-    max_output_points=50000,
+    max_output_points=500000,
 ):
     """
     Show a 2D plot with grid cells colored by majority classification.
@@ -3040,6 +3086,11 @@ def show_classified_grid_cells(
             not given. Ignored when `bboxes` is supplied.
         show_points (bool): If True and `pcd` is given, scatter the XY points as
             a background.
+        show_full_plot (bool): If True and `pcd` is given, expand the axis to the
+            full point-cloud extent (rather than clipping to the grid) so the
+            whole plot is shown with the grid cells overlaid only where they
+            fall. Implies scattering the background points. Falls back to the
+            grid extent (with a warning) if no `pcd` is supplied.
         point_size (int): Marker size for background points when shown.
         title (str | None): Optional title for the plot.
         label_colors (dict | None): Optional mapping {label: matplotlib color}.
@@ -3077,17 +3128,17 @@ def show_classified_grid_cells(
     ax_left.set_aspect("equal")
     ax_right = fig.add_subplot(gs[0, 1])
 
-    # Optional background points in grayscale
-    if show_points and pcd is not None and len(pcd.points) > 0:
-        plot_cols = np.full(
-            (pcd.points.shape[0], 3), 0.6, dtype=float
-        )  # Default to grayscale
+    # Optional background points in grayscale. show_full_plot implies the
+    # scatter, since the whole point of the wider view is to see the plot.
+    if (show_points or show_full_plot) and pcd is not None and len(pcd.points) > 0:
+        # Match plot_positions' background grayscale (value 0.7, alpha 0.4).
+        plot_cols = np.full((pcd.points.shape[0], 3), 0.7, dtype=float)
         ax_left.scatter(
             pcd.points[:, 0],
             pcd.points[:, 1],
             s=point_size,
             c=plot_cols,
-            alpha=0.5,
+            alpha=0.4,
             edgecolor="none",
         )
 
@@ -3152,7 +3203,10 @@ def show_classified_grid_cells(
         )
         ax_left.add_patch(rect)
 
-    # Set axis limits based on bbox data
+    # Set axis limits. By default clip to the grid (bbox) extent; when
+    # show_full_plot is set, expand to the full point-cloud extent so the whole
+    # plot is shown with the grid cells overlaid only where they fall.
+    x_min = x_max = y_min = y_max = None
     if bboxes:
         all_x_coords = []
         all_y_coords = []
@@ -3164,15 +3218,33 @@ def show_classified_grid_cells(
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
-            logger.debug(
-                "Setting axis limits: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
-                x_min,
-                x_max,
-                y_min,
-                y_max,
+
+    if show_full_plot:
+        if pcd is not None and len(pcd.points) > 0:
+            px = pcd.points[:, 0]
+            py = pcd.points[:, 1]
+            px_min, px_max = float(px.min()), float(px.max())
+            py_min, py_max = float(py.min()), float(py.max())
+            x_min = px_min if x_min is None else min(x_min, px_min)
+            x_max = px_max if x_max is None else max(x_max, px_max)
+            y_min = py_min if y_min is None else min(y_min, py_min)
+            y_max = py_max if y_max is None else max(y_max, py_max)
+        else:
+            logger.warning(
+                "show_full_plot=True but no point cloud supplied; "
+                "showing the grid extent only."
             )
-            ax_left.set_xlim(x_min, x_max)
-            ax_left.set_ylim(y_min, y_max)
+
+    if x_min is not None:
+        logger.debug(
+            "Setting axis limits: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )
+        ax_left.set_xlim(x_min, x_max)
+        ax_left.set_ylim(y_min, y_max)
 
     if title is not None:
         ax_left.set_title(title)
@@ -3215,11 +3287,36 @@ def show_classified_grid_cells(
             for c in categories
         ]
         x_pos = np.arange(len(categories))
-        ax_right.bar(x_pos, counts, color=bar_colors)
+        # Counts can span a wide range (a few dominant classes with hundreds of
+        # cells alongside rare ones with just one or two). A linear axis makes
+        # the small classes vanish, so switch to a log-scaled count axis when the
+        # spread is large; keep it linear otherwise.
+        positive = [c for c in counts if c > 0]
+        use_log = bool(positive) and (max(positive) / min(positive) >= 20)
+        bars = ax_right.bar(x_pos, counts, color=bar_colors)
+        if use_log:
+            ax_right.set_yscale("log")
+            # Keep value-1 bars visible and leave headroom for the labels.
+            ax_right.set_ylim(bottom=0.7, top=max(counts) * 1.6)
         ax_right.set_xticks(x_pos)
-        ax_right.set_xticklabels([str(c) for c in categories], rotation=45, ha="right")
+        # Fully vertical (90°) x-tick labels so class names stay legible in the
+        # narrow panel without overlapping.
+        ax_right.set_xticklabels(
+            [str(c) for c in categories], rotation=90, fontsize=8
+        )
+        # Annotate each bar with its exact count so rare classes remain readable
+        # regardless of the axis scale.
+        for rect, count in zip(bars, counts):
+            ax_right.annotate(
+                str(int(count)),
+                (rect.get_x() + rect.get_width() / 2, count),
+                ha="center",
+                va="bottom",
+                fontsize=6,
+                xytext=(0, 1),
+                textcoords="offset points",
+            )
         ax_right.set_ylabel("Count")
-        ax_right.set_title("Cells per class")
         ax_right.margins(x=0.05)
 
     # Tight layout and return the figure

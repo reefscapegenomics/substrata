@@ -2,6 +2,12 @@ import re
 
 OUTPUT_FOLDER = "output"
 
+# measure_all parallelism. Capped (rather than -1 = all cores) because the
+# measurements are memory-heavy: gap fraction shares the full point cloud across
+# threads, and the plotly/Kaleido QC images (when enabled) each spawn a headless
+# browser subprocess. Running one per core exhausts RAM on many-core machines.
+DEFAULT_MEASURE_N_JOBS = 4
+
 DEFAULT_INLIER_RANGE = 0.01
 DEFAULT_TPI_RADIUS_INNER = 0.1  # metres; excludes focal object from neighbourhood
 DEFAULT_TPI_RADIUS_OUTER = 0.5  # metres; outer limit of annulus neighbourhood
