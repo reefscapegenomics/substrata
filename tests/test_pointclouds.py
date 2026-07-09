@@ -136,8 +136,11 @@ class TestRemoveStrayXYPoints(unittest.TestCase):
         self.assertEqual(len(viz.plot_2d_calls), 1)
         hl = viz.plot_2d_calls[0]["highlight_coords"]
         self.assertIsNotNone(hl)
-        # Highlighted (removed) points are the far strays.
-        self.assertTrue(np.all(np.abs(np.asarray(hl)[:, :2]) > 20.0))
+        # Highlighted (removed) points are the far strays: each flagged point
+        # lies well outside the 10 m body (its dominant XY coordinate exceeds
+        # 15 m). Checked per-point — a stray may sit near an axis (e.g. y=20),
+        # so an element-wise "both axes > 20" test would wrongly fail.
+        self.assertTrue(np.all(np.abs(np.asarray(hl)[:, :2]).max(axis=1) > 15.0))
 
     def test_density_frac_zero_is_noop(self):
         pts, colors, _, _ = _dense_with_strays()
