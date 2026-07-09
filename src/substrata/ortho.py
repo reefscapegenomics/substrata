@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Standard Library
 import logging
+import warnings
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 # Third-Party Libraries
@@ -895,6 +896,7 @@ class OrthoGrid:
         measurement: Optional[Callable] = None,
         metric: Optional[str] = None,
         neighborhood_scale: float = 1.0,
+        min_points: int = 10,
         value_label: Optional[str] = None,
     ) -> None:
         """Build the grid and reduce every cell.
@@ -934,6 +936,11 @@ class OrthoGrid:
                 = exactly the cell; ``2.0`` = a 2×2-cell square). Must be
                 ``>= 1.0``. Larger values borrow neighbouring points for a more
                 robust fit on sparse grids.
+            min_points: For ``value_by="custom"`` — cells whose sampling window
+                holds fewer than this many points are left ``NaN`` instead of
+                being measured. Guards plane-fit measurements against
+                sparse/near-degenerate edge cells (which otherwise emit numeric
+                warnings and nonsense values). Must be ``>= 1``.
             value_label: Optional colorbar/axis label (defaults to *metric* in
                 custom mode).
         """
@@ -953,6 +960,8 @@ class OrthoGrid:
                 )
             if neighborhood_scale < 1.0:
                 raise ValueError("neighborhood_scale must be >= 1.0")
+            if min_points < 1:
+                raise ValueError("min_points must be >= 1")
             if metric is None:
                 metric = self._CUSTOM_METRIC_DEFAULTS.get(
                     getattr(measurement, "__name__", None)
@@ -972,6 +981,7 @@ class OrthoGrid:
         self.measurement = measurement
         self.metric = metric
         self.neighborhood_scale = float(neighborhood_scale)
+        self.min_points = int(min_points)
         self.value_label = value_label
         self.info: dict = {}
 
@@ -1168,7 +1178,7 @@ class OrthoGrid:
         r = int(np.ceil(half / cs - 0.5)) if self.neighborhood_scale > 1.0 else 0
 
         occ = np.argwhere(self.present)
-        fails = 0
+        fails = skipped = 0
         for jy, jx in tqdm(
             occ,
             desc="OrthoGrid custom ({})".format(
@@ -1186,6 +1196,11 @@ class OrthoGrid:
                 member_idx = self._window_members(
                     cell_members, jy, jx, r, nx, ny, pts_xy, cx, cy, half
                 )
+            # Too few points for a stable measurement (e.g. a sparse edge cell
+            # that would give a degenerate plane fit): leave NaN, not a failure.
+            if member_idx is None or len(member_idx) < self.min_points:
+                skipped += 1
+                continue
             z_cell = (
                 float(np.mean(pts_z[own])) if own is not None and len(own) else 0.0
             )
@@ -1195,6 +1210,11 @@ class OrthoGrid:
             except Exception as exc:  # keep going; a bad cell is just NaN
                 fails += 1
                 logger.debug("custom cell (%d,%d) failed: %s", jx, jy, exc)
+        if skipped:
+            logger.info(
+                "value_by='custom': %d/%d cells below min_points=%d (left NaN)",
+                skipped, len(occ), self.min_points,
+            )
         if fails:
             logger.warning(
                 "value_by='custom': %d/%d cells failed the measurement",
@@ -1245,7 +1265,12 @@ class OrthoGrid:
         # measurements (e.g. TPI); unused by neighbourhood-only measurements.
         ann.radius = self.cell_size * np.sqrt(2.0) / 2.0
         ann.simple_pcd = simple
-        ann.measure(self.measurement, generate_image=False)
+        # A marginal cell can still trip expected numeric warnings inside the
+        # measurement (degenerate covariance, complex eigvecs); keep them out of
+        # the per-cell output. Genuine errors still raise and are handled above.
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore")
+            ann.measure(self.measurement, generate_image=False)
         val = ann.measurements.get(self.metric)
         return float(val) if val is not None else np.nan
 
@@ -1491,6 +1516,8 @@ class OrthoGrid:
         title: Optional[str] = None,
         label_colors: Optional[dict] = None,
         figsize: Tuple[int, int] = (12, 5),
+        robust: bool = False,
+        robust_percentiles: Tuple[float, float] = (2.0, 98.0),
     ):
         """Render the grid as a matplotlib Figure with a side panel.
 
@@ -1508,6 +1535,12 @@ class OrthoGrid:
             title: Optional left-panel title.
             label_colors: Optional ``{label: color}`` map (label mode).
             figsize: Figure size in inches.
+            robust: Continuous modes only — clip the colour scale (and histogram
+                x-range) to ``robust_percentiles`` of the report cells instead of
+                the raw min/max, so a few outlier cells don't flatten the map.
+                Default ``False`` (exact min/max).
+            robust_percentiles: ``(low, high)`` percentiles used when
+                ``robust=True``.
 
         Returns:
             matplotlib.figure.Figure.
@@ -1526,7 +1559,9 @@ class OrthoGrid:
         if self.value_by == "label":
             self._show_label(ax_left, ax_right, label_colors, plt, mpatches)
         else:
-            self._show_continuous(ax_left, ax_right, cmap, plt)
+            self._show_continuous(
+                ax_left, ax_right, cmap, plt, robust, robust_percentiles
+            )
 
         # View the full point cloud (union of its extent and the grid) when the
         # cloud is shown; otherwise clip to the grid extent.
@@ -1563,18 +1598,35 @@ class OrthoGrid:
             pass
         return fig
 
-    def _show_continuous(self, ax_left, ax_right, cmap, plt) -> None:
+    @staticmethod
+    def _scale_limits(scale_src, robust, pct):
+        """Colour-scale ``(vmin, vmax)`` for the continuous raster.
+
+        ``robust`` clips to the ``pct`` ``(low, high)`` percentiles so a few
+        outlier cells don't dominate the scale; otherwise the raw min/max are
+        used. Empty input yields ``(0.0, 1.0)``. Equal limits are nudged apart.
+        """
+        if scale_src.size == 0:
+            return 0.0, 1.0
+        if robust:
+            lo, hi = np.percentile(scale_src, pct)
+            vmin, vmax = float(lo), float(hi)
+        else:
+            vmin, vmax = float(scale_src.min()), float(scale_src.max())
+        if vmin == vmax:
+            vmax = vmin + 1e-6
+        return vmin, vmax
+
+    def _show_continuous(
+        self, ax_left, ax_right, cmap, plt, robust=False,
+        robust_percentiles=(2.0, 98.0),
+    ) -> None:
         """Colormapped raster + value histogram."""
         vals = self.values
         finite = vals[~np.isnan(vals)]
         rep = vals[self.report_mask & ~np.isnan(vals)]
         scale_src = rep if rep.size else finite
-        if scale_src.size:
-            vmin, vmax = float(scale_src.min()), float(scale_src.max())
-        else:
-            vmin, vmax = 0.0, 1.0
-        if vmin == vmax:
-            vmax = vmin + 1e-6
+        vmin, vmax = self._scale_limits(scale_src, robust, robust_percentiles)
 
         cmap_obj = plt.get_cmap(cmap or "viridis")
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
@@ -1594,6 +1646,9 @@ class OrthoGrid:
         if rep.size:
             bins = int(np.clip(np.sqrt(rep.size), 5, 30))
             ax_right.hist(rep, bins=bins, color="0.5", edgecolor="0.3")
+        if robust and rep.size:
+            # Match the histogram window to the (clipped) colour scale.
+            ax_right.set_xlim(vmin, vmax)
         ax_right.set_xlabel(self._value_label())
         ax_right.set_ylabel("Cell count")
 

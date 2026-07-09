@@ -363,7 +363,7 @@ class TestOrthoGridCustom(unittest.TestCase):
     def test_sparse_present_and_nan(self):
         og = _CountingGrid(
             pcd=_sparse_pc(), value_by="custom", measurement=self._dummy(),
-            metric="Ra", cell_size=1.0,
+            metric="Ra", cell_size=1.0, min_points=1,
         )
         # Finite exactly on present cells.
         self.assertTrue(np.array_equal(np.isfinite(og.values), og.present))
@@ -372,6 +372,29 @@ class TestOrthoGridCustom(unittest.TestCase):
         # An empty interior cell is NaN.
         rec = og.value_at(1.5, 1.5)
         self.assertTrue(rec is None or np.isnan(og.values[rec["iy"], rec["ix"]]))
+
+    def test_default_min_points(self):
+        og = _CountingGrid(
+            pcd=_ramp_pc(), value_by="custom", measurement=self._dummy(),
+            cell_size=1.0,
+        )
+        self.assertEqual(og.min_points, 10)
+
+    def test_min_points_gates_sparse_cells(self):
+        # Sparse cells: (0,0) has 2 points, (2,2) has 3.
+        og = _CountingGrid(
+            pcd=_sparse_pc(), value_by="custom", measurement=self._dummy(),
+            metric="Ra", cell_size=1.0, min_points=3,
+        )
+        # Below-threshold cell is left NaN even though it holds points.
+        self.assertTrue(og.present[0, 0])
+        self.assertTrue(np.isnan(og.values[0, 0]))
+        # At/above threshold is measured.
+        self.assertEqual(og.value_at(2.5, 2.5)["value"], 3.0)
+        # min_points < 1 is rejected.
+        with self.assertRaises(ValueError):
+            _CountingGrid(pcd=_sparse_pc(), value_by="custom",
+                          measurement=self._dummy(), metric="Ra", min_points=0)
 
     def test_neighborhood_scale_widens_window(self):
         pc = _ramp_pc()  # dense, so neighbours exist
@@ -419,6 +442,40 @@ class TestOrthoGridCustom(unittest.TestCase):
         with self.assertRaises(ValueError):
             ortho.OrthoGrid(pcd=pc, value_by="custom",
                             measurement=(lambda *a, **k: None))
+
+
+class TestScaleLimits(unittest.TestCase):
+    def test_robust_clips_outlier(self):
+        # Many small values (~0.01-0.05) with a single large outlier, like a
+        # degenerate roughness cell on an otherwise smooth map.
+        data = np.concatenate([np.linspace(0.01, 0.05, 200), [6.0]])
+        vmin_r, vmax_r = ortho.OrthoGrid._scale_limits(data, True, (2.0, 98.0))
+        vmin_e, vmax_e = ortho.OrthoGrid._scale_limits(data, False, (2.0, 98.0))
+        self.assertLess(vmax_r, 1.0)     # robust ignores the 6.0 outlier
+        self.assertEqual(vmax_e, 6.0)    # exact keeps it
+
+    def test_equal_values_nudged(self):
+        data = np.array([2.0, 2.0, 2.0])
+        vmin, vmax = ortho.OrthoGrid._scale_limits(data, False, (2.0, 98.0))
+        self.assertLess(vmin, vmax)
+
+    def test_empty_defaults(self):
+        self.assertEqual(
+            ortho.OrthoGrid._scale_limits(np.array([]), True, (2.0, 98.0)),
+            (0.0, 1.0),
+        )
+
+
+class TestOrthoGridShowRobust(unittest.TestCase):
+    def test_robust_sets_histogram_xlim(self):
+        og = ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0)
+        rep = og.values[og.report_mask & ~np.isnan(og.values)]
+        vmin, vmax = ortho.OrthoGrid._scale_limits(rep, True, (2.0, 98.0))
+        fig = og.show(show_pcd=False, robust=True)
+        ax_hist = next(a for a in fig.axes if a.get_ylabel() == "Cell count")
+        xlo, xhi = ax_hist.get_xlim()
+        self.assertAlmostEqual(xlo, vmin, places=6)
+        self.assertAlmostEqual(xhi, vmax, places=6)
 
 
 if __name__ == "__main__":  # pragma: no cover
