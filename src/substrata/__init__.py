@@ -46,6 +46,8 @@ from .classification import *
 
 from .ortho import *
 
+from .animations import *
+
 # from .firefish import *
 # from .utils import *
 # from .initializer import *

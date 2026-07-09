@@ -25,6 +25,10 @@ DEFAULT_BENTHIC_BASE_FALLOFF = 0.20  # m; depth below base where height weight r
 # --- OrthoGrid (gridded per-cell rasters: DEM / density / labels) --------------
 DEFAULT_ORTHO_CELL_SIZE = 0.1  # metres; default OrthoGrid cell side length
 
+# --- Animation (animated matplotlib figures) ----------------------------------
+DEFAULT_ANIM_FPS = 15          # frames per second for exported GIF/MP4
+DEFAULT_ANIM_DURATION = 5.0    # seconds; default fill length of an animation
+
 ANN_DEFAULT_COL_ORDER = {
     "id": 0,
     "orig_x": 1,
