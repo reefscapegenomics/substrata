@@ -1019,7 +1019,8 @@ def handle_intercepts(args):
 
 
 def handle_intercepts_plot(args):
-    from substrata import measurements, visualizations
+    from substrata import measurements
+    from substrata.ortho import OrthoGrid
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
@@ -1065,51 +1066,28 @@ def handle_intercepts_plot(args):
             print(f"Warning: could not load point cloud {pcd_path}: {exc}")
             pcd = None
 
-    # Determine the grid cells, in order of preference:
-    #   1. The exact generation grid stored in the YAML (grid_bbox), replayed at
-    #      the requested cell size and aligned to the true origin.
-    #   2. Reconstruct the generation grid by re-running the same deterministic
-    #      box search as `intercepts` on the oriented point cloud (for older
-    #      files that predate grid_bbox). Requires --box-length/--box-width and
-    #      the point cloud. This reproduces the exact cells because
-    #      find_optimal_box_position is a pure histogram/convolution over the
-    #      same points, so the sub-cell-jittered intercepts land back in their
-    #      own cells (avoiding the phantom "No data" cells from a re-derived,
-    #      phase-misaligned grid).
-    #   3. Otherwise derive a grid from the annotation extent.
-    bboxes = None
+    # Resolve the reporting area / lattice alignment for the label grid, in
+    # order of preference:
+    #   1. exact generation grid from the YAML (grid_bbox) -> reporting bbox;
+    #   2. --fit-grid: recover the lattice from the intercepts themselves
+    #      (point-cloud independent, best for older files lacking grid_bbox);
+    #   3. --box-length/--box-width: reconstruct the generation box (a pure
+    #      histogram/convolution over the same points), optionally from a manual
+    #      top-left --position;
+    #   4. otherwise align the grid to the intercepts.
+    bbox = None
+    intercepts = None
     if grid_bbox is not None:
-        try:
-            bboxes = measurements.subdivide_boxes(grid_bbox, args.grid_size)
-        except ValueError:
-            print(
-                f"Warning: grid_bbox is not divisible by --grid-size {args.grid_size}; "
-                "deriving the grid from the annotation extent instead."
-            )
-
-    # Fit the grid directly from the intercepts (point-cloud independent): scan
-    # the sub-cell origin offset for the best one-point-per-cell alignment. This
-    # is the most robust option for older files lacking grid_bbox.
-    if bboxes is None and getattr(args, "fit_grid", False):
-        bboxes, info = measurements.get_bboxes_from_intercepts(
-            anns, args.grid_size, return_info=True
-        )
-        print(
-            f"Fitted grid from intercepts: {info.get('nx')}x{info.get('ny')} cells, "
-            f"offset {info.get('offset')}, {info.get('empty')} empty / "
-            f"{info.get('multi')} multi-occupancy."
-        )
-
-    if (
-        bboxes is None
-        and getattr(args, "box_length", None)
-        and getattr(args, "box_width", None)
-    ):
+        bbox = grid_bbox
+    elif getattr(args, "fit_grid", False):
+        intercepts = anns
+    elif getattr(args, "box_length", None) and getattr(args, "box_width", None):
         if pcd is None:
             print(
-                "Warning: --box-length/--box-width given but no point cloud could "
-                "be loaded; falling back to the annotation extent for the grid."
+                "Warning: --box-length/--box-width given but no point cloud "
+                "could be loaded; aligning the grid to the intercepts instead."
             )
+            intercepts = anns
         else:
             if getattr(args, "points", None):
                 print(
@@ -1121,33 +1099,37 @@ def handle_intercepts_plot(args):
                 # Manual top-left [x, y] (mirrors `intercepts --position`).
                 pos = ast.literal_eval(args.position)
                 x_tl, y_tl = float(pos[0]), float(pos[1])
-                optimal_bbox = [
+                bbox = [
                     [x_tl, y_tl],
                     [x_tl + args.box_length, y_tl + args.box_width],
                 ]
             else:
-                optimal_bbox = measurements.find_optimal_box_position(
+                bbox = measurements.find_optimal_box_position(
                     pcd,
                     box_length=args.box_length,
                     box_width=args.box_width,
                     step_size=getattr(args, "step_size", 0.1),
                     vis=False,
                 )
-            try:
-                bboxes = measurements.subdivide_boxes(optimal_bbox, args.grid_size)
-            except ValueError:
-                print(
-                    f"Warning: reconstructed box is not divisible by --grid-size "
-                    f"{args.grid_size}; deriving the grid from the annotation "
-                    "extent instead."
-                )
+    else:
+        intercepts = anns
 
-    fig = visualizations.show_classified_grid_cells(
-        anns,
-        bboxes=bboxes,
+    grid = OrthoGrid(
+        annotations=anns,
         pcd=pcd,
+        value_by="label",
         cell_size=args.grid_size,
-        show_points=getattr(args, "show_points", True),
+        bbox=bbox,
+        intercepts=intercepts,
+    )
+    if grid.info:
+        print(
+            f"Fitted grid from intercepts: {grid.info.get('nx')}x"
+            f"{grid.info.get('ny')} cells, {grid.info.get('empty')} empty / "
+            f"{grid.info.get('multi')} multi-occupancy."
+        )
+    fig = grid.show(
+        show_context=getattr(args, "show_points", True),
         title=getattr(args, "title", None),
     )
     out = args.output or (os.path.splitext(ann_path)[0] + "_grid.png")

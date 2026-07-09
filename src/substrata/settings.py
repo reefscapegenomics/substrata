@@ -22,6 +22,9 @@ DEFAULT_BENTHIC_INTERCEPT_RADIUS = 0.02  # metres; XY search radius for z-interc
 DEFAULT_BENTHIC_BASE_PERCENTILE = 10  # percentile of inner-radius z = colony base level
 DEFAULT_BENTHIC_BASE_FALLOFF = 0.20  # m; depth below base where height weight reaches 0
 
+# --- OrthoGrid (gridded per-cell rasters: DEM / density / labels) --------------
+DEFAULT_ORTHO_CELL_SIZE = 0.1  # metres; default OrthoGrid cell side length
+
 ANN_DEFAULT_COL_ORDER = {
     "id": 0,
     "orig_x": 1,
