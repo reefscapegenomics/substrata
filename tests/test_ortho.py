@@ -317,5 +317,109 @@ class TestOrthoMapGroup(unittest.TestCase):
             ortho.OrthoMapGroup([])
 
 
+class _CountingGrid(ortho.OrthoGrid):
+    """OrthoGrid whose per-cell measurement is just the member-point count.
+
+    Overriding ``_measure_cell`` exercises the real ``_reduce_custom`` binning /
+    window-widening / present-masking loop without importing ``measurements``
+    or building a real ``SimplePointCloud``.
+    """
+
+    def _measure_cell(self, idx, center_world):
+        self.last_center = center_world
+        return float(0 if idx is None else len(idx))
+
+
+def _sparse_pc():
+    """Two point clusters in cells (0,0) and (2,2) of a 1 m grid."""
+    pts = np.array([
+        [0.5, 0.5, 0.0], [0.55, 0.6, 0.1],
+        [2.5, 2.5, 0.0], [2.4, 2.55, 0.2], [2.6, 2.45, -0.1],
+    ])
+    return _PC(pts)
+
+
+class TestOrthoGridCustom(unittest.TestCase):
+    def _dummy(self, metric=None):
+        # A callable whose __name__ maps to a default metric ("Ra").
+        def calc_roughness(*a, **k):  # noqa: D401 - stub
+            return None
+        return calc_roughness
+
+    def test_dense_values_equal_member_counts(self):
+        pc = _ramp_pc()  # 4x4 cells, 100 points each
+        og = _CountingGrid(
+            pcd=pc, value_by="custom", measurement=self._dummy(),
+            cell_size=1.0,
+        )
+        # metric defaults to "Ra" for a calc_roughness-named callable.
+        self.assertEqual(og.metric, "Ra")
+        self.assertEqual(og.value_by, "custom")
+        self.assertEqual(og.values.shape, (4, 4))
+        # Every cell present; value == its own member count (100).
+        self.assertTrue(np.array_equal(np.isfinite(og.values), og.present))
+        self.assertEqual(og.value_at(0.5, 0.5)["value"], 100.0)
+
+    def test_sparse_present_and_nan(self):
+        og = _CountingGrid(
+            pcd=_sparse_pc(), value_by="custom", measurement=self._dummy(),
+            metric="Ra", cell_size=1.0,
+        )
+        # Finite exactly on present cells.
+        self.assertTrue(np.array_equal(np.isfinite(og.values), og.present))
+        self.assertEqual(og.value_at(0.5, 0.5)["value"], 2.0)
+        self.assertEqual(og.value_at(2.5, 2.5)["value"], 3.0)
+        # An empty interior cell is NaN.
+        rec = og.value_at(1.5, 1.5)
+        self.assertTrue(rec is None or np.isnan(og.values[rec["iy"], rec["ix"]]))
+
+    def test_neighborhood_scale_widens_window(self):
+        pc = _ramp_pc()  # dense, so neighbours exist
+        og1 = _CountingGrid(
+            pcd=pc, value_by="custom", measurement=self._dummy(),
+            metric="Ra", cell_size=1.0, neighborhood_scale=1.0,
+        )
+        og2 = _CountingGrid(
+            pcd=pc, value_by="custom", measurement=self._dummy(),
+            metric="Ra", cell_size=1.0, neighborhood_scale=2.0,
+        )
+        # Interior cell (1,1) borrows neighbouring points when widened.
+        v1 = og1.value_at(1.5, 1.5)["value"]
+        v2 = og2.value_at(1.5, 1.5)["value"]
+        self.assertGreater(v2, v1)
+
+    def test_value_label_is_metric(self):
+        og = _CountingGrid(
+            pcd=_ramp_pc(), value_by="custom", measurement=self._dummy(),
+            metric="Rq", cell_size=1.0,
+        )
+        self.assertEqual(og._value_label(), "Rq")
+        og2 = _CountingGrid(
+            pcd=_ramp_pc(), value_by="custom", measurement=self._dummy(),
+            metric="Ra", cell_size=1.0, value_label="roughness Ra (m)",
+        )
+        self.assertEqual(og2._value_label(), "roughness Ra (m)")
+
+    def test_invalid_custom_args(self):
+        pc = _ramp_pc()
+        # No measurement.
+        with self.assertRaises(ValueError):
+            ortho.OrthoGrid(pcd=pc, value_by="custom")
+        # Non-callable measurement.
+        with self.assertRaises(ValueError):
+            ortho.OrthoGrid(pcd=pc, value_by="custom", measurement="calc_roughness")
+        # neighborhood_scale < 1.
+        with self.assertRaises(ValueError):
+            ortho.OrthoGrid(pcd=pc, value_by="custom", measurement=self._dummy(),
+                            neighborhood_scale=0.5)
+        # No pcd.
+        with self.assertRaises(ValueError):
+            ortho.OrthoGrid(value_by="custom", measurement=self._dummy())
+        # Unknown measurement name and no metric -> cannot infer.
+        with self.assertRaises(ValueError):
+            ortho.OrthoGrid(pcd=pc, value_by="custom",
+                            measurement=(lambda *a, **k: None))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
