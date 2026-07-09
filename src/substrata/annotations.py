@@ -121,21 +121,37 @@ class Annotations:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
-    def show(self, pcd: Any, color=False) -> None:
-        """Show annotation positions overlaid on a point cloud.
+    def show(self, pcd: Any, color=False) -> Any:
+        """Show annotation positions over a point-cloud ortho map.
 
         Args:
             pcd: Point cloud to draw as background.
-        """
-        visualizations.plot_positions(self, pcd, color=color)
+            color: Draw the background in true colour when True; otherwise
+                (default) desaturate it to grey.
 
-    def show_position(self, pcd: Any, color=False) -> None:
-        """Show annotation position overlaid on a point cloud.
+        Returns:
+            PIL.Image.Image: Top-down ortho map with annotation markers
+            coloured by label.
+        """
+        from substrata.ortho import OrthoMap
+
+        return OrthoMap(pcd).show(
+            highlights=self,
+            color_by="label",
+            grayscale=not color,
+        )
+
+    def show_position(self, pcd: Any, color=False) -> Any:
+        """Alias of :meth:`show` — annotation positions over an ortho map.
 
         Args:
             pcd: Point cloud to draw as background.
+            color: See :meth:`show`.
+
+        Returns:
+            PIL.Image.Image: The rendered ortho map.
         """
-        visualizations.plot_positions(self, pcd, color=color)
+        return self.show(pcd, color=color)
 
     def append(self, annotation: "Annotation") -> None:
         if annotation.id in self.data:
@@ -1480,13 +1496,26 @@ class Annotation:
             self.get_point_cloud_by_radius(self.parent.pcd, 0.2)
         visualizations.show(self.simple_pcd, highlight_coords=self.coords)
 
-    def show_position(self, pcd: Any, color=False, zoom=None) -> None:
-        """Show annotation position overlaid on a point cloud.
+    def show_position(self, pcd: Any, color=False, zoom=None) -> Any:
+        """Show this annotation's position over a point-cloud ortho map.
 
         Args:
             pcd: Point cloud to draw as background.
+            color: Draw the background in true colour when True; otherwise
+                (default) desaturate it to grey.
+            zoom: Optional side length in metres of a square window centred
+                on the annotation (e.g. ``zoom=1`` shows a 1x1 m area).
+
+        Returns:
+            PIL.Image.Image: Ortho map with the annotation marked in red.
         """
-        visualizations.plot_positions(self, pcd, color=color, zoom=zoom)
+        from substrata.ortho import OrthoMap
+
+        return OrthoMap(pcd).show(
+            highlights=self,
+            grayscale=not color,
+            crop=(self.coords, zoom) if zoom else None,
+        )
 
     def show_measurement_image(self, key: str, width: float = 12) -> None:
         """Display a stored measurement image (e.g. ``tpi_image``).

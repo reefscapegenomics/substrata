@@ -250,13 +250,25 @@ class Cameras:
         )
 
     def show(self, pcd, color=False):
-        """
-        Show the camera positions in the pointcloud.
+        """Show the camera positions over a point-cloud ortho map.
 
         Args:
-            pcd (PointCloud): The pointcloud to show the camera positions in.
+            pcd (PointCloud): The pointcloud to draw as background.
+            color (bool): Draw the background in true colour when True;
+                otherwise (default) desaturate it to grey so the red camera
+                markers stand out.
+
+        Returns:
+            PIL.Image.Image: Top-down ortho map with camera markers (red,
+            filled/hollow by camera group).
         """
-        visualizations.plot_positions(self, pcd, color=color)
+        from substrata.ortho import OrthoMap
+
+        return OrthoMap(pcd).show(
+            highlights=self,
+            fill_by_group=True,
+            grayscale=not color,
+        )
 
     def append(self, cam):
         if cam.cam_id in self.data:

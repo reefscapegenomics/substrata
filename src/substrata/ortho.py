@@ -18,6 +18,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_cmap(name: str, n: Optional[int] = None):
+    """Return a matplotlib colormap, resampled to *n* colours if given.
+
+    Imported lazily so ``ortho`` has no import-time matplotlib dependency.
+    """
+    import matplotlib
+
+    try:
+        cmap = matplotlib.colormaps[name]
+    except (AttributeError, KeyError):  # pragma: no cover - old matplotlib
+        import matplotlib.cm as mcm
+
+        cmap = mcm.get_cmap(name)
+    if n is not None and hasattr(cmap, "resampled"):
+        cmap = cmap.resampled(n)
+    return cmap
+
+
+def _rgb255(rgba) -> Tuple[int, int, int]:
+    """Convert a 0-1 RGBA tuple to a 0-255 RGB tuple."""
+    return tuple(int(round(float(c) * 255)) for c in rgba[:3])
+
+
+def _as_per_point(value, n: int) -> list:
+    """Broadcast *value* to a length-*n* list of per-point values.
+
+    A single RGB tuple or ``None`` is repeated; a sequence already of
+    length *n* is passed through unchanged.
+    """
+    if value is None:
+        return [None] * n
+    single_rgb = isinstance(value, tuple) and len(value) == 3
+    if single_rgb and all(isinstance(c, (int, float)) for c in value):
+        return [value] * n
+    seq = list(value)
+    return seq if len(seq) == n else [value] * n
+
+
 class OrthoMap:
     """Pre-rendered 2D orthographic projection of a point cloud.
 
@@ -84,8 +122,9 @@ class OrthoMap:
             )
         )
 
+        colors = self._get_colors(pcd, len(points))
         self.image: np.ndarray = self._rasterize(
-            xs, ys, pcd,
+            xs, ys, colors,
             min_x, min_y,
             self.resolution,
             self.width, self.height,
@@ -159,6 +198,11 @@ class OrthoMap:
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
         background_color: Optional[Tuple[int, int, int]] = None,
+        color_by: Optional[str] = None,
+        fill_by_group: bool = False,
+        label_colors: Optional[dict] = None,
+        grayscale: bool = False,
+        crop: Optional[Tuple] = None,
     ) -> Image.Image:
         """Return the ortho map as a PIL Image with optional highlights.
 
@@ -168,8 +212,10 @@ class OrthoMap:
 
         Args:
             highlights: Locations to highlight.  Accepts an
-                ``Annotation``, ``Annotations`` container, a numpy
-                array of shape ``(N, 3)``, or a list of 3-element
+                ``Annotation``, an ``Annotations``/``Cameras`` container
+                (any object with a ``.data`` mapping of items that have
+                ``.coords`` and optionally ``.label``/``.group``), a
+                numpy array of shape ``(N, 3)``, or a list of 3-element
                 coordinate arrays.
             width: Display width in pixels.
             height: Display height in pixels.
@@ -181,13 +227,27 @@ class OrthoMap:
                 regardless of display resolution.  Takes precedence over
                 *point_size*.
             point_color: RGB fill colour for highlight markers.
-                Pass ``None`` for a transparent (hollow) fill.
-            point_outline: RGB outline colour for highlight markers
+                Pass ``None`` for a transparent (hollow) fill.  Used as
+                the marker colour unless *color_by* assigns per-point
+                colours.
+            point_outline: RGB outline colour for filled markers
                 (``None`` to disable the outline).
             point_shape: Marker shape — ``"circle"`` or ``"square"``.
             background_color: RGB colour for empty (no-data) pixels.
                 Defaults to ``None`` which keeps the original white
                 background.
+            color_by: Per-point marker colouring.  ``"label"`` assigns a
+                distinct ``tab20`` colour per highlight label; ``"z"``
+                maps each highlight's Z coordinate through a ``bwr``
+                colormap.  ``None`` (default) uses *point_color* for all.
+            fill_by_group: When True, highlights are drawn filled or
+                hollow by the even/odd index of their ``group`` value.
+            label_colors: Optional explicit ``{label: (r, g, b)}`` map,
+                overriding the automatic ``tab20`` assignment.
+            grayscale: Desaturate the background raster (highlights stay
+                coloured).
+            crop: ``(center, size_metres)`` window to crop to, where
+                *center* is a coordinate (used for zoom-to-annotation).
 
         Returns:
             PIL ``Image`` with the orthographic map and any requested
@@ -201,11 +261,14 @@ class OrthoMap:
         else:
             img = Image.fromarray(self.image)
 
+        if grayscale:
+            img = img.convert("L").convert("RGB")
+
         if width is not None or height is not None:
             img = self._resize(img, width, height)
 
         if highlights is not None:
-            coords_3d = self._extract_coords(highlights)
+            coords_3d, labels, groups = self._extract_highlights(highlights)
             if len(coords_3d) > 0:
                 pixels = self.project(coords_3d)
                 if pixels.ndim == 1:
@@ -217,7 +280,11 @@ class OrthoMap:
                     | (pixels[:, 1] >= self.height)
                 )
                 if out_mask.any():
-                    out_coords = coords_3d[np.newaxis, :] if coords_3d.ndim == 1 else coords_3d
+                    out_coords = (
+                        coords_3d[np.newaxis, :]
+                        if coords_3d.ndim == 1
+                        else coords_3d
+                    )
                     logger.warning(
                         "%d highlight(s) outside map bounds:\n%s",
                         int(out_mask.sum()),
@@ -226,11 +293,19 @@ class OrthoMap:
                             for c in out_coords[out_mask]
                         ),
                     )
+                fill_colors, outline_colors = self._resolve_marker_style(
+                    coords_3d, labels, groups,
+                    color_by, label_colors, fill_by_group,
+                    point_color, point_outline,
+                )
                 self._draw_highlights(
                     img, coords_3d,
-                    point_size, point_color, point_outline,
+                    point_size, fill_colors, outline_colors,
                     point_shape, point_size_metres,
                 )
+
+        if crop is not None:
+            img = self._crop_to(img, crop)
 
         if self._rotation:
             img = img.rotate(-self._rotation, expand=True)
@@ -315,10 +390,24 @@ class OrthoMap:
         return w, h, resolution
 
     @staticmethod
+    def _get_colors(
+        pcd: Union[PointCloud, SimplePointCloud],
+        n: int,
+    ) -> np.ndarray:
+        """Return an ``(n, 3)`` colour array for *pcd* (white if absent)."""
+        if hasattr(pcd, "colors"):
+            colors = np.asarray(pcd.colors)
+            if colors.ndim != 2 or colors.shape[0] != n:
+                colors = np.ones((n, 3), dtype=np.float64)
+        else:
+            colors = np.ones((n, 3), dtype=np.float64)
+        return colors
+
+    @staticmethod
     def _rasterize(
         xs: np.ndarray,
         ys: np.ndarray,
-        pcd: Union[PointCloud, SimplePointCloud],
+        colors: np.ndarray,
         min_x: float,
         min_y: float,
         resolution: float,
@@ -333,7 +422,7 @@ class OrthoMap:
         Args:
             xs: Projected x-coordinates.
             ys: Projected y-coordinates.
-            pcd: Source point cloud (for colours).
+            colors: Per-point colours ``(N, 3)`` in the 0-1 range.
             min_x: Minimum x in projected space.
             min_y: Minimum y in projected space.
             resolution: Metres per pixel.
@@ -350,11 +439,8 @@ class OrthoMap:
         np.clip(ix, 0, width - 1, out=ix)
         np.clip(iy, 0, height - 1, out=iy)
 
-        if hasattr(pcd, "colors"):
-            colors = np.asarray(pcd.colors)
-            if colors.ndim != 2 or colors.shape[0] != n:
-                colors = np.ones((n, 3), dtype=np.float64)
-        else:
+        colors = np.asarray(colors, dtype=np.float64)
+        if colors.ndim != 2 or colors.shape[0] != n:
             colors = np.ones((n, 3), dtype=np.float64)
 
         splat = np.zeros((height, width, 3), dtype=np.float64)
@@ -382,8 +468,8 @@ class OrthoMap:
         img: Image.Image,
         coords_3d: np.ndarray,
         radius: int,
-        color: Optional[Tuple[int, int, int]],
-        outline: Optional[Tuple[int, int, int]],
+        fill_colors,
+        outline_colors,
         shape: str = "circle",
         radius_metres: Optional[float] = None,
     ) -> None:
@@ -394,8 +480,11 @@ class OrthoMap:
             coords_3d: World coordinates ``(N, 3)``.
             radius: Marker radius in display pixels.  Ignored when
                 *radius_metres* is set.
-            color: Fill colour, or ``None`` for transparent fill.
-            outline: Outline colour or ``None``.
+            fill_colors: A single RGB fill colour (or ``None`` for hollow)
+                applied to every marker, or a length-N sequence of
+                per-marker fill colours.
+            outline_colors: Outline colour(s), single or per-marker; same
+                broadcasting rules as *fill_colors*.
             shape: ``"circle"`` or ``"square"``.
             radius_metres: Marker diameter in metres.  When provided,
                 overrides *radius* and scales the marker to span this
@@ -408,16 +497,100 @@ class OrthoMap:
         pixels = self.project(coords_3d)
         if pixels.ndim == 1:
             pixels = pixels[np.newaxis, :]
+        n = len(pixels)
+        fills = _as_per_point(fill_colors, n)
+        outlines = _as_per_point(outline_colors, n)
         draw = ImageDraw.Draw(img)
         bbox_fn = draw.ellipse if shape == "circle" else draw.rectangle
-        for px, py in pixels:
+        for (px, py), fill, outline in zip(pixels, fills, outlines):
             dx = px * scale_x
             dy = py * scale_y
             bbox_fn(
                 [dx - radius, dy - radius, dx + radius, dy + radius],
-                fill=color,
+                fill=fill,
                 outline=outline,
             )
+
+    def _resolve_marker_style(
+        self,
+        coords: np.ndarray,
+        labels: list,
+        groups: list,
+        color_by: Optional[str],
+        label_colors: Optional[dict],
+        fill_by_group: bool,
+        point_color: Optional[Tuple[int, int, int]],
+        point_outline: Optional[Tuple[int, int, int]],
+    ) -> Tuple[list, list]:
+        """Compute per-point fill and outline colours for highlights.
+
+        Filled markers use the resolved colour as fill with *point_outline*
+        as the border; hollow markers (group-based) use ``None`` fill and
+        the resolved colour as the outline.
+
+        Returns:
+            ``(fill_colors, outline_colors)`` lists, length ``len(coords)``.
+        """
+        n = len(coords)
+
+        if color_by == "label" and any(lbl is not None for lbl in labels):
+            uniq = sorted({lbl for lbl in labels if lbl is not None})
+            cmap = _get_cmap("tab20", max(1, len(uniq)))
+            lut = dict(label_colors) if label_colors else {}
+            for i, lbl in enumerate(uniq):
+                lut.setdefault(lbl, _rgb255(cmap(i)))
+            base_colors = [lut.get(lbl, point_color) for lbl in labels]
+        elif color_by == "z":
+            z = coords[:, 2].astype(float)
+            zmin, zmax = float(np.nanmin(z)), float(np.nanmax(z))
+            if not (np.isfinite(zmin) and np.isfinite(zmax)) or zmin == zmax:
+                zmin, zmax = zmin - 1e-6, zmax + 1e-6
+            cmap = _get_cmap("bwr")
+            norm = (z - zmin) / (zmax - zmin)
+            base_colors = [_rgb255(cmap(float(t))) for t in norm]
+        else:
+            base_colors = [point_color] * n
+
+        if fill_by_group and any(g is not None for g in groups):
+            uniq_g = sorted({g for g in groups if g is not None}, key=str)
+            g_fill = {g: (i % 2 == 0) for i, g in enumerate(uniq_g)}
+            filled = [g_fill.get(g, True) for g in groups]
+        else:
+            filled = [True] * n
+
+        fill_colors, outline_colors = [], []
+        for col, is_filled in zip(base_colors, filled):
+            if is_filled:
+                fill_colors.append(col)
+                outline_colors.append(point_outline)
+            else:
+                fill_colors.append(None)
+                outline_colors.append(col)
+        return fill_colors, outline_colors
+
+    def _crop_to(self, img: Image.Image, crop: Tuple) -> Image.Image:
+        """Crop *img* to a metre-space window ``(center, size_metres)``.
+
+        The box is clamped to the image bounds so no padding is added.
+        """
+        center, size_m = crop
+        center = np.asarray(center, dtype=np.float64).reshape(-1)
+        if center.shape[0] < 3:
+            center = np.array([center[0], center[1], 0.0])
+        scale_x = img.width / self.width
+        scale_y = img.height / self.height
+        cx, cy = self.project(center[:3])
+        cx *= scale_x
+        cy *= scale_y
+        half_w = (size_m / 2.0) / self.resolution * scale_x
+        half_h = (size_m / 2.0) / self.resolution * scale_y
+        left = max(0, int(round(cx - half_w)))
+        top = max(0, int(round(cy - half_h)))
+        right = min(img.width, int(round(cx + half_w)))
+        bottom = min(img.height, int(round(cy + half_h)))
+        if right <= left or bottom <= top:
+            return img
+        return img.crop((left, top, right, bottom))
 
     @staticmethod
     def _resize(
@@ -453,44 +626,193 @@ class OrthoMap:
         return img.resize((new_w, new_h), Image.LANCZOS)
 
     @staticmethod
-    def _extract_coords(
-        highlights: Union[
-            Annotation,
-            Annotations,
-            List[np.ndarray],
-            np.ndarray,
-        ],
-    ) -> np.ndarray:
-        """Normalise *highlights* into an ``(N, 3)`` coordinate array.
+    def _extract_highlights(
+        highlights,
+    ) -> Tuple[np.ndarray, list, list]:
+        """Normalise *highlights* into coords with label/group metadata.
 
-        Args:
-            highlights: One of the accepted highlight types.
+        Accepts a single ``Annotation``, any container with a ``.data``
+        mapping of items exposing ``.coords`` (and optionally ``.label``
+        / ``.group``) such as ``Annotations`` or ``Cameras``, a numpy
+        array of shape ``(N, 3)``, or a list of coordinates.
 
         Returns:
-            Numpy array of 3D coordinates with shape ``(N, 3)``.
+            ``(coords, labels, groups)`` where *coords* is an ``(N, 3)``
+            array and *labels*/*groups* are length-N lists (entries may
+            be ``None``).
         """
-        from substrata.annotations import Annotation, Annotations
-
-        if isinstance(highlights, Annotations):
-            return np.array(
-                [a.coords for a in highlights.data.values()]
+        # Single Annotation-like object (has .coords but not a container).
+        if hasattr(highlights, "coords") and not hasattr(highlights, "data"):
+            coords = np.asarray(highlights.coords, dtype=np.float64)
+            return (
+                coords[np.newaxis, :],
+                [getattr(highlights, "label", None)],
+                [getattr(highlights, "group", None)],
             )
-        if isinstance(highlights, Annotation):
-            return highlights.coords[np.newaxis, :]
+
+        # Container with .data mapping to items with .coords.
+        if hasattr(highlights, "data") and hasattr(highlights.data, "values"):
+            coords, labels, groups = [], [], []
+            for item in highlights.data.values():
+                c = getattr(item, "coords", None)
+                if c is None:
+                    continue
+                c = np.asarray(c, dtype=np.float64)
+                if c.shape[0] >= 3:
+                    coords.append(c[:3])
+                    labels.append(getattr(item, "label", None))
+                    groups.append(getattr(item, "group", None))
+            if coords:
+                return np.vstack(coords), labels, groups
+            return np.empty((0, 3), dtype=np.float64), [], []
 
         arr = np.asarray(highlights, dtype=np.float64)
         if arr.ndim == 1:
             arr = arr[np.newaxis, :]
-        return arr
+        n = len(arr)
+        return arr, [None] * n, [None] * n
+
+
+class OrthoMapGroup(OrthoMap):
+    """Composite orthographic map over several point clouds.
+
+    All clouds are projected into a single shared frame (common origin
+    and metres-per-pixel) and rasterized together, so overlapping regions
+    blend naturally.  The result behaves like an :class:`OrthoMap` — every
+    method (``show``, ``project``, highlight overlays) is inherited — with
+    :meth:`show` accepting one or more annotation sets to overlay.
+    """
+
+    def __init__(
+        self,
+        pcds,
+        up_vector: Optional[Union[List[float], np.ndarray]] = None,
+        pixel_width: Optional[int] = None,
+        pixel_height: Optional[int] = None,
+        rotation: int = 0,
+    ) -> None:
+        """Initialize a composite ortho map from several point clouds.
+
+        Args:
+            pcds: Iterable of point clouds to composite into one frame.
+            up_vector: Projection "up" direction (default top-down z).
+            pixel_width: Optional target width in pixels.
+            pixel_height: Optional target height in pixels.
+            rotation: In-plane rotation in degrees applied on ``show``.
+        """
+        pcds = list(pcds)
+        if not pcds:
+            raise ValueError("OrthoMapGroup requires at least one point cloud")
+
+        if up_vector is None:
+            up_vector = np.array([0.0, 0.0, 1.0])
+        up = np.asarray(up_vector, dtype=np.float64)
+        up = up / np.linalg.norm(up)
+        self._up_vector = up
+        self._rotation = rotation
+        self.rotation = self._rotation_to_z(up)
+
+        xs_all, ys_all, colors_all = [], [], []
+        total = 0
+        for pcd in pcds:
+            points = np.asarray(pcd.points)
+            if len(points) == 0:
+                continue
+            rotated = (self.rotation @ points.T).T
+            xs_all.append(rotated[:, 0])
+            ys_all.append(rotated[:, 1])
+            colors_all.append(self._get_colors(pcd, len(points)))
+            total += len(points)
+        if total == 0:
+            raise ValueError("OrthoMapGroup point clouds contain no points")
+
+        xs = np.concatenate(xs_all)
+        ys = np.concatenate(ys_all)
+        colors = np.concatenate(colors_all, axis=0)
+
+        min_x, max_x = float(xs.min()), float(xs.max())
+        min_y, max_y = float(ys.min()), float(ys.max())
+        extent_x = max(max_x - min_x, 1e-9)
+        extent_y = max(max_y - min_y, 1e-9)
+        self.origin = np.array([min_x, min_y])
+        self.width, self.height, self.resolution = self._compute_dimensions(
+            extent_x, extent_y, total, pixel_width, pixel_height,
+        )
+        self.image = self._rasterize(
+            xs, ys, colors,
+            min_x, min_y,
+            self.resolution,
+            self.width, self.height,
+        )
+        logger.info(
+            "OrthoMapGroup created: %d x %d px  (%d clouds, %d points)",
+            self.width, self.height, len(pcds), total,
+        )
+
+    def __repr__(self) -> str:
+        """Return a concise summary of the composite ortho map."""
+        return (
+            f"OrthoMapGroup({self.width}x{self.height} px, "
+            f"res={self.resolution:.6f} m/px, "
+            f"up={self._up_vector.tolist()})"
+        )
+
+    def show(
+        self,
+        annotations_list=None,
+        color_by: Optional[str] = "label",
+        **kwargs,
+    ) -> Image.Image:
+        """Render the composite map with per-label-coloured annotations.
+
+        Args:
+            annotations_list: A single ``Annotations`` container, an
+                iterable of containers (merged), or a coordinate array.
+                ``None`` renders the composite with no overlay.
+            color_by: Highlight colouring mode (default ``"label"``).
+            **kwargs: Forwarded to :meth:`OrthoMap.show`.
+
+        Returns:
+            PIL ``Image`` of the composite map.
+        """
+        highlights = self._merge_annotations(annotations_list)
+        return super().show(highlights=highlights, color_by=color_by, **kwargs)
+
+    @staticmethod
+    def _merge_annotations(annotations_list):
+        """Merge one or more annotation containers into a single set."""
+        if annotations_list is None:
+            return None
+        if hasattr(annotations_list, "data") or hasattr(
+            annotations_list, "coords"
+        ):
+            return annotations_list
+
+        containers = list(annotations_list)
+        if not containers:
+            return None
+        if not all(hasattr(a, "data") for a in containers):
+            return annotations_list
+
+        class _MergedHighlights:
+            pass
+
+        merged = _MergedHighlights()
+        merged.data = {}
+        idx = 0
+        for anns in containers:
+            for item in anns.data.values():
+                merged.data[idx] = item
+                idx += 1
+        return merged
 
 
 def _resolve_label(ann) -> Optional[str]:
     """Best available classification label for an annotation, or ``None``.
 
-    Mirrors ``visualizations._ann_label``: prefer the classifier result
-    (``ann.image_match.classification['label']``) and fall back to the plain
-    ``ann.label``. Empty strings are treated as missing. Duck-typed so
-    ``ortho`` needs no ``annotations`` import.
+    Prefers the classifier result (``ann.image_match.classification['label']``)
+    and falls back to the plain ``ann.label``. Empty strings are treated as
+    missing. Duck-typed so ``ortho`` needs no ``annotations`` import.
     """
     im = getattr(ann, "image_match", None)
     cls = getattr(im, "classification", None)

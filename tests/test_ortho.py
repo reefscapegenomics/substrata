@@ -55,9 +55,10 @@ class _PC:
 
 
 class _Ann:
-    def __init__(self, coords, label=None):
+    def __init__(self, coords, label=None, group=None):
         self.coords = np.asarray(coords, dtype=float)
         self.label = label
+        self.group = group
 
 
 class _Container:
@@ -184,11 +185,120 @@ class TestOrthoGridShow(unittest.TestCase):
         self.assertEqual(type(fig).__name__, "Figure")
 
 
+def _count_color(img, rgb):
+    arr = np.asarray(img)
+    return int(np.all(arr == np.array(rgb, dtype=arr.dtype), axis=-1).sum())
+
+
 class TestOrthoMapBasics(unittest.TestCase):
     def test_show_returns_pil(self):
         om = ortho.OrthoMap(_ramp_pc(), pixel_width=100)
         img = om.show()
         self.assertEqual(img.size, (om.width, om.height))
+
+    def test_default_highlight_is_red(self):
+        om = ortho.OrthoMap(_ramp_pc(), pixel_width=120)
+        img = om.show(highlights=np.array([[2.0, 2.0, 2.0]]), point_size=8)
+        self.assertGreater(_count_color(img, (255, 0, 0)), 0)
+
+
+class TestOrthoMapStyling(unittest.TestCase):
+    def setUp(self):
+        self.pc = _ramp_pc()
+        self.anns = _Container([
+            _Ann([0.5, 0.5, 0.5], label="coral", group="A"),
+            _Ann([3.5, 3.5, 3.5], label="algae", group="B"),
+            _Ann([2.0, 2.0, 2.0], label="coral", group="A"),
+        ])
+
+    def test_color_by_label_differs_from_default(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=150)
+        default = np.asarray(om.show(highlights=self.anns, point_size=8))
+        labelled = np.asarray(
+            om.show(highlights=self.anns, color_by="label", point_size=8)
+        )
+        self.assertFalse(np.array_equal(default, labelled))
+
+    def test_fill_by_group_changes_markers(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=150)
+        filled = np.asarray(om.show(highlights=self.anns, point_size=8))
+        grouped = np.asarray(
+            om.show(highlights=self.anns, fill_by_group=True, point_size=8)
+        )
+        self.assertFalse(np.array_equal(filled, grouped))
+
+    def test_explicit_label_colors(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=150)
+        img = np.asarray(om.show(
+            highlights=self.anns, color_by="label",
+            label_colors={"coral": (0, 255, 0), "algae": (0, 0, 255)},
+            point_size=8,
+        ))
+        self.assertGreater(_count_color(img, (0, 255, 0)), 0)
+        self.assertGreater(_count_color(img, (0, 0, 255)), 0)
+
+    def test_grayscale_background(self):
+        om = ortho.OrthoMap(_PC(_ramp_pc().points, np.random.RandomState(0)
+                                .rand(len(_ramp_pc().points), 3)),
+                            pixel_width=120)
+        img = np.asarray(om.show(grayscale=True))
+        # A grayscale image has r == g == b everywhere.
+        self.assertTrue(np.all((img[..., 0] == img[..., 1])
+                               & (img[..., 1] == img[..., 2])))
+
+    def test_crop_narrows_output(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=200)
+        img = om.show(highlights=_Ann([2.0, 2.0, 2.0]),
+                      crop=([2.0, 2.0, 2.0], 1.0))
+        self.assertLess(img.size[0], om.width)
+        self.assertLess(img.size[1], om.height)
+
+
+class TestExtractHighlights(unittest.TestCase):
+    def test_single_annotation(self):
+        coords, labels, groups = ortho.OrthoMap._extract_highlights(
+            _Ann([1.0, 2.0, 3.0], label="x", group="g")
+        )
+        self.assertEqual(coords.shape, (1, 3))
+        self.assertEqual(labels, ["x"])
+        self.assertEqual(groups, ["g"])
+
+    def test_container_metadata(self):
+        cont = _Container([_Ann([0, 0, 0], "a", "g1"),
+                           _Ann([1, 1, 1], "b", "g2")])
+        coords, labels, groups = ortho.OrthoMap._extract_highlights(cont)
+        self.assertEqual(coords.shape, (2, 3))
+        self.assertEqual(labels, ["a", "b"])
+        self.assertEqual(groups, ["g1", "g2"])
+
+    def test_plain_array(self):
+        coords, labels, groups = ortho.OrthoMap._extract_highlights(
+            np.array([[0, 0, 0], [1, 1, 1]])
+        )
+        self.assertEqual(coords.shape, (2, 3))
+        self.assertEqual(labels, [None, None])
+
+
+class TestOrthoMapGroup(unittest.TestCase):
+    def test_composites_two_clouds(self):
+        pc1 = _ramp_pc()
+        pc2 = _PC(pc1.points + np.array([4.0, 0.0, 0.0]))
+        single = ortho.OrthoMap(pc1, pixel_width=150)
+        grp = ortho.OrthoMapGroup([pc1, pc2], pixel_width=300)
+        self.assertGreaterEqual(grp.width, single.width)
+        self.assertEqual(grp.image.shape, (grp.height, grp.width, 3))
+
+    def test_show_with_annotations(self):
+        pc1 = _ramp_pc()
+        pc2 = _PC(pc1.points + np.array([4.0, 0.0, 0.0]))
+        grp = ortho.OrthoMapGroup([pc1, pc2], pixel_width=300)
+        anns = _Container([_Ann([0.5, 0.5, 0.5], "coral")])
+        img = grp.show([anns], color_by="label", point_size=6)
+        self.assertEqual(img.size, (grp.width, grp.height))
+
+    def test_empty_raises(self):
+        with self.assertRaises(ValueError):
+            ortho.OrthoMapGroup([])
 
 
 if __name__ == "__main__":  # pragma: no cover
