@@ -2,6 +2,12 @@ import re
 
 OUTPUT_FOLDER = "output"
 
+# measure_all parallelism. Capped (rather than -1 = all cores) because the
+# measurements are memory-heavy: gap fraction shares the full point cloud across
+# threads, and the plotly/Kaleido QC images (when enabled) each spawn a headless
+# browser subprocess. Running one per core exhausts RAM on many-core machines.
+DEFAULT_MEASURE_N_JOBS = 4
+
 DEFAULT_INLIER_RANGE = 0.01
 DEFAULT_TPI_RADIUS_INNER = 0.1  # metres; excludes focal object from neighbourhood
 DEFAULT_TPI_RADIUS_OUTER = 0.5  # metres; outer limit of annulus neighbourhood
@@ -15,6 +21,9 @@ DEFAULT_BENTHIC_INTERCEPT_RADIUS = 0.02  # metres; XY search radius for z-interc
 # Height-weighted "interaction cover": colony base level + below-base weight falloff.
 DEFAULT_BENTHIC_BASE_PERCENTILE = 10  # percentile of inner-radius z = colony base level
 DEFAULT_BENTHIC_BASE_FALLOFF = 0.20  # m; depth below base where height weight reaches 0
+
+# --- OrthoGrid (gridded per-cell rasters: DEM / density / labels) --------------
+DEFAULT_ORTHO_CELL_SIZE = 0.1  # metres; default OrthoGrid cell side length
 
 ANN_DEFAULT_COL_ORDER = {
     "id": 0,

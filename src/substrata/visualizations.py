@@ -1578,15 +1578,20 @@ def plot_positions(
     color=False,
     show_x_z=False,
     show_z=False,
+    show_legend=False,
     zoom=None,
 ):
     """Plot positions (Cameras, Annotations, or Nx3 coords) in X–Y and optionally X–Z views.
 
     - Background shows a grayscale decimated point cloud if provided.
       If color=True and the point cloud has colors, use those instead.
-    - Markers are colored by Z (bwr colormap) if show_z=True, otherwise in red.
+    - Markers are colored by Z (bwr colormap) if show_z=True; else by their
+      annotation label (distinct colour per label) when labels are available
+      (e.g. an Annotations input); otherwise in red.
     - If items have a `group` attribute, groups are encoded as filled (even index)
-      vs hollow (odd index) and a legend is shown.
+      vs hollow (odd index).
+    - Group/label legends are only drawn when show_legend=True, placed to the
+      right of the plot so they never overlap the points.
 
     Args:
         positions: One of:
@@ -1605,6 +1610,8 @@ def plot_positions(
         show_x_z: If True, show X–Z plot in addition to X–Y (default False).
         show_z: If True, color markers by Z coordinate with colorbar (default False).
             If False, all markers are colored red.
+        show_legend: If True, draw the group and/or label legend(s) to the right
+            of the plot (default False).
         zoom: Optional zoom level (only used for single Annotation). If provided,
             limits the view to a zoom x zoom meter area centered on the annotation.
             For example, zoom=1 shows a 1x1m area, zoom=2 shows a 2x2m area.
@@ -1643,7 +1650,8 @@ def plot_positions(
             if arr.ndim == 2 and arr.shape[1] >= 3:
                 coords = arr[:, :3]
                 groups = [None] * len(coords)
-                return coords, groups
+                labels = [None] * len(coords)
+                return coords, groups, labels
         except Exception:
             pass
 
@@ -1653,14 +1661,16 @@ def plot_positions(
                 items = list(pos.data.values())
                 coords = []
                 groups = []
+                labels = []
                 for it in items:
                     if hasattr(it, "coords") and it.coords is not None:
                         c = np.asarray(it.coords, dtype=float)
                         if c.shape[0] >= 3:
                             coords.append(c[:3])
                             groups.append(getattr(it, "group", None))
+                            labels.append(_ann_label(it))
                 if coords:
-                    return np.vstack(coords), groups
+                    return np.vstack(coords), groups, labels
             except Exception:
                 pass
 
@@ -1668,14 +1678,16 @@ def plot_positions(
         try:
             coords = []
             groups = []
+            labels = []
             for it in list(pos):
                 if hasattr(it, "coords") and it.coords is not None:
                     c = np.asarray(it.coords, dtype=float)
                     if c.shape[0] >= 3:
                         coords.append(c[:3])
                         groups.append(getattr(it, "group", None))
+                        labels.append(_ann_label(it))
             if coords:
-                return np.vstack(coords), groups
+                return np.vstack(coords), groups, labels
         except Exception:
             pass
 
@@ -1685,7 +1697,7 @@ def plot_positions(
             "iterable of items with .coords."
         )
 
-    coords, groups = _normalize_positions(positions)
+    coords, groups, labels = _normalize_positions(positions)
     if coords.size == 0:
         raise ValueError("No positions with coords provided.")
 
@@ -1693,6 +1705,15 @@ def plot_positions(
     valid_groups = [g for g in groups if g is not None]
     unique_groups = sorted(set(valid_groups))
     group_to_fill = {g: (i % 2 == 0) for i, g in enumerate(unique_groups)}
+
+    # Prepare label → colour mapping (distinct colour per label). Used when
+    # labels are available (e.g. Annotations) and Z-colouring is not requested;
+    # unlabeled points fall back to grey.
+    unique_labels = sorted({lab for lab in labels if lab is not None})
+    color_by_label = bool(unique_labels) and not show_z
+    if color_by_label:
+        lcmap = plt.cm.get_cmap("tab20", max(1, len(unique_labels)))
+        label_colors = {lab: lcmap(i) for i, lab in enumerate(unique_labels)}
 
     # Prepare color mapping by Z coordinate (blue→red) if show_z is True
     z_vals = np.array(coords[:, 2], dtype=float)
@@ -1761,9 +1782,11 @@ def plot_positions(
         xs = np.asarray(coords[:, x_idx], dtype=float)
         ys = np.asarray(coords[:, y_idx], dtype=float)
         # Draw hollow vs filled by group
-        for x, y, g, z in zip(xs, ys, groups, z_vals):
+        for x, y, g, z, lab in zip(xs, ys, groups, z_vals, labels):
             if show_z and cmap is not None and norm is not None:
                 col = cmap(norm(z))
+            elif color_by_label:
+                col = label_colors.get(lab, (0.7, 0.7, 0.7))
             else:
                 col = "red"
             filled = group_to_fill.get(g, True)
@@ -1828,41 +1851,60 @@ def plot_positions(
             cbar = fig.colorbar(sm, ax=ax_top, fraction=0.046, pad=0.04)
         cbar.set_label("Z (m)")
 
-    # Group legend (if groups present)
-    if unique_groups:
+    # Legends: groups (filled/hollow) and/or labels (colour), only when
+    # requested. Placed outside the axes on the right so they never overlap the
+    # plotted points; stacked vertically when both are present.
+    if show_legend:
         from matplotlib.lines import Line2D
 
-        handles = []
-        for g in unique_groups:
-            if group_to_fill[g]:
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        marker="o",
-                        color="w",
-                        label=str(g),
-                        markerfacecolor="black",
-                        markeredgecolor="black",
-                        markersize=8,
-                        linewidth=0,
-                    )
+        axis_legends = []
+
+        if unique_groups:
+            group_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(g),
+                    markerfacecolor="black" if group_to_fill[g] else "none",
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
                 )
-            else:
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        marker="o",
-                        color="w",
-                        label=str(g),
-                        markerfacecolor="none",
-                        markeredgecolor="black",
-                        markersize=8,
-                        linewidth=0,
-                    )
+                for g in unique_groups
+            ]
+            axis_legends.append(("Groups", group_handles))
+
+        if color_by_label:
+            label_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(lab),
+                    markerfacecolor=label_colors[lab],
+                    markeredgecolor="black",
+                    markersize=8,
+                    linewidth=0,
                 )
-        ax_top.legend(handles=handles, title="Groups", loc="upper right", frameon=False)
+                for lab in unique_labels
+            ]
+            axis_legends.append(("Labels", label_handles))
+
+        for i, (leg_title, handles) in enumerate(axis_legends):
+            leg = ax_top.legend(
+                handles=handles,
+                title=leg_title,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0 - i * 0.5),
+                frameon=False,
+                borderaxespad=0.0,
+            )
+            # Keep all but the last legend by re-adding as a persistent artist.
+            if i < len(axis_legends) - 1:
+                ax_top.add_artist(leg)
 
     if title:
         fig.suptitle(title)
@@ -2363,11 +2405,14 @@ def plot_measurements(
                     zorder=3,
                 )
         tick_labels = [
-            f"{label}\nn={len(plot_data[i])}" for i, label in enumerate(unique_labels)
+            f"{label} (n={len(plot_data[i])})"
+            for i, label in enumerate(unique_labels)
         ]
-        ax.set_xticklabels(tick_labels)
+        # Fully vertical (90°) x-tick labels so class names stay legible when
+        # there are many of them.
+        ax.set_xticklabels(tick_labels, rotation=90, ha="center", va="top")
         ax.set_title(key, fontsize=9)
-        ax.tick_params(axis="x", labelsize=7, rotation=45 if len(unique_labels) > 4 else 0)
+        ax.tick_params(axis="x", labelsize=7)
         ax.tick_params(axis="y", labelsize=7)
         ax.set_rasterized(True)
 
@@ -2956,285 +3001,6 @@ def _ann_label(ann):
         return str(cls["label"])
     lbl = getattr(ann, "label", None)
     return str(lbl) if lbl not in (None, "") else None
-
-
-def _grid_bboxes_from_annotations(annotations, cell_size=None):
-    """Build a regular grid of cell bboxes covering the annotation XY extent.
-
-    Args:
-        annotations: An `Annotations` instance.
-        cell_size (float | None): Side length of each square cell. If None, it
-            is estimated under a one-annotation-per-cell assumption as
-            ``sqrt(width * height / n)``.
-
-    Returns:
-        List of bboxes, each ([x_min, y_min], [x_max, y_max]).
-    """
-    from substrata import measurements
-
-    coords = np.asarray(annotations.coords, dtype=float)
-    if coords.size == 0:
-        return []
-    xy = coords[:, :2]
-    min_x, min_y = xy.min(axis=0)
-    max_x, max_y = xy.max(axis=0)
-    width = float(max_x - min_x)
-    height = float(max_y - min_y)
-
-    if cell_size is None:
-        # One-per-cell assumption: cell area ~ total area / n_points.
-        cell_size = float(np.sqrt(max(width * height, 1e-9) / max(len(xy), 1)))
-
-    cs = float(cell_size)
-    # Snap the extent outward to whole multiples of the cell size so the overall
-    # box divides evenly (subdivide_boxes requires this).
-    x0 = np.floor(min_x / cs) * cs
-    y0 = np.floor(min_y / cs) * cs
-    x1 = np.ceil(max_x / cs) * cs
-    y1 = np.ceil(max_y / cs) * cs
-    # Guard against a degenerate (zero-width) axis.
-    if x1 - x0 < cs:
-        x1 = x0 + cs
-    if y1 - y0 < cs:
-        y1 = y0 + cs
-    return measurements.subdivide_boxes(([x0, y0], [x1, y1]), cs)
-
-
-def show_classified_grid_cells(
-    annotations,
-    bboxes=None,
-    pcd=None,
-    cell_size=None,
-    show_points=False,
-    point_size=1,
-    title=None,
-    label_colors=None,
-    max_output_points=50000,
-):
-    """
-    Show a 2D plot with grid cells colored by majority classification.
-
-    Given an `Annotations` object, determine for each grid cell which
-    annotations fall within the cell bounds and color the cell based on the
-    majority label (from `annotation.image_match.classification['label']` when
-    a classifier has run, otherwise the plain `annotation.label`).
-
-    The grid cells can be supplied explicitly via `bboxes`. If `bboxes` is None,
-    a regular grid is built over the annotation XY extent using `cell_size`
-    (auto-estimated as ``sqrt(area / n)`` when `cell_size` is also None). Note
-    that annotation coordinates must already be in the frame in which the grid
-    is axis-aligned (e.g. the orientation used to generate the intercepts).
-
-    - Cells with no classified annotations are colored gray.
-    - Grid cell outlines are not drawn; only the filled cell color is shown.
-
-    Args:
-        annotations: An `Annotations` instance.
-        bboxes: Optional list of bounding boxes, where each item is
-            (min_corner[x, y], max_corner[x, y]). A single bbox can also be
-            passed as ((x_min, y_min), (x_max, y_max)). If None, the grid is
-            derived from the annotation coordinates.
-        pcd: Optional point cloud (SimplePointCloud or PointCloud) used only for
-            the optional background scatter.
-        cell_size (float | None): Side length of each grid cell when `bboxes` is
-            not given. Ignored when `bboxes` is supplied.
-        show_points (bool): If True and `pcd` is given, scatter the XY points as
-            a background.
-        point_size (int): Marker size for background points when shown.
-        title (str | None): Optional title for the plot.
-        label_colors (dict | None): Optional mapping {label: matplotlib color}.
-
-    Returns:
-        matplotlib.figure.Figure: The figure for further manipulation, display,
-        or saving.
-    """
-    # Build the grid from the annotations when no bboxes are supplied.
-    if bboxes is None:
-        bboxes = _grid_bboxes_from_annotations(annotations, cell_size)
-
-    # Normalize bboxes input: accept a single bbox as well
-    if (
-        isinstance(bboxes, (list, tuple))
-        and len(bboxes) == 2
-        and isinstance(bboxes[0], (list, tuple))
-        and isinstance(bboxes[1], (list, tuple))
-        and len(bboxes[0]) == 2
-        and len(bboxes[1]) == 2
-        and not (
-            isinstance(bboxes[0][0], (list, tuple))
-            or isinstance(bboxes[1][0], (list, tuple))
-        )
-    ):
-        bboxes = [bboxes]
-
-    # Decimate if required (and ensure PointCloud format)
-    if pcd is not None:
-        pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
-
-    fig = plt.figure(figsize=(12, 5))
-    gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
-    ax_left = fig.add_subplot(gs[0, 0])
-    ax_left.set_aspect("equal")
-    ax_right = fig.add_subplot(gs[0, 1])
-
-    # Optional background points in grayscale
-    if show_points and pcd is not None and len(pcd.points) > 0:
-        plot_cols = np.full(
-            (pcd.points.shape[0], 3), 0.6, dtype=float
-        )  # Default to grayscale
-        ax_left.scatter(
-            pcd.points[:, 0],
-            pcd.points[:, 1],
-            s=point_size,
-            c=plot_cols,
-            alpha=0.5,
-            edgecolor="none",
-        )
-
-    # Build default label color mapping if not provided
-    if label_colors is None:
-        # Collect labels present in annotations
-        labels = [
-            lbl
-            for lbl in (_ann_label(ann) for ann in annotations.data.values())
-            if lbl is not None
-        ]
-        unique_labels = sorted(set(labels))
-        cmap = plt.cm.get_cmap("tab20", max(1, len(unique_labels)))
-        label_colors = {lbl: cmap(i) for i, lbl in enumerate(unique_labels)}
-
-    # Helper to compute majority label for a bbox
-    def majority_label_for_bbox(min_corner, max_corner):
-        counts = {}
-        for ann in annotations.data.values():
-            x, y = ann.coords[0], ann.coords[1]
-            if (min_corner[0] <= x < max_corner[0]) and (
-                min_corner[1] <= y < max_corner[1]
-            ):
-                lbl = _ann_label(ann)
-                if lbl is not None:
-                    counts[lbl] = counts.get(lbl, 0) + 1
-        if not counts:
-            return None
-        # Return the label with highest count (break ties deterministically by label name)
-        max_count = max(counts.values())
-        candidates = sorted([lbl for lbl, c in counts.items() if c == max_count])
-        return candidates[0] if candidates else None
-
-    # Draw filled rectangles for each bbox colored by majority label
-    labels_present = set()
-    label_counts_by_cell = {}
-    logger.debug("Drawing %d bounding boxes", len(bboxes))
-    for i, bbox in enumerate(bboxes):
-        min_corner, max_corner = bbox
-        label = majority_label_for_bbox(min_corner, max_corner)
-        if label is None:
-            face_color = (0.7, 0.7, 0.7)  # gray for missing
-        else:
-            face_color = label_colors.get(label, (0.7, 0.7, 0.7))
-            labels_present.add(label)
-            label_counts_by_cell[label] = label_counts_by_cell.get(label, 0) + 1
-
-        if label is None:
-            label_counts_by_cell["No data"] = label_counts_by_cell.get("No data", 0) + 1
-
-        x_vals = [min_corner[0], max_corner[0]]
-        y_vals = [min_corner[1], max_corner[1]]
-        width = x_vals[1] - x_vals[0]
-        height = y_vals[1] - y_vals[0]
-        rect = plt.Rectangle(
-            (x_vals[0], y_vals[0]),
-            width,
-            height,
-            facecolor=face_color,
-            edgecolor="none",
-            alpha=0.6,
-        )
-        ax_left.add_patch(rect)
-
-    # Set axis limits based on bbox data
-    if bboxes:
-        all_x_coords = []
-        all_y_coords = []
-        for bbox in bboxes:
-            min_corner, max_corner = bbox
-            all_x_coords.extend([min_corner[0], max_corner[0]])
-            all_y_coords.extend([min_corner[1], max_corner[1]])
-
-        if all_x_coords and all_y_coords:
-            x_min, x_max = min(all_x_coords), max(all_x_coords)
-            y_min, y_max = min(all_y_coords), max(all_y_coords)
-            logger.debug(
-                "Setting axis limits: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
-                x_min,
-                x_max,
-                y_min,
-                y_max,
-            )
-            ax_left.set_xlim(x_min, x_max)
-            ax_left.set_ylim(y_min, y_max)
-
-    if title is not None:
-        ax_left.set_title(title)
-
-    # Build legend: include only labels present plus a gray "No data"
-    handles = []
-    for lbl in sorted(labels_present):
-        handles.append(
-            mpatches.Patch(
-                facecolor=label_colors.get(lbl, (0.7, 0.7, 0.7)),
-                edgecolor="none",
-                label=str(lbl),
-            )
-        )
-    handles.append(
-        mpatches.Patch(facecolor=(0.7, 0.7, 0.7), edgecolor="none", label="No data")
-    )
-    if len(handles) > 0:
-        ax_left.legend(
-            handles=handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.05),
-            ncol=min(len(handles), 6),
-            frameon=False,
-        )
-
-    # Right panel: bar chart with counts per category (including No data)
-    if label_counts_by_cell:
-        categories = list(
-            sorted([k for k in label_counts_by_cell.keys() if k != "No data"])
-        )
-        counts = [label_counts_by_cell[c] for c in categories]
-        # Append No data at the end if present
-        if "No data" in label_counts_by_cell:
-            categories.append("No data")
-            counts.append(label_counts_by_cell["No data"])
-
-        bar_colors = [
-            label_colors.get(c, (0.7, 0.7, 0.7)) if c != "No data" else (0.7, 0.7, 0.7)
-            for c in categories
-        ]
-        x_pos = np.arange(len(categories))
-        ax_right.bar(x_pos, counts, color=bar_colors)
-        ax_right.set_xticks(x_pos)
-        ax_right.set_xticklabels([str(c) for c in categories], rotation=45, ha="right")
-        ax_right.set_ylabel("Count")
-        ax_right.set_title("Cells per class")
-        ax_right.margins(x=0.05)
-
-    # Tight layout and return the figure
-    plt.tight_layout()
-
-    # Match right plot area height to left plot area height
-    try:
-        left_pos = ax_left.get_position()
-        right_pos = ax_right.get_position()
-        ax_right.set_position(
-            [right_pos.x0, left_pos.y0, right_pos.width, left_pos.height]
-        )
-    except Exception:
-        pass
-    return fig
 
 
 def show_intercept_point(intercept_point):

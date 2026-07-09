@@ -173,7 +173,7 @@ def get_best_fit_plane_ransac(
     return a, b, c, d, inliers_idx
 
 
-def get_plane_angles(pcd, vis=False):
+def get_plane_angles(pcd, vis=False, generate_image=True):
     """Calculate orientation angles for the best-fit plane of a point cloud.
 
     The plane normal is aligned with the point cloud normals by
@@ -183,6 +183,9 @@ def get_plane_angles(pcd, vis=False):
     Args:
         pcd: Point cloud object with ``.points`` (and optionally ``.normals``).
         vis: If True, show an interactive 3-D visualisation of the elevation.
+        generate_image: If True (default), also render a static elevation-angle
+            QC image (via plotly/Kaleido). Set False to skip that expensive
+            render and return ``None`` for the image (e.g. batch runs).
 
     Returns:
         tuple: A 6-element tuple containing:
@@ -231,9 +234,11 @@ def get_plane_angles(pcd, vis=False):
     if vis:
         visualizations.visualize_elevation_angle(pcd, [a, b, c, d], interactive=True)
 
-    image = visualizations.visualize_elevation_angle(
-        pcd, [a, b, c, d], interactive=False
-    )
+    image = None
+    if generate_image:
+        image = visualizations.visualize_elevation_angle(
+            pcd, [a, b, c, d], interactive=False
+        )
 
     return (
         theta_deg,
@@ -289,7 +294,7 @@ def get_dev_rugosity(pcd):
     return dev_rugosity
 
 
-def calc_roughness(pcd):
+def calc_roughness(pcd, generate_image=True):
     """
     Compute plane-detrended roughness (Ra, Rq) for a point cloud.
 
@@ -345,8 +350,14 @@ def calc_roughness(pcd):
     ra = float(dist.mean())
     rq = float(np.sqrt((dist**2).mean()))
 
-    # Pass ra and rq to avoid recalculating in visualize_roughness
-    image = visualizations.visualize_roughness(pcd, interactive=False, ra=ra, rq=rq)
+    # The QC image is an expensive plotly/Kaleido render; skip it unless asked
+    # for (e.g. batch runs via measure_all default to metrics only).
+    image = None
+    if generate_image:
+        # Pass ra and rq to avoid recalculating in visualize_roughness
+        image = visualizations.visualize_roughness(
+            pcd, interactive=False, ra=ra, rq=rq
+        )
 
     return ra, rq, image
 
@@ -1283,14 +1294,15 @@ def get_fractal_dimension(pcd, iterations=10, plot=False):
     return slope
 
 
-def get_vector_dispersion(geom):
+def get_vector_dispersion(geom, generate_image=True):
     """
     Function to get the vector normal dispersion of a geometry (either
     PointCloud or Mesh). Adapted from Young et al., 2017.
 
     Returns the dispersion scalar and a static visualization image (numpy array),
     same pattern as calc_roughness. Only PointCloud-like geometry is visualized;
-    for TriangleMesh, the image is None.
+    for TriangleMesh, the image is None. When ``generate_image`` is False the
+    (expensive plotly/Kaleido) image is skipped and returned as None.
     """
     if isinstance(
         geom,
@@ -1317,7 +1329,8 @@ def get_vector_dispersion(geom):
 
     image = None
     if (
-        isinstance(
+        generate_image
+        and isinstance(
             geom,
             (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
         )
@@ -1584,22 +1597,21 @@ def calc_gap_fraction(
     raw_cover = len(np.unique(cover_pixels, axis=0))
     gapF_raw = (img_area - raw_cover) / img_area
 
-    # Map the points(/colors) to the image pixels
+    # Map the points(/colors) to the image pixels. Vectorized so this scales to
+    # the full point cloud without a Python-level per-point loop (which made
+    # this the runtime bottleneck for large clouds).
     if color_output:
         rgb_colors = (np.asarray(pcd.colors)[points_to_keep] * 255).astype(np.uint8)
-        # Calculate the norms to be able to determine closest points
+        # For each pixel keep the colour of the point closest to the centre. We
+        # scatter-assign in order of decreasing distance so the nearest point
+        # (smallest norm) is written last and therefore wins per pixel.
         norms = np.linalg.norm(trans_points, axis=1)
-        mapping = -np.ones((resolution, resolution), dtype=int)
-        # Iterate over the points
-        for i in range(len(trans_points)):
-            # Update color if this mapped point is closer to the center
-            mapped_id = mapping[cover_pixels[i][0], cover_pixels[i][1]]
-            if mapped_id == -1 or norms[i] < norms[mapped_id]:
-                mapping[cover_pixels[i][0], cover_pixels[i][1]] = i
-                image[cover_pixels[i][0], cover_pixels[i][1]] = rgb_colors[i]
+        order = np.argsort(-norms, kind="stable")
+        image_flat = image.reshape(-1, 3)
+        flat_idx = cover_pixels[:, 0] * resolution + cover_pixels[:, 1]
+        image_flat[flat_idx[order]] = rgb_colors[order]
     else:
-        for i in range(len(trans_points)):
-            image[cover_pixels[i][0], cover_pixels[i][1]] = [255, 255, 255]
+        image[cover_pixels[:, 0], cover_pixels[:, 1]] = [255, 255, 255]
 
     # Apply floodFill algorithm to calculate center gap fraction.
     # By default, use a centre point and an "upslope" point; otherwise convert

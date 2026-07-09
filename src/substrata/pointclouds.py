@@ -733,141 +733,123 @@ class PointCloud:
             if hasattr(self, attr):
                 delattr(self, attr)
 
-    def remove_edge_clusters(
+    def remove_stray_xy_points(
         self,
-        eps: float = 0.1,
-        min_samples: int = 10,
-        keep_top_n_clusters: int = 1,
+        density_frac: float = 0.1,
+        n_bins: int = 128,
+        smooth_radius: int = 2,
+        preview: bool = False,
     ) -> None:
-        """Remove stray points and edge clusters when viewed from top-down.
+        """Trim stray points around the X/Y edges to clean up the cloud.
 
-        This method projects points to the XY plane and uses DBSCAN clustering
-        to identify disconnected clusters. It keeps only the largest cluster(s)
-        and removes all points belonging to smaller edge clusters and stray
-        points.
+        Works purely in 2D (top-down). The XY footprint is binned into an
+        ``n_bins`` x ``n_bins`` grid, and the per-cell counts are box-blurred
+        over a ``(2*smooth_radius+1)`` window before thresholding. Smoothing is
+        what keeps the *interior* intact: a sparse cell in the middle of the
+        body (a coral gap/hole) inherits density from its dense neighbours and
+        survives, while the genuine outer fringe - bordered by empty space -
+        stays low and is dropped. A point is removed when its smoothed density
+        is below ``density_frac`` of the *typical* (median) occupied cell.
+        Because the threshold is a fraction of the cloud's own density it adapts
+        to scale and never wipes a uniformly-sparse cloud; higher
+        ``density_frac`` removes more. It is a single O(N) histogram pass, so it
+        stays fast on very large clouds.
 
         Args:
-            eps: Maximum distance between two points to be considered neighbors
-                in the DBSCAN clustering (in the same units as point
-                coordinates). This should be adjusted based on the scale of your
-                point cloud.
-            min_samples: Minimum number of points required to form a cluster.
-                Points with fewer neighbors will be marked as noise and removed.
-            keep_top_n_clusters: Number of largest clusters to keep. Default is
-                1 (keeps only the main cluster). Set to a higher value to keep
-                multiple large clusters.
+            density_frac: Cull cells below this fraction of the median occupied
+                (smoothed) cell density (0-1). Higher = more aggressive. 0
+                removes nothing.
+            n_bins: Grid resolution per axis for the XY histogram.
+            smooth_radius: Half-width (in cells) of the box blur applied to the
+                density grid before thresholding. Larger fills bigger interior
+                gaps (fewer interior points removed). 0 disables smoothing.
+            preview: If True, do NOT modify the cloud. Instead compute which
+                points would be removed, log the removed count/percentage and
+                threshold settings, and return a simple 2D (top-down) plot with
+                the removed points highlighted in red. Re-run with
+                ``preview=False`` to commit the removal.
 
-        Raises:
-            ImportError: If sklearn is not available.
+        Returns:
+            With ``preview=False``: None (the cloud is filtered in place). With
+            ``preview=True``: the preview ``matplotlib.figure.Figure`` (nothing
+            is changed).
         """
-        try:
-            from sklearn.cluster import DBSCAN
-        except ImportError:
-            raise ImportError(
-                "sklearn is required for remove_edge_clusters. "
-                "Install it with: pip install scikit-learn"
-            )
+        if not 0 <= density_frac < 1:
+            raise ValueError("density_frac must be in [0, 1).")
+        if n_bins < 1:
+            raise ValueError("n_bins must be >= 1.")
+        if smooth_radius < 0:
+            raise ValueError("smooth_radius must be >= 0.")
 
         pts = np.asarray(self.points)
-        if len(pts) == 0:
+        total = len(pts)
+        if total == 0:
             logger.warning("Point cloud is empty, nothing to filter.")
             return
 
-        # Warn if point cloud is very large (DBSCAN can be memory-intensive)
-        if len(pts) > 1_000_000:
-            logger.warning(
-                f"Point cloud has {len(pts):,} points. DBSCAN clustering may be "
-                "memory-intensive. Consider downsampling first or using a larger "
-                "eps value."
-            )
+        # Bin the XY footprint into an n_bins x n_bins grid and count per cell.
+        xy = pts[:, :2]
+        mins = xy.min(axis=0)
+        span = np.maximum(xy.max(axis=0) - mins, 1e-9)
+        ij = np.minimum(((xy - mins) / span * n_bins).astype(np.intp), n_bins - 1)
+        counts = np.zeros((n_bins, n_bins), dtype=np.int64)
+        np.add.at(counts, (ij[:, 0], ij[:, 1]), 1)
 
-        # Validate eps parameter
-        if eps <= 0:
-            raise ValueError(
-                "eps must be positive. Consider the scale of your "
-                "point cloud coordinates."
-            )
+        # Box-blur the density so interior gaps inherit neighbouring density and
+        # only the true edge fringe stays low. Sum over a (2r+1)^2 window.
+        r = smooth_radius
+        if r > 0:
+            padded = np.pad(counts, r).astype(np.float64)
+            smooth = np.zeros((n_bins, n_bins), dtype=np.float64)
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    smooth += padded[
+                        r + dx: r + dx + n_bins, r + dy: r + dy + n_bins
+                    ]
+        else:
+            smooth = counts.astype(np.float64)
 
-        # Project to XY plane (2D coordinates)
-        xy_coords = pts[:, :2]
-
-        # Perform DBSCAN clustering in 2D
-        try:
-            clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(xy_coords)
-            labels = clustering.labels_
-        except MemoryError:
-            raise MemoryError(
-                "DBSCAN ran out of memory. Try downsampling the point cloud first "
-                "or using a larger eps value to reduce computational complexity."
-            )
-
-        # Count points in each cluster (excluding noise, which has label -1)
-        non_noise_labels = labels[labels >= 0]
-        unique_labels, counts = np.unique(non_noise_labels, return_counts=True)
-
-        if len(unique_labels) == 0:
-            # All points are noise - shouldn't happen with reasonable params
-            logger.warning(
-                "All points were classified as noise. Consider adjusting "
-                "eps or min_samples parameters."
-            )
-            return
-
-        # Sort clusters by size (largest first)
-        sorted_indices = np.argsort(counts)[::-1]
-        sorted_labels = unique_labels[sorted_indices]
-
-        # Keep only the top N clusters
-        labels_to_keep = sorted_labels[:keep_top_n_clusters]
-        mask = np.isin(labels, labels_to_keep)
-
-        # Count removed points for logging
-        n_removed = np.sum(~mask)
-        n_kept = np.sum(mask)
-
-        if n_removed == 0:
-            logger.info("No edge clusters found to remove.")
-            return
-
-        logger.info(
-            f"Removed {n_removed:,} points from edge clusters, "
-            f"kept {n_kept:,} points in main cluster(s)."
+        # Threshold as a fraction of the typical (median) occupied cell density.
+        occupied = counts > 0
+        median_occupied = float(np.median(smooth[occupied]))
+        threshold = density_frac * median_occupied
+        per_point_density = smooth[ij[:, 0], ij[:, 1]]
+        keep_mask = per_point_density >= threshold
+        n_removed = int(np.count_nonzero(~keep_mask))
+        n_kept = total - n_removed
+        pct = 100.0 * n_removed / total
+        settings_str = (
+            f"density_frac={density_frac}, n_bins={n_bins}, "
+            f"smooth_radius={smooth_radius}"
         )
 
-        # Filter the point cloud
-        filtered_points = pts[mask]
-
-        # Colors and normals may be absent; only filter if present and aligned
-        try:
-            colors_np = np.asarray(self.o3d_pcd.colors)
-            use_colors = (
-                len(colors_np) > 0
-                and colors_np.shape[0] == pts.shape[0]
-                and len(colors_np.shape) > 1
+        if preview:
+            logger.info(
+                f"[preview] {settings_str} would remove {n_removed:,}/{total:,} "
+                f"point(s) ({pct:.1f}%), keeping {n_kept:,}."
             )
-        except (AttributeError, ValueError):
-            use_colors = False
-            colors_np = None
+            from substrata.visualizations import plot_2d
 
-        try:
-            normals_np = np.asarray(self.o3d_pcd.normals)
-            use_normals = (
-                len(normals_np) > 0
-                and normals_np.shape[0] == pts.shape[0]
-                and len(normals_np.shape) > 1
+            return plot_2d(
+                self,
+                highlight_coords=(pts[~keep_mask] if n_removed else None),
+                title=(
+                    f"XY threshold ({settings_str}) would remove "
+                    f"{n_removed:,} points ({pct:.1f}%)"
+                ),
             )
-        except (AttributeError, ValueError):
-            use_normals = False
-            normals_np = None
 
-        new_pcd = o3d.geometry.PointCloud()
-        new_pcd.points = o3d.utility.Vector3dVector(filtered_points)
-        if use_colors and colors_np is not None:
-            new_pcd.colors = o3d.utility.Vector3dVector(colors_np[mask])
-        if use_normals and normals_np is not None:
-            new_pcd.normals = o3d.utility.Vector3dVector(normals_np[mask])
+        if n_removed == 0:
+            logger.info(f"No stray XY points to remove ({settings_str}).")
+            return
 
-        self.o3d_pcd = new_pcd
+        # select_by_index carries colors/normals over automatically.
+        keep_idx = np.nonzero(keep_mask)[0].tolist()
+        self.o3d_pcd = self.o3d_pcd.select_by_index(keep_idx)
+        logger.info(
+            f"Removed {n_removed:,}/{total:,} stray XY point(s) ({pct:.1f}%), "
+            f"kept {n_kept:,} ({settings_str})."
+        )
 
         # Invalidate any cached kd-trees as indices changed
         for attr in ("o3d_pcd_tree", "o3d_pcd_tree_xy"):

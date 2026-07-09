@@ -1080,18 +1080,42 @@ class Annotations:
             )
 
     def measure_all(
-        self, measurement_func: Union[Callable, str], *args: Any, **kwargs: Any
+        self,
+        measurement_func: Union[Callable, str],
+        *args: Any,
+        generate_images: bool = False,
+        n_jobs: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
         """Conduct measurements for all annotations.
 
         Args:
             measurement_func: Function to measure an annotation, or its name
                 as a string (resolved from :mod:`substrata.measurements`).
-            *args: Additional arguments.
-            **kwargs: Additional keyword arguments.
+            *args: Additional positional arguments forwarded to the measurement.
+            generate_images: If True, also produce and retain the per-annotation
+                QC images (``*_image`` measurement keys) so they can later be
+                rendered with :func:`~substrata.visualizations.save_measurement_visualizations_to_pdf`.
+                Defaults to False: the QC images (plotly/Kaleido renders for
+                roughness, dispersion and plane angles in particular) are the
+                dominant memory cost and each spawns a headless browser, so batch
+                runs compute the scalar metrics only. Re-run with
+                ``generate_images=True`` (optionally on a subset) when you want
+                the images for visual QC. Note the QC renders use plotly/Kaleido
+                (a headless browser); generating them for many annotations at
+                once is slow and heavy, so prefer a subset and/or ``n_jobs=1``.
+            n_jobs: Number of parallel (thread) workers. Defaults to
+                ``settings.DEFAULT_MEASURE_N_JOBS`` (a small cap rather than all
+                cores) because the measurements are memory-heavy; pass ``-1`` to
+                use every core, or ``1`` to run serially.
+            **kwargs: Additional keyword arguments forwarded to the measurement.
         """
         if isinstance(measurement_func, str):
             measurement_func = getattr(measurements, measurement_func)
+        # Thread the image toggle to each annotation's measure() (which pops it).
+        kwargs["generate_image"] = generate_images
+        if n_jobs is None:
+            n_jobs = settings.DEFAULT_MEASURE_N_JOBS
         if measurement_func.__name__ in [
             "get_mask_surface_area", "calc_tpi_and_tri", "calc_benthic_fraction",
         ]:
@@ -1106,6 +1130,16 @@ class Annotations:
                 ann_id, output = ann.measure(measurement_func, *args, **kwargs)
                 results[ann_id] = output
         else:
+            # Use the threading backend (not loky processes) for all parallel
+            # measurements. Process workers pickle a full private copy of every
+            # argument and of each annotation object into every worker — for gap
+            # fraction that means the whole point cloud, and for all measurements
+            # it means each annotation's accumulated state (retained QC images,
+            # image matches). That pickling pressure is what exhausts RAM and
+            # makes loky workers die with "a worker stopped ... memory leak".
+            # Threads share those objects by reference (one copy total), and the
+            # heavy work is GIL-releasing NumPy / cv2 / open3d, so it still runs
+            # concurrently.
             with tqdm_joblib(
                 tqdm(
                     desc="Conducting {} measurement for all annotations...".format(
@@ -1114,7 +1148,7 @@ class Annotations:
                     total=len(self.data),
                 )
             ):
-                results_list = Parallel(n_jobs=-1, max_nbytes=None)(
+                results_list = Parallel(n_jobs=n_jobs, prefer="threads")(
                     delayed(ann.measure)(measurement_func, *args, **kwargs)
                     for ann in self.data.values()
                 )
@@ -1793,8 +1827,16 @@ class Annotation:
         Returns:
             Tuple containing (annotation id, result).
         """
+        # `generate_image` controls whether QC images are produced/retained.
+        # Batch runs (measure_all) default it to False to stay fast and memory
+        # -safe; single measurements keep the historical default of True.
+        generate_image = kwargs.pop("generate_image", True)
         if measurement_func.__name__ == "calc_gap_fraction":
             gapF_raw, gapF_fill, gapF_image = measurement_func(self, *args)
+            # The image is a cheap byproduct of the computation (needed for the
+            # flood-fill), but only retain it when images are requested.
+            if not generate_image:
+                gapF_image = None
             self.measurements["gapF_raw"] = gapF_raw
             self.measurements["gapF_fill"] = gapF_fill
             self.measurements["gapF_image"] = gapF_image
@@ -1811,13 +1853,17 @@ class Annotation:
             self.measurements["dev_rug"] = dev_rug
             return self.id, [dev_rug]
         elif measurement_func.__name__ == "calc_roughness":
-            ra, rq, roughness_image = measurement_func(self.simple_pcd)
+            ra, rq, roughness_image = measurement_func(
+                self.simple_pcd, generate_image=generate_image
+            )
             self.measurements["Ra"] = ra
             self.measurements["Rq"] = rq
             self.measurements["roughness_image"] = roughness_image
             return self.id, [ra, rq, roughness_image]
         elif measurement_func.__name__ == "get_vector_dispersion":
-            vector_disp, vector_dispersion_image = measurement_func(self.simple_pcd)
+            vector_disp, vector_dispersion_image = measurement_func(
+                self.simple_pcd, generate_image=generate_image
+            )
             self.measurements["vector_disp"] = vector_disp
             self.measurements["vector_dispersion_image"] = vector_dispersion_image
             return self.id, [vector_disp, vector_dispersion_image]
@@ -1827,7 +1873,7 @@ class Annotation:
             return self.id, [SA_in_cm2]
         elif measurement_func.__name__ == "get_plane_angles":
             theta, psi, elevation, plane_coeffs, azimuth, elevation_image = (
-                measurement_func(self.simple_pcd)
+                measurement_func(self.simple_pcd, generate_image=generate_image)
             )
             self.measurements["theta"] = theta
             self.measurements["psi"] = psi
@@ -1849,7 +1895,9 @@ class Annotation:
             if "center" not in kwargs:
                 kwargs = {**kwargs, "center": self.coords}
             tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_abs, tri_plane, tpi_image = (
-                measurement_func(self.simple_pcd, *args, **kwargs)
+                measurement_func(
+                    self.simple_pcd, *args, generate_image=generate_image, **kwargs
+                )
             )
             self.measurements["tpi_abs"] = tpi_abs
             self.measurements["std_annulus_z"] = std_annulus_z
@@ -1880,7 +1928,7 @@ class Annotation:
             # for the colony inset instead of recomputing an intercept/match.
             if "focal_annotation" not in kwargs:
                 kwargs = {**kwargs, "focal_annotation": self}
-            result = measurement_func(*args, **kwargs)
+            result = measurement_func(*args, generate_image=generate_image, **kwargs)
             self.measurements["benthic_fraction"] = result["fraction"]
             self.measurements["benthic_target_class"] = result["target_class"]
             self.measurements["benthic_fraction_interacting"] = (
