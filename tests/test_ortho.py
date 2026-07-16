@@ -73,6 +73,15 @@ def _ramp_pc(n=40, span=4.0):
     return _PC(pts)
 
 
+def _flat_pc(z, span=4.0, n=20, x0=0.0, y0=0.0):
+    """A flat square cloud at constant height *z*, offset by (x0, y0)."""
+    g = np.mgrid[0:n, 0:n].reshape(2, -1).T / n * span
+    pts = np.column_stack([
+        g[:, 0] + x0, g[:, 1] + y0, np.full(len(g), float(z)),
+    ])
+    return _PC(pts)
+
+
 class TestOrthoGridDEM(unittest.TestCase):
     def setUp(self):
         self.pc = _ramp_pc()
@@ -296,21 +305,245 @@ class TestExtractHighlights(unittest.TestCase):
 
 
 class TestOrthoMapGroup(unittest.TestCase):
-    def test_composites_two_clouds(self):
+    def test_raw_composite_arrange_none(self):
+        # Legacy behaviour: composite clouds at their true world coords.
         pc1 = _ramp_pc()
         pc2 = _PC(pc1.points + np.array([4.0, 0.0, 0.0]))
         single = ortho.OrthoMap(pc1, pixel_width=150)
-        grp = ortho.OrthoMapGroup([pc1, pc2], pixel_width=300)
+        grp = ortho.OrthoMapGroup([pc1, pc2], pixel_width=300, arrange=None)
         self.assertGreaterEqual(grp.width, single.width)
         self.assertEqual(grp.image.shape, (grp.height, grp.width, 3))
+        self.assertTrue(all(off == (0.0, 0.0) for off in grp._offsets))
 
-    def test_show_with_annotations(self):
-        pc1 = _ramp_pc()
-        pc2 = _PC(pc1.points + np.array([4.0, 0.0, 0.0]))
-        grp = ortho.OrthoMapGroup([pc1, pc2], pixel_width=300)
-        anns = _Container([_Ann([0.5, 0.5, 0.5], "coral")])
-        img = grp.show([anns], color_by="label", point_size=6)
+    def test_stack_orders_by_depth_auto(self):
+        # Input deep-first; auto-order must still put the shallow plot on top
+        # (larger world-y => higher in the image => larger dy).
+        deep = _flat_pc(z=-20.0)
+        shallow = _flat_pc(z=-5.0)
+        grp = ortho.OrthoMapGroup([deep, shallow], pixel_width=200)
+        dy_deep = grp._offsets[0][1]
+        dy_shallow = grp._offsets[1][1]
+        self.assertGreater(dy_shallow, dy_deep)
+
+    def test_manual_order_respected(self):
+        deep = _flat_pc(z=-20.0)
+        shallow = _flat_pc(z=-5.0)
+        # Force the deep plot (index 0) to the top despite being deeper.
+        grp = ortho.OrthoMapGroup(
+            [deep, shallow], pixel_width=200, order=[0, 1],
+        )
+        self.assertGreater(grp._offsets[0][1], grp._offsets[1][1])
+
+    def test_vertical_spacing_increases_height(self):
+        clouds = [_flat_pc(z=-5.0), _flat_pc(z=-20.0)]
+        tight = ortho.OrthoMapGroup(clouds, pixel_width=200,
+                                    vertical_spacing=0.5)
+        loose = ortho.OrthoMapGroup(clouds, pixel_width=200,
+                                    vertical_spacing=5.0)
+        self.assertGreater(loose.height, tight.height)
+
+    def test_per_plot_annotations_land_in_bounds(self):
+        deep = _flat_pc(z=-20.0)
+        shallow = _flat_pc(z=-5.0)
+        grp = ortho.OrthoMapGroup([deep, shallow], pixel_width=200)
+        # Each set is in its own plot's frame (same xy, different depth).
+        anns_deep = _Container([_Ann([2.0, 2.0, -20.0], "coral")])
+        anns_shallow = _Container([_Ann([2.0, 2.0, -5.0], "sponge")])
+        merged = grp._build_highlights([anns_deep, anns_shallow])
+        coords = np.vstack([it.coords for it in merged.data.values()])
+        pixels = grp.project(coords)
+        self.assertTrue(np.all(pixels[:, 0] >= 0))
+        self.assertTrue(np.all(pixels[:, 0] < grp.width))
+        self.assertTrue(np.all(pixels[:, 1] >= 0))
+        self.assertTrue(np.all(pixels[:, 1] < grp.height))
+        # Deep annotation (index 0) sits lower => larger pixel-y.
+        self.assertGreater(pixels[0, 1], pixels[1, 1])
+
+    def test_autosplit_single_combined(self):
+        # Distinct xy frames so a combined set can be split by position.
+        shallow = _flat_pc(z=-5.0, x0=0.0, y0=0.0)
+        deep = _flat_pc(z=-20.0, x0=100.0, y0=100.0)
+        grp = ortho.OrthoMapGroup([shallow, deep], pixel_width=200)
+        combined = _Container([
+            _Ann([2.0, 2.0, -5.0], "coral"),        # -> shallow
+            _Ann([102.0, 102.0, -20.0], "sponge"),  # -> deep
+        ])
+        merged = grp._build_highlights(combined)
+        coords = np.vstack([it.coords for it in merged.data.values()])
+        pixels = grp.project(coords)
+        self.assertTrue(np.all(pixels[:, 0] >= 0))
+        self.assertTrue(np.all(pixels[:, 0] < grp.width))
+        self.assertTrue(np.all(pixels[:, 1] >= 0))
+        self.assertTrue(np.all(pixels[:, 1] < grp.height))
+        # Shallow annotation (first) sits higher => smaller pixel-y.
+        self.assertLess(pixels[0, 1], pixels[1, 1])
+
+    def test_show_with_labels(self):
+        grp = ortho.OrthoMapGroup(
+            [_flat_pc(z=-5.0), _flat_pc(z=-20.0)],
+            pixel_width=200, names=["shallow", "deep"],
+        )
+        img = grp.show(show_labels=True, label_color=(0, 0, 0))
+        # Labels live in an added left gutter: same height, wider than the raster.
+        self.assertEqual(img.height, grp.height)
+        self.assertGreater(img.width, grp.width)
+
+    def test_show_per_plot_annotations(self):
+        grp = ortho.OrthoMapGroup(
+            [_flat_pc(z=-5.0), _flat_pc(z=-20.0)], pixel_width=200,
+        )
+        anns = [
+            _Container([_Ann([2.0, 2.0, -5.0], "coral")]),
+            _Container([_Ann([2.0, 2.0, -20.0], "sponge")]),
+        ]
+        img = grp.show(anns, color_by="label", point_size=6)
         self.assertEqual(img.size, (grp.width, grp.height))
+
+    def test_per_plot_annotations_with_none_entry(self):
+        # A plot with no annotations (None) must be skipped, not collapse the
+        # per-plot list into a coordinate array.
+        grp = ortho.OrthoMapGroup(
+            [_flat_pc(z=-5.0), _flat_pc(z=-20.0)], pixel_width=200,
+        )
+        anns = [_Container([_Ann([2.0, 2.0, -5.0], "coral")]), None]
+        merged = grp._build_highlights(anns)
+        self.assertEqual(len(merged.data), 1)
+        img = grp.show(anns, color_by="label")
+        self.assertEqual(img.size, (grp.width, grp.height))
+
+    def test_centroid_alignment_differs_from_bbox_center(self):
+        # An L-shaped (asymmetric) plot: centroid != bbox midpoint, so the two
+        # alignment modes place it at different x offsets.
+        pts = np.array([[x / 5.0, y / 5.0, 0.0]
+                        for x in range(20) for y in range(20)
+                        if x < 6 or y < 6], dtype=float)
+        plots = [_PC(pts), _flat_pc(z=-10.0)]
+        g_centroid = ortho.OrthoMapGroup(plots, pixel_width=200,
+                                         align="centroid")
+        g_center = ortho.OrthoMapGroup(plots, pixel_width=200, align="center")
+        self.assertNotAlmostEqual(
+            g_centroid._offsets[0][0], g_center._offsets[0][0],
+        )
+
+    def test_slope_orientation_reduces_foreshortening(self):
+        # A steeply tilted planar cloud is heavily foreshortened top-down; the
+        # slope view sees it face-on, so its view-plane extent is larger.
+        n, span = 25, 4.0
+        g = np.mgrid[0:n, 0:n].reshape(2, -1).T / n * span
+        u, v = g[:, 0], g[:, 1]
+        # Plane tilted ~60 deg: z grows fast with u (steep down-slope).
+        pts = np.column_stack([u, v, 1.8 * u])
+        pc = _PC(pts)
+        top = ortho.OrthoMapGroup([pc], pixel_width=200, orient="topdown")
+        slope = ortho.OrthoMapGroup([pc], pixel_width=200, orient="slope")
+
+        def max_extent(bb):
+            return max(bb[1] - bb[0], bb[3] - bb[2])
+
+        self.assertGreater(
+            max_extent(slope._plot_bboxes[0]),
+            max_extent(top._plot_bboxes[0]) * 1.2,
+        )
+
+    def test_slope_view_is_face_on(self):
+        # After the slope rotation the plane should be flat (view-z ~ 0).
+        n, span = 20, 4.0
+        g = np.mgrid[0:n, 0:n].reshape(2, -1).T / n * span
+        u, v = g[:, 0], g[:, 1]
+        pts = np.column_stack([u, v, 1.3 * u + 0.4 * v])
+        grp = ortho.OrthoMapGroup([_PC(pts)], pixel_width=200, orient="slope")
+        rotated = (grp._rotations[0] @ pts.T).T
+        self.assertLess(np.ptp(rotated[:, 2]), 1e-6)
+
+    def test_slope_tilt_has_no_z_spin(self):
+        # A near-flat plot must not be spun in-plane: the slope rotation is
+        # (near) identity, i.e. no z-axis rotation of the horizontal frame.
+        n, span = 20, 4.0
+        g = np.mgrid[0:n, 0:n].reshape(2, -1).T / n * span
+        u, v = g[:, 0], g[:, 1]
+        pts = np.column_stack([u, v, 0.001 * u])  # barely sloped
+        grp = ortho.OrthoMapGroup([_PC(pts)], pixel_width=200, orient="slope")
+        np.testing.assert_allclose(grp._rotations[0], np.eye(3), atol=1e-2)
+
+    def test_slope_flat_plot_falls_back(self):
+        # A perfectly flat plot -> slope rotation == top-down (identity, z-up).
+        grp = ortho.OrthoMapGroup([_flat_pc(z=-5.0)], orient="slope",
+                                  pixel_width=100)
+        np.testing.assert_allclose(grp._rotations[0], np.eye(3), atol=1e-9)
+
+    def test_marker_size_scales_with_composite(self):
+        # Default marker size grows with the composite so dots stay visible.
+        plots = [_flat_pc(z=-5.0), _flat_pc(z=-20.0)]
+        anns = [_Container([_Ann([2.0, 2.0, -5.0], "a")]),
+                _Container([_Ann([2.0, 2.0, -20.0], "b")])]
+
+        def nonwhite(img):
+            return int((np.asarray(img) != 255).any(-1).sum())
+
+        big = ortho.OrthoMapGroup(plots, pixel_height=4000)
+        small = ortho.OrthoMapGroup(plots, pixel_height=600)
+        # Same annotations, but the larger composite draws larger markers.
+        self.assertGreater(
+            nonwhite(big.show(anns, show_labels=False)),
+            nonwhite(small.show(anns, show_labels=False)),
+        )
+
+    def test_load_font_returns_scalable(self):
+        font = ortho.OrthoMapGroup._load_font(120)
+        # A scalable font exposes the requested size; the fixed fallback would
+        # not carry 120. Either way it must be a usable font object.
+        self.assertTrue(hasattr(font, "getbbox") or hasattr(font, "getsize"))
+
+    def test_label_colours_consistent_across_plots(self):
+        # A label shared by different plots must map to one colour composite-wide
+        # (colours are assigned over the union of all plots' labels).
+        grp = ortho.OrthoMapGroup([_flat_pc(z=-5.0), _flat_pc(z=-20.0)],
+                                  pixel_width=200, names=["a", "b"])
+        anns = [
+            _Container([_Ann([1.0, 1.0, -5.0], "coral"),
+                        _Ann([3.0, 3.0, -5.0], "sponge")]),
+            _Container([_Ann([1.0, 1.0, -20.0], "sponge"),
+                        _Ann([3.0, 3.0, -20.0], "algae")]),
+        ]
+        merged = grp._build_highlights(anns)
+        labels = [it.label for it in merged.data.values()]
+        coords = np.vstack([it.coords for it in merged.data.values()])
+        fills, _ = grp._resolve_marker_style(
+            coords, labels, [None] * len(labels),
+            "label", None, False, (255, 0, 0), (0, 0, 0),
+        )
+        by_label = {}
+        for lbl, col in zip(labels, fills):
+            by_label.setdefault(lbl, set()).add(tuple(col))
+        # "sponge" is in both plots -> exactly one colour.
+        self.assertEqual(len(by_label["sponge"]), 1)
+
+    def test_vertical_labels_narrower_than_horizontal(self):
+        grp = ortho.OrthoMapGroup([_flat_pc(z=-5.0), _flat_pc(z=-20.0)],
+                                  pixel_height=1200,
+                                  names=["cur_sna_05m", "cur_sna_20m"])
+        base = grp.width
+        vert = grp.show(show_labels=True, label_rotation=90)
+        horiz = grp.show(show_labels=True, label_rotation=0)
+        self.assertLess(vert.width - base, horiz.width - base)
+
+    def test_legend_adds_panel_with_marker_colours(self):
+        grp = ortho.OrthoMapGroup([_flat_pc(z=-5.0), _flat_pc(z=-20.0)],
+                                  pixel_height=1200, names=["a", "b"])
+        anns = [
+            _Container([_Ann([1.0, 1.0, -5.0], "coral")]),
+            _Container([_Ann([3.0, 3.0, -20.0], "sponge")]),
+        ]
+        plain = grp.show(anns, show_labels=False)
+        withleg = grp.show(anns, show_labels=False, legend=True)
+        # Legend is appended below -> taller image.
+        self.assertGreater(withleg.height, plain.height)
+        # The legend swatches use the same LUT as the markers.
+        lut = ortho._label_color_lut(["coral", "sponge"])
+        panel = np.asarray(withleg)[plain.height:]
+        panel_colours = {tuple(c) for c in panel.reshape(-1, 3)}
+        for col in lut.values():
+            self.assertIn(tuple(col), panel_colours)
 
     def test_empty_raises(self):
         with self.assertRaises(ValueError):

@@ -68,6 +68,10 @@ workflows end to end:
   terrain ruggedness index (TRI)
 * :doc:`notebooks/measurements_benthic_fraction` — benthic fraction: cover of a
   target benthic class around annotations, using the crop classifier
+* :doc:`notebooks/segment_pointcloud` — segment a point cloud by classifying the
+  image patch each point projects into, then recolour by category
+* :doc:`notebooks/multiplots` — stack several plots (e.g. a depth transect) into
+  a single orthographic figure with ``OrthoMapGroup``
 
 Many of these workflows can also be driven from the terminal; see
 :doc:`command_line_usage`.
@@ -95,6 +99,8 @@ documents all modules, classes, and functions.
    notebooks/transferring_annotations
    notebooks/measurements_tpi
    notebooks/measurements_benthic_fraction
+   notebooks/segment_pointcloud
+   notebooks/multiplots
 
 .. toctree::
    :maxdepth: 2

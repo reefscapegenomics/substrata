@@ -42,6 +42,21 @@ def _rgb255(rgba) -> Tuple[int, int, int]:
     return tuple(int(round(float(c) * 255)) for c in rgba[:3])
 
 
+def _label_color_lut(labels, label_colors=None) -> dict:
+    """Map each distinct label to a stable RGB colour.
+
+    Labels are sorted and assigned successive ``tab20`` colours; an explicit
+    ``label_colors`` mapping overrides individual entries.  Shared by the
+    marker styling and the legend so both agree.
+    """
+    uniq = sorted({lbl for lbl in labels if lbl is not None})
+    cmap = _get_cmap("tab20", max(1, len(uniq)))
+    lut = dict(label_colors) if label_colors else {}
+    for i, lbl in enumerate(uniq):
+        lut.setdefault(lbl, _rgb255(cmap(i)))
+    return lut
+
+
 def _as_per_point(value, n: int) -> list:
     """Broadcast *value* to a length-*n* list of per-point values.
 
@@ -535,11 +550,7 @@ class OrthoMap:
         n = len(coords)
 
         if color_by == "label" and any(lbl is not None for lbl in labels):
-            uniq = sorted({lbl for lbl in labels if lbl is not None})
-            cmap = _get_cmap("tab20", max(1, len(uniq)))
-            lut = dict(label_colors) if label_colors else {}
-            for i, lbl in enumerate(uniq):
-                lut.setdefault(lbl, _rgb255(cmap(i)))
+            lut = _label_color_lut(labels, label_colors)
             base_colors = [lut.get(lbl, point_color) for lbl in labels]
         elif color_by == "z":
             z = coords[:, 2].astype(float)
@@ -674,14 +685,76 @@ class OrthoMap:
         return arr, [None] * n, [None] * n
 
 
-class OrthoMapGroup(OrthoMap):
-    """Composite orthographic map over several point clouds.
+class _HighlightItem:
+    """Minimal highlight carrier consumed by :meth:`OrthoMap._extract_highlights`.
 
-    All clouds are projected into a single shared frame (common origin
-    and metres-per-pixel) and rasterized together, so overlapping regions
-    blend naturally.  The result behaves like an :class:`OrthoMap` — every
-    method (``show``, ``project``, highlight overlays) is inherited — with
-    :meth:`show` accepting one or more annotation sets to overlay.
+    Holds a shifted 3D ``coords`` plus optional ``label``/``group`` so that
+    :class:`OrthoMapGroup` can re-home each plot's annotations into the
+    composite layout frame without depending on the original item type.
+    """
+
+    __slots__ = ("coords", "label", "group")
+
+    def __init__(self, coords, label=None, group=None):
+        self.coords = coords
+        self.label = label
+        self.group = group
+
+
+class _MergedHighlights:
+    """Container with a ``.data`` mapping, matching the annotation-set duck type."""
+
+    def __init__(self):
+        self.data = {}
+
+
+class OrthoMapGroup(OrthoMap):
+    """Composite ortho of several plots laid out in a single frame.
+
+    Unlike a plain :class:`OrthoMap`, the input clouds are **not** assumed to
+    share a world frame.  The typical use case is several plots of the same
+    location captured at different depths — each carries its own coordinate
+    frame, scale, and orientation (already baked into ``pcd.points``).  Each
+    plot keeps that scale/orientation; the group only **translates** each plot
+    so they line up into one picture.
+
+    Two layout modes (``arrange``):
+
+    * ``"stack"`` (default) — a **depth-ordered vertical stack**.  Plots are
+      ordered by mean height (``z``), shallowest (least-negative ``z``) on top
+      down to deepest at the bottom, aligned horizontally, and separated by a
+      definable vertical gap.  Order can be overridden with *order*.
+    * ``None`` — the legacy behaviour: composite every cloud at its true world
+      coordinates, assuming the clouds are already co-registered.
+
+    Two per-plot orientations (``orient``):
+
+    * ``"topdown"`` (default) — every plot is projected along the shared
+      *up_vector* (a top-down view).
+    * ``"slope"`` — each plot is viewed **face-on to its own best-fit plane**.
+      This removes the foreshortening a top-down view imposes on steep plots,
+      so the imagery reads at a consistent scale.  The orientation reuses the
+      same building blocks as :meth:`PointCloud.apply_along_slope_transform`
+      (PCA plane normal + :meth:`geom.Transform.from_up_vector`) but is
+      computed non-destructively — the input clouds are never modified.  The
+      tilt turns about a horizontal axis, so it adds **no in-plane (z-axis)
+      rotation**: a near-flat plot is left essentially unchanged and each plot
+      keeps its own azimuth.
+
+    All :class:`OrthoMap` machinery (``show``, ``project``, highlight overlays,
+    crop, resize) is inherited.  :meth:`show` accepts annotations either as a
+    **per-plot list** parallel to *pcds* (each set is transformed with its plot)
+    or as a **single combined set** that is auto-split across plots by position.
+
+    Example::
+
+        grp = OrthoMapGroup(
+            [p.pcd for p in plots],          # shallow..deep, any order
+            pixel_height=6000,
+            vertical_spacing=1.0,            # metres between tiles
+            names=[p.project_id for p in plots],
+        )
+        img = grp.show([p.annotations for p in plots])
     """
 
     def __init__(
@@ -691,19 +764,49 @@ class OrthoMapGroup(OrthoMap):
         pixel_width: Optional[int] = None,
         pixel_height: Optional[int] = None,
         rotation: int = 0,
+        arrange: Optional[str] = "stack",
+        order: Optional[List[int]] = None,
+        vertical_spacing: float = 1.0,
+        align: str = "centroid",
+        names: Optional[List[str]] = None,
+        orient: str = "topdown",
     ) -> None:
-        """Initialize a composite ortho map from several point clouds.
+        """Initialize a composite ortho map from several plots.
 
         Args:
-            pcds: Iterable of point clouds to composite into one frame.
-            up_vector: Projection "up" direction (default top-down z).
+            pcds: Iterable of point clouds, one per plot.
+            up_vector: World "up" direction (default z).  Used for the
+                top-down projection and to measure each plot's depth for
+                ordering.
             pixel_width: Optional target width in pixels.
-            pixel_height: Optional target height in pixels.
+            pixel_height: Optional target height in pixels.  Recommended over
+                *pixel_width* for a tall vertical stack.
             rotation: In-plane rotation in degrees applied on ``show``.
+            arrange: ``"stack"`` for a depth-ordered vertical layout
+                (default) or ``None`` to composite clouds at their true world
+                coordinates (legacy co-registered behaviour).
+            order: Optional explicit stacking order as a list of plot indices
+                (top to bottom).  ``None`` orders automatically by depth
+                (shallow/least-negative on top).  Ignored when *arrange* is
+                ``None``.
+            vertical_spacing: Gap in metres between stacked plots' bounding
+                boxes.  Ignored when *arrange* is ``None``.
+            align: Horizontal alignment of the stacked plots — ``"centroid"``
+                (default, aligns each plot's mean position), ``"center"``
+                (bounding-box midpoint), ``"left"``, or ``"right"``.  Ignored
+                when *arrange* is ``None``.
+            names: Optional per-plot labels (parallel to *pcds*) drawn on the
+                composite by :meth:`show` when ``show_labels`` is enabled.
+            orient: ``"topdown"`` (default) projects every plot along
+                *up_vector*; ``"slope"`` views each plot face-on to its own
+                best-fit plane (down-slope pointing down).  See the class
+                docstring.
         """
         pcds = list(pcds)
         if not pcds:
             raise ValueError("OrthoMapGroup requires at least one point cloud")
+        if orient not in ("topdown", "slope"):
+            raise ValueError(f"Unknown orient mode: {orient!r}")
 
         if up_vector is None:
             up_vector = np.array([0.0, 0.0, 1.0])
@@ -711,22 +814,73 @@ class OrthoMapGroup(OrthoMap):
         up = up / np.linalg.norm(up)
         self._up_vector = up
         self._rotation = rotation
-        self.rotation = self._rotation_to_z(up)
+        # The composite is assembled directly in the layout plane, so the
+        # inherited ``project`` uses an identity view rotation; each plot's own
+        # view rotation is applied per plot (below and in ``_to_layout``).
+        self.rotation = np.eye(3)
+        self._arrange = arrange
+        self._orient = orient
+        self._names = list(names) if names is not None else None
 
-        xs_all, ys_all, colors_all = [], [], []
+        r_shared = self._rotation_to_z(up)
+
+        # Project every plot into its own view plane and record, per plot, its
+        # view rotation, rotated points/colours, 2D bbox, centroid and depth.
+        n = len(pcds)
+        rotations: List[Optional[np.ndarray]] = [None] * n
+        rot_xs: List[Optional[np.ndarray]] = [None] * n
+        rot_ys: List[Optional[np.ndarray]] = [None] * n
+        cols: List[Optional[np.ndarray]] = [None] * n
+        bboxes: List[Optional[Tuple[float, float, float, float]]] = [None] * n
+        centroids: List[Optional[Tuple[float, float]]] = [None] * n
+        depth_keys: List[float] = [float("nan")] * n
         total = 0
-        for pcd in pcds:
+        for i, pcd in enumerate(pcds):
             points = np.asarray(pcd.points)
             if len(points) == 0:
                 continue
-            rotated = (self.rotation @ points.T).T
-            xs_all.append(rotated[:, 0])
-            ys_all.append(rotated[:, 1])
-            colors_all.append(self._get_colors(pcd, len(points)))
+            r_i = r_shared if orient == "topdown" else self._slope_rotation(
+                points, up, r_shared,
+            )
+            rotations[i] = r_i
+            rotated = (r_i @ points.T).T
+            rx, ry = rotated[:, 0], rotated[:, 1]
+            rot_xs[i], rot_ys[i] = rx, ry
+            cols[i] = self._get_colors(pcd, len(points))
+            bboxes[i] = (
+                float(rx.min()), float(rx.max()),
+                float(ry.min()), float(ry.max()),
+            )
+            centroids[i] = (float(rx.mean()), float(ry.mean()))
+            # Depth for ordering is measured along the shared world up-vector,
+            # independent of each plot's own view rotation.
+            depth_keys[i] = float((points @ up).mean())
             total += len(points)
         if total == 0:
             raise ValueError("OrthoMapGroup point clouds contain no points")
 
+        # Per-plot 2D offsets in the (per-plot) view plane.
+        if arrange == "stack":
+            offsets = self._compute_stack_offsets(
+                bboxes, centroids, depth_keys, order, vertical_spacing, align,
+            )
+        elif arrange is None:
+            offsets = [(0.0, 0.0)] * n
+        else:
+            raise ValueError(f"Unknown arrange mode: {arrange!r}")
+        self._rotations = rotations
+        self._offsets = offsets
+        self._plot_bboxes = bboxes  # pre-shift, for auto-splitting annotations
+
+        # Apply offsets and rasterize all plots into one frame.
+        xs_all, ys_all, colors_all = [], [], []
+        for i in range(n):
+            if rot_xs[i] is None:
+                continue
+            dx, dy = offsets[i]
+            xs_all.append(rot_xs[i] + dx)
+            ys_all.append(rot_ys[i] + dy)
+            colors_all.append(cols[i])
         xs = np.concatenate(xs_all)
         ys = np.concatenate(ys_all)
         colors = np.concatenate(colors_all, axis=0)
@@ -745,9 +899,22 @@ class OrthoMapGroup(OrthoMap):
             self.resolution,
             self.width, self.height,
         )
+
+        # Layout-space anchor for each tile's label: the composite's left edge
+        # (so all labels share one x) at the tile's vertical centre.
+        self._label_anchors: List[Optional[np.ndarray]] = [None] * n
+        for i in range(n):
+            if bboxes[i] is None:
+                continue
+            _, _, miny, maxy = bboxes[i]
+            dy = offsets[i][1]
+            cy = 0.5 * (miny + maxy) + dy
+            self._label_anchors[i] = np.array([min_x, cy, 0.0])
+
         logger.info(
-            "OrthoMapGroup created: %d x %d px  (%d clouds, %d points)",
-            self.width, self.height, len(pcds), total,
+            "OrthoMapGroup created: %d x %d px  (%d clouds, %d points, "
+            "arrange=%s, orient=%s)",
+            self.width, self.height, n, total, arrange, orient,
         )
 
     def __repr__(self) -> str:
@@ -755,57 +922,434 @@ class OrthoMapGroup(OrthoMap):
         return (
             f"OrthoMapGroup({self.width}x{self.height} px, "
             f"res={self.resolution:.6f} m/px, "
-            f"up={self._up_vector.tolist()})"
+            f"up={self._up_vector.tolist()}, arrange={self._arrange!r}, "
+            f"orient={self._orient!r})"
         )
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def _compute_stack_offsets(
+        self, bboxes, centroids, depth_keys, order, vertical_spacing, align,
+    ):
+        """Compute per-plot ``(dx, dy)`` offsets for a vertical depth stack.
+
+        Plots are placed top to bottom.  Because :meth:`_rasterize` maps
+        larger view-plane ``y`` to the top image row, the first plot in the
+        order (shallowest by default) ends up on top.
+
+        Args:
+            bboxes: Per-plot view-plane bounding boxes
+                ``(minx, maxx, miny, maxy)`` (or ``None`` for empty plots).
+            centroids: Per-plot view-plane ``(cx, cy)`` mean positions, used
+                for ``align="centroid"``.
+            depth_keys: Per-plot mean depth (along the world up-vector), used
+                for the default ordering.
+            order: Explicit list of plot indices (top to bottom), or ``None``
+                to order by descending depth (shallow first).
+            vertical_spacing: Gap in metres between consecutive tiles.
+            align: ``"centroid"``, ``"center"``, ``"left"`` or ``"right"``.
+
+        Returns:
+            List of ``(dx, dy)`` offsets in original plot order; empty plots
+            get ``(0.0, 0.0)``.
+        """
+        n = len(bboxes)
+        valid = [i for i in range(n) if bboxes[i] is not None]
+        if order is None:
+            seq = sorted(valid, key=lambda i: depth_keys[i], reverse=True)
+        else:
+            seq = [i for i in order if i in valid]
+
+        offsets = [(0.0, 0.0)] * n
+        top = 0.0
+        for i in seq:
+            minx, maxx, miny, maxy = bboxes[i]
+            if align == "centroid":
+                dx = -centroids[i][0]
+            elif align == "center":
+                dx = -0.5 * (minx + maxx)
+            elif align == "left":
+                dx = -minx
+            elif align == "right":
+                dx = -maxx
+            else:
+                raise ValueError(f"Unknown align mode: {align!r}")
+            dy = top - maxy
+            offsets[i] = (dx, dy)
+            top = top - (maxy - miny) - vertical_spacing
+        return offsets
+
+    def _slope_rotation(self, points, up, fallback):
+        """Return a 3x3 view rotation that looks face-on to the plot's slope.
+
+        Reuses the along-slope mechanism of
+        :meth:`PointCloud.apply_along_slope_transform`: a PCA best-fit plane
+        normal is mapped to +z with :meth:`geom.Transform.from_up_vector` so
+        the plot is viewed face-on (removing foreshortening).  The one
+        remaining in-plane degree of freedom is then used to keep the plot's
+        **top-down heading** — the same world direction points "up" as in the
+        top-down view — so the plot is not spun about the view z-axis.  That
+        heading reference is a fixed world axis (not the slope gradient), so a
+        near-flat plot gets no correction and never spins.  Computed without
+        mutating the input; falls back to *fallback* (the shared top-down
+        rotation) if the plane fit is degenerate.
+
+        Args:
+            points: ``(N, 3)`` world coordinates of the plot.
+            up: Unit world up-vector.
+            fallback: Shared top-down rotation; also used to derive the
+                heading reference and returned if the plane fit is degenerate.
+
+        Returns:
+            A 3x3 rotation matrix.
+        """
+        from substrata import geom  # pure-numpy; safe without heavy deps
+
+        pts = np.asarray(points, dtype=np.float64)
+        if len(pts) < 3:
+            return fallback
+        if len(pts) > 50000:  # subsample large clouds for the plane fit
+            pts = pts[:: len(pts) // 50000 + 1]
+
+        # PCA best-fit plane normal (smallest-eigenvalue eigenvector), oriented
+        # towards up — equivalent to measurements.get_best_fit_plane_PCA.
+        cov = np.cov((pts - pts.mean(axis=0)).T)
+        evals, evecs = np.linalg.eigh(cov)
+        normal = evecs[:, int(np.argmin(evals))]
+        norm = np.linalg.norm(normal)
+        if norm < 1e-9:
+            return fallback
+        normal = normal / norm
+        if float(normal @ up) < 0:
+            normal = -normal
+
+        m1 = geom.Transform.from_up_vector(normal).mat[:3, :3]  # face-on tilt
+        # Heading reference: the world direction that maps to image +y in the
+        # top-down view.  Rotate in-plane so it maps to +y here too, keeping
+        # the plot's orientation and adding no spurious z-spin.
+        world_up_axis = fallback.T @ np.array([0.0, 1.0, 0.0])
+        ref = m1 @ world_up_axis
+        if np.hypot(ref[0], ref[1]) < 1e-6:  # heading undefined (rare)
+            return m1
+        beta = float(np.arctan2(ref[1], ref[0]))
+        m2 = geom.Transform.from_euler(0.0, 0.0, np.pi / 2 - beta).mat[:3, :3]
+        return m2 @ m1
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
 
     def show(
         self,
         annotations_list=None,
         color_by: Optional[str] = "label",
+        show_labels: Optional[bool] = None,
+        label_color: Tuple[int, int, int] = (0, 0, 0),
+        font_size: Optional[int] = None,
+        point_size: Optional[int] = None,
+        point_size_metres: Optional[float] = None,
+        label_rotation: int = 90,
+        legend: bool = False,
+        label_colors: Optional[dict] = None,
         **kwargs,
     ) -> Image.Image:
-        """Render the composite map with per-label-coloured annotations.
+        """Render the composite map with annotations and optional tile labels.
+
+        Marker and label sizes default to a fraction of the composite height
+        (so they stay legible on the large rasters this class produces) and can
+        be overridden.
 
         Args:
-            annotations_list: A single ``Annotations`` container, an
-                iterable of containers (merged), or a coordinate array.
-                ``None`` renders the composite with no overlay.
+            annotations_list: Annotations to overlay.  Either a **per-plot
+                list** parallel to *pcds* (each set is translated with its
+                plot), a **single combined** container (auto-split across plots
+                by position), a single ``Annotation``/coordinate array, or
+                ``None`` for no overlay.
             color_by: Highlight colouring mode (default ``"label"``).
+            show_labels: Draw per-plot *names*.  Defaults to ``True`` when
+                *names* were provided and *arrange* is ``"stack"``.
+            label_color: RGB colour for the tile labels.
+            font_size: Label font size in pixels.  Defaults to ~1.25% of the
+                composite height.
+            point_size: Marker radius in pixels.  Defaults to ~0.25% of the
+                composite height.  Ignored when *point_size_metres* is given.
+            point_size_metres: Marker diameter in metres (consistent physical
+                size across plots).  Overrides *point_size*.
+            label_rotation: Rotation of the tile labels in degrees — ``90``
+                (default) draws them vertically in a narrow left gutter, ``0``
+                horizontally.
+            legend: When True and *color_by* is ``"label"``, append a colour
+                legend (swatch + label name) below the composite.
+            label_colors: Optional explicit ``{label: (r, g, b)}`` map applied
+                to both the markers and the legend.
             **kwargs: Forwarded to :meth:`OrthoMap.show`.
 
         Returns:
             PIL ``Image`` of the composite map.
         """
-        highlights = self._merge_annotations(annotations_list)
-        return super().show(highlights=highlights, color_by=color_by, **kwargs)
+        if point_size_metres is not None:
+            kwargs["point_size_metres"] = point_size_metres
+        else:
+            if point_size is None:
+                point_size = max(3, round(self.height * 0.0025))
+            kwargs["point_size"] = point_size
+        if label_colors is not None:
+            kwargs["label_colors"] = label_colors
+
+        highlights = self._build_highlights(annotations_list)
+        img = super().show(highlights=highlights, color_by=color_by, **kwargs)
+
+        if font_size is None:
+            font_size = max(8, round(self.height * 0.0125))
+
+        if show_labels is None:
+            show_labels = self._names is not None and self._arrange == "stack"
+        if show_labels and self._names:
+            img = self._draw_labels(img, label_color, font_size, label_rotation)
+
+        if legend and color_by == "label":
+            pool = []
+            if highlights is not None and hasattr(highlights, "data"):
+                pool = [getattr(it, "label", None)
+                        for it in highlights.data.values()]
+            img = self._draw_legend(
+                img, pool, label_colors, font_size, label_color,
+            )
+        return img
+
+    def _draw_labels(self, img, label_color, font_size, label_rotation=90):
+        """Draw per-plot names in a left gutter, one per tile.
+
+        A white margin is added to the left of the composite and each name is
+        drawn there — right-aligned to a common x and vertically centred on its
+        tile — so labels never overlap the imagery and line up with each other.
+        *label_rotation* (``90`` by default) draws the text vertically for a
+        narrow gutter; ``0`` draws it horizontally.  Returns the (widened)
+        image.  Vertical placement honours a ``width``/``height`` resize but
+        not ``crop`` or the display ``rotation``.
+        """
+        pairs = [
+            (str(name), anchor)
+            for name, anchor in zip(self._names, self._label_anchors)
+            if name is not None and anchor is not None
+        ]
+        if not pairs:
+            return img
+
+        font = self._load_font(font_size)
+        patches = [
+            (self._render_text_patch(name, font, label_color, label_rotation),
+             anchor)
+            for name, anchor in pairs
+        ]
+        pad = max(4, round(font_size * 0.4))
+        margin = max(p.width for p, _ in patches) + 2 * pad
+
+        canvas = Image.new(
+            "RGB", (img.width + margin, img.height), (255, 255, 255),
+        )
+        canvas.paste(img, (margin, 0))
+
+        scale_y = img.height / self.height
+        x_right = margin - pad
+        for patch, anchor in patches:
+            py = float(self.project(anchor)[1]) * scale_y
+            x = int(round(x_right - patch.width))
+            y = int(round(py - patch.height / 2))
+            canvas.paste(patch, (x, y), patch)
+        return canvas
 
     @staticmethod
-    def _merge_annotations(annotations_list):
-        """Merge one or more annotation containers into a single set."""
+    def _render_text_patch(text, font, color, rotation=0):
+        """Render *text* to a tight RGBA patch, optionally rotated (degrees)."""
+        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        bb = measure.textbbox((0, 0), text, font=font)
+        w, h = max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
+        patch = Image.new("RGBA", (w + 2, h + 2), (0, 0, 0, 0))
+        ImageDraw.Draw(patch).text(
+            (1 - bb[0], 1 - bb[1]), text, font=font,
+            fill=tuple(color) + (255,),
+        )
+        if rotation:
+            patch = patch.rotate(rotation, expand=True)
+        return patch
+
+    def _draw_legend(self, img, labels, label_colors, font_size, text_color):
+        """Append a label-colour legend below the composite (returns new img)."""
+        uniq = sorted({lbl for lbl in labels if lbl is not None})
+        if not uniq:
+            return img
+        lut = _label_color_lut(labels, label_colors)
+        font = self._load_font(font_size)
+
+        pad = max(4, round(font_size * 0.4))
+        swatch = font_size
+        row_h = swatch + pad
+        measure = ImageDraw.Draw(img)
+        text_w = max(
+            measure.textbbox((0, 0), lbl, font=font)[2] for lbl in uniq
+        )
+        panel_h = len(uniq) * row_h + 2 * pad
+        panel_w = max(img.width, 3 * pad + swatch + text_w)
+
+        canvas = Image.new("RGB", (panel_w, img.height + panel_h),
+                           (255, 255, 255))
+        canvas.paste(img, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+
+        y = img.height + pad
+        for lbl in uniq:
+            col = tuple(lut.get(lbl, text_color))
+            draw.rectangle([pad, y, pad + swatch, y + swatch],
+                           fill=col, outline=(0, 0, 0))
+            tx, ty = 2 * pad + swatch, y + swatch / 2
+            try:
+                draw.text((tx, ty), lbl, fill=text_color, font=font,
+                          anchor="lm")
+            except (ValueError, TypeError):  # bitmap font: no anchor support
+                bb = draw.textbbox((0, 0), lbl, font=font)
+                draw.text((tx, ty - (bb[3] - bb[1]) / 2), lbl,
+                          fill=text_color, font=font)
+            y += row_h
+        return canvas
+
+    @staticmethod
+    def _load_font(font_size):
+        """Load a scalable font at *font_size* px, falling back gracefully.
+
+        Pillow's built-in bitmap default font does not scale, so a large
+        ``font_size`` needs either ``load_default(size)`` (Pillow >= 10) or a
+        TrueType font; older Pillow falls back to the fixed default.
+        """
+        from PIL import ImageFont
+
+        try:  # Pillow >= 10 returns a scalable default at the requested size
+            return ImageFont.load_default(size=font_size)
+        except TypeError:
+            pass
+        for name in ("DejaVuSans.ttf", "Arial.ttf"):
+            try:
+                return ImageFont.truetype(name, font_size)
+            except Exception:  # pragma: no cover - font not installed
+                continue
+        return ImageFont.load_default()  # last resort (fixed size)
+
+    # ------------------------------------------------------------------
+    # Annotation layout
+    # ------------------------------------------------------------------
+
+    def _build_highlights(self, annotations_list):
+        """Normalise annotations into layout-shifted highlights.
+
+        Returns a container whose ``.data`` items carry composite-frame
+        coordinates, or ``None`` when there is nothing to draw.
+        """
         if annotations_list is None:
             return None
-        if hasattr(annotations_list, "data") or hasattr(
+
+        single = hasattr(annotations_list, "data") or hasattr(
             annotations_list, "coords"
-        ):
-            return annotations_list
+        )
+        n_plots = len(self._rotations)
 
-        containers = list(annotations_list)
-        if not containers:
-            return None
-        if not all(hasattr(a, "data") for a in containers):
-            return annotations_list
+        if not single:
+            seq = list(annotations_list)
+            # A list parallel to the plots (len == n_plots) is treated as
+            # per-plot; entries may be ``None`` (a plot with no annotations)
+            # and are skipped by :meth:`_merge_per_plot`.
+            if len(seq) == n_plots and n_plots > 0:
+                return self._merge_per_plot(seq)
+            # A bare list of coordinates carries no plot association; auto-split
+            # each coordinate across the plots by position.
+            return self._autosplit_single(annotations_list)
 
-        class _MergedHighlights:
-            pass
+        return self._autosplit_single(annotations_list)
 
+    def _merge_per_plot(self, containers):
+        """Map each plot's annotation set into the composite layout frame."""
         merged = _MergedHighlights()
-        merged.data = {}
         idx = 0
-        for anns in containers:
-            for item in anns.data.values():
-                merged.data[idx] = item
+        for i, anns in enumerate(containers):
+            if anns is None:
+                continue
+            for coords, label, group in self._iter_coord_label_group(anns):
+                merged.data[idx] = _HighlightItem(
+                    self._to_layout(coords, i), label, group,
+                )
                 idx += 1
-        return merged
+        return merged if merged.data else None
+
+    def _autosplit_single(self, container):
+        """Assign each annotation to a plot by position, then map it."""
+        merged = _MergedHighlights()
+        idx = 0
+        for coords, label, group in self._iter_coord_label_group(container):
+            i = self._assign_plot(coords)
+            merged.data[idx] = _HighlightItem(
+                self._to_layout(coords, i), label, group,
+            )
+            idx += 1
+        return merged if merged.data else None
+
+    def _to_layout(self, coord, i):
+        """Map a world *coord* of plot *i* into composite layout coordinates.
+
+        Applies the plot's view rotation and layout offset so the inherited
+        (identity-rotation) ``project`` lands it on the right tile.  The z
+        component carries world depth so ``color_by="z"`` stays meaningful.
+        """
+        c = np.asarray(coord, dtype=np.float64)
+        r = self._rotations[i] @ c
+        dx, dy = self._offsets[i]
+        return np.array([r[0] + dx, r[1] + dy, float(c @ self._up_vector)])
+
+    def _assign_plot(self, coord):
+        """Index of the plot whose view-plane bbox best matches *coord*."""
+        c = np.asarray(coord, dtype=np.float64)
+        contained, best, best_d = [], 0, float("inf")
+        for i, bb in enumerate(self._plot_bboxes):
+            if bb is None:
+                continue
+            r = self._rotations[i] @ c
+            rx, ry = float(r[0]), float(r[1])
+            minx, maxx, miny, maxy = bb
+            cx, cy = 0.5 * (minx + maxx), 0.5 * (miny + maxy)
+            d = (rx - cx) ** 2 + (ry - cy) ** 2
+            if minx <= rx <= maxx and miny <= ry <= maxy:
+                contained.append((d, i))
+            if d < best_d:
+                best_d, best = d, i
+        return min(contained)[1] if contained else best
+
+    def _iter_coord_label_group(self, anns):
+        """Yield ``(coords, label, group)`` from any annotation-set form."""
+        if hasattr(anns, "data") and hasattr(anns.data, "values"):
+            for item in anns.data.values():
+                c = getattr(item, "coords", None)
+                if c is None:
+                    continue
+                c = np.asarray(c, dtype=np.float64)
+                if c.shape[0] >= 3:
+                    yield (
+                        c[:3], _resolve_label(item),
+                        getattr(item, "group", None),
+                    )
+        elif hasattr(anns, "coords"):
+            c = np.asarray(anns.coords, dtype=np.float64)
+            if c.shape[0] >= 3:
+                yield (
+                    c[:3], _resolve_label(anns),
+                    getattr(anns, "group", None),
+                )
+        else:
+            arr = np.asarray(anns, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]
+            for c in arr:
+                if c.shape[0] >= 3:
+                    yield c[:3], None, None
 
 
 def _resolve_label(ann) -> Optional[str]:
