@@ -87,7 +87,9 @@ autodoc_mock_imports = [
     "plotly",
     "fastai",
     "fpdf",
-    # Submodules occasionally imported directly
+    # Submodules occasionally imported directly (list the parent package too,
+    # or importing the submodule fails before the mock finder is consulted)
+    "mpl_toolkits",
     "mpl_toolkits.mplot3d",
 ]
 
