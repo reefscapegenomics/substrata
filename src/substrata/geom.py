@@ -97,17 +97,17 @@ class Transform:
             pcd: A point cloud exposing a ``points`` array of shape (N, 3).
 
         Returns:
-            A 4×4 translation matrix applying the computed X/Y offset.
+            A Transform applying the computed X/Y translation offset.
         """
         min_x = np.min(pcd.points[:, 0])
         min_y = np.min(pcd.points[:, 1])
         x_offset = -min_x if min_x < 0 else 0
         y_offset = -min_y if min_y < 0 else 0
-        translation_matrix = np.eye(4)
+        translation_matrix = np.eye(4, dtype=float)
         translation_matrix[0, 3] = x_offset
         translation_matrix[1, 3] = y_offset
 
-        return translation_matrix
+        return cls(translation_matrix)
 
     @classmethod
     def from_axis_angle(cls, axis: FloatArray, angle_rad: float) -> "Transform":
