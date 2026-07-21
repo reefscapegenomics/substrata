@@ -87,6 +87,18 @@ class Transform:
 
     @classmethod
     def shift_to_positive_xy(cls, pcd: object) -> "Transform":
+        """Build a translation that shifts a point cloud into the +X/+Y quadrant.
+
+        Computes the offset needed so that the minimum X and Y coordinates of
+        ``pcd`` become non-negative; axes already at or above zero are left
+        untouched.
+
+        Args:
+            pcd: A point cloud exposing a ``points`` array of shape (N, 3).
+
+        Returns:
+            A 4×4 translation matrix applying the computed X/Y offset.
+        """
         min_x = np.min(pcd.points[:, 0])
         min_y = np.min(pcd.points[:, 1])
         x_offset = -min_x if min_x < 0 else 0

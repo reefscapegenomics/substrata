@@ -98,18 +98,22 @@ class Annotations:
         return len(self.data)
 
     def items(self) -> Any:
+        """Return a view of the ``(id, Annotation)`` pairs held."""
         return self.data.items()
 
     @property
     def coords(self) -> List[np.ndarray]:
+        """List of each annotation's coordinates, in insertion order."""
         return [annotation.coords for annotation in self.data.values()]
 
     @property
     def classifications(self) -> List[Optional[str]]:
+        """List of each annotation's classification (``None`` if unset)."""
         return [annotation.classification for annotation in self.data.values()]
 
     @property
     def image_matches(self) -> Dict[str, Any]:
+        """Map annotation id to its selected image match, skipping unset ones."""
         return {
             annotation.id: annotation.image_match
             for annotation in self.data.values()
@@ -181,6 +185,15 @@ class Annotations:
         )
 
     def append(self, annotation: "Annotation") -> None:
+        """Add an annotation to the collection, keyed by its id.
+
+        Args:
+            annotation: The annotation to add. Its ``parent`` is set to this
+                collection.
+
+        Raises:
+            ValueError: If an annotation with the same id already exists.
+        """
         if annotation.id in self.data:
             raise ValueError(f"Annotation with id {annotation.id} already exists.")
         else:
@@ -2036,6 +2049,22 @@ class Annotation:
 
 
 class InterceptAnnotation(Annotation):
+    """Annotation for a ray-surface intercept point.
+
+    Represents a point where a search ray meets (or is projected onto) the
+    surface, extending :class:`Annotation` with the search radius used and
+    with metadata describing how the intercept was resolved.
+
+    Attributes:
+        search_radius: Radius used when searching for the intercept.
+        is_extrapolated: True if the intercept was extrapolated rather than
+            found directly on the surface.
+        estimated_intercept_coords: Estimated intercept coordinates when the
+            point was extrapolated, otherwise None.
+        simple_pcd: SimplePointCloud of the neighboring coordinates, set only
+            when ``neighboring_coords`` is provided.
+    """
+
     def __init__(
         self,
         coords: Union[List[float], np.ndarray],
@@ -2139,6 +2168,16 @@ class Scalebars:
         return "\n".join(lines)
 
     def store_target_coords(self, target_data: Dict) -> None:
+        """Assign target coordinates to matching scalebars and rescale.
+
+        For each label in ``target_data``, the coordinates are stored on any
+        scalebar whose ``target1_label`` or ``target2_label`` matches, then
+        :meth:`calc_scalefactor` is called to refresh the summary statistics.
+
+        Args:
+            target_data: Mapping of target label to a sequence whose first
+                element is the target's ``(x, y, z)`` coordinates.
+        """
         for target_label, target_coords in target_data.items():
             for scalebar in self.data:
                 if target_label == scalebar.target1_label:
@@ -2148,6 +2187,19 @@ class Scalebars:
         self.calc_scalefactor()
 
     def calc_scalefactor(self, max_var: float = 0.005) -> Optional[float]:
+        """Compute the mean scale factor across all resolved scalebars.
+
+        Averages the per-scalebar scale factors and stores the count, variance
+        and standard error on the instance. A warning is printed when the
+        variance exceeds ``max_var``.
+
+        Args:
+            max_var: Variance threshold above which a warning is printed.
+
+        Returns:
+            Optional[float]: The mean scale factor, or None if no scalebar has
+            both target coordinates set.
+        """
         scalefactors = []
         for scalebar in self.data:
             scalefactor = scalebar.calc_scalefactor()
@@ -2278,6 +2330,16 @@ class Scalebar(object):
         self.target2_coords = None
 
     def calc_scalefactor(self) -> Optional[float]:
+        """Compute this scalebar's scale factor from its two target coords.
+
+        Measures the raw Euclidean distance between the two targets (stored on
+        ``raw_dist``) and divides the known ``length`` by it (stored on
+        ``scalefactor``).
+
+        Returns:
+            Optional[float]: The scale factor, or None if either target's
+            coordinates are unset.
+        """
         if self.target1_coords is not None and self.target2_coords is not None:
             x1 = float(self.target1_coords[0])
             y1 = float(self.target1_coords[1])

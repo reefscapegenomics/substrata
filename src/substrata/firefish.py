@@ -340,6 +340,16 @@ class FireFish:
 
 
 def get_unix_time(unknown_datetime):
+    """Convert a datetime value to a Unix timestamp (seconds since epoch).
+
+    Args:
+        unknown_datetime (str or numeric): A datetime value. If a string, it is
+            parsed as UTC using settings.CAM_DATETIME_FORMAT; otherwise it is
+            assumed to already be a Unix timestamp and returned unchanged.
+
+    Returns:
+        float: The Unix timestamp in seconds.
+    """
     if isinstance(unknown_datetime, str):
         return (
             datetime.strptime(unknown_datetime, settings.CAM_DATETIME_FORMAT)

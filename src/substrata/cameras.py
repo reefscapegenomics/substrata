@@ -206,6 +206,7 @@ class Cameras:
 
     @property
     def coords(self):
+        """List of coordinates for every camera in the collection."""
         return [camera.coords for camera in self.data.values()]
 
     # @property
@@ -236,6 +237,7 @@ class Cameras:
         return len(self.data)
 
     def items(self):
+        """Return a view of ``(cam_id, Camera)`` pairs in the collection."""
         return self.data.items()
 
     @property
@@ -245,6 +247,7 @@ class Cameras:
 
     @property
     def group_names(self):
+        """Sorted list of unique group names across all cameras."""
         return sorted(
             {cam.group for cam in self.data.values() if hasattr(cam, "group")}
         )
@@ -271,6 +274,14 @@ class Cameras:
         )
 
     def append(self, cam):
+        """Add a camera to the collection and set it as its parent.
+
+        Args:
+            cam (Camera): The camera to add. Its ``cam_id`` is used as the key.
+
+        Raises:
+            ValueError: If a camera with the same ``cam_id`` already exists.
+        """
         if cam.cam_id in self.data:
             raise ValueError(f"Camera with id {cam.cam_id} already exists.")
         else:
@@ -320,6 +331,14 @@ class Cameras:
         )  # TODO: CHECK!
 
     def subset(self, length):
+        """Return a new container with the first ``length`` cameras.
+
+        Args:
+            length (int): Number of cameras to include, taken in insertion order.
+
+        Returns:
+            Cameras: New container with the selected cameras re-parented to it.
+        """
         cameras_subset = self._empty_like()
         for cam_id in list(self.data.keys())[:length]:
             cameras_subset.data[cam_id] = self.data[cam_id]
@@ -440,6 +459,16 @@ class Cameras:
 
     # Convenience alias to match the requested call-site: Cameras.group("name")
     def group(self, group_name):
+        """Return a subset of cameras belonging to ``group_name``.
+
+        Convenience alias for :meth:`subset_by_group`.
+
+        Args:
+            group_name (str): Name of the group (as given by ``Camera.group``).
+
+        Returns:
+            Cameras: New container with cameras from the requested group.
+        """
         return self.subset_by_group(group_name)
 
     def _empty_like(self) -> "Cameras":
@@ -1596,6 +1625,15 @@ class Camera:
 
     @property
     def filepath(self):
+        """Resolved image filepath for this camera.
+
+        Returns the original filepath unless the parent container defines
+        ``filepath_replace`` or ``filename_prefix`` rules, in which case the
+        updated filepath is returned.
+
+        Returns:
+            str: The image filepath.
+        """
         if (
             not hasattr(self.parent, "filepath_replace")
             or not self.parent.filepath_replace
@@ -1869,7 +1907,27 @@ class Camera:
     def pixel_to_point(
         self, x_img, y_img, pcd, search_radius=0.001, reprojection_threshold=None
     ):
-        """ """
+        """Back-project an image pixel onto the point cloud.
+
+        Casts a ray from the camera centre through the pixel, finds where it
+        intercepts the point cloud, and validates the result by re-projecting
+        the 3D intercept back to image space.
+
+        Args:
+            x_img (float): Pixel x-coordinate in the image.
+            y_img (float): Pixel y-coordinate in the image.
+            pcd (PointCloud): Point cloud to intercept the ray against.
+            search_radius (float): Search radius for the ray-cloud intercept.
+            reprojection_threshold (float, optional): Maximum allowed pixel
+                distance between the input pixel and the re-projected 3D
+                intercept. If exceeded, the match is rejected.
+
+        Returns:
+            tuple | None: ``(coords, [back_x, back_y], pixel_distance)`` where
+            ``coords`` is the 3D intercept, ``[back_x, back_y]`` its re-projected
+            pixel, and ``pixel_distance`` the reprojection error; ``None`` if the
+            back-projection fails or exceeds ``reprojection_threshold``.
+        """
         back_vector = self.pixel_to_ray(x_img, y_img)
         back_point = pcd.get_intercept(
             self.coords,
@@ -2199,6 +2257,11 @@ class Camera:
         return None
 
     def has_coords_datetime(self):
+        """Whether the camera has both ``coords`` and ``datetime`` set.
+
+        Returns:
+            bool: True if both attributes exist and are not None.
+        """
         return (
             hasattr(self, "coords")
             and self.coords is not None
@@ -2207,6 +2270,11 @@ class Camera:
         )
 
     def has_coords_datetime_camdist(self):
+        """Whether ``coords``, ``datetime`` and ``camdist`` are all set.
+
+        Returns:
+            bool: True if all three attributes exist and are not None.
+        """
         return (
             hasattr(self, "coords")
             and self.coords is not None
@@ -2322,6 +2390,11 @@ class ImageMatch:
         self.mask = None  # selected mask for measurements
 
     def set_image_mask_id(self, mask_id):
+        """Select the mask to use for measurements by its index.
+
+        Args:
+            mask_id (int): Index into ``self.masks`` of the mask to select.
+        """
         self.mask = self.masks[mask_id]
 
     def check_if_obstructed(self, pcd, reprojection_threshold, intercept_radius):

@@ -79,8 +79,9 @@ the crop-classification and segmentation tooling.
 Visualization
 -------------
 
-Open3D/matplotlib rendering, composite-view and QC PDF reports, and fast 2-D
-orthographic projections of point clouds.
+Open3D/matplotlib rendering, composite-view and QC PDF reports, fast 2-D
+orthographic projections of point clouds, and animated versions of those
+orthographic maps.
 
 .. automodule:: substrata.visualizations
     :members:
@@ -88,6 +89,11 @@ orthographic projections of point clouds.
     :show-inheritance:
 
 .. automodule:: substrata.ortho
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+.. automodule:: substrata.animations
     :members:
     :undoc-members:
     :show-inheritance:

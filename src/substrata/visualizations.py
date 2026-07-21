@@ -26,6 +26,15 @@ from substrata.logging import logger
 
 
 def capture_geoms_to_file(geoms, output_file):
+    """Render open3d geometries offscreen and save a screenshot to a file.
+
+    Creates a hidden open3d visualizer window, adds each geometry, renders a
+    single frame, and writes the resulting image to disk.
+
+    Args:
+        geoms: Iterable of open3d geometry objects to render.
+        output_file (str): Path where the captured screen image is written.
+    """
     vis = visualization.Visualizer()
     vis.create_window(visible=False)
     for geom in geoms:
@@ -1027,6 +1036,19 @@ def plot_compare(pcd1, pcd2, point_size=1, max_output_points=50000):
 
 
 def create_vector_geom(vector, length):
+    """Create an open3d LineSet representing a vector from the origin.
+
+    Builds a single line segment starting at the origin and extending in the
+    direction of ``vector`` scaled by ``length``.
+
+    Args:
+        vector: Direction of the vector as a 3-element sequence [x, y, z].
+        length (float): Scale factor applied to the vector to set its length.
+
+    Returns:
+        open3d.geometry.LineSet: Line segment from the origin to
+        ``vector * length``.
+    """
     lineset = geometry.LineSet()
     lineset.points = utility.Vector3dVector(
         [np.array([0, 0, 0]), np.array(vector) * float(length)]
@@ -1036,6 +1058,19 @@ def create_vector_geom(vector, length):
 
 
 def show_coords_as_lines(pcd, points, Jupyter=False):
+    """Display a point cloud with vertical z-lines rising from given points.
+
+    For each non-None point, draws a vertical line from the point upward by
+    ``settings.LEN_ORIENT_LINE`` and visualizes the lines alongside the point
+    cloud.
+
+    Args:
+        pcd: PointCloud whose underlying ``o3d_pcd`` is displayed.
+        points: Iterable of [x, y, z] coordinates (may contain None entries,
+            which are skipped).
+        Jupyter (bool): Whether to render for a Jupyter environment. Defaults
+            to False.
+    """
     # Create orientation z-lines originating from points
     connect_points = []
     for point in points:
@@ -1055,6 +1090,17 @@ def show_coords_as_lines(pcd, points, Jupyter=False):
 
 
 def show_grid_points(pcd, grid_indices):
+    """Highlight selected grid points in red and display the point cloud.
+
+    Ensures a KD-tree exists on the point cloud, then for each valid index
+    recolors the neighboring points within a 0.05 radius to red before
+    displaying the cloud.
+
+    Args:
+        pcd: PointCloud to recolor and display; a KD-tree is built if missing.
+        grid_indices: Iterable of point indices to highlight (None entries are
+            skipped).
+    """
     try:
         pcd.o3d_pcd_tree
     except AttributeError:
@@ -1068,6 +1114,20 @@ def show_grid_points(pcd, grid_indices):
 
 
 def show_point_values(pcd, annotations, meta_data_col_index=None, size=0.2):
+    """Display a point cloud with a colored sphere at each annotation.
+
+    Places a sphere at every annotation's coordinates. If ``meta_data_col_index``
+    is given, the sphere color encodes the corresponding metadata value (clamped
+    to 1.0) as a yellowish shade; otherwise spheres are red.
+
+    Args:
+        pcd: PointCloud whose underlying ``o3d_pcd`` is displayed.
+        annotations: Annotations object whose ``data`` values provide ``coords``
+            and ``meta_data`` for each point.
+        meta_data_col_index (int, optional): Index into each annotation's
+            ``meta_data`` used to color the spheres. Defaults to None (red).
+        size (float): Radius of each sphere. Defaults to 0.2.
+    """
     # Create orientation z-lines originating from points
     sphere_geoms = []
     for annotation in annotations.data.values():

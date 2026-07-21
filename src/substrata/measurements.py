@@ -1344,6 +1344,15 @@ def get_vector_dispersion(geom, generate_image=True):
 
 
 def get_rgb_stats(pcd):
+    """Compute per-channel median colors and overall luminance of a point cloud.
+
+    Args:
+        pcd: A point cloud whose ``colors`` are RGB values in [0, 1].
+
+    Returns:
+        tuple: ``(median_red, median_green, median_blue, luminance)``, where
+        luminance is the Rec. 709 weighted sum of the median channel values.
+    """
     median_red = np.median(np.asarray(pcd.colors)[:, 0])
     median_green = np.median(np.asarray(pcd.colors)[:, 1])
     median_blue = np.median(np.asarray(pcd.colors)[:, 2])
@@ -1352,6 +1361,20 @@ def get_rgb_stats(pcd):
 
 
 def generate_filled_circle(center, radius, spacing):
+    """Generate a grid of points filling a horizontal circle.
+
+    Points are laid out on a regular grid in the x-y plane at the center's z
+    height, keeping only those within ``radius`` of the center.
+
+    Args:
+        center: Sequence ``(cx, cy, cz)`` giving the circle center coordinates.
+        radius (float): Circle radius.
+        spacing (float): Grid spacing between candidate points.
+
+    Returns:
+        numpy.ndarray: Array of shape ``(N, 3)`` with the points inside the
+        circle, all sharing the center's z value.
+    """
     points = []
     cx, cy, cz = center  # Center coordinates
     for x in np.arange(cx - radius, cx + radius + spacing, spacing):
@@ -1710,7 +1733,19 @@ def cast_ray_pointcloud(starting_coord, ray_vector, points, dist_threshold):
 
 
 def generate_point_grid(bounding_box, spacing):
-    """ """
+    """Generate a regular horizontal grid of points above a bounding box.
+
+    Grid points span the box in x and y at the given spacing and all share a
+    single z value set just above the box top (``max_bound[2] + spacing``).
+
+    Args:
+        bounding_box: Pair ``[min_bound, max_bound]`` of 3-D corner
+            coordinates, e.g. ``[[min_x, min_y, min_z], [max_x, max_y, max_z]]``.
+        spacing (float): Spacing between grid points.
+
+    Returns:
+        numpy.ndarray: Array of shape ``(N, 3)`` with the flattened grid points.
+    """
     min_bound, max_bound = bounding_box
     x_range = np.arange(min_bound[0], max_bound[0], spacing)
     y_range = np.arange(min_bound[1], max_bound[1], spacing)
@@ -2262,6 +2297,20 @@ def generate_random_xy_points_within_cells(bboxes, points_per_cell, z_value=0):
 
 
 def create_mesh_poisson(pcd, depth):
+    """Reconstruct a triangle mesh from a point cloud via Poisson meshing.
+
+    Runs Open3D Poisson surface reconstruction and trims the lowest-density
+    vertices (bottom 10% by density) to remove poorly supported geometry.
+
+    Args:
+        pcd: A point cloud exposing an ``o3d_pcd`` Open3D point cloud with
+            estimated normals.
+        depth (int): Poisson reconstruction depth (octree depth); higher values
+            yield finer detail.
+
+    Returns:
+        open3d.geometry.TriangleMesh: The reconstructed, density-trimmed mesh.
+    """
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
         pcd.o3d_pcd, depth=depth
     )
@@ -2273,6 +2322,26 @@ def create_mesh_poisson(pcd, depth):
 def get_random_stratified_points_raycast(
     pcd, cell_size, num_points, vis=True
 ):  # Should we exclude the meshing in this step?
+    """Sample stratified random surface points via top-down raycasting.
+
+    Builds a Poisson mesh of the point cloud, divides its extent into square
+    grid cells of ``cell_size``, generates random ray origins above each cell,
+    and casts downward (-z) rays onto the mesh. Each hit is snapped back to the
+    nearest original point (within 0.01 units), giving stratified samples that
+    lie on actual point-cloud vertices.
+
+    Args:
+        pcd: A point cloud with ``points`` and an ``o3d_pcd`` used for meshing.
+        cell_size (float): Side length of the square stratification cells.
+        num_points (int): Number of random rays generated per cell.
+        vis (bool): If True, display the point cloud with sampled points
+            highlighted. Defaults to True.
+
+    Returns:
+        tuple: ``(random_points_coords, random_points_idx)`` where the first is
+        an array of the sampled point coordinates and the second is the array of
+        their indices into ``pcd.points``.
+    """
     mesh = create_mesh_poisson(pcd, depth=9)
     bounding_boxes = create_grid_cells_from_pcd(pcd, cell_size)
     z_max = np.max(pcd.points[:, 2]) + 10  # might be good not to hardcode this
@@ -2318,6 +2387,26 @@ def get_random_stratified_points_raycast(
 
 
 def get_random_stratified_points_raycast_temp(pcd, ray_points, mesh_depth=9):
+    """Raycast pre-supplied ray origins onto a Poisson mesh to sample points.
+
+    Temporary/experimental variant of ``get_random_stratified_points_raycast``.
+    Instead of generating ray origins internally from stratification cells, it
+    accepts caller-provided ``ray_points`` and exposes the mesh depth, and it
+    performs no visualization. Rays are cast downward (-z) onto a Poisson mesh
+    of the point cloud, and hits are snapped to the nearest original point
+    (within 0.01 units).
+
+    Args:
+        pcd: A point cloud with ``points`` and an ``o3d_pcd`` used for meshing.
+        ray_points (numpy.ndarray): Array of shape ``(N, 3)`` of ray origin
+            coordinates (rays travel in the -z direction).
+        mesh_depth (int): Poisson reconstruction depth. Defaults to 9.
+
+    Returns:
+        tuple: ``(random_points_coords, random_points_idx)`` where the first is
+        an array of the sampled point coordinates and the second is the array of
+        their indices into ``pcd.points``.
+    """
     print("Creating mesh...")
     mesh = create_mesh_poisson(pcd, depth=mesh_depth)
 
@@ -2487,14 +2576,30 @@ def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
 
 @dataclass
 class DepthRegressionResult:
+    """Result of fitting a linear regression of depth against 3-D position.
+
+    Produced by ``fit_depth_regression``, which models depth as a linear
+    function of ``(x, y, z)``.
+    """
+
+    #: Regression coefficient vector, sign-adjusted so that stepping along it
+    #: decreases depth (points "up").
     up_vector: np.ndarray
+    #: Regression intercept (depth at the origin).
     depth_offset: float
+    #: Depth change per unit distance, i.e. the L2 norm of the coefficient vector.
     depth_per_unit: float
+    #: Mean squared error of the predicted depths.
     mse: float
+    #: Root mean squared error of the predicted depths.
     rmse: float
+    #: Mean absolute error of the predicted depths.
     mae: float
+    #: Coefficient of determination (R-squared) of the fit.
     r2: float
+    #: Predicted depth for each input point.
     depths_pred: np.ndarray
+    #: Residuals (observed minus predicted depth).
     depths_res: np.ndarray
 
 

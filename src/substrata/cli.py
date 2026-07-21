@@ -554,6 +554,15 @@ def _print_xyz_offset_report(report: dict) -> None:
 
 
 def handle_decimate(args):
+    """Decimate a PLY to a target point count, writing a smaller PLY.
+
+    Resolves the input PLY and output path from the project initializer
+    (CWD) when not given explicitly, and can apply the project's stored
+    color correction to the written points.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -591,6 +600,16 @@ def handle_decimate(args):
 
 
 def handle_repair(args):
+    """Rewrite a PLY into a strict Open3D-compatible form.
+
+    Drops extra vertex properties and non-finite rows (float32 xyz, optional
+    uchar RGB and float32 normals). With no --output the input is renamed to
+    <input>_old.ply and the repaired file is written back in its place; the
+    original is restored if the rewrite fails.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -639,6 +658,14 @@ def handle_repair(args):
 
 
 def handle_head(args):
+    """Print the first N vertex rows of a PLY for a quick preview.
+
+    Resolves the input PLY from the project initializer (CWD) when not given
+    explicitly.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -655,6 +682,16 @@ def handle_head(args):
 
 
 def handle_scalebars(args):
+    """Generate a scalebar QC PDF from a point cloud and marker annotations.
+
+    Loads the PLY (optionally stream-decimated to --points) and the markers
+    CSV, builds Scalebars from the RGL target definitions, and writes a PDF.
+    With --save_yaml the computed scale factor is persisted to the project
+    YAML.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -779,6 +816,14 @@ def handle_colors(args):
 
 
 def handle_views(args):
+    """Save a composite-views PDF for a point cloud.
+
+    Initializes the project (loading the point cloud, and cameras/markers
+    when available) and renders multiple perspectives to a PDF.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -798,6 +843,17 @@ def handle_views(args):
 
 
 def handle_orient(args):
+    """Compute and apply scale and orientation, saving results to YAML.
+
+    Runs the scale_and_orient workflow (using marker depths from --markers
+    or camera depths otherwise) unless --manual is set, optionally applies
+    an interactively entered manual transform, and propagates the world
+    transform to cameras/markers/annotations. Writes the project YAML plus
+    composite-views and depth-residuals PDFs.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
 
@@ -936,6 +992,15 @@ def handle_firefish(args):
 
 
 def handle_cams2video(args):
+    """Create an annotated fly-through video from the project cameras.
+
+    Initializes the project, optionally loads annotations and subsets the
+    cameras by group name, then renders an MP4 walking through the camera
+    poses over the point cloud.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
     from substrata import visualizations
@@ -996,6 +1061,17 @@ def handle_cams2video(args):
 
 
 def handle_intercepts(args):
+    """Compute Z-intercepts over a grid and save them to CSV.
+
+    Requires a non-identity world transform. Optionally aligns along the
+    slope first, places a bounding box (automatically or from --position),
+    subdivides it into cells, samples a random XY point per cell, and
+    computes the point-cloud Z-intercepts. Writes a grid image and an
+    intercepts CSV (plus a generation YAML for --slope).
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     # Use initializer to infer defaults from CWD when not provided
     from substrata.initializer import ProjectInitializer
     from substrata import measurements, visualizations
@@ -1095,6 +1171,17 @@ def handle_intercepts(args):
 
 
 def handle_intercepts_plot(args):
+    """Re-plot a saved intercepts CSV as a 2D grid colored by label.
+
+    Reads the orientation (and optional exact generation grid) from --yaml
+    or the project, applies it to the annotations, and builds an OrthoGrid
+    aligned via the saved grid_bbox, --fit-grid, or --box-length/--box-width
+    reconstruction. Saves a grid PNG, an animated GIF of the grid filling in,
+    and (when a point cloud is available) an annotation positions PNG.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     from substrata import measurements
     from substrata.ortho import OrthoGrid
 
@@ -1268,6 +1355,15 @@ def handle_intercepts_plot(args):
 
 
 def handle_align(args):
+    """Register a source PLY to a target PLY and print the transform.
+
+    Loads both point clouds (optionally stream-decimated to --points),
+    computes the auto-alignment transform mapping source to target space,
+    and prints the transform and its metrics.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
     from substrata.pointclouds import PointCloud
 
     if not args.source or not args.target:
@@ -2283,6 +2379,13 @@ def handle_train(args):
 
 
 def main():
+    """Build the argparse CLI and dispatch to the selected subcommand handler.
+
+    Defines all subcommands (decimate, repair, head, scalebars, views, orient,
+    colors, firefish, cams2video, intercepts, intercepts-plot, align, images,
+    camsync, transform, train, metashape-export), parses the arguments, and
+    calls the matching handle_* function.
+    """
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
