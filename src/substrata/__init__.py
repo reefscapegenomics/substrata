@@ -48,6 +48,8 @@ from .ortho import *
 
 from .animations import *
 
+from .segmentation import *
+
 # from .firefish import *
 # from .utils import *
 # from .initializer import *

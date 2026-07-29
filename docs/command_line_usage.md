@@ -133,6 +133,29 @@ substrata orient
 substrata orient --input pointcloud.ply
 ```
 
+## Segmentation
+
+Segment the point cloud by reusing the trained crop classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the 224 px patch, then propagate the labels to every point via nearest neighbour. Saves the classified query points to a compact `<id>_seg.npz` (the source of truth) plus a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance). Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
+
+Usage: `substrata segment [--input PLY] [--classifier PKL] [--cell-size M] [--sampling voxel|xy_grid] [--no-occlusion] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--output-npz NPZ] [--output-ply PLY]`
+
+```bash
+# Using default behavior (auto-detects project + classifier from CWD)
+substrata segment
+
+# Use a specific classifier and 10 cm query spacing
+substrata segment --classifier crop_classifier.pkl --cell-size 0.10
+
+# Manual category colours (repeatable): coral=red, macroalgae=green, substrate=yellow
+substrata segment --color CS=ff0000 --color MA=00ff00 --color SU=ffff00
+
+# Top-down sampling (faster; may leave gaps at oblique angles) and no occlusion filtering
+substrata segment --sampling xy_grid --no-occlusion
+
+# Also stream-recolour the full-size PLY to <id>_seg.ply
+substrata segment --full-ply
+```
+
 ## Color calibration
 
 Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and optionally store the affine color correction (matrix + offset) in the project YAML. The PLY is always loaded in full when `--input` is given (never stream-decimated).

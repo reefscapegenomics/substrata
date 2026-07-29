@@ -842,6 +842,95 @@ def handle_views(args):
     init.pcd.save_pdf(filepath=output_pdf)
 
 
+def handle_segment(args):
+    """Segment the point cloud by classifying camera patches at query points."""
+    import numpy as np
+
+    from substrata.initializer import ProjectInitializer
+    from substrata import classification, segmentation
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+    if args.input:
+        init.pcd_filepath = args.input
+    init.initialize()
+
+    if init.pcd is None:
+        raise SystemExit("No point cloud found to segment (provide --input).")
+    if init.cams is None:
+        raise SystemExit("No cameras found; segmentation needs camera poses + photos.")
+
+    # Remap camera photo paths when the poses reference a different mount than
+    # where the photos live locally (same as cams.set_filepath_replace).
+    if getattr(args, "photo_path_replace", None):
+        init.cams.set_filepath_replace(*args.photo_path_replace)
+
+    classifier_path = getattr(args, "classifier", None) or init.classifier_filepath
+    if not classifier_path:
+        raise SystemExit(
+            "No classifier found. Provide --classifier or set 'classifier' in "
+            "the project YAML."
+        )
+    learn = classification.get_image_classifier(classifier_path)
+
+    # Manual category colours: --color LABEL=RRGGBB (repeatable).
+    label_colors = {}
+    for spec in getattr(args, "color", None) or []:
+        if "=" not in spec:
+            raise SystemExit(f"Invalid --color {spec!r}; expected LABEL=RRGGBB.")
+        lbl, hexv = spec.split("=", 1)
+        label_colors[lbl] = _parse_hex_color(hexv)
+
+    seg = segmentation.segment_point_cloud(
+        init.pcd, init.cams, learn,
+        world_transform=init.pcd.world_transform,
+        cell_size=args.cell_size,
+        sampling=args.sampling,
+        occlusion=not args.no_occlusion,
+        label_colors=label_colors or None,
+    )
+
+    npz_path = args.output_npz or _get_output_filepath(init, "seg.npz")
+    seg.save(npz_path)
+    print(f"Saved segmentation: {npz_path} ({seg.n_queries:,} query points)")
+
+    # Propagate to the decimated cloud, print the category breakdown, and write a
+    # recoloured copy.
+    pts = np.asarray(init.pcd.points)
+    codes = seg.propagate(pts, max_radius=args.max_radius)
+    print("Categories:")
+    for lbl, cnt in sorted(seg.summary(codes).items(), key=lambda kv: -kv[1]):
+        print(f"  {lbl}: {cnt:,} ({100 * cnt / len(codes):.1f}%)")
+
+    ply_out = args.output_ply or _get_output_filepath(init, "seg_dec.ply")
+    _write_recolored_decimated(init.pcd, seg, codes, ply_out)
+    print(f"Saved recoloured decimated cloud: {ply_out}")
+
+    # Optional streaming full-size recolour.
+    if getattr(args, "full_ply", None) is not None:
+        full_in = args.full_ply or init.ply_full_path
+        if not full_in:
+            raise SystemExit("--full-ply given but no full-size PLY path found.")
+        full_out = _get_output_filepath(init, "seg.ply")
+        segmentation.recolor_ply_file(
+            full_in, full_out, seg,
+            world_transform=init.pcd.world_transform,
+            max_radius=args.max_radius,
+        )
+        print(f"Saved recoloured full-size cloud: {full_out}")
+
+
+def _write_recolored_decimated(pcd, seg, codes, output_path):
+    """Write the decimated cloud with segmentation colours to a PLY."""
+    import numpy as np
+    import open3d as o3d
+
+    new_colors = seg.recolor(np.asarray(pcd.colors), codes)
+    o3d_pcd = pcd.o3d_pcd
+    o3d_pcd.colors = o3d.utility.Vector3dVector(new_colors)
+    o3d.io.write_point_cloud(output_path, o3d_pcd)
+
+
 def handle_orient(args):
     """Compute and apply scale and orientation, saving results to YAML.
 
@@ -2694,6 +2783,67 @@ def main():
         help="Reset all paths to local (relative to project path).",
     )
 
+    # segment (point-cloud segmentation via image-match classification)
+    p_seg = subparsers.add_parser(
+        "segment",
+        help=(
+            "Segment the point cloud by classifying camera patches at sampled "
+            "query points; saves <id>_seg.npz + a recoloured cloud."
+        ),
+    )
+    p_seg.add_argument(
+        "--input", "--ply", dest="input", type=str, default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_seg.add_argument(
+        "--classifier", dest="classifier", type=str, default=None,
+        help="Classifier .pkl (overrides the project YAML 'classifier').",
+    )
+    p_seg.add_argument(
+        "--cell-size", dest="cell_size", type=float, default=None,
+        help="Query spacing / voxel size in metres (default 0.05).",
+    )
+    p_seg.add_argument(
+        "--sampling", dest="sampling", choices=["voxel", "xy_grid"], default="voxel",
+        help="Query sampling: 'voxel' (3D, default) or 'xy_grid' (top-down).",
+    )
+    p_seg.add_argument(
+        "--no-occlusion", dest="no_occlusion", action="store_true",
+        help="Skip reprojection occlusion filtering (faster, less accurate).",
+    )
+    p_seg.add_argument(
+        "--max-radius", dest="max_radius", type=float, default=None,
+        help="Leave points farther than this (m) from any query unlabeled.",
+    )
+    p_seg.add_argument(
+        "--color", dest="color", action="append", default=None,
+        metavar="LABEL=RRGGBB",
+        help="Manual category colour, e.g. --color CS=ff0000 (repeatable).",
+    )
+    p_seg.add_argument(
+        "--photo-path-replace", dest="photo_path_replace", nargs=2,
+        default=None, metavar=("OLD", "NEW"),
+        help="Remap camera photo paths (substring OLD -> NEW) when the poses "
+             "reference a different mount than where the photos live locally.",
+    )
+    p_seg.add_argument(
+        "--full-ply", dest="full_ply", nargs="?", const="", default=None,
+        help="Also stream-recolour the full-size PLY (optional explicit path; "
+             "defaults to the project's full PLY).",
+    )
+    p_seg.add_argument(
+        "--output-npz", dest="output_npz", type=str, default=None,
+        help="Segmentation .npz output path (default <id>_seg.npz).",
+    )
+    p_seg.add_argument(
+        "--output-ply", dest="output_ply", type=str, default=None,
+        help="Recoloured decimated PLY output path (default <id>_seg_dec.ply).",
+    )
+    p_seg.add_argument(
+        "--local", dest="local", action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
+
     # colors (ColorChecker calibration QC + optional YAML colour correction)
     p_colors = subparsers.add_parser(
         "colors",
@@ -3630,6 +3780,7 @@ def main():
         "scalebars": handle_scalebars,
         "views": handle_views,
         "orient": handle_orient,
+        "segment": handle_segment,
         "colors": handle_colors,
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,

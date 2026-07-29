@@ -24,6 +24,7 @@ DEFAULT_BENTHIC_BASE_FALLOFF = 0.20  # m; depth below base where height weight r
 
 # --- OrthoGrid (gridded per-cell rasters: DEM / density / labels) --------------
 DEFAULT_ORTHO_CELL_SIZE = 0.1  # metres; default OrthoGrid cell side length
+DEFAULT_SEG_CELL_SIZE = 0.05  # metres; default point-cloud segmentation query spacing
 
 # --- Animation (animated matplotlib figures) ----------------------------------
 DEFAULT_ANIM_FPS = 15          # frames per second for exported GIF/MP4

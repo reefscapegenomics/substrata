@@ -1,10 +1,13 @@
 # Standard Library
 import os
 import math
+from collections import defaultdict
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from ssl import SSLSocket
+from typing import Any, Dict, List, Optional, Tuple
 
 # Third-Party Libraries
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
@@ -12,10 +15,24 @@ from PIL import Image
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+# NOTE: ``torch`` and ``sam2`` are heavy/optional and are imported lazily (inside
+# the functions that need them, via ``_require_sam2``) so that importing this
+# module — and therefore ``substrata`` as a whole — does not require them. This is
+# what lets ``segmentation`` be added to the package's star-imports.
 
 # Local Modules
+
+# Only the point-cloud segmentation API is star-exported into the flat
+# ``substrata.*`` namespace (this module is in ``__init__``'s star-import list).
+# The SAM2 image helpers below (including a ``Mask`` class that would otherwise
+# collide with ``cameras.Mask``) stay accessible via ``substrata.segmentation.*``
+# but are deliberately kept out of ``__all__``.
+__all__ = [
+    "Segmentation",
+    "sample_query_points",
+    "segment_point_cloud",
+    "recolor_ply_file",
+]
 
 
 class Mask:
@@ -40,6 +57,10 @@ def get_sam2_predictor(
 
     from https://github.com/facebookresearch/sam2
     """
+    import torch  # lazy: heavy/optional, not required to import the package
+
+    build_sam2, SAM2ImagePredictor = _require_sam2()
+
     # select the device for computation
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -207,7 +228,7 @@ def sift_match_batched(
     target_cams,
     max_dim=500,
     target_max_dim=500,
-    downscale_interpolation=cv2.INTER_AREA,
+    downscale_interpolation=None,
     n_jobs=-1,
     batch_size=10,  # Process in batches to avoid memory issues
 ):
@@ -218,6 +239,9 @@ def sift_match_batched(
     """
     from joblib import Parallel, delayed
     from tqdm import tqdm
+
+    if downscale_interpolation is None:
+        downscale_interpolation = cv2.INTER_AREA
 
     def load_and_resize_gray(filepath, max_dim):
         img = cv2.imread(filepath)
@@ -350,7 +374,7 @@ def visualize_sift_matches(
     query,
     target_cam,
     max_dim=800,
-    downscale_interpolation=cv2.INTER_AREA,
+    downscale_interpolation=None,
     use_gpu=False,
     save_path=None,
     show_plot=True,
@@ -373,6 +397,9 @@ def visualize_sift_matches(
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+
+    if downscale_interpolation is None:
+        downscale_interpolation = cv2.INTER_AREA
 
     def load_and_resize_gray_from_array(img_array, max_dim, crop_area=None):
         h, w = img_array.shape[:2]
@@ -658,7 +685,7 @@ def estimate_macro_camera_pose_from_gopro(
     macro_camera,
     point_cloud,
     max_dim=800,
-    downscale_interpolation=cv2.INTER_AREA,
+    downscale_interpolation=None,
     use_gpu=False,
     min_matches=10,
     reprojection_threshold=2.0,
@@ -704,6 +731,9 @@ def estimate_macro_camera_pose_from_gopro(
     import cv2
     import numpy as np
     from substrata.logging import logger
+
+    if downscale_interpolation is None:
+        downscale_interpolation = cv2.INTER_AREA
 
     # Validate inputs
     if not hasattr(gopro_camera, "coords") or gopro_camera.coords is None:
@@ -1542,3 +1572,696 @@ def _require_sam2():
             "or follow the project’s installation instructions."
         ) from e
     return build_sam2, SAM2ImagePredictor
+
+
+# ===========================================================================
+# Point-cloud segmentation via image-match classification
+# ===========================================================================
+#
+# Classify/segment a whole point cloud by reusing the trained per-annotation
+# crop classifier: sample a grid of query points across the cloud, project each
+# to its best camera photo, cut a 224 px patch, classify it, then propagate the
+# labels to every cloud point via nearest neighbour. Unlike the SAM2 code above
+# this is a 3-D point-cloud operation; its only heavy dependency (fastai) is
+# imported lazily, so this module stays importable without torch/sam2.
+
+# PLY storage type -> numpy dtype (for the streaming full-size recolor).
+_PLY_NP_DTYPE = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "i2", "int16": "i2", "ushort": "u2", "uint16": "u2",
+    "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
+    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
+}
+
+
+def _build_label_colors(
+    codebook: List[str], overrides: Optional[Dict[str, Tuple[int, int, int]]] = None
+) -> Dict[str, Tuple[int, int, int]]:
+    """Build a ``{label: (r, g, b)}`` 0-255 map (tab20 defaults + manual overrides).
+
+    Mirrors the ``label_colors``/``tab20`` convention used across ortho and
+    annotations rendering. ``overrides`` (e.g. ``{"CS": (255, 0, 0)}``) win over
+    the auto colours; labels not in ``overrides`` get a stable tab20 colour.
+    """
+    import matplotlib.pyplot as plt  # already a top-level import; kept explicit
+
+    cmap = plt.get_cmap("tab20")
+    colors = {
+        lbl: tuple(int(255 * c) for c in cmap(i % 20)[:3])
+        for i, lbl in enumerate(codebook)
+    }
+    if overrides:
+        colors.update({k: tuple(v) for k, v in overrides.items() if k in codebook})
+    return colors
+
+
+@dataclass
+class Segmentation:
+    """A point-cloud segmentation result — standalone, not attached to a cloud.
+
+    The source of truth is the small set of classified *query points*
+    (``query_coords`` + ``query_labels``); per-point labels for a full cloud are
+    a derived cache produced on demand by :meth:`propagate`. Persisted compactly
+    to ``.npz`` so it costs zero memory when not loaded.
+
+    Attributes:
+        query_coords: ``(Nq, 3)`` float32 world-frame coordinates of classified
+            query points (kept only where a label was assigned).
+        query_labels: ``(Nq,)`` object array of category label strings.
+        query_conf: ``(Nq,)`` float classifier confidences.
+        codebook: ordered unique labels; the integer code of a label is its index.
+        label_colors: ``{label: (r, g, b)}`` 0-255 display colours.
+        point_codes: optional ``(N,)`` int cache of per-point label codes for a
+            specific cloud (``-1`` = unlabeled). Derived; not persisted by default.
+    """
+
+    query_coords: np.ndarray
+    query_labels: np.ndarray
+    query_conf: np.ndarray
+    codebook: List[str]
+    label_colors: Dict[str, Tuple[int, int, int]]
+    point_codes: Optional[np.ndarray] = None
+    _tree: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def n_queries(self) -> int:
+        return len(self.query_coords)
+
+    @classmethod
+    def from_query_labels(
+        cls,
+        query_coords: np.ndarray,
+        labels: np.ndarray,
+        conf: np.ndarray,
+        label_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    ) -> "Segmentation":
+        """Build a Segmentation, keeping only successfully-classified queries."""
+        matched = np.array([bool(l) for l in labels])
+        if not matched.any():
+            raise ValueError(
+                "No query points were classified. Nothing to segment — most "
+                "likely the camera photo filepaths do not resolve on disk "
+                "(check cams.set_filepath_replace(old, new))."
+            )
+        qc = np.asarray(query_coords)[matched].astype(np.float32)
+        ql = np.asarray(labels, dtype=object)[matched]
+        qcf = np.asarray(conf, dtype=float)[matched]
+        codebook = sorted(set(ql.tolist()))
+        colors = _build_label_colors(codebook, label_colors)
+        return cls(qc, ql, qcf, codebook, colors)
+
+    def _query_tree(self):
+        if self._tree is None:
+            from scipy.spatial import cKDTree
+
+            self._tree = cKDTree(self.query_coords)
+        return self._tree
+
+    def propagate(
+        self, points: np.ndarray, max_radius: Optional[float] = None
+    ) -> np.ndarray:
+        """Assign each point the label of its nearest classified query.
+
+        Args:
+            points: ``(N, 3)`` world-frame coordinates.
+            max_radius: if given, points farther than this from any query are
+                left unlabeled (``-1``); default ``None`` labels every point
+                (gap-free).
+
+        Returns:
+            ``(N,)`` int16 array of label codes (``-1`` = unlabeled).
+        """
+        if self.n_queries == 0:
+            raise ValueError("Segmentation has no query points to propagate.")
+        code_of_query = np.array(
+            [self.codebook.index(l) for l in self.query_labels], dtype=np.int16
+        )
+        dist, idx = self._query_tree().query(points, k=1, workers=-1)
+        codes = code_of_query[idx].astype(np.int16)
+        if max_radius is not None:
+            codes[dist > max_radius] = -1
+        return codes
+
+    def recolor(
+        self,
+        orig_colors: np.ndarray,
+        point_codes: Optional[np.ndarray] = None,
+        value_floor: float = 0.3,
+        unlabeled: str = "gray",
+    ) -> np.ndarray:
+        """Blend each point's category colour with its original luminance.
+
+        The category base colour is modulated by the point's own luminance
+        (floored at ``value_floor`` so the tint stays visible in dark areas), so
+        surface relief survives the recolouring. Returns ``(N, 3)`` 0-1 RGB.
+
+        Args:
+            orig_colors: ``(N, 3)`` original colours (0-1 or 0-255).
+            point_codes: per-point label codes; defaults to ``self.point_codes``.
+            value_floor: minimum luminance scaling for labeled points.
+            unlabeled: ``"gray"`` (dim grayscale) or ``"keep"`` (original colour).
+        """
+        if point_codes is None:
+            point_codes = self.point_codes
+        if point_codes is None:
+            raise ValueError("No point_codes given; call propagate() first.")
+        oc = np.asarray(orig_colors, dtype=float)
+        if oc.size and oc.max() > 1.0:
+            oc = oc / 255.0
+        lum = oc @ np.array([0.299, 0.587, 0.114])
+        v = value_floor + (1.0 - value_floor) * lum
+        palette = (
+            np.array([self.label_colors[l] for l in self.codebook], dtype=float)
+            / 255.0
+        )
+        out = np.zeros_like(oc)
+        labeled = point_codes >= 0
+        out[labeled] = palette[point_codes[labeled]] * v[labeled, None]
+        if unlabeled == "gray":
+            out[~labeled] = (lum[~labeled] * 0.6)[:, None]
+        else:  # "keep": original colour
+            out[~labeled] = oc[~labeled]
+        return np.clip(out, 0.0, 1.0)
+
+    def summary(self, point_codes: Optional[np.ndarray] = None) -> Dict[str, int]:
+        """Return {label: count}. Uses ``point_codes`` if given, else query labels."""
+        if point_codes is not None:
+            uniq, cnt = np.unique(point_codes[point_codes >= 0], return_counts=True)
+            return {self.codebook[c]: int(n) for c, n in zip(uniq, cnt)}
+        uniq, cnt = np.unique(self.query_labels, return_counts=True)
+        return {str(u): int(n) for u, n in zip(uniq, cnt)}
+
+    def save(self, path: str, include_point_codes: bool = False) -> str:
+        """Persist to a compact ``.npz`` (query points are tiny)."""
+        payload = dict(
+            query_coords=self.query_coords,
+            query_labels=np.array(self.query_labels, dtype=object),
+            query_conf=self.query_conf,
+            codebook=np.array(self.codebook, dtype=object),
+            color_values=np.array(
+                [self.label_colors[l] for l in self.codebook], dtype=np.int16
+            ),
+        )
+        if include_point_codes and self.point_codes is not None:
+            payload["point_codes"] = self.point_codes
+        np.savez_compressed(path, **payload)
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "Segmentation":
+        d = np.load(path, allow_pickle=True)
+        codebook = d["codebook"].tolist()
+        colors = {
+            lbl: tuple(int(c) for c in d["color_values"][i])
+            for i, lbl in enumerate(codebook)
+        }
+        return cls(
+            d["query_coords"], d["query_labels"], d["query_conf"], codebook, colors,
+            point_codes=d["point_codes"] if "point_codes" in d.files else None,
+        )
+
+
+def sample_query_points(
+    pcd, cell_size: float, method: str = "voxel", rep: str = "highest"
+) -> np.ndarray:
+    """Sample one representative query point per cell across the cloud.
+
+    Args:
+        pcd: a :class:`~substrata.pointclouds.PointCloud` (uses ``pcd.points`` in
+            the world frame, and ``pcd.o3d_pcd`` for voxel downsampling).
+        cell_size: cell / voxel side in metres (== target spatial resolution).
+        method: ``"voxel"`` (3-D voxel downsample — covers vertical faces and
+            overhangs, the default) or ``"xy_grid"`` (one point per top-down XY
+            cell — faster, but leaves gaps at oblique viewing angles).
+        rep: for ``xy_grid``, ``"highest"`` (max-z surface point, best for camera
+            matching) or ``"centroid"``.
+
+    Returns:
+        ``(Nq, 3)`` array of query coordinates (world frame).
+    """
+    pts = np.asarray(pcd.points)
+    if method == "voxel":
+        down = pcd.o3d_pcd.voxel_down_sample(cell_size)
+        return np.asarray(down.points)
+    if method != "xy_grid":
+        raise ValueError(f"unknown sampling method: {method!r}")
+
+    ix = np.floor(pts[:, 0] / cell_size).astype(np.int64)
+    iy = np.floor(pts[:, 1] / cell_size).astype(np.int64)
+    ix -= ix.min()
+    iy -= iy.min()
+    key = ix * (iy.max() + 1) + iy  # unique per XY cell
+
+    if rep == "highest":
+        order = np.lexsort((pts[:, 2], key))
+        k_sorted = key[order]
+        last = np.ones(len(k_sorted), dtype=bool)
+        last[:-1] = k_sorted[1:] != k_sorted[:-1]
+        return pts[order[last]]
+
+    uniq, inv = np.unique(key, return_inverse=True)
+    sums = np.zeros((len(uniq), 3))
+    np.add.at(sums, inv, pts)
+    counts = np.bincount(inv, minlength=len(uniq))[:, None]
+    return sums / counts
+
+
+def _match_points_to_cameras(
+    query_coords: np.ndarray,
+    cams,
+    world_transform: Optional[np.ndarray] = None,
+    pcd=None,
+    occlusion: bool = True,
+    intercept_radius: Optional[float] = None,
+    discard_threshold: Optional[float] = None,
+    verbose: bool = True,
+):
+    """Find each query point's best camera (fast, vectorized, occlusion-aware).
+
+    For every camera, project *all* query points at once
+    (:meth:`~substrata.cameras.Camera.project_points`) and keep the running
+    best camera per query by the ``relevance`` metric — O(cameras) numpy passes,
+    no per-query Python loop. When ``occlusion`` is on, run the reprojection
+    ray-march (``pcd.get_intercept``) once per query against its *chosen*
+    camera and drop queries whose line of sight is blocked. This is the
+    production replacement for ``Annotations.get_first_image_matches``, which
+    looped every camera per query and ran the ray-march per candidate (~15 min
+    for 40 k queries).
+
+    Returns:
+        ``(best_cam, best_x, best_y, best_depth, cam_list)`` where ``best_cam``
+        is an ``(Nq,)`` int index into ``cam_list`` (``-1`` = unmatched),
+        ``best_x``/``best_y`` are ``(Nq,)`` pixel coordinates, and ``best_depth``
+        is the ``(Nq,)`` camera-to-point distance (world metres) of the chosen
+        camera — used to report the physical crop footprint.
+    """
+    from substrata import settings
+
+    if intercept_radius is None:
+        intercept_radius = settings.DEFAULT_INTERCEPT_SEARCH_RADIUS
+    if discard_threshold is None:
+        discard_threshold = settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD
+
+    query_coords = np.asarray(query_coords, dtype=float)
+    n = len(query_coords)
+
+    # Camera projection uses each point's *original* (pre-world-transform)
+    # coords; occlusion uses the world-frame coords + world pcd. Derive the
+    # original-frame coords once.
+    if world_transform is not None and not np.allclose(world_transform, np.eye(4)):
+        inv = np.linalg.inv(np.asarray(world_transform, dtype=float))
+        homog = np.hstack([query_coords, np.ones((n, 1))])
+        orig = (homog @ inv.T)[:, :3]
+    else:
+        orig = query_coords
+
+    cam_list = list(cams)
+    best_rel = np.full(n, np.inf)
+    best_cam = np.full(n, -1, dtype=int)
+    best_x = np.zeros(n)
+    best_y = np.zeros(n)
+    best_depth = np.zeros(n)
+
+    iterator = (
+        tqdm(cam_list, desc="Projecting cameras", unit="cam") if verbose else cam_list
+    )
+    for ci, cam in enumerate(iterator):
+        if getattr(cam, "enabled", True) is False or cam.sensor is None:
+            continue
+        x, y, depth, rel, in_view = cam.project_points(orig, use_orig_coords=True)
+        better = in_view & (depth > 0) & (rel < best_rel)
+        if not better.any():
+            continue
+        best_rel = np.where(better, rel, best_rel)
+        best_cam = np.where(better, ci, best_cam)
+        best_x = np.where(better, x, best_x)
+        best_y = np.where(better, y, best_y)
+        best_depth = np.where(better, depth, best_depth)
+
+    if occlusion and pcd is not None:
+        pcd.build_kd_tree()
+        matched_idx = np.nonzero(best_cam >= 0)[0]
+        it = (
+            tqdm(matched_idx, desc="Occlusion check", unit="pt")
+            if verbose else matched_idx
+        )
+        for qi in it:
+            cam = cam_list[best_cam[qi]]
+            try:
+                vector = cam.pixel_to_ray(float(best_x[qi]), float(best_y[qi]))
+                intercept = pcd.get_intercept(
+                    cam.coords, search_radius=intercept_radius,
+                    vector=vector, always_return=True,
+                )
+            except Exception:  # noqa: BLE001 - drop the match on any ray failure
+                best_cam[qi] = -1
+                continue
+            if intercept is None:
+                best_cam[qi] = -1
+                continue
+            err = float(np.linalg.norm(query_coords[qi] - intercept.coords))
+            if err > discard_threshold:
+                best_cam[qi] = -1  # line of sight blocked by nearer surface
+
+    return best_cam, best_x, best_y, best_depth, cam_list
+
+
+def _classify_crops(
+    query_coords: np.ndarray,
+    best_cam: np.ndarray,
+    best_x: np.ndarray,
+    best_y: np.ndarray,
+    cam_list,
+    learn,
+    crop_size: int = 224,
+    batch_size: int = 64,
+    flush_batch: int = 16384,
+    verbose: bool = True,
+):
+    """Decode each photo once, cut its crops, and classify them in flushed batches.
+
+    Groups matched queries by source photo so every full-res JPEG is decoded a
+    single time (the dominant cost) and slices its patches from the in-memory
+    array. Crops are classified and **freed** in bounded batches of
+    ``flush_batch`` rather than accumulating every patch for the whole cloud
+    before a single forward pass — that unbounded list was ~150 KB × millions of
+    queries and blew the 125 GB budget at fine ``cell_size``. Peak crop memory is
+    now ~``flush_batch`` patches (+ one decoded photo), independent of cloud size.
+    Returns ``(labels, conf)`` aligned with ``query_coords``
+    (unmatched/failed → ``""`` / ``nan``).
+    """
+    from substrata import classification
+
+    n = len(query_coords)
+    labels = np.full(n, "", dtype=object)
+    conf = np.full(n, np.nan)
+
+    by_file: Dict[str, list] = defaultdict(list)
+    for qi in np.nonzero(best_cam >= 0)[0]:
+        cam = cam_list[best_cam[qi]]
+        by_file[cam.filepath].append((int(qi), best_x[qi], best_y[qi]))
+    if not by_file:
+        return labels, conf
+
+    example_fp = next(iter(by_file))
+    if verbose:
+        print(
+            f"  {len(by_file)} unique photos; example: {example_fp} "
+            f"(exists={os.path.isfile(example_fp) if example_fp else 'n/a'})"
+        )
+
+    vocab = getattr(getattr(learn, "dls", None), "vocab", None)
+    crops: list = []
+    crop_qids: list = []
+    n_open_fail = n_oob = n_classified = 0
+    half = crop_size // 2
+
+    def _flush():
+        """Classify the buffered crops, write results, and free the buffer."""
+        nonlocal crops, crop_qids, n_classified
+        if not crops:
+            return
+        dl = learn.dls.test_dl(crops, bs=batch_size)
+        # Silence fastai's per-call progress bar (this runs many times); no-op
+        # for any learner without ``no_bar`` (e.g. test doubles).
+        cm = learn.no_bar() if hasattr(learn, "no_bar") else nullcontext()
+        with cm:
+            probs, _ = learn.get_preds(dl=dl)
+        for qi, p in zip(crop_qids, probs.tolist()):
+            res = classification._result_from_probs(p, vocab)
+            labels[qi] = res["label"]
+            conf[qi] = res["confidence"]
+        n_classified += len(crops)
+        crops, crop_qids = [], []
+
+    it = (
+        tqdm(by_file.items(), desc="Decoding photos", unit="photo")
+        if verbose else by_file.items()
+    )
+    for fp, group in it:
+        try:
+            arr = np.asarray(Image.open(fp).convert("RGB"))
+        except (OSError, ValueError):
+            n_open_fail += 1
+            continue
+        h, w = arr.shape[:2]
+        for qi, x, y in group:
+            left, top = int(x - half), int(y - half)
+            lft, tp = max(0, left), max(0, top)
+            rgt, bot = min(w, left + crop_size), min(h, top + crop_size)
+            if lft >= rgt or tp >= bot:
+                n_oob += 1
+                continue
+            crops.append(Image.fromarray(arr[tp:bot, lft:rgt]))
+            crop_qids.append(qi)
+            if len(crops) >= flush_batch:
+                _flush()  # bound peak memory: classify + free mid-photo
+    _flush()  # remainder
+
+    if verbose:
+        if n_open_fail:
+            print(
+                f"  WARNING: {n_open_fail}/{len(by_file)} photos failed to open "
+                "— check camera filepaths / cams.set_filepath_replace(...)"
+            )
+        print(f"  classified {n_classified} crops ({n_oob} dropped as out-of-bounds)")
+    return labels, conf
+
+
+def _report_crop_footprint(
+    best_cam, best_depth, cam_list, crop_size, cell_size, depth_scale=1.0
+):
+    """Print the physical size a classifier crop covers on the substrate.
+
+    A crop is a fixed ``crop_size``-px cut from the full-res photo, so on the
+    substrate it spans ``crop_size * depth / fx`` (``fx`` = focal length in px,
+    ``depth`` = camera-to-point distance). ``best_depth`` is in the *original*
+    (pre-world-transform) frame, so ``depth_scale`` (world metres per original
+    unit) converts it to metres. This is the real resolution floor: sampling
+    much finer than the footprint just re-classifies heavily overlapping crops.
+    Uses the depths already computed during matching.
+    """
+    matched = best_cam >= 0
+    if not matched.any():
+        return
+    fxs = [
+        c.sensor.fx for c in cam_list
+        if getattr(c, "sensor", None) is not None
+        and getattr(c.sensor, "fx", None)
+    ]
+    if not fxs:
+        return
+    fx = float(np.median(fxs))
+    depths = np.abs(best_depth[matched].astype(float)) * depth_scale
+    fp = crop_size * depths / fx  # metres
+    lo, med, hi = np.percentile(fp, [5, 50, 95])
+    print(
+        f"[footprint] crop ~= {med * 100:.1f} cm on substrate "
+        f"(5-95 pct {lo * 100:.1f}-{hi * 100:.1f} cm; "
+        f"crop {crop_size}px, fx {fx:.0f}px, depth {np.median(depths):.2f} m)"
+    )
+    if cell_size < 0.5 * med:
+        print(
+            f"  NOTE: cell_size {cell_size * 100:.1f} cm is well below the crop "
+            f"footprint — adjacent queries classify overlapping patches "
+            f"(oversampling; little extra detail)."
+        )
+
+
+def segment_point_cloud(
+    pcd,
+    cams,
+    classifier,
+    *,
+    world_transform: Optional[np.ndarray] = None,
+    cell_size: Optional[float] = None,
+    sampling: str = "voxel",
+    occlusion: bool = True,
+    label_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    crop_size: Optional[int] = None,
+    batch_size: int = 64,
+    flush_batch: int = 16384,
+    verbose: bool = True,
+) -> Segmentation:
+    """Segment a point cloud by classifying camera patches at sampled query points.
+
+    Samples query points across ``pcd``, matches each to its best camera photo
+    (fast vectorized, occlusion-aware), classifies the 224 px patches with the
+    trained crop classifier, and returns a :class:`Segmentation`. Propagate its
+    labels to a cloud with :meth:`Segmentation.propagate`, recolour with
+    :meth:`Segmentation.recolor`, or recolour a full-size PLY with
+    :func:`recolor_ply_file`.
+
+    Args:
+        pcd: decimated :class:`~substrata.pointclouds.PointCloud` (world frame).
+        cams: project :class:`~substrata.cameras.Cameras`.
+        classifier: a loaded fastai learner or a path to a ``.pkl`` (loaded via
+            :func:`substrata.classification.get_image_classifier`).
+        world_transform: project world transform; defaults to
+            ``pcd.world_transform``.
+        cell_size: query spacing / voxel size in metres
+            (default ``settings.DEFAULT_SEG_CELL_SIZE``).
+        sampling: ``"voxel"`` (default) or ``"xy_grid"`` (see
+            :func:`sample_query_points`).
+        occlusion: run reprojection occlusion filtering (drops points seen
+            through a nearer surface).
+        label_colors: optional ``{label: (r, g, b)}`` overrides (0-255).
+        crop_size: patch size in px (default ``settings.TRAIN_CROP_SIZE``).
+        batch_size: inference batch size.
+        flush_batch: max crops held in memory before a forward pass frees them
+            (bounds peak RAM regardless of ``cell_size`` / cloud size).
+
+    Returns:
+        A :class:`Segmentation` (classified query points + codebook + colours).
+    """
+    from substrata import classification, settings
+
+    if cell_size is None:
+        cell_size = settings.DEFAULT_SEG_CELL_SIZE
+    if crop_size is None:
+        crop_size = settings.TRAIN_CROP_SIZE
+    if world_transform is None:
+        world_transform = getattr(pcd, "world_transform", None)
+
+    learn = (
+        classification.get_image_classifier(classifier)
+        if isinstance(classifier, str)
+        else classifier
+    )
+
+    qc = sample_query_points(pcd, cell_size, method=sampling)
+    if verbose:
+        print(
+            f"[sample] {len(qc):,} query points "
+            f"({sampling}, {cell_size * 100:.0f} cm)"
+        )
+
+    best_cam, best_x, best_y, best_depth, cam_list = _match_points_to_cameras(
+        qc, cams, world_transform=world_transform,
+        pcd=(pcd if occlusion else None), occlusion=occlusion, verbose=verbose,
+    )
+    if verbose:
+        print(f"[match] {int((best_cam >= 0).sum()):,}/{len(qc):,} queries matched")
+        # best_depth is in the original frame; convert to world metres via the
+        # world_transform's linear scale (cbrt of its 3x3 determinant).
+        depth_scale = 1.0
+        if world_transform is not None:
+            lin = np.asarray(world_transform, dtype=float)[:3, :3]
+            depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
+        _report_crop_footprint(
+            best_cam, best_depth, cam_list, crop_size, cell_size, depth_scale
+        )
+
+    labels, conf = _classify_crops(
+        qc, best_cam, best_x, best_y, cam_list, learn,
+        crop_size=crop_size, batch_size=batch_size, flush_batch=flush_batch,
+        verbose=verbose,
+    )
+    if verbose:
+        print(f"[classify] {int((labels != '').sum()):,} classified")
+
+    return Segmentation.from_query_labels(qc, labels, conf, label_colors=label_colors)
+
+
+def recolor_ply_file(
+    input_ply: str,
+    output_ply: str,
+    segmentation: Segmentation,
+    *,
+    world_transform: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    value_floor: float = 0.3,
+    unlabeled: str = "keep",
+    chunk_bytes: int = 64 << 20,
+    verbose: bool = True,
+) -> str:
+    """Stream a full-size PLY and rewrite its colours from a segmentation.
+
+    Reads ``input_ply`` in chunks (never loading it fully), propagates the
+    segmentation's labels to each chunk's points, blends the category colour
+    with the point's original luminance, and writes the recoloured cloud to
+    ``output_ply`` — type-preserving (uchar 0-255 or float 0-1). Reuses the PLY
+    header/streaming helpers from :mod:`substrata.pointclouds`.
+
+    Args:
+        input_ply: path to the full-size PLY (raw, original frame).
+        output_ply: destination path.
+        segmentation: a :class:`Segmentation` (query points are in world frame).
+        world_transform: transform mapping the PLY's raw coords into the world
+            frame the segmentation lives in (default: the pcd world transform you
+            used when segmenting). If ``None``/identity, coords are used as-is.
+        max_radius: propagation cap (``None`` = label every point).
+        value_floor / unlabeled: passed to :meth:`Segmentation.recolor`
+            (``unlabeled="keep"`` retains original colour for unlabeled points).
+        chunk_bytes: streaming chunk size.
+    """
+    from substrata import pointclouds as pc
+
+    wt = None
+    if world_transform is not None and not np.allclose(world_transform, np.eye(4)):
+        wt = np.asarray(world_transform, dtype=float)
+
+    with open(input_ply, "rb") as fin:
+        fmt, endian, n_vertices, vprops, rec_size, _ = pc._parse_ply_header(fin)
+        layout = pc._ply_red_green_blue_layout(vprops)
+        if layout is None:
+            raise ValueError("Input PLY has no red/green/blue properties to recolour.")
+        red_type = layout[3]
+
+        dtype = np.dtype([(name, endian + _PLY_NP_DTYPE[t]) for t, name in vprops])
+        recs_per_chunk = max(1, chunk_bytes // rec_size)
+
+        with open(output_ply, "wb") as fout:
+            fout.write(_seg_output_header(fmt, vprops, n_vertices))
+            remaining = n_vertices
+            bar = (
+                tqdm(total=n_vertices, desc="Recolouring PLY", unit="pt")
+                if verbose else None
+            )
+            while remaining > 0:
+                k = min(recs_per_chunk, remaining)
+                buf = fin.read(k * rec_size)
+                if len(buf) < k * rec_size:
+                    raise ValueError("Unexpected EOF while reading PLY vertex data.")
+                recs = np.frombuffer(buf, dtype=dtype, count=k).copy()
+
+                xyz = np.column_stack(
+                    [recs["x"], recs["y"], recs["z"]]
+                ).astype(float)
+                if wt is not None:
+                    xyz = (np.hstack([xyz, np.ones((k, 1))]) @ wt.T)[:, :3]
+
+                codes = segmentation.propagate(xyz, max_radius=max_radius)
+                orig_rgb = np.column_stack(
+                    [recs["red"], recs["green"], recs["blue"]]
+                ).astype(float)
+                new_rgb = segmentation.recolor(
+                    orig_rgb, codes, value_floor=value_floor, unlabeled=unlabeled,
+                )  # 0-1
+
+                if red_type in ("uchar", "uint8"):
+                    vals = np.round(new_rgb * 255.0).astype(recs["red"].dtype)
+                else:  # float/double stored 0-1
+                    vals = new_rgb.astype(recs["red"].dtype)
+                recs["red"] = vals[:, 0]
+                recs["green"] = vals[:, 1]
+                recs["blue"] = vals[:, 2]
+
+                fout.write(recs.tobytes())
+                remaining -= k
+                if bar is not None:
+                    bar.update(k)
+            if bar is not None:
+                bar.close()
+    return output_ply
+
+
+def _seg_output_header(fmt: str, vprops, vertex_count: int) -> bytes:
+    """Clean minimal PLY header for the recoloured output (all props preserved)."""
+    lines = [b"ply\n", f"format {fmt} 1.0\n".encode("ascii")]
+    lines.append(b"comment recoloured by substrata segmentation\n")
+    lines.append(f"element vertex {vertex_count}\n".encode("ascii"))
+    for t, name in vprops:
+        lines.append(f"property {t} {name}\n".encode("ascii"))
+    lines.append(b"end_header\n")
+    return b"".join(lines)

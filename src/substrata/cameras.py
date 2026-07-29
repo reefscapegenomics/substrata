@@ -1817,6 +1817,81 @@ class Camera:
         else:
             return None, None, None, None
 
+    def project_points(self, coords, use_orig_coords=False):
+        """Vectorized :meth:`get_pixel_coords` over many 3D points at once.
+
+        Projects an ``(N, 3)`` array of 3D points through this camera in a single
+        set of numpy operations (the pose is inverted once, not per point). This
+        is the fast path used by point-cloud segmentation, where every query
+        point must be tested against every camera; the per-point
+        :meth:`get_pixel_coords` is far too slow at that scale. The projection
+        math (Brown-Conrady distortion, ``in_view`` test and ``relevance``
+        metric) is identical to :meth:`get_pixel_coords` - see the parity test
+        in ``tests/test_segmentation.py``.
+
+        Args:
+            coords: ``(N, 3)`` array (or a single ``(3,)`` point) of 3D points.
+            use_orig_coords: If True, use the original (pre-world-transform)
+                pose/centre; otherwise the current world-frame pose/centre.
+
+        Returns:
+            Tuple ``(x, y, depth, relevance, in_view)`` of length-``N`` arrays
+            (``x``/``y`` are rounded integer pixels, ``in_view`` is boolean). For
+            a single input point, scalar values are returned. Unlike
+            :meth:`get_pixel_coords`, out-of-view points are *not* dropped - the
+            caller filters on ``in_view``.
+        """
+        pts = np.asarray(coords, dtype=float)
+        single = pts.ndim == 1
+        pts = np.atleast_2d(pts)  # (N, 3)
+
+        if use_orig_coords:
+            cam_coords = self.orig_coords
+            cam_transform = self.orig_camera_transform
+        else:
+            cam_coords = self.coords
+            cam_transform = self.camera_transform
+        cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
+
+        homog = np.hstack([pts, np.ones((pts.shape[0], 1))])  # (N, 4)
+        proj = homog @ np.linalg.inv(cam_transform).T          # (N, 4)
+        depth = proj[:, 2]
+        x_norm = proj[:, 0] / depth
+        y_norm = proj[:, 1] / depth
+
+        s = self.sensor
+        r2 = x_norm**2 + y_norm**2
+        radial = 1 + s.k1 * r2 + s.k2 * r2**2 + s.k3 * r2**3
+        x_dist = (
+            x_norm * radial + 2 * s.p1 * x_norm * y_norm + s.p2 * (r2 + 2 * x_norm**2)
+        )
+        y_dist = (
+            y_norm * radial + s.p1 * (r2 + 2 * y_norm**2) + 2 * s.p2 * x_norm * y_norm
+        )
+        x_img = s.fx * x_dist + s.cx
+        y_img = s.fy * y_dist + s.cy
+
+        in_view = (
+            (r2 * s.fx**2 < 1.01 * s.width**2)
+            & (x_img >= 0) & (x_img <= s.width)
+            & (y_img >= 0) & (y_img <= s.height)
+        )
+
+        cam_center = np.asarray(cam_coords, dtype=float).ravel()[:3]
+        dist_sq = np.sum((cam_center - pts) ** 2, axis=1)
+        relevance = np.abs((np.abs(depth) + dist_sq) / (s.fx * s.fy)) * (
+            10 + np.abs(x_img - 0.5 * s.width) + np.abs(y_img - 0.5 * s.height)
+        )
+
+        x_px = np.rint(x_img)
+        y_px = np.rint(y_img)
+        if single:
+            return (
+                float(x_px[0]), float(y_px[0]), float(depth[0]),
+                float(relevance[0]), bool(in_view[0]),
+            )
+        return x_px, y_px, depth, relevance, in_view
+
     def pixel_to_ray(self, x_img, y_img, use_optimization=False, iterations=20):
         """
         Compute the 3D ray (origin and direction) for a given image pixel.
