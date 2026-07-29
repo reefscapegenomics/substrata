@@ -218,6 +218,7 @@ class OrthoMap:
         fill_by_group: bool = False,
         label_colors: Optional[dict] = None,
         grayscale: bool = False,
+        image_opacity: float = 1.0,
         crop: Optional[Tuple] = None,
     ) -> Image.Image:
         """Return the ortho map as a PIL Image with optional highlights.
@@ -262,6 +263,10 @@ class OrthoMap:
                 overriding the automatic ``tab20`` assignment.
             grayscale: Desaturate the background raster (highlights stay
                 coloured).
+            image_opacity: Blend the background raster toward the white
+                background — ``1.0`` (default) leaves it unchanged, ``0.0``
+                fades it out entirely (leaving only highlights). Highlights are
+                drawn afterward and are unaffected.
             crop: ``(center, size_metres)`` window to crop to, where
                 *center* is a coordinate (used for zoom-to-annotation).
 
@@ -279,6 +284,15 @@ class OrthoMap:
 
         if grayscale:
             img = img.convert("L").convert("RGB")
+
+        if not 0.0 <= image_opacity <= 1.0:
+            raise ValueError(
+                f"image_opacity must be in [0, 1], got {image_opacity}"
+            )
+        if image_opacity < 1.0:
+            arr = np.asarray(img).astype(np.float32)
+            arr = arr * image_opacity + 255.0 * (1.0 - image_opacity)
+            img = Image.fromarray(arr.round().clip(0, 255).astype(np.uint8))
 
         if width is not None or height is not None:
             img = self._resize(img, width, height)
@@ -1069,7 +1083,8 @@ class OrthoMapGroup(OrthoMap):
                 ``None`` for no overlay.
             color_by: Highlight colouring mode (default ``"label"``).
             show_labels: Draw per-plot *names*.  Defaults to ``True`` when
-                *names* were provided and *arrange* is ``"stack"``.
+                *names* were provided and *arrange* is ``"stack"``.  Pass
+                ``False`` to hide the per-plot tile labels.
             label_color: RGB colour for the tile labels.
             font_size: Label font size in pixels.  Defaults to ~1.25% of the
                 composite height.
@@ -1084,7 +1099,10 @@ class OrthoMapGroup(OrthoMap):
                 legend (swatch + label name) below the composite.
             label_colors: Optional explicit ``{label: (r, g, b)}`` map applied
                 to both the markers and the legend.
-            **kwargs: Forwarded to :meth:`OrthoMap.show`.
+            **kwargs: Forwarded to :meth:`OrthoMap.show` — notably
+                ``image_opacity`` (``0``–``1``) to fade the reef imagery
+                toward white so the annotation markers stand out (``1.0``
+                unchanged, ``0.0`` imagery hidden), and ``grayscale``.
 
         Returns:
             PIL ``Image`` of the composite map.

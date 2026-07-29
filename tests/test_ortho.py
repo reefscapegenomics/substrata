@@ -271,6 +271,28 @@ class TestOrthoMapStyling(unittest.TestCase):
         self.assertTrue(np.all((img[..., 0] == img[..., 1])
                                & (img[..., 1] == img[..., 2])))
 
+    def test_image_opacity_fades_to_white(self):
+        om = ortho.OrthoMap(_PC(_ramp_pc().points, np.random.RandomState(0)
+                                .rand(len(_ramp_pc().points), 3)),
+                            pixel_width=120)
+        full = np.asarray(om.show())
+        # Default (1.0) is a no-op.
+        self.assertTrue(np.array_equal(full, np.asarray(
+            om.show(image_opacity=1.0))))
+        # 0.0 fades the raster completely to white.
+        gone = np.asarray(om.show(image_opacity=0.0))
+        self.assertTrue(np.all(gone == 255))
+        # 0.5 blends toward white: every pixel is >= the full-strength raster,
+        # and strictly lighter wherever the raster was not already white.
+        half = np.asarray(om.show(image_opacity=0.5))
+        self.assertTrue(np.all(half >= full))
+        self.assertTrue(np.any(half > full))
+
+    def test_image_opacity_out_of_range(self):
+        om = ortho.OrthoMap(_ramp_pc(), pixel_width=100)
+        self.assertRaises(ValueError, om.show, image_opacity=1.5)
+        self.assertRaises(ValueError, om.show, image_opacity=-0.1)
+
     def test_crop_narrows_output(self):
         om = ortho.OrthoMap(self.pc, pixel_width=200)
         img = om.show(highlights=_Ann([2.0, 2.0, 2.0]),
