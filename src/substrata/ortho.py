@@ -213,6 +213,8 @@ class OrthoMap:
         point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
+        point_open: bool = False,
+        point_outline_width: int = 1,
         background_color: Optional[Tuple[int, int, int]] = None,
         color_by: Optional[str] = None,
         fill_by_group: bool = False,
@@ -250,6 +252,16 @@ class OrthoMap:
             point_outline: RGB outline colour for filled markers
                 (``None`` to disable the outline).
             point_shape: Marker shape — ``"circle"`` or ``"square"``.
+            point_open: When True, markers are drawn as open outlines with a
+                fully transparent interior, so the underlying imagery shows
+                through.  The marker colour (from *point_color* or
+                *color_by*) is applied to the border instead of the fill,
+                which makes *point_outline* unused.  Takes precedence over
+                *fill_by_group*.
+            point_outline_width: Border thickness in display pixels
+                (``1`` by default).  The border is drawn inward from the
+                marker bounding box, so a thicker border does not enlarge
+                the marker.  Applies to filled and open markers alike.
             background_color: RGB colour for empty (no-data) pixels.
                 Defaults to ``None`` which keeps the original white
                 background.
@@ -285,6 +297,11 @@ class OrthoMap:
         if grayscale:
             img = img.convert("L").convert("RGB")
 
+        if point_outline_width < 1:
+            raise ValueError(
+                "point_outline_width must be >= 1, got "
+                f"{point_outline_width}"
+            )
         if not 0.0 <= image_opacity <= 1.0:
             raise ValueError(
                 f"image_opacity must be in [0, 1], got {image_opacity}"
@@ -326,12 +343,12 @@ class OrthoMap:
                 fill_colors, outline_colors = self._resolve_marker_style(
                     coords_3d, labels, groups,
                     color_by, label_colors, fill_by_group,
-                    point_color, point_outline,
+                    point_color, point_outline, point_open,
                 )
                 self._draw_highlights(
                     img, coords_3d,
                     point_size, fill_colors, outline_colors,
-                    point_shape, point_size_metres,
+                    point_shape, point_size_metres, point_outline_width,
                 )
 
         if crop is not None:
@@ -502,6 +519,7 @@ class OrthoMap:
         outline_colors,
         shape: str = "circle",
         radius_metres: Optional[float] = None,
+        outline_width: int = 1,
     ) -> None:
         """Draw highlight markers onto *img* (modified in place).
 
@@ -519,6 +537,10 @@ class OrthoMap:
             radius_metres: Marker diameter in metres.  When provided,
                 overrides *radius* and scales the marker to span this
                 distance in world space.
+            outline_width: Border thickness in display pixels.  The border
+                is drawn inward from the marker bounding box, so the outer
+                diameter stays at *radius* (or *radius_metres*) no matter
+                how thick the border is.
         """
         scale_x = img.width / self.width
         scale_y = img.height / self.height
@@ -539,6 +561,7 @@ class OrthoMap:
                 [dx - radius, dy - radius, dx + radius, dy + radius],
                 fill=fill,
                 outline=outline,
+                width=outline_width,
             )
 
     @staticmethod
@@ -551,12 +574,16 @@ class OrthoMap:
         fill_by_group: bool,
         point_color: Optional[Tuple[int, int, int]],
         point_outline: Optional[Tuple[int, int, int]],
+        point_open: bool = False,
     ) -> Tuple[list, list]:
         """Compute per-point fill and outline colours for highlights.
 
         Filled markers use the resolved colour as fill with *point_outline*
-        as the border; hollow markers (group-based) use ``None`` fill and
-        the resolved colour as the outline.
+        as the border; hollow markers use ``None`` fill and the resolved
+        colour as the outline.  Markers are hollow when *point_open* is set
+        (all of them) or, failing that, by even/odd group when
+        *fill_by_group* is set.  Because an open marker carries its colour
+        on the border, *point_outline* is unused for those points.
 
         Returns:
             ``(fill_colors, outline_colors)`` lists, length ``len(coords)``.
@@ -577,7 +604,9 @@ class OrthoMap:
         else:
             base_colors = [point_color] * n
 
-        if fill_by_group and any(g is not None for g in groups):
+        if point_open:
+            filled = [False] * n
+        elif fill_by_group and any(g is not None for g in groups):
             uniq_g = sorted({g for g in groups if g is not None}, key=str)
             g_fill = {g: (i % 2 == 0) for i, g in enumerate(uniq_g)}
             filled = [g_fill.get(g, True) for g in groups]
@@ -1102,7 +1131,10 @@ class OrthoMapGroup(OrthoMap):
             **kwargs: Forwarded to :meth:`OrthoMap.show` — notably
                 ``image_opacity`` (``0``–``1``) to fade the reef imagery
                 toward white so the annotation markers stand out (``1.0``
-                unchanged, ``0.0`` imagery hidden), and ``grayscale``.
+                unchanged, ``0.0`` imagery hidden), ``grayscale``, and
+                ``point_open`` / ``point_outline_width`` to draw the markers
+                as open rings of a given border thickness so the imagery
+                stays visible underneath them.
 
         Returns:
             PIL ``Image`` of the composite map.
@@ -2090,6 +2122,8 @@ class OrthoGrid:
         point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
+        point_open: bool = False,
+        point_outline_width: float = 1.0,
         highlight_label_colors: Optional[dict] = None,
     ):
         """Render the grid as a matplotlib Figure with a side panel.
@@ -2136,6 +2170,12 @@ class OrthoGrid:
                 *color_by* assigns per-point colours.
             point_outline: RGB marker outline (``None`` to disable).
             point_shape: ``"circle"`` or ``"square"``.
+            point_open: Draw every marker as an open outline with a fully
+                transparent interior, so the map shows through. The marker
+                colour is applied to the border rather than the fill, making
+                *point_outline* unused. Takes precedence over *fill_by_group*.
+            point_outline_width: Border thickness in matplotlib points
+                (``1.0`` by default). Applies to filled and open markers alike.
             highlight_label_colors: Optional ``{label: (r, g, b)}`` map for
                 *color_by="label"* (distinct from *label_colors*, which colours
                 the cells in label mode).
@@ -2188,7 +2228,9 @@ class OrthoGrid:
                 color_by=color_by, fill_by_group=fill_by_group,
                 point_size=point_size, point_size_metres=point_size_metres,
                 point_color=point_color, point_outline=point_outline,
-                point_shape=point_shape, label_colors=highlight_label_colors,
+                point_shape=point_shape, point_open=point_open,
+                point_outline_width=point_outline_width,
+                label_colors=highlight_label_colors,
             )
 
         if title is not None:
@@ -2209,7 +2251,8 @@ class OrthoGrid:
         self, ax, mpatches, highlights, color_by="auto", fill_by_group=False,
         point_size=5, point_size_metres=None,
         point_color=(255, 0, 0), point_outline=(0, 0, 0),
-        point_shape="circle", label_colors=None,
+        point_shape="circle", point_open=False, point_outline_width=1.0,
+        label_colors=None,
     ) -> None:
         """Scatter annotation points over the map (``ax``), styled like OrthoMap.
 
@@ -2217,7 +2260,10 @@ class OrthoGrid:
         coords and per-point colours, projects them into the grid frame via
         ``self.rotation``, and draws with matplotlib. ``point_size_metres`` draws
         markers to scale in map coordinates; otherwise ``point_size`` is a
-        display-point radius.
+        display-point radius. ``point_open`` draws every marker as an open
+        outline with a transparent interior, and ``point_outline_width`` is the
+        border thickness in matplotlib points (unlike ``OrthoMap``, which counts
+        image pixels).
         """
         coords, labels, groups = OrthoMap._extract_highlights(highlights)
         if len(coords) == 0:
@@ -2240,7 +2286,7 @@ class OrthoGrid:
 
         fills, outlines = OrthoMap._resolve_marker_style(
             coords, labels, groups, color_by, label_colors, fill_by_group,
-            point_color, point_outline,
+            point_color, point_outline, point_open,
         )
 
         def _mpl(col):
@@ -2255,19 +2301,21 @@ class OrthoGrid:
                 if point_shape == "square":
                     patch = mpatches.Rectangle(
                         (px - r, py - r), point_size_metres, point_size_metres,
-                        facecolor=fc, edgecolor=ec, linewidth=1.0, zorder=4,
+                        facecolor=fc, edgecolor=ec,
+                        linewidth=point_outline_width, zorder=4,
                     )
                 else:
                     patch = mpatches.Circle(
                         (px, py), r, facecolor=fc, edgecolor=ec,
-                        linewidth=1.0, zorder=4,
+                        linewidth=point_outline_width, zorder=4,
                     )
                 ax.add_patch(patch)
         else:
             marker = "s" if point_shape == "square" else "o"
             ax.scatter(
                 xy[:, 0], xy[:, 1], marker=marker, s=(2.0 * point_size) ** 2,
-                facecolors=fills, edgecolors=outlines, linewidths=1.0, zorder=4,
+                facecolors=fills, edgecolors=outlines,
+                linewidths=point_outline_width, zorder=4,
             )
 
     @staticmethod

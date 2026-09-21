@@ -1555,6 +1555,9 @@ def calc_gap_fraction(
     max_radius=None,
     output_filename=None,
     seed_points=None,
+    fill_color=(0, 0, 128),
+    show_rings=False,
+    ring_color=(255, 255, 255),
 ):
     """
     Calculate gap fraction based on hemispherical projection:
@@ -1577,7 +1580,35 @@ def calc_gap_fraction(
             drawn as markers on the output image after the gap fraction is
             calculated, so they do not affect the result and can be used to
             iteratively tune their placement.
+        fill_color: RGB colour used for the flood fill that marks the connected
+            sky region, as a 3-tuple in 0-255 (default ``(0, 0, 128)``, navy).
+            ``gapF_fill`` is measured by counting pixels of exactly this colour,
+            so pick one that does not occur in the benthic imagery — otherwise
+            those pixels are counted as sky and inflate the result.
+        show_rings: When True, draw concentric zenith-angle rings at 22.5, 45,
+            67.5 and 90 degrees over the output image (default False). In this
+            projection the radius scales linearly with the zenith angle, so the
+            rings sit at 25%, 50%, 75% and 100% of the image radius, the last
+            tracing the horizon at the edge of the imaging area. They are drawn
+            after the gap fraction is measured and so never affect the result.
+        ring_color: RGB colour for those rings, as a 3-tuple in 0-255 (default
+            white).
+
+    Returns:
+        tuple: ``(gapF_raw, gapF_fill, image)`` - the raw gap fraction, the
+            flood-filled (connected sky) gap fraction, and the hemispherical
+            projection as an ``(H, W, 3)`` uint8 RGB array.
     """
+    fill_color = tuple(int(c) for c in fill_color)
+    if len(fill_color) != 3 or not all(0 <= c <= 255 for c in fill_color):
+        raise ValueError(
+            f"fill_color must be an RGB 3-tuple in 0-255, got {fill_color!r}"
+        )
+    ring_color = tuple(int(c) for c in ring_color)
+    if len(ring_color) != 3 or not all(0 <= c <= 255 for c in ring_color):
+        raise ValueError(
+            f"ring_color must be an RGB 3-tuple in 0-255, got {ring_color!r}"
+        )
 
     # Translate the point cloud by the negation of the center coordinates
     # and remove points with a negative z value
@@ -1653,7 +1684,6 @@ def calc_gap_fraction(
         visualize_seeds = True
 
     diff = (1, 1, 1)
-    fill_color = (0, 0, 128)
     for seed_point in seed_points_px:
         retval, image, _, _ = cv2.floodFill(
             image, None, seed_point, fill_color, diff, diff
@@ -1661,6 +1691,23 @@ def calc_gap_fraction(
 
     fill_pixel_count = cv2.countNonZero(cv2.inRange(image, fill_color, fill_color))
     gapF_fill = fill_pixel_count / img_area
+
+    # Draw the zenith-angle rings AFTER counting so they don't affect
+    # gapF_fill. The projected radius is (phi / pi) * resolution, so a zenith
+    # angle of `deg` sits at (deg / 180) * resolution pixels from the centre -
+    # evenly spaced quarters of the imaging area, with 90 deg on its edge.
+    if show_rings:
+        ring_thickness = max(1, resolution // 400)
+        for deg in (22.5, 45.0, 67.5, 90.0):
+            ring_px = int(round((deg / 180.0) * resolution))
+            cv2.circle(
+                image,
+                (radius, radius),
+                ring_px,
+                ring_color,
+                thickness=ring_thickness,
+                lineType=cv2.LINE_AA,
+            )
 
     # Draw seed markers AFTER counting so they don't affect gapF_fill.
     # A high-contrast green cross with a thin black outline is used so the

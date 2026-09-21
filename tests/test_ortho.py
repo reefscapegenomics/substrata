@@ -215,6 +215,14 @@ def _count_color(img, rgb):
     return int(np.all(arr == np.array(rgb, dtype=arr.dtype), axis=-1).sum())
 
 
+def _color_bbox(img, rgb):
+    """``(row_min, row_max, col_min, col_max)`` of the *rgb* pixels."""
+    arr = np.asarray(img)
+    mask = np.all(arr == np.array(rgb, dtype=arr.dtype), axis=-1)
+    rows, cols = np.nonzero(mask)
+    return (int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max()))
+
+
 class TestOrthoMapBasics(unittest.TestCase):
     def test_show_returns_pil(self):
         om = ortho.OrthoMap(_ramp_pc(), pixel_width=100)
@@ -733,6 +741,119 @@ class TestOrthoGridShowRobust(unittest.TestCase):
         self.assertAlmostEqual(xhi, vmax, places=6)
 
 
+class TestOrthoMapOpenMarkers(unittest.TestCase):
+    """Open (hollow) markers and their configurable border thickness."""
+
+    # Dense enough to leave no unrasterized gaps at PX_WIDTH, so the
+    # interior check below is not fooled by empty (white) background.
+    PX_WIDTH = 120
+
+    def setUp(self):
+        # A *coloured* cloud, so "the imagery shows through" is a real
+        # assertion — against a white raster a white fill would pass too.
+        base = _ramp_pc(n=240)
+        xy = base.points[:, :2] / 4.0
+        colors = np.column_stack([xy[:, 0], xy[:, 1],
+                                  np.full(len(xy), 0.2)])
+        self.pc = _PC(base.points, colors)
+        self.coords = np.array([[2.0, 2.0, 2.0]])
+
+    def _centre_px(self, om):
+        px, py = om.project(self.coords)[0]
+        return int(py), int(px)
+
+    def test_point_open_leaves_interior_untouched(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        plain = np.asarray(om.show())
+        opened = np.asarray(om.show(highlights=self.coords, point_size=10,
+                                    point_open=True))
+        row, col = self._centre_px(om)
+        # Guard the guard: the interior must carry real imagery, otherwise
+        # this comparison would hold for an opaque white fill as well.
+        self.assertFalse(np.array_equal(plain[row, col],
+                                        np.array([255, 255, 255], np.uint8)))
+        # The imagery shows through the ring, but the ring itself is drawn.
+        self.assertTrue(np.array_equal(plain[row, col], opened[row, col]))
+        self.assertGreater(_count_color(opened, (255, 0, 0)), 0)
+
+    def test_filled_marker_does_cover_interior(self):
+        # Contrast with the default: a filled disc overwrites the centre.
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        filled = np.asarray(om.show(highlights=self.coords, point_size=10))
+        row, col = self._centre_px(om)
+        self.assertTrue(np.array_equal(filled[row, col],
+                                       np.array([255, 0, 0], dtype=np.uint8)))
+
+    def test_point_open_uses_marker_colour_on_border(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        img = om.show(highlights=self.coords, point_size=10,
+                      point_open=True, point_color=(0, 255, 0))
+        self.assertGreater(_count_color(img, (0, 255, 0)), 0)
+        # point_outline is unused for open markers.
+        same = om.show(highlights=self.coords, point_size=10,
+                       point_open=True, point_color=(0, 255, 0),
+                       point_outline=(0, 0, 255))
+        self.assertTrue(np.array_equal(np.asarray(img), np.asarray(same)))
+
+    def test_thicker_border_grows_inward(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        thin = om.show(highlights=self.coords, point_size=10,
+                       point_open=True, point_outline_width=1)
+        thick = om.show(highlights=self.coords, point_size=10,
+                        point_open=True, point_outline_width=4)
+        self.assertGreater(_count_color(thick, (255, 0, 0)),
+                           _count_color(thin, (255, 0, 0)))
+        # A thicker border does not enlarge the marker.
+        self.assertEqual(_color_bbox(thin, (255, 0, 0)),
+                         _color_bbox(thick, (255, 0, 0)))
+
+    def test_outline_width_applies_to_squares(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        thin = om.show(highlights=self.coords, point_size=10,
+                       point_shape="square", point_open=True)
+        thick = om.show(highlights=self.coords, point_size=10,
+                        point_shape="square", point_open=True,
+                        point_outline_width=4)
+        self.assertGreater(_count_color(thick, (255, 0, 0)),
+                           _count_color(thin, (255, 0, 0)))
+
+    def test_outline_width_below_one_raises(self):
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        self.assertRaises(ValueError, om.show, highlights=self.coords,
+                          point_outline_width=0)
+        self.assertRaises(ValueError, om.show, highlights=self.coords,
+                          point_outline_width=-2)
+
+    def test_resolve_marker_style_point_open(self):
+        coords = np.array([[0.5, 0.5, 0.5], [2.0, 2.0, 2.0]])
+        fills, outlines = ortho.OrthoMap._resolve_marker_style(
+            coords, [None, None], [None, None],
+            None, None, False, (255, 0, 0), (0, 0, 0), True,
+        )
+        self.assertEqual(fills, [None, None])
+        self.assertEqual(outlines, [(255, 0, 0), (255, 0, 0)])
+
+    def test_point_open_overrides_fill_by_group(self):
+        # fill_by_group would normally fill group "A" and hollow group "B".
+        coords = np.array([[0.5, 0.5, 0.5], [2.0, 2.0, 2.0]])
+        fills, _ = ortho.OrthoMap._resolve_marker_style(
+            coords, [None, None], ["A", "B"],
+            None, None, True, (255, 0, 0), (0, 0, 0), True,
+        )
+        self.assertEqual(fills, [None, None])
+
+    def test_point_open_keeps_per_label_colours(self):
+        anns = _Container([_Ann([0.5, 0.5, 0.5], label="coral"),
+                           _Ann([3.5, 3.5, 3.5], label="algae")])
+        om = ortho.OrthoMap(self.pc, pixel_width=self.PX_WIDTH)
+        img = om.show(highlights=anns, color_by="label", point_size=8,
+                      point_open=True, point_outline_width=2,
+                      label_colors={"coral": (0, 255, 0),
+                                    "algae": (0, 0, 255)})
+        self.assertGreater(_count_color(img, (0, 255, 0)), 0)
+        self.assertGreater(_count_color(img, (0, 0, 255)), 0)
+
+
 class TestOrthoGridHighlights(unittest.TestCase):
     def _grid(self, **kw):
         return ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0, **kw)
@@ -806,6 +927,38 @@ class TestOrthoGridHighlights(unittest.TestCase):
         og = ortho.OrthoGrid(annotations=anns, value_by="label", cell_size=1.0)
         fig = og.show(show_pcd=False, highlights=anns)
         self.assertGreaterEqual(len(fig.axes[0].collections), 1)
+
+    def test_point_open_scatter_is_hollow(self):
+        fig = self._grid().show(
+            show_pcd=False, highlights=self._anns(),
+            point_open=True, point_outline_width=2.5,
+        )
+        coll = fig.axes[0].collections[-1]
+        fc = coll.get_facecolors()
+        # facecolors="none" -> no faces (or fully transparent ones).
+        self.assertTrue(len(fc) == 0 or np.all(fc[:, 3] == 0))
+        self.assertTrue(np.allclose(coll.get_linewidths(), 2.5))
+        # Edges carry the per-label colours.
+        ec = coll.get_edgecolors()
+        self.assertGreaterEqual(len({tuple(np.round(c, 3)) for c in ec}), 2)
+
+    def test_point_open_patches_are_hollow(self):
+        import matplotlib.patches as mpatches
+        fig = self._grid().show(
+            show_pcd=False, highlights=self._anns(), point_size_metres=0.5,
+            point_open=True, point_outline_width=3.0,
+        )
+        circles = [p for p in fig.axes[0].patches
+                   if isinstance(p, mpatches.Circle)]
+        self.assertEqual(len(circles), 2)
+        for c in circles:
+            self.assertEqual(c.get_facecolor()[3], 0.0)
+            self.assertEqual(c.get_linewidth(), 3.0)
+
+    def test_outline_width_default_is_one(self):
+        fig = self._grid().show(show_pcd=False, highlights=self._anns())
+        coll = fig.axes[0].collections[-1]
+        self.assertTrue(np.allclose(coll.get_linewidths(), 1.0))
 
 
 if __name__ == "__main__":  # pragma: no cover

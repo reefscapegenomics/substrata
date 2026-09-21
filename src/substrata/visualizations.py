@@ -3263,6 +3263,76 @@ def create_annotated_video(
         shutil.rmtree(temp_image_matches_output, ignore_errors=True)
 
 
+# Right-hand padding (px) reserved in visualize_elevation_angle so its 3-D
+# scene lands in the same place as visualize_roughness /
+# visualize_vector_dispersion, which lose room on the right to their colour
+# bars. Plotly re-centres a 3-D scene in the space the colour bar leaves,
+# shifting the cube left by half the reserved width; those two shift by 59 and
+# 66 px respectively (they differ because their colour bar titles differ in
+# width), so 2 x 62 px puts all three within a few px of each other.
+_ELEVATION_RIGHT_PAD_PX = 124
+
+
+def _resolve_scene_axes(points, xlim=None, ylim=None, zlim=None):
+    """Resolve plotly 3-D scene axis ranges, aspect ratio and scene scale.
+
+    By default each axis is centred on the data and given the same span (the
+    largest of the three data extents), which renders as a cube with equal
+    units on every axis. Any of *xlim*/*ylim*/*zlim* replaces that axis'
+    window with an explicit ``(min, max)``; axes left as None keep the default
+    span. The aspect ratio is derived from the resulting spans, so one metre
+    stays the same on-screen length on every axis even when the spans differ
+    (a 10x10x2 m window renders as a flat slab, not a stretched cube).
+
+    Args:
+        points: (N, 3) array of the points being plotted.
+        xlim: Optional (min, max) window for the X axis, in point-cloud units.
+        ylim: Optional (min, max) window for the Y axis.
+        zlim: Optional (min, max) window for the Z axis.
+
+    Returns:
+        tuple: ``(ranges, aspect, max_range)`` where *ranges* maps ``"x"``/
+            ``"y"``/``"z"`` to a ``[lo, hi]`` list, *aspect* maps the same keys
+            to an aspect ratio normalised so the longest axis is ``1.0``, and
+            *max_range* is the longest span (used to size arrows and sticks so
+            they stay proportional to the requested window).
+
+    Raises:
+        ValueError: If a limit is not a two-element ``(min, max)`` with
+            ``max > min``.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        mids = np.zeros(3)
+        default_half = 0.5
+    else:
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        mids = 0.5 * (mins + maxs)
+        default_half = 0.5 * max(float(np.max(maxs - mins)), 1e-9)
+
+    ranges = {}
+    for axis, lim, mid in zip("xyz", (xlim, ylim, zlim), mids):
+        if lim is None:
+            ranges[axis] = [mid - default_half, mid + default_half]
+            continue
+        if len(lim) != 2:
+            raise ValueError(
+                f"{axis}lim must be a (min, max) pair, got {lim!r}"
+            )
+        lo, hi = float(lim[0]), float(lim[1])
+        if not hi > lo:
+            raise ValueError(
+                f"{axis}lim must have max > min, got {lim!r}"
+            )
+        ranges[axis] = [lo, hi]
+
+    spans = {axis: ranges[axis][1] - ranges[axis][0] for axis in "xyz"}
+    max_range = max(spans.values())
+    aspect = {axis: spans[axis] / max_range for axis in "xyz"}
+    return ranges, aspect, max_range
+
+
 def visualize_elevation_angle_legacy(
     pcd,
     plane_coeffs,
@@ -3408,6 +3478,9 @@ def visualize_elevation_angle(
     height=400,
     point_size=2,
     interactive=False,
+    xlim=None,
+    ylim=None,
+    zlim=None,
 ):
     """
     Visualize the fitted plane and the point cloud using plotly for interactive 3D visualization.
@@ -3428,6 +3501,13 @@ def visualize_elevation_angle(
         point_size: Scatter marker size for the point cloud (default 2).
         interactive: If True and output_filename is None, displays interactively. If False and
             output_filename is None, returns a static image as numpy array (default False).
+        xlim: Optional (min, max) X axis range in point-cloud units, for fixing the
+            axes across figures (e.g. panels of a manuscript). None (default) centres
+            the axis on the data. The aspect ratio follows the requested spans, so one
+            metre stays the same on-screen length on every axis. The arrows, angle arc
+            and fitted plane scale with the requested window.
+        ylim: Optional (min, max) Y axis range. See *xlim*.
+        zlim: Optional (min, max) Z axis range. See *xlim*.
 
     Returns:
         plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if interactive=True
@@ -3467,8 +3547,16 @@ def visualize_elevation_angle(
     mid_z = 0.5 * (z_min + z_max)
     origin = np.array([mid_x, mid_y, mid_z])
 
-    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
+    # Axis windows: the data extent by default, or the caller's fixed ranges.
+    axis_ranges, axis_aspect, max_range = _resolve_scene_axes(
+        points, xlim, ylim, zlim
+    )
     arrow_length = max_range
+
+    # The plane spans the visible window when that was set explicitly,
+    # otherwise just the data (preserving the default appearance).
+    plane_x = axis_ranges["x"] if xlim is not None else [x_min, x_max]
+    plane_y = axis_ranges["y"] if ylim is not None else [y_min, y_max]
 
     # Calculate plane normal and elevation angle
     plane_normal_unit = np.array([a, b, c]) / np.linalg.norm([a, b, c])
@@ -3480,8 +3568,8 @@ def visualize_elevation_angle(
     fig = go.Figure()
 
     # 1) Plot the fitted plane (semi-transparent red surface)
-    x_plane = np.linspace(x_min, x_max, 20)
-    y_plane = np.linspace(y_min, y_max, 20)
+    x_plane = np.linspace(plane_x[0], plane_x[1], 20)
+    y_plane = np.linspace(plane_y[0], plane_y[1], 20)
     xx, yy = np.meshgrid(x_plane, y_plane)
     zz = (-a * xx - b * yy - d) / c
 
@@ -3614,7 +3702,6 @@ def visualize_elevation_angle(
 
     # Update layout with equal aspect ratio (same pixels per meter for all axes)
     # Set camera view similar to matplotlib default (x on right, y going back)
-    half_range = max_range / 2.0
     camera_eye = {
         "x": 1.25,
         "y": -1.25,
@@ -3628,23 +3715,21 @@ def visualize_elevation_angle(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
-            aspectmode="cube",  # Ensures equal unit distances across all axes
-            xaxis=dict(
-                range=[mid_x - half_range, mid_x + half_range],
-            ),
-            yaxis=dict(
-                range=[mid_y - half_range, mid_y + half_range],
-            ),
-            zaxis=dict(
-                range=[mid_z - half_range, mid_z + half_range],
-            ),
+            # Ensures equal unit distances across all axes
+            aspectmode="manual",
+            aspectratio=dict(**axis_aspect),
+            xaxis=dict(range=axis_ranges["x"]),
+            yaxis=dict(range=axis_ranges["y"]),
+            zaxis=dict(range=axis_ranges["z"]),
             camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
         ),
         title=f"Elevation angle: {elevation_angle:.1f}°",
         width=width,
         height=height,
         showlegend=False,
-        margin=dict(l=0, r=0, t=40, b=0),
+        # Reserve the space the other two lose to their colour bars, so the
+        # 3-D scene is positioned consistently across the three figures.
+        margin=dict(l=0, r=_ELEVATION_RIGHT_PAD_PX, t=40, b=0),
     )
 
     # Show, save, or return static image
@@ -3723,6 +3808,9 @@ def visualize_roughness(
     interactive=False,
     ra=None,
     rq=None,
+    xlim=None,
+    ylim=None,
+    zlim=None,
 ):
     """
     Visualize the roughness calculation (Ra and Rq) for a point cloud.
@@ -3750,6 +3838,13 @@ def visualize_roughness(
             calculated from the point cloud.
         rq: Optional Rq (root mean square roughness) value. If None, will be
             calculated from the point cloud.
+        xlim: Optional (min, max) X axis range in point-cloud units, for fixing the
+            axes across figures (e.g. panels of a manuscript). None (default)
+            centres the axis on the data. The aspect ratio follows the requested
+            spans, so one metre stays the same on-screen length on every axis. The
+            fitted plane spans the requested window.
+        ylim: Optional (min, max) Y axis range. See *xlim*.
+        zlim: Optional (min, max) Z axis range. See *xlim*.
 
     Returns:
         plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if
@@ -3799,23 +3894,26 @@ def visualize_roughness(
     # Calculate max absolute distance for colorbar scaling
     max_abs_dist = np.max(np.abs(dists)) if len(dists) > 0 else 1.0
 
-    # Calculate bounds and origin
+    # Data bounds, used below for the fitted-plane extent.
     x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
     y_min, y_max = np.min(points[:, 1]), np.max(points[:, 1])
-    z_min, z_max = np.min(points[:, 2]), np.max(points[:, 2])
-    mid_x = 0.5 * (x_min + x_max)
-    mid_y = 0.5 * (y_min + y_max)
-    mid_z = 0.5 * (z_min + z_max)
 
-    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
-    half_range = max_range / 2.0
+    # Axis windows: the data extent by default, or the caller's fixed ranges.
+    axis_ranges, axis_aspect, _ = _resolve_scene_axes(
+        points, xlim, ylim, zlim
+    )
+
+    # The plane spans the visible window when that was set explicitly,
+    # otherwise just the data (preserving the default appearance).
+    plane_x = axis_ranges["x"] if xlim is not None else [x_min, x_max]
+    plane_y = axis_ranges["y"] if ylim is not None else [y_min, y_max]
 
     # Create figure
     fig = go.Figure()
 
     # 1) Plot the fitted plane (semi-transparent gray surface)
-    x_plane = np.linspace(x_min, x_max, 20)
-    y_plane = np.linspace(y_min, y_max, 20)
+    x_plane = np.linspace(plane_x[0], plane_x[1], 20)
+    y_plane = np.linspace(plane_y[0], plane_y[1], 20)
     xx, yy = np.meshgrid(x_plane, y_plane)
     zz = (-a * xx - b * yy - d) / c
 
@@ -3870,16 +3968,11 @@ def visualize_roughness(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
-            aspectmode="cube",
-            xaxis=dict(
-                range=[mid_x - half_range, mid_x + half_range],
-            ),
-            yaxis=dict(
-                range=[mid_y - half_range, mid_y + half_range],
-            ),
-            zaxis=dict(
-                range=[mid_z - half_range, mid_z + half_range],
-            ),
+            aspectmode="manual",
+            aspectratio=dict(**axis_aspect),
+            xaxis=dict(range=axis_ranges["x"]),
+            yaxis=dict(range=axis_ranges["y"]),
+            zaxis=dict(range=axis_ranges["z"]),
             camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
         ),
         title=f"Rq (RMS Roughness): {rq:.6f} m, Ra: {ra:.6f} m",
@@ -4027,7 +4120,7 @@ def visualize_tpi(
 
     panel_configs = [
         (tpi_abs,   "Z relative to focal point (m)",                mean_tpi_abs,  "TPI_abs",   mean_tri_abs,   "TRI_abs"),
-        (tpi_plane, "Z relative to annulus plane at focal point (m)", mean_tpi_plane, "TPI_plane", mean_tri_plane, "TRI_plane"),
+        (tpi_plane, "Z relative to annulus plane (m)", mean_tpi_plane, "TPI_plane", mean_tri_plane, "TRI_plane"),
     ]
 
     for ax, (values, label, mean_val, tpi_name, tri_val, tri_name) in zip(axes, panel_configs):
@@ -4059,11 +4152,9 @@ def visualize_tpi(
 
         if center is not None:
             cx, cy = float(center[0]), float(center[1])
-            # The star marks the focal point and is coloured by the TPI metric
-            # (focal vs. neighbourhood), distinct from the per-point colorbar
-            # scale of "Z relative to focal point"; label it so its colour is
-            # not misread as that scale (on which the focal point would be 0).
-            star_label = f"focal point (colour = {tpi_name})"
+            # The star marks the focal point, coloured by the TPI metric (focal
+            # vs. neighbourhood) rather than by the per-point colorbar scale.
+            # The title reports that metric, so no legend entry is needed.
             if mean_val is not None and np.isfinite(mean_val):
                 ax.scatter(
                     cx, cy,
@@ -4076,12 +4167,9 @@ def visualize_tpi(
                     zorder=5,
                     edgecolors="black",
                     linewidths=0.5,
-                    label=star_label,
                 )
             else:
-                ax.scatter(
-                    cx, cy, c="black", marker="*", s=200, zorder=5, label=star_label
-                )
+                ax.scatter(cx, cy, c="black", marker="*", s=200, zorder=5)
             if radius_inner > 0:
                 ax.add_patch(
                     mpatches.Circle(
@@ -4094,7 +4182,6 @@ def visualize_tpi(
                         (cx, cy), radius_outer, fill=False, color="black", lw=1
                     )
                 )
-            ax.legend(loc="upper right", fontsize=7, framealpha=0.7)
 
         ax.set_aspect("equal")
         ax.set_xlabel("X (m)")
@@ -4147,6 +4234,112 @@ def _benthic_finish(fig, dpi, output_filename, interactive):
     if img.mode != "RGB":
         img = img.convert("RGB")
     return np.array(img, dtype=np.uint8)
+
+
+def _smooth_histogram(counts, sigma_bins):
+    """Gaussian-smooth histogram *counts* with a kernel *sigma_bins* wide.
+
+    Uses edge-reflected padding so the curve does not sag at 0 and 1, where a
+    channel's density is often highest.  ``sigma_bins <= 0`` returns *counts*
+    unchanged.
+
+    Args:
+        counts: 1-D array of per-bin counts.
+        sigma_bins: Gaussian standard deviation expressed in bins.
+
+    Returns:
+        numpy.ndarray: Smoothed counts, same length as *counts*.
+    """
+    counts = np.asarray(counts, dtype=float)
+    if sigma_bins is None or sigma_bins <= 0 or counts.size == 0:
+        return counts
+    radius = max(1, int(round(3.0 * sigma_bins)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / float(sigma_bins)) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(counts, radius, mode="reflect")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def visualize_rgb_stats(
+    pcd,
+    output_filename=None,
+    width=600,
+    height=400,
+    dpi=100,
+    bins=256,
+    smoothing=4.0,
+    interactive=False,
+):
+    """Visualize the RGB colour distribution of a point cloud subset.
+
+    Companion to :func:`substrata.measurements.get_rgb_stats`.  Pass any point
+    cloud subset (e.g. the points within a radius of an annotation) and it
+    plots one smoothed density curve per channel, each drawn and filled in its
+    own colour, with a dashed line marking that channel's median as reported by
+    ``get_rgb_stats``.
+
+    Every point contributes to the distribution (no decimation), so the medians
+    drawn are exactly those ``get_rgb_stats`` returns for the same subset.
+
+    Args:
+        pcd: Point cloud with a ``colors`` attribute of RGB values, either in
+            [0, 1] or in [0, 255] (0-255 input is normalised automatically).
+        output_filename: Optional path to save the figure (png, jpg, pdf, svg).
+            When None the figure is returned as an image array instead.
+        width: Figure width in pixels (default 600, matching the other
+            visualizations).
+        height: Figure height in pixels (default 400).
+        dpi: Dots per inch used for the figure and any saved output.
+        bins: Number of histogram bins per channel used before smoothing
+            (default 256).  More bins plus smoothing gives a finer curve.
+        smoothing: Width of the Gaussian smoothing kernel, in bins (default
+            4.0).  Pass ``0`` to disable smoothing and plot the raw histogram.
+        interactive: When True and *output_filename* is None, show the figure
+            instead of returning it as an array.
+
+    Returns:
+        matplotlib.figure.Figure | numpy.ndarray: The figure when saved or
+            shown interactively, otherwise the rendered image as an
+            ``(H, W, 3)`` uint8 RGB array.
+
+    Raises:
+        ValueError: If the point cloud has no colours.
+    """
+    from substrata import measurements
+
+    colors = np.asarray(getattr(pcd, "colors", None))
+    if colors is None or colors.size == 0:
+        raise ValueError("Point cloud has no colours to summarise")
+    colors = colors.reshape(-1, 3).astype(float)
+    # Accept 0-255 input (as elsewhere in this module) and work in [0, 1].
+    if colors.max() > 1.0:
+        colors = colors / 255.0
+
+    median_r, median_g, median_b, luminance = measurements.get_rgb_stats(pcd)
+    medians = (median_r, median_g, median_b)
+    if max(medians) > 1.0:  # get_rgb_stats echoes the input scale
+        medians = tuple(m / 255.0 for m in medians)
+        luminance = luminance / 255.0
+
+    fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    for i, colour in enumerate(("red", "green", "blue")):
+        counts, _ = np.histogram(colors[:, i], bins=edges)
+        curve = _smooth_histogram(counts.astype(float), smoothing)
+        ax.fill_between(centres, curve, color=colour, alpha=0.35, linewidth=0)
+        ax.plot(centres, curve, color=colour, linewidth=1.5)
+        ax.axvline(medians[i], color=colour, linestyle="--", linewidth=1.2)
+
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("Channel value")
+    ax.set_ylabel("Point count")
+    fig.tight_layout()
+
+    return _benthic_finish(fig, dpi, output_filename, interactive)
 
 
 def _draw_annulus_context(ax, center, radius_inner, radius_outer, set_limits=True):
@@ -4631,6 +4824,11 @@ def visualize_vector_dispersion(
     point_size=2,
     interactive=False,
     dispersion=None,
+    normal_length=None,
+    normal_width=2,
+    xlim=None,
+    ylim=None,
+    zlim=None,
 ):
     """
     Visualize global vector normal dispersion (Young et al., 2017) on a point cloud.
@@ -4660,6 +4858,19 @@ def visualize_vector_dispersion(
             array (default False).
         dispersion: Optional precomputed global dispersion scalar. If None, will be
             calculated from the point cloud using get_vector_dispersion.
+        normal_length: Optional length of the normal lines, as an absolute distance
+            in point-cloud units (metres). None (default) uses 2.5% of the scene
+            extent, which varies with the cloud; setting it keeps the lines
+            identical across figures.
+        normal_width: Line thickness of the normal lines in pixels (default 2).
+        xlim: Optional (min, max) X axis range in point-cloud units, for fixing the
+            axes across figures (e.g. panels of a manuscript). None (default)
+            centres the axis on the data. The aspect ratio follows the requested
+            spans, so one metre stays the same on-screen length on every axis. The
+            mean-normal arrow scales with the requested window; the normal lines do
+            too unless *normal_length* is set.
+        ylim: Optional (min, max) Y axis range. See *xlim*.
+        zlim: Optional (min, max) Z axis range. See *xlim*.
 
     Returns:
         plotly.graph_objects.Figure | np.ndarray: The interactive plotly figure if
@@ -4669,6 +4880,11 @@ def visualize_vector_dispersion(
     import plotly
     import plotly.graph_objects as go
     from substrata import measurements
+
+    if normal_length is not None and float(normal_length) <= 0:
+        raise ValueError(f"normal_length must be > 0, got {normal_length}")
+    if normal_width <= 0:
+        raise ValueError(f"normal_width must be > 0, got {normal_width}")
 
     # Decimate if required (and ensure PointCloud format)
     pcd = pointclouds.get_decimated_pcd(pcd, max_output_points)
@@ -4710,11 +4926,17 @@ def visualize_vector_dispersion(
     mid_x = 0.5 * (x_min + x_max)
     mid_y = 0.5 * (y_min + y_max)
     mid_z = 0.5 * (z_min + z_max)
-    max_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
-    half_range = max_range / 2.0
 
-    # Stick length as fraction of scene (normals point outward from surface)
-    stick_length = max_range * 0.025
+    # Axis windows: the data extent by default, or the caller's fixed ranges.
+    axis_ranges, axis_aspect, max_range = _resolve_scene_axes(
+        points, xlim, ylim, zlim
+    )
+
+    # Stick length: an absolute distance when given, else 2.5% of the scene
+    # (normals point outward from the surface).
+    stick_length = (
+        max_range * 0.025 if normal_length is None else float(normal_length)
+    )
     stick_ends = points + stick_length * unit_normals
 
     # Bin deviation for stick coloring (Plotly line traces need one color per trace)
@@ -4772,7 +4994,7 @@ def visualize_vector_dispersion(
                 y=seg_y,
                 z=seg_z,
                 mode="lines",
-                line=dict(color=bin_color, width=2),
+                line=dict(color=bin_color, width=normal_width),
                 showlegend=False,
             )
         )
@@ -4815,10 +5037,11 @@ def visualize_vector_dispersion(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
-            aspectmode="cube",
-            xaxis=dict(range=[mid_x - half_range, mid_x + half_range]),
-            yaxis=dict(range=[mid_y - half_range, mid_y + half_range]),
-            zaxis=dict(range=[mid_z - half_range, mid_z + half_range]),
+            aspectmode="manual",
+            aspectratio=dict(**axis_aspect),
+            xaxis=dict(range=axis_ranges["x"]),
+            yaxis=dict(range=axis_ranges["y"]),
+            zaxis=dict(range=axis_ranges["z"]),
             camera=dict(eye=camera_eye, center=camera_center, up=camera_up),
         ),
         title=f"Vector dispersion: {dispersion:.4f} (blue = aligned, red = max deviation)",
