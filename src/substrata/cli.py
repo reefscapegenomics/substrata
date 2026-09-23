@@ -2,6 +2,7 @@
 import argparse
 import ast
 from collections import Counter
+import json
 import os
 import re
 import subprocess
@@ -599,7 +600,7 @@ def handle_decimate(args):
     )
 
 
-def handle_repair(args):
+def handle_ply_repair(args):
     """Rewrite a PLY into a strict Open3D-compatible form.
 
     Drops extra vertex properties and non-finite rows (float32 xyz, optional
@@ -1909,6 +1910,419 @@ def handle_camsync(args):
     init.cams.save()
 
 
+
+def _pr_prompt_duplicate(label, name, old_path, candidates):
+    """Ask which of several same-named candidates to use.
+
+    Args:
+        label (str): What is being resolved, e.g. "Camera" or "YAML key".
+        name (str): Identifier shown after the label.
+        old_path (str): The value currently stored.
+        candidates (list): Absolute paths sharing the same basename.
+
+    Returns:
+        tuple: ``(action, path)`` where action is "pick", "skip" or "abort".
+    """
+    from substrata.pathrepair import path_basename
+
+    print(
+        f"\n{label} {name}: {len(candidates)} candidates named "
+        f"{path_basename(old_path)!r}"
+    )
+    print(f"  stored value: {old_path}")
+    for i, cand in enumerate(candidates, start=1):
+        print(f"  [{i}] {cand}")
+    prompt = f"Choose 1-{len(candidates)}, [m]anual path, [s]kip, [a]bort: "
+    while True:
+        ans = input(prompt).strip().lower()
+        if ans in ("a", "abort"):
+            return ("abort", None)
+        if ans in ("s", "skip"):
+            return ("skip", None)
+        if ans in ("m", "manual"):
+            return _pr_prompt_manual()
+        if ans.isdigit() and 1 <= int(ans) <= len(candidates):
+            return ("pick", candidates[int(ans) - 1])
+        print("  Not a valid choice.")
+
+
+def _pr_prompt_missing(label, name, old_path):
+    """Ask where something is, when the search found nothing.
+
+    Args:
+        label (str): What is being resolved, e.g. "Camera" or "YAML key".
+        name (str): Identifier shown after the label.
+        old_path (str): The value currently stored.
+
+    Returns:
+        tuple: ``(action, path)`` where action is "pick", "skip" or "abort".
+    """
+    from substrata.pathrepair import path_basename
+
+    print(
+        f"\n{label} {name}: nothing named {path_basename(old_path)!r} found "
+        "under the search root"
+    )
+    print(f"  stored value: {old_path}")
+    return _pr_prompt_manual()
+
+
+def _pr_prompt_manual():
+    """Read a path from the user, re-prompting until it exists.
+
+    A path that does not exist is never accepted: doing so would break the
+    guarantee that every planned change is verified before anything is written.
+
+    Returns:
+        tuple: ``(action, path)`` where action is "pick", "skip" or "abort".
+    """
+    while True:
+        ans = input("Enter a path, or [s]kip, [a]bort: ").strip()
+        if ans.lower() in ("a", "abort"):
+            return ("abort", None)
+        if ans.lower() in ("s", "skip") or not ans:
+            return ("skip", None)
+        path = os.path.expanduser(ans)
+        if os.path.exists(path):
+            return ("pick", os.path.abspath(path))
+        print(f"  Not an existing file or directory: {path}")
+
+
+def _print_yaml_report(yplan):
+    """Print the project-file section of the path-repair report."""
+    print(f"\nProject files ({os.path.basename(yplan.yaml_path)}):")
+    width = max((len(e.key) for e in yplan.entries), default=4)
+    for entry in yplan.entries:
+        if entry.new is not None:
+            print(
+                f"  {entry.key:<{width}}  {entry.old}  ->  {entry.new}"
+                f"   ({entry.how})"
+            )
+        elif entry.how in ("missing", "skipped"):
+            print(f"  {entry.key:<{width}}  <{entry.how}: {entry.old}>")
+        else:
+            print(f"  {entry.key:<{width}}  ok")
+
+
+def _print_cams_report(plan, max_rows):
+    """Print the camera-image section, grouped by folder mapping."""
+    from substrata.pathrepair import path_basename, path_dirname
+
+    by_mapping = {}
+    individual = []
+    for cam_id, new_path in sorted(plan.changes.items()):
+        old_dir = path_dirname(plan.stored.get(cam_id, ""))
+        new_dir = path_dirname(new_path)
+        if plan.dir_map.get(old_dir) == new_dir:
+            by_mapping.setdefault((old_dir, new_dir), []).append((cam_id, new_path))
+        else:
+            individual.append((cam_id, new_path))
+
+    print(f"\nCamera images ({len(plan.changes)} to update):")
+    for (old_dir, new_dir), rows in sorted(by_mapping.items()):
+        print(f"  {old_dir}  ->  {new_dir}   ({len(rows)} cameras)")
+        for cam_id, new_path in rows[:max_rows]:
+            print(f"      {cam_id}  {path_basename(new_path)}")
+        if len(rows) > max_rows:
+            print(f"      ... {len(rows) - max_rows} more")
+    if individual:
+        print("  (individual)")
+        for cam_id, new_path in individual[:max_rows]:
+            print(f"      {cam_id}  {new_path}")
+        if len(individual) > max_rows:
+            print(f"      ... {len(individual) - max_rows} more")
+
+
+def handle_path_repair(args):
+    """Check and repair every stale path in a project.
+
+    Runs in two phases. Phase A repairs the project's own file paths in
+    ``<id>.yaml``; phase B repairs the per-camera image paths in
+    ``<id>.meta.json``. Both phases are planned in full before either writes, so
+    aborting at any point leaves the project untouched.
+
+    Phase A deliberately works on the raw YAML and never constructs a
+    :class:`ProjectInitializer`: ``initialize()`` guards the point cloud and the
+    cameras on truthiness alone, so a stale path is loaded and crashes with a
+    bare ``FileNotFoundError`` before any repair could run.
+
+    Phase B reads and writes :attr:`Camera.orig_filepath` only, never the
+    derived :attr:`Camera.filepath`, and freezes the camera selection to a set
+    of ids before any mutation, because :attr:`Camera.group` is itself derived
+    from the filepath.
+
+    Args:
+        args: Parsed command-line arguments.
+    """
+    from substrata import pathrepair as pr
+    from substrata.cameras import Cameras
+    from substrata.logging import logger
+
+    find = getattr(args, "find", None)
+    replace = getattr(args, "replace", None)
+    if replace is not None and find is None:
+        raise SystemExit("--replace requires --find.")
+    if find is not None and not find:
+        raise SystemExit("--find must not be empty.")
+    if replace is not None and replace == find:
+        raise SystemExit("--find and --replace are identical; nothing to do.")
+
+    do_yaml = not getattr(args, "cams_only", False)
+    do_cams = not getattr(args, "yaml_only", False)
+    interactive = sys.stdin.isatty()
+    max_rows = settings.PATHREPAIR_MAX_REPORT_ROWS
+
+    base, cwd = _cwd_base()
+    project_dir = os.path.abspath(cwd)
+    yaml_path = os.path.join(project_dir, f"{base}.yaml")
+    has_yaml = os.path.isfile(yaml_path)
+
+    print(f"Project:   {base}   ({project_dir})")
+
+    def on_dup(key, old, cands):
+        if not interactive:
+            raise RuntimeError(
+                f"{key!r}: {len(cands)} candidates for {old!r} and no way to ask."
+            )
+        return _pr_prompt_duplicate("YAML key", key, old, cands)
+
+    def on_miss(key, old):
+        if not interactive:
+            return ("skip", None)
+        return _pr_prompt_missing("YAML key", key, old)
+
+    # ---- Phase A: project files in the YAML -------------------------------
+    yplan = None
+    if do_yaml and has_yaml:
+        with open(yaml_path, "r") as f:
+            config = yaml.safe_load(f) or {}
+        if not isinstance(config, dict):
+            raise SystemExit(f"Project YAML is not a mapping: {yaml_path}")
+        try:
+            yplan = pr.plan_yaml_repair(yaml_path, config, on_dup, on_miss)
+        except pr.PathAborted:
+            raise SystemExit("Aborted; nothing written.")
+        except RuntimeError as e:
+            raise SystemExit(
+                f"{e}\n  Re-run in an interactive terminal, or repair the YAML "
+                "by hand."
+            )
+    elif do_yaml:
+        print("No project YAML found; project files follow naming conventions.")
+
+    # ---- Resolve where the cameras live, from the plan (not from disk) ----
+    if yplan is not None:
+        meta_path = yplan.resolved.get("cams_meta_json")
+        xml_path = yplan.resolved.get("cams_xml")
+    else:
+        meta_path = os.path.join(project_dir, f"{base}.meta.json")
+        xml_path = os.path.join(project_dir, f"{base}.cams.xml")
+        meta_path = meta_path if os.path.isfile(meta_path) else None
+        xml_path = xml_path if os.path.isfile(xml_path) else None
+
+    # ---- Phase B: camera image paths in the meta JSON ---------------------
+    cplan = None
+    cams = None
+    if do_cams:
+        if not meta_path or not xml_path:
+            print(
+                "\nSkipping camera images: the cameras meta JSON / .cams.xml "
+                "could not be located."
+            )
+        else:
+            cams = Cameras(meta_path, xml_path)
+            if not cams.data:
+                print("\nSkipping camera images: no cameras loaded.")
+            else:
+                cplan = _plan_camera_paths(
+                    args, cams, meta_path, project_dir, interactive, pr
+                )
+
+    # ---- Gates ------------------------------------------------------------
+    if cplan is not None:
+        if replace is not None and cplan.missing:
+            print(f"\n{len(cplan.missing)} resolved image(s) do not exist:")
+            for cam_id, path in sorted(cplan.missing.items())[:max_rows]:
+                print(f"  {cam_id}  {path}")
+            raise SystemExit(
+                f"{len(cplan.missing)} resolved image(s) do not exist; "
+                "nothing written."
+            )
+        collisions = cplan.collisions()
+        if collisions:
+            print(f"\n{len(collisions)} path collision(s):")
+            for path, ids in sorted(collisions.items())[:max_rows]:
+                print(f"  {path}  <- {', '.join(ids)}")
+            raise SystemExit(
+                f"Refusing to write: {len(collisions)} path collision(s)."
+            )
+
+    yaml_changes = yplan.changes if yplan is not None else {}
+    cam_changes = cplan.changes if cplan is not None else {}
+    if not yaml_changes and not cam_changes:
+        print("\nNothing to repair; all paths already resolve.")
+        return
+
+    # ---- Report -----------------------------------------------------------
+    if yplan is not None:
+        _print_yaml_report(yplan)
+    if cplan is not None and cam_changes:
+        _print_cams_report(cplan, max_rows)
+        print(f"\nCamera images already valid: {len(cplan.unchanged)}")
+        if cplan.skipped:
+            print(f"Camera images skipped:       {len(cplan.skipped)}")
+        empty = pr.zero_byte_paths(list(cam_changes.values()))
+        if empty:
+            print(f"Warning: {len(empty)} matched image(s) are zero bytes.")
+
+    if getattr(args, "dry_run", False):
+        print("\nDry run: nothing written.")
+        return
+
+    if not getattr(args, "yes", False):
+        if not interactive:
+            raise SystemExit(
+                "Confirmation required; re-run with --yes in non-interactive use."
+            )
+        ans = input(
+            f"\nProceed? {len(yaml_changes)} YAML key(s) and "
+            f"{len(cam_changes)} camera path(s) will be updated. [y/N]: "
+        )
+        if ans.strip().lower() not in ("y", "yes"):
+            raise SystemExit("Aborted.")
+
+    # ---- Write ------------------------------------------------------------
+    if yaml_changes:
+        with open(yaml_path, "r") as f:
+            text = f.read()
+        patched = pr.patch_yaml_paths(text, yaml_changes)
+        out = pr.atomic_write_text(patched, yaml_path)
+        print(f"Updated {len(yaml_changes)} path(s) in {out}")
+    if cam_changes:
+        cams.set_filepaths(cam_changes)
+        n = cams.save_paths(cams_meta_filepath=meta_path,
+                            only_cam_ids=set(cam_changes))
+        print(f"Updated {n} camera path(s).")
+    logger.info(
+        "path-repair: %s YAML key(s), %s camera path(s)",
+        len(yaml_changes),
+        len(cam_changes),
+    )
+
+    # ---- Post-write verification -----------------------------------------
+    if yplan is not None and yplan.unresolved:
+        print(f"Warning: {len(yplan.unresolved)} project path(s) still missing:")
+        for entry in yplan.unresolved[:max_rows]:
+            print(f"  {entry.key}  {entry.old}")
+    if cams is not None:
+        still = cams.missing_image_paths(use_orig=True)
+        if still:
+            print(f"Warning: {len(still)} camera image(s) still missing:")
+            for cam_id, path in sorted(still.items())[:max_rows]:
+                print(f"  {cam_id}  {path}")
+        else:
+            print(f"All {len(cams.data)} camera images now resolve on disk.")
+
+
+def _plan_camera_paths(args, cams, meta_path, project_dir, interactive, pr):
+    """Plan the camera-image half of a path repair.
+
+    The camera selection is frozen to a set of ids before anything mutates,
+    because :attr:`Camera.group` is derived from the filepath being repaired.
+
+    Args:
+        args: Parsed command-line arguments.
+        cams: Loaded :class:`Cameras` container.
+        meta_path (str): Path to the cameras meta JSON.
+        project_dir (str): Absolute project directory.
+        interactive (bool): Whether prompting is possible.
+        pr: The :mod:`substrata.pathrepair` module.
+
+    Returns:
+        PathPlan: The planned camera path changes.
+    """
+    find = getattr(args, "find", None)
+    replace = getattr(args, "replace", None)
+
+    stored = {
+        cam_id: cam.orig_filepath
+        for cam_id, cam in cams.data.items()
+        if cam.orig_filepath
+    }
+
+    selected = set(stored)
+    filters = []
+    if find is not None:
+        selected = {cid for cid in selected if find in stored[cid]}
+        filters.append(f"--find {find}")
+    group = getattr(args, "cams_group", None)
+    if group is not None:
+        selected = {
+            cid
+            for cid in selected
+            if getattr(cams.data[cid], "group", None) == group
+        }
+        filters.append(f"--cams-group {group}")
+    sensor_id = getattr(args, "sensor_id", None)
+    if sensor_id is not None:
+        selected = {
+            cid
+            for cid in selected
+            if getattr(cams.data[cid], "sensor_id", None) == sensor_id
+        }
+        filters.append(f"--sensor-id {sensor_id}")
+
+    if not selected:
+        # Built defensively: Cameras.group_names sorts an unfiltered set and
+        # raises TypeError when any group is None, which is exactly the case
+        # for Windows-authored projects.
+        groups = sorted(
+            {g for g in (getattr(c, "group", None) for c in cams.data.values()) if g}
+        )
+        sensors = sorted(
+            {
+                s
+                for s in (getattr(c, "sensor_id", None) for c in cams.data.values())
+                if s is not None
+            }
+        )
+        raise SystemExit(
+            f"No cameras matched the given filters ({', '.join(filters)}).\n"
+            f"  Available groups: {groups if groups else '[]'}\n"
+            f"  Available sensor ids: {sensors if sensors else '[]'}"
+        )
+
+    sel_paths = {cid: stored[cid] for cid in selected}
+    root = os.path.abspath(getattr(args, "root", None) or project_dir)
+
+    if replace is not None:
+        return pr.plan_find_replace(sel_paths, find, replace)
+
+    index = pr.build_image_index(root)
+    try:
+        return pr.resolve_image_paths(
+            sel_paths,
+            index,
+            on_duplicate=(
+                (lambda cid, old, c: _pr_prompt_duplicate("Camera", cid, old, c))
+                if interactive
+                else None
+            ),
+            on_missing=(
+                (lambda cid, old: _pr_prompt_missing("Camera", cid, old))
+                if interactive
+                else None
+            ),
+        )
+    except pr.PathAborted:
+        raise SystemExit("Aborted; nothing written.")
+    except RuntimeError as e:
+        raise SystemExit(
+            f"{e}\n  Re-run in an interactive terminal, or use --find/--replace "
+            "to set the paths explicitly."
+        )
+
+
 def handle_images(args):
     """Handle the image matching CLI command.
 
@@ -2470,10 +2884,10 @@ def handle_train(args):
 def main():
     """Build the argparse CLI and dispatch to the selected subcommand handler.
 
-    Defines all subcommands (decimate, repair, head, scalebars, views, orient,
+    Defines all subcommands (decimate, ply-repair, head, scalebars, views, orient,
     colors, firefish, cams2video, intercepts, intercepts-plot, align, images,
-    camsync, transform, train, metashape-export), parses the arguments, and
-    calls the matching handle_* function.
+    camsync, path-repair, transform, train, metashape-export), parses the
+    arguments, and calls the matching handle_* function.
     """
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2602,7 +3016,7 @@ def main():
 
     # repair (re-emit a PLY that Open3D can parse, e.g. Metashape exports)
     p_rep = subparsers.add_parser(
-        "repair",
+        "ply-repair",
         help=(
             "Rewrite a PLY in a strict Open3D-compatible form "
             "(float32 xyz, optional uchar RGB, optional float32 normals); "
@@ -3566,6 +3980,117 @@ def main():
         help="Apply the inverse of the cumulative transforms (default: False).",
     )
 
+    # path-repair
+    p_pathrepair = subparsers.add_parser(
+        "path-repair",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help=(
+            "Check and repair stale paths in a project: the project files "
+            "listed in the YAML and the per-camera image paths."
+        ),
+        epilog=(
+            "Runs in two phases. Phase A repairs the project's own file paths\n"
+            "in <id>.yaml; phase B repairs the per-camera image paths in\n"
+            "<id>.meta.json. The .cams.xml is never modified (it stores image\n"
+            "labels, not paths).\n"
+            "\n"
+            "Each broken path is resolved by trying, in order: the conventional\n"
+            "filename in the project folder, a recursive search by basename,\n"
+            "then asking. Repaired YAML entries inside the project folder are\n"
+            "written as bare filenames, so the YAML survives the next move.\n"
+            "The YAML is patched line by line, preserving comments, key order\n"
+            "and any keys substrata does not itself use.\n"
+            "\n"
+            "Both phases are planned in full before either writes, so aborting\n"
+            "leaves the project untouched. --find/--replace does a literal\n"
+            "substitution on camera paths and refuses to write unless every\n"
+            "resulting path exists.\n"
+            "\n"
+            "Use this instead of --local. That flag rebases every path onto the\n"
+            "working directory by basename, unverified and discarding any\n"
+            "nested structure; this command changes only paths that are broken\n"
+            "and verifies each result.\n"
+            "\n"
+            "Non-goals: --find is literal, never a regex or glob; a stored .jpg\n"
+            "is not matched to an on-disk .png of the same stem."
+        ),
+    )
+    _pr_scope = p_pathrepair.add_mutually_exclusive_group()
+    _pr_scope.add_argument(
+        "--yaml-only",
+        dest="yaml_only",
+        action="store_true",
+        help="Repair the project YAML only; leave camera image paths alone.",
+    )
+    _pr_scope.add_argument(
+        "--cams-only",
+        dest="cams_only",
+        action="store_true",
+        help="Repair camera image paths only; leave the project YAML alone.",
+    )
+    p_pathrepair.add_argument(
+        "--find",
+        dest="find",
+        type=str,
+        default=None,
+        metavar="STR",
+        help=(
+            "Camera images only: consider cameras whose stored path contains "
+            "STR. With --replace, STR is also the substring that is replaced."
+        ),
+    )
+    p_pathrepair.add_argument(
+        "--replace",
+        dest="replace",
+        type=str,
+        default=None,
+        metavar="STR",
+        help=(
+            "Replace --find with STR in the stored paths (literal, not regex). "
+            "Requires --find. Skips the recursive search; every resulting path "
+            "must exist or nothing is written."
+        ),
+    )
+    p_pathrepair.add_argument(
+        "--cams-group",
+        "--cams_group",
+        dest="cams_group",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Only consider cameras in this group (as given by Camera.group).",
+    )
+    p_pathrepair.add_argument(
+        "--sensor-id",
+        "--sensor_id",
+        dest="sensor_id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Only consider cameras using this sensor id (from the .cams.xml).",
+    )
+    p_pathrepair.add_argument(
+        "--root",
+        dest="root",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Directory searched recursively for images. Default: current folder.",
+    )
+    p_pathrepair.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Print the planned path changes and exit without writing.",
+    )
+    p_pathrepair.add_argument(
+        "--yes",
+        "-y",
+        dest="yes",
+        action="store_true",
+        help="Skip the confirmation prompt before writing.",
+    )
+
     # train
     p_train = subparsers.add_parser(
         "train",
@@ -3775,7 +4300,7 @@ def main():
     handlers = {
         "decimate": handle_decimate,
         "metashape-export": handle_metashape_export,
-        "repair": handle_repair,
+        "ply-repair": handle_ply_repair,
         "head": handle_head,
         "scalebars": handle_scalebars,
         "views": handle_views,
@@ -3789,6 +4314,7 @@ def main():
         "align": handle_align,
         "images": handle_images,
         "camsync": handle_camsync,
+        "path-repair": handle_path_repair,
         "transform": handle_transform,
         "train": handle_train,
     }

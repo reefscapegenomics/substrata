@@ -28,9 +28,42 @@ import exifread
 
 # Local Modules
 from substrata import visualizations, settings, geom, measurements
+from substrata.pathrepair import path_basename
 from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(data: dict, out_path: str) -> str:
+    """Write ``data`` as indented JSON to ``out_path`` atomically.
+
+    Writes to a temporary file in the same directory and ``os.replace``s it into
+    position, so an interrupted write cannot truncate the original file.
+
+    Args:
+        data: JSON-serializable mapping to write.
+        out_path: Destination path (created or replaced).
+
+    Returns:
+        str: The absolute path written.
+    """
+    out_abs = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_abs) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".json.tmp", prefix=".cams_meta_", dir=out_dir
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, out_abs)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return out_abs
 
 
 def _sync_camera_enabled_to_cams_xml(cameras: Cameras, xml_path: str) -> None:
@@ -639,26 +672,108 @@ class Cameras:
 
         data["cameras"] = cameras_out
 
-        out_abs = os.path.abspath(out_path)
-        out_dir = os.path.dirname(out_abs) or "."
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".json.tmp", prefix=".cams_meta_", dir=out_dir
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
-            os.replace(tmp_path, out_abs)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        out_abs = _atomic_write_json(data, out_path)
         print(f"Saved camera metadata to {out_abs}")
 
         if xml_path and os.path.isfile(xml_path):
             _sync_camera_enabled_to_cams_xml(self, xml_path)
+
+    def save_paths(
+        self,
+        cams_meta_filepath: str | None = None,
+        only_cam_ids: set | None = None,
+    ) -> int:
+        """Persist camera image filepaths to the meta JSON file.
+
+        Merges ``path`` for each loaded camera from :attr:`Camera.orig_filepath`
+        into the existing file, leaving every other key (``center``,
+        ``transform``, ``enabled``, ...) exactly as found on disk.
+
+        Unlike :meth:`save`, cameras without a pose are written too. :meth:`save`
+        skips them, since it exists to write poses; but a camera left unaligned
+        in Metashape still has an image path, and is in fact among the most
+        likely to have a stale one. The ``.cams.xml`` is never touched here: it
+        stores image labels, not paths.
+
+        Args:
+            cams_meta_filepath: Output path. Defaults to
+                :attr:`cams_meta_filepath`.
+            only_cam_ids: Optional set of camera ids to write. ``None`` writes
+                every loaded camera.
+
+        Returns:
+            int: Number of camera entries whose ``path`` value changed on disk.
+
+        Raises:
+            ValueError: If no output path is known or the file has no
+                ``cameras`` key.
+        """
+        out_path = cams_meta_filepath or getattr(self, "cams_meta_filepath", None)
+        if not out_path:
+            raise ValueError("No cams_meta_filepath; pass cams_meta_filepath=...")
+
+        with open(out_path, "r") as f:
+            data = json.load(f)
+        if "cameras" not in data:
+            raise ValueError(
+                f"Invalid cameras meta JSON (no 'cameras' key): {out_path}"
+            )
+
+        cameras_out = copy.deepcopy(data["cameras"])
+        n_changed = 0
+        for cam_id, cam in self.data.items():
+            if only_cam_ids is not None and cam_id not in only_cam_ids:
+                continue
+            if cam_id not in cameras_out:
+                logger.warning(
+                    "Camera %s in memory but not in meta JSON; skipping save for it",
+                    cam_id,
+                )
+                continue
+            new_path = cam.orig_filepath
+            if not new_path:
+                continue
+            if cameras_out[cam_id].get("path") != new_path:
+                cameras_out[cam_id]["path"] = new_path
+                n_changed += 1
+
+        data["cameras"] = cameras_out
+        out_abs = _atomic_write_json(data, out_path)
+        print(f"Saved camera paths to {out_abs}")
+        return n_changed
+
+    def set_filepaths(self, path_by_cam_id: dict) -> None:
+        """Set image filepaths for cameras from a mapping of cam_id -> filepath.
+
+        Args:
+            path_by_cam_id: Mapping of camera id to new image filepath.
+        """
+        for cam_id, path in path_by_cam_id.items():
+            cam = self.data.get(cam_id)
+            if cam is not None:
+                cam.set_filepath(path)
+
+    def missing_image_paths(self, use_orig: bool = False) -> dict:
+        """Cameras whose image file does not exist on disk.
+
+        Zero-byte files are *not* reported as missing: locating an image and
+        validating it are separate jobs.
+
+        Args:
+            use_orig: Check :attr:`Camera.orig_filepath` (the value persisted to
+                the meta JSON) rather than the resolved :attr:`Camera.filepath`,
+                which may have container-level find/replace rules applied.
+
+        Returns:
+            dict: Mapping of camera id to the filepath that was checked, for
+            every camera whose image is absent or unset.
+        """
+        missing = {}
+        for cam_id, cam in self.data.items():
+            path = cam.orig_filepath if use_orig else cam.filepath
+            if not path or not os.path.isfile(path):
+                missing[cam_id] = path
+        return missing
 
     def get_cam_sensor_parameters_from_file(self, cams_xml_filepath):
         """Parse XML file and create Sensor objects, then assign to cameras.
@@ -1644,6 +1759,20 @@ class Camera:
             return self.orig_filepath
         else:
             return self._get_updated_filepath()
+
+    def set_filepath(self, path: str) -> None:
+        """Set this camera's stored image filepath and refresh derived state.
+
+        Assigns :attr:`orig_filepath` (the value persisted to the meta JSON) and
+        recomputes :attr:`filename`, which is otherwise cached at construction
+        and would go stale. Note that :attr:`group` is derived from the
+        filepath, so group membership may change as a result of this call.
+
+        Args:
+            path: New image filepath.
+        """
+        self.orig_filepath = path
+        self.filename = path_basename(path)
 
     @property
     def group(self):

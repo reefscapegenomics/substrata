@@ -224,3 +224,24 @@ RGL_COLOR_CALIBRATIONS = [
     ["target 42", "target 41", "target 40", "target 39", "top-right"],
     ["target 43", "target 44", "target 45", "target 46", "bottom-right"],
 ]
+
+# path-repair: recursive image search for repairing camera image paths.
+PATHREPAIR_IMAGE_EXTS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".dng",
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".arw",
+    ".raf",
+    ".orf",
+)
+# Directory names never descended into when indexing images (in addition to any
+# dot-prefixed directory). Crop folders are excluded because `substrata train`
+# writes crops whose basenames shadow the source photos.
+PATHREPAIR_SKIP_DIR_NAMES = ("__pycache__", "node_modules") + TRAIN_CROP_DIRS
+PATHREPAIR_MAX_REPORT_ROWS = 10  # example rows printed per old-dir -> new-dir mapping

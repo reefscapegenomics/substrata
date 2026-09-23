@@ -61,14 +61,14 @@ substrata orient     # compute scale + world_transform
 
 Rewrite a PLY in a strict Open3D-compatible form (float32 xyz, optional `uchar` RGB, optional float32 normals). Extra vertex properties and non-finite rows are dropped. By default the input is renamed to `<input>_old.ply` and the repaired file is written in its place.
 
-Usage: `substrata repair [--input PLY] [--output PLY] [--local]`
+Usage: `substrata ply-repair [--input PLY] [--output PLY] [--local]`
 
 ```bash
 # Repair in place (original kept as <input>_old.ply)
-substrata repair --input pointcloud.ply
+substrata ply-repair --input pointcloud.ply
 
 # Write the repaired copy to an explicit path (input left untouched)
-substrata repair --input pointcloud.ply --output pointcloud_fixed.ply
+substrata ply-repair --input pointcloud.ply --output pointcloud_fixed.ply
 ```
 
 ## PLY file preview (head)
@@ -368,6 +368,49 @@ substrata camsync -s 0 -u 1 --auto-offsets --yes
 
 # Add a fixed offset (meters) in the pose-source camera frame when copying pose
 substrata camsync -s 0 -u 1 --time-offset 12.5 --xyz 0,0.12,0
+```
+
+## Path repair (path-repair)
+
+A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. `path-repair` checks and repairs both.
+
+It runs in two phases. Phase A repairs the project file paths in the YAML; phase B repairs the per-camera image paths in the meta JSON. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` or `--cams-only` to run just one phase.
+
+Each broken path is resolved by trying, in order: the conventional filename in the project folder, then a recursive search by basename, then asking you. The YAML's `path:` key is repaired first, because every relative value beneath it resolves against that key — one stale `path:` is usually the whole problem. Repaired YAML entries that sit inside the project folder are written as **bare filenames**, so the YAML stays portable and survives the next move.
+
+The YAML is patched line by line, preserving comments, key order and any keys substrata does not itself use. (The initializer's own `save_config_to_yaml` rebuilds the file from scratch and drops anything it does not model, so it is not used here.)
+
+Both phases are planned in full before either writes, so aborting at any point leaves the project untouched. `--dry-run` prints the plan and writes nothing. For camera images, `--find` with `--replace` does a literal substring substitution and refuses to write unless every resulting path exists; `--find`, `--cams-group` and `--sensor-id` restrict which cameras are considered and apply to phase B only.
+
+**Use this instead of `--local`.** That flag rebases every path onto the working directory by basename — unverified, and discarding any nested folder structure — and on `orient`, `scalebars`, `colors` and `firefish --save_yaml` it is then persisted into the YAML as a side effect. `path-repair` changes only the paths that are actually broken, and verifies each result before writing.
+
+Related: `substrata segment --photo-path-replace OLD NEW` applies the same camera substitution for a single run without saving it; `substrata path-repair --find OLD --replace NEW` makes it permanent.
+
+Usage: `substrata path-repair [--yaml-only | --cams-only] [--find STR] [--replace STR] [--cams-group NAME] [--sensor-id ID] [--root DIR] [--dry-run] [--yes]`
+
+```bash
+# Inspect what would change, without writing anything
+substrata path-repair --dry-run
+
+# Repair a project that has been moved or copied to this machine
+substrata path-repair
+
+# Repair only the project YAML, or only the camera images
+substrata path-repair --yaml-only
+substrata path-repair --cams-only
+
+# Search elsewhere for the photos (e.g. an external drive)
+substrata path-repair --root /Volumes/ReefArchive
+
+# Only repair cameras whose stored path mentions the old drive
+substrata path-repair --find /Volumes/OldDrive
+
+# Only repair one camera group, or one sensor
+substrata path-repair --cams-group auv
+substrata path-repair --sensor-id 1
+
+# Literal find/replace on camera paths; refuses to write unless every result exists
+substrata path-repair --find "D:\photos" --replace /data/reefs/photos
 ```
 
 ## Transform annotations

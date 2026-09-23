@@ -30,6 +30,7 @@ from .logging import logger
 
 from .annotations import *
 from .color_calibration import *
+from .pathrepair import *
 from .cameras import *
 from .pointclouds import *
 from .initializer import *

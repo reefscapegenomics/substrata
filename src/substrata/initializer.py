@@ -133,6 +133,7 @@ class ProjectInitializer:
 
         # Filepaths
         self.ply_filepath = self.__add_path_if_needed(ply_file)
+        self.__set_derived_ply_paths()
         self.cams_meta_json_filepath = self.__add_path_if_needed(
             yaml_config.get("cams_meta_json")
         )
@@ -514,6 +515,37 @@ class ProjectInitializer:
             depth_markers.apply_transform(self.world_transform)
 
         return self.up_vector, self.depth_offset, self.depth_per_unit
+
+    def __set_derived_ply_paths(self):
+        """Populate ``ply_dec_path`` and ``ply_full_path`` from the conventions.
+
+        ``init_with_path`` sets these while probing the folder, but the YAML
+        branch previously left them ``None``. Several subcommands (``decimate``,
+        ``ply-repair``, ``head``, ``scalebars``, ``segment --full-ply``) resolve
+        their input through :attr:`ply_full_path`, so in any project carrying a
+        YAML they failed with "No input PLY found" despite a valid ``ply:`` key.
+
+        Both the decimated and full-resolution conventional names are checked
+        against the project directory; whichever exists is recorded. The value
+        of :attr:`ply_filepath` itself is left untouched.
+        """
+        if not self.path or not self.id:
+            return
+        dec_path = os.path.join(self.path, f"{self.id}_dec50M.ply")
+        full_path = os.path.join(self.path, f"{self.id}.ply")
+        if self.ply_dec_path is None and os.path.exists(dec_path):
+            self.ply_dec_path = dec_path
+        if self.ply_full_path is None and os.path.exists(full_path):
+            self.ply_full_path = full_path
+        # A ply: key pointing somewhere non-conventional still counts as the
+        # full-resolution cloud unless it is the decimated file.
+        if (
+            self.ply_full_path is None
+            and self.ply_filepath
+            and self.ply_filepath != self.ply_dec_path
+            and os.path.exists(self.ply_filepath)
+        ):
+            self.ply_full_path = self.ply_filepath
 
     def __add_path_if_needed(self, filename):
         # If filename is an absolute path or contains directories, use it as is.

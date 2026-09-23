@@ -60,6 +60,7 @@ def _load_cameras_class():
             yield
 
         log_mod.tqdm_joblib = tqdm_joblib
+        log_mod.logger = __import__("logging").getLogger("substrata")
         sys.modules["substrata.logging"] = log_mod
 
     if "substrata.cameras" not in sys.modules:
