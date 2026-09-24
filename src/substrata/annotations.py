@@ -1901,7 +1901,7 @@ class Annotation:
         # -safe; single measurements keep the historical default of True.
         generate_image = kwargs.pop("generate_image", True)
         if measurement_func.__name__ == "calc_gap_fraction":
-            gapF_raw, gapF_fill, gapF_image = measurement_func(self, *args)
+            gapF_raw, gapF_fill, gapF_image = measurement_func(self, *args, **kwargs)
             # The image is a cheap byproduct of the computation (needed for the
             # flood-fill), but only retain it when images are requested.
             if not generate_image:

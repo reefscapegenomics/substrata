@@ -4103,11 +4103,24 @@ def visualize_tpi(
         matplotlib.figure.Figure | np.ndarray: Figure object when
         ``interactive=True`` or ``output_filename`` is set; otherwise an
         (H, W, 3) uint8 RGB array.
+
+    Raises:
+        ValueError: If ``tpi_abs`` or ``tpi_plane`` is not one value per point
+            (e.g. the scalar focal-point TPI stored in
+            ``Annotation.measurements``).
     """
     dpi = 100
     pts = np.asarray(pcd.points, dtype=float)
     tpi_abs = np.asarray(tpi_abs, dtype=float)
     tpi_plane = np.asarray(tpi_plane, dtype=float)
+    for name, arr in (("tpi_abs", tpi_abs), ("tpi_plane", tpi_plane)):
+        if arr.shape != (len(pts),):
+            raise ValueError(
+                f"{name} must be a per-point array of shape ({len(pts)},), got "
+                f"shape {arr.shape}. The scalar focal-point values in "
+                "Annotation.measurements cannot be plotted per point; use "
+                "measurements['tpi_image'] (rendered by calc_tpi_and_tri) instead."
+            )
 
     if len(pts) > max_output_points:
         rng = np.random.default_rng(seed=42)

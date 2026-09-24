@@ -181,3 +181,27 @@ class TestVisualizeRgbStats(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class _PointsPC:
+    """Minimal stand-in: visualize_tpi only needs ``.points``."""
+
+    def __init__(self, points):
+        self.points = np.asarray(points, dtype=float)
+
+
+@unittest.skipUnless(v is not None, "requires the open3d/substrata environment")
+class TestVisualizeTpiInputs(unittest.TestCase):
+    def setUp(self):
+        self.pc = _PointsPC(np.random.default_rng(0).normal(size=(50, 3)))
+
+    def test_scalar_tpi_raises_clear_error(self):
+        # Annotation.measurements stores scalar focal-point TPI values.
+        with self.assertRaises(ValueError) as cm:
+            v.visualize_tpi(self.pc, tpi_abs=-0.18, tpi_plane=0.05)
+        self.assertIn("tpi_image", str(cm.exception))
+
+    def test_per_point_arrays_render(self):
+        vals = np.asarray(self.pc.points)[:, 2]
+        img = v.visualize_tpi(self.pc, vals, vals)
+        self.assertEqual(img.ndim, 3)
