@@ -203,7 +203,7 @@ If you use substrata in your research, please cite it as:
 @software{substrata,
   author  = {Bongaerts, Pim},
   title   = {substrata: 3-D point-cloud analysis for coral reef photogrammetry},
-  year    = {2025},
+  year    = {2026},
   version = {0.1.0},
   url     = {https://github.com/reefscapegenomics/substrata}
 }
@@ -234,10 +234,9 @@ former members of the Reefscape Genomics Lab (in alphabetical order):
 - Flore Wijnands: time-series visualizations
 
 Parts of substrata were developed with the help of AI coding assistants, mainly Cursor
-and Anthropic's Claude (via [Claude Code](https://claude.com/claude-code)) [and
-Cursor]. They were used to draft and refactor code, write tests, and prepare
-documentation and tutorials. All AI-assisted changes were directed, reviewed, and 
-tested by the maintainer.
+and Anthropic's Claude (via [Claude Code](https://claude.com/claude-code)). They were 
+used to draft and refactor code, write tests, and prepare documentation. All AI-assisted
+ changes were directed, reviewed, and tested by the maintainer.
 
 ## ⚖️ License
 
