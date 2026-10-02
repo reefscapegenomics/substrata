@@ -228,6 +228,7 @@ former members of the Reefscape Genomics Lab (in alphabetical order):
 
 - Alejandra Hernández: annotation and classification workflow
 - Phaedra Hernández: annotation and classification workflow
+- Jennifer Hoey: terrain measures and visualizations
 - Dennis van Hulten: stratified random point sampling and roughness measures
 - Maxine Mouly: terrain measures and visualizations
 - Katharine Prata: initial workflow and up-vector alignment
