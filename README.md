@@ -203,7 +203,7 @@ If you use substrata in your research, please cite it as:
 @software{substrata,
   author  = {Bongaerts, Pim},
   title   = {substrata: 3-D point-cloud analysis for coral reef photogrammetry},
-  year    = {2025},
+  year    = {2026},
   version = {0.1.0},
   url     = {https://github.com/reefscapegenomics/substrata}
 }

@@ -8,6 +8,7 @@ authors:
     orcid: "https://orcid.org/0000-0001-6747-6044"
     affiliation: "California Academy of Sciences"
 version: 0.1.0
+date-released: "2026-10-02"
 license: MIT
 repository-code: "https://github.com/reefscapegenomics/substrata"
 url: "https://substrata.readthedocs.io/"
