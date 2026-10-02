@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use substrata in your research, please cite it as below."
+title: "substrata: 3-D point-cloud analysis for coral reef photogrammetry"
+type: software
+authors:
+  - given-names: Pim
+    family-names: Bongaerts
+    orcid: "https://orcid.org/0000-0001-6747-6044"
+    affiliation: "California Academy of Sciences"
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/reefscapegenomics/substrata"
+url: "https://substrata.readthedocs.io/"
+abstract: >-
+  substrata is a Python package and command-line tool for processing and
+  analyzing 3-D reconstructions of coral reefs. It takes the outputs of a
+  structure-from-motion pipeline (dense point clouds, camera poses, and image
+  annotations) and turns them into scaled, oriented models that can be
+  measured, annotated, and compared across sites, depths, and time points.
+keywords:
+  - photogrammetry
+  - point cloud
+  - structure from motion
+  - coral reef
+  - 3-D reconstruction
+  - benthic ecology

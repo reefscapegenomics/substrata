@@ -1,0 +1,604 @@
+# Command-line usage of `substrata`
+
+This tutorial walks through the available command-line tools of the `substrata` Python package.
+
+Note: All commands look for a YAML project file or default filenames in the current working directory, unless separately specified. Most commands use the `ProjectInitializer` to auto-detect project files based on the current directory name.
+
+## Decimation of PLY files
+
+Decimate a PLY file to reduce the number of points. With no arguments, uses initializer on CWD, output to `<id>_dec50M.ply`, target = 50,000,000 points.
+
+Usage: `substrata decimate [--input PLY] [--output PLY] [--points N]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata decimate
+
+# With explicit arguments
+substrata decimate --input cur_sna_20m_20200303.ply --output cur_sna_20m_20200303_dec50M.ply --points 50000000
+
+# Using short flags
+substrata decimate --ply input.ply -n 10000000
+```
+
+## Metashape project export
+
+Initialize a substrata project directly from an Agisoft Metashape project (`.psx`). This writes the point cloud (`<id>.ply`), a decimated copy (`<id>_dec50M.ply`), camera calibration/poses (`<id>.cams.xml`, `<id>.meta.json`), markers (`<id>_markers.csv`), and a starter project file (`<id>.yaml`) — everything in raw chunk-local coordinates. Scale and orientation are left for `substrata orient` (or `substrata firefish`) to compute afterward.
+
+Like the other commands, it follows substrata's folder convention: with no arguments it treats the current directory (named `<id>`) as the project folder, exports from `<id>.psx` inside it, and writes all the files alongside it. The common workflow is simply to `cd` into the project folder and run it with no arguments.
+
+The export itself must run inside Metashape's own bundled Python (`substrata` and its dependencies cannot be installed there), so this command shells out to the Metashape executable and runs a packaged export script under it. Metashape must be installed locally. The executable is resolved from `--metashape`, then the `METASHAPE_EXE` environment variable, then common install locations. The point cloud is decimated to `<id>_dec50M.ply` afterward (open3d runs in the substrata environment, not in Metashape's).
+
+By default, outputs that already exist are skipped with a warning and the remaining files are still generated, so a re-run fills in only what is missing (for example, running `--metadata-only` first and then the full command later). Pass `--overwrite` to regenerate everything.
+
+Usage: `substrata metashape-export [--psx PSX] [-o OUTPUT_DIR] [--id ID] [--chunk CHUNK] [--metashape PATH] [--metadata-only] [--overwrite]`
+
+```bash
+# Common usage: run inside the project folder (uses <foldername>.psx)
+cd cur_sna_20m_20200303
+substrata metashape-export
+
+# Cameras + markers only, skipping the (slow) point cloud and decimation
+substrata metashape-export --metadata-only
+
+# Explicit project file and Metashape launcher
+substrata metashape-export --psx project.psx --metashape ~/tools/metashape-pro/metashape.sh
+
+# Write into a different output directory
+substrata metashape-export --psx /data/raw/survey.psx -o /data/projects/cur_sna_20m_20200303
+
+# Choose a specific chunk (by label or 0-based index)
+substrata metashape-export --chunk "dense_chunk"
+
+# Re-run and overwrite everything (otherwise existing files are skipped)
+substrata metashape-export --overwrite
+
+# Typical next step (in the same folder)
+substrata orient     # compute scale + world_transform
+```
+
+## PLY repair (Open3D-compatible rewrite)
+
+Rewrite a PLY in a strict Open3D-compatible form (float32 xyz, optional `uchar` RGB, optional float32 normals). Extra vertex properties and non-finite rows are dropped. By default the input is renamed to `<input>_old.ply` and the repaired file is written in its place.
+
+Usage: `substrata ply-repair [--input PLY] [--output PLY] [--local]`
+
+```bash
+# Repair in place (original kept as <input>_old.ply)
+substrata ply-repair --input pointcloud.ply
+
+# Write the repaired copy to an explicit path (input left untouched)
+substrata ply-repair --input pointcloud.ply --output pointcloud_fixed.ply
+```
+
+## PLY file preview (head)
+
+Show the first N vertex rows from a PLY file.
+
+Usage: `substrata head [--input PLY] [-n N]`
+
+```bash
+# Show first 5 rows (default)
+substrata head
+
+# Show first 10 rows
+substrata head --input pointcloud.ply -n 10
+```
+
+## Visual assessment of scalebars
+
+Generate a scalebar PDF from a point cloud and marker annotations. Optionally save the computed scale factor to YAML.
+
+Usage: `substrata scalebars [--input PLY] [--markers CSV] [--output_pdf PDF] [--points N] [--save_yaml]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata scalebars
+
+# With explicit arguments
+substrata scalebars --input cur_sna_20m_20200303_dec50M.ply --markers cur_sna_20m_20200303_markers.csv --output_pdf ~/scalebar_check.pdf
+
+# Save scale factor to YAML
+substrata scalebars --save_yaml
+
+# Limit points loaded (stream decimation)
+substrata scalebars --points 10000000
+```
+
+## Composite views
+
+Save composite views PDF for a point cloud showing multiple perspectives.
+
+Usage: `substrata views [--input PLY] [--output_pdf PDF]`
+
+```bash
+# Using default behavior
+substrata views
+
+# With explicit output path
+substrata views --input pointcloud.ply --output_pdf views.pdf
+```
+
+## Orientation and scaling
+
+Calculate and apply scale and orientation transforms, then save to YAML. Also generates composite views and camera depth residuals PDFs.
+
+Usage: `substrata orient [--input PLY]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata orient
+
+# With explicit PLY path
+substrata orient --input pointcloud.ply
+```
+
+## Segmentation
+
+Segment the point cloud by reusing the trained crop classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the 224 px patch, then propagate the labels to every point via nearest neighbour. Saves the classified query points to a compact `<id>_seg.npz` (the source of truth) plus a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance). Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
+
+Usage: `substrata segment [--input PLY] [--classifier PKL] [--cell-size M] [--sampling voxel|xy_grid] [--no-occlusion] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--output-npz NPZ] [--output-ply PLY]`
+
+```bash
+# Using default behavior (auto-detects project + classifier from CWD)
+substrata segment
+
+# Use a specific classifier and 10 cm query spacing
+substrata segment --classifier crop_classifier.pkl --cell-size 0.10
+
+# Manual category colours (repeatable): coral=red, macroalgae=green, substrate=yellow
+substrata segment --color CS=ff0000 --color MA=00ff00 --color SU=ffff00
+
+# Top-down sampling (faster; may leave gaps at oblique angles) and no occlusion filtering
+substrata segment --sampling xy_grid --no-occlusion
+
+# Also stream-recolour the full-size PLY to <id>_seg.ply
+substrata segment --full-ply
+```
+
+## Color calibration
+
+Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and optionally store the affine color correction (matrix + offset) in the project YAML. The PLY is always loaded in full when `--input` is given (never stream-decimated).
+
+Usage: `substrata colors [--input PLY] [--markers CSV] [--output_pdf PDF] [-n N] [--save_yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata colors
+
+# Save the affine colour_correction into the project YAML
+substrata colors --save_yaml
+
+# Stream-sample the default YAML PLY to N vertices for a faster QC pass
+substrata colors -n 10000000
+
+# Omit specific ColorChecker cards from the fit (by 0-based index or by name)
+substrata colors --exclude-index 0 --exclude-index 3
+substrata colors --exclude-name top-left
+```
+
+## FireFish alignment
+
+Run FireFish/Cameras alignment to determine up vector and generate output PDF. Initializes FireFish and Cameras, then determines the up vector based on camera depth data.
+
+Usage: `substrata firefish [--firefish-file FILE] [--target-depth M] [--cam-depths-file CSV] [--depth-outlier-threshold M] [--cams_group GROUP] [--offset SEC] [--beam-half-angle DEG] [--distance-percentile P] [--sonar-offset X Y Z] [--depth-sensor-offset X Y Z] [--water-level M] [--recompute-camdists] [--input PLY] [--save_yaml]`
+
+The camera-derived altitude (`camdist`, plotted against the FireFish altitude) is the distance from the camera to the point cloud within a cone around the camera view vector. It is matched to the FireFish Ping2 echosounder by default:
+
+- `--beam-half-angle` (default 12.5): cone half-angle in degrees (the Ping2 has a 25° full −3 dB beamwidth).
+- `--distance-percentile` (default 5): percentile of the in-beam distances, as a proxy for the sonar's first return (nearest surface). Use `-1` for the mean (the behaviour before these options existed, which used a 15° half-angle).
+- `--sonar-offset X Y Z` (default `0 0 0`): sonar position relative to the camera centre in metres, in the camera frame (x: image right, y: image down, z: view direction).
+- `--recompute-camdists`: `camdist` is otherwise only computed when the camdepths CSV does not exist yet.
+
+The up vector is fitted by regressing the FireFish depths against camera positions. If the depth sensor is mounted away from the camera centre, `--depth-sensor-offset X Y Z` (metres, camera frame; default `0 0 0`) regresses the depths against the sensor positions instead, following each photo's orientation (lever-arm correction). For example, a sensor 15 cm behind the camera centre along the view axis is `0 0 -0.15`. With `--save_yaml` the offset is recorded in the YAML as `firefish_depth_sensor_offset`.
+
+The FireFish measures depth below the water surface, which moves with the tide. `--water-level M` (default 0) gives the water level relative to mean sea level during the survey (e.g. from a nearby tide gauge; negative below MSL), and converts all FireFish depths to depth below MSL (depth + water level) before the time sync and regression. It is recorded in the YAML as `firefish_water_level`.
+
+```bash
+# Using default behavior (auto-detects from CWD, infers depth from directory name)
+substrata firefish
+
+# With explicit target depth
+substrata firefish --target-depth 20
+
+# Filter cameras by group
+substrata firefish --cams_group "group_name"
+
+# Save results to YAML
+substrata firefish --save_yaml
+
+# With manual time offset
+substrata firefish --offset 30
+
+# Recompute camdist for a sonar mounted 15 cm from the camera (image-down direction)
+substrata firefish --offset 30 --sonar-offset 0 0.15 0 --recompute-camdists
+
+# Depth sensor 15 cm behind the camera centre (lever-arm correction)
+substrata firefish --depth-sensor-offset 0 0 -0.15
+
+# ... and reference depths to mean sea level (survey at 0.32 m below MSL)
+substrata firefish --depth-sensor-offset 0 0 -0.15 --water-level -0.32
+```
+
+## Camera video creation
+
+Create a video from cameras by drawing image matches. Optionally include annotations in the video.
+
+Usage: `substrata cams2video [--input PLY] [--annotations CSV] [--cams_group GROUP] [--label] [--resolution WIDTH] [--output_mp4 MP4]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata cams2video
+
+# With annotations
+substrata cams2video --annotations annotations.csv
+
+# Filter cameras by group
+substrata cams2video --cams_group "group_name"
+
+# Use label column from annotations
+substrata cams2video --label
+
+# Resize images to specific width
+substrata cams2video --resolution 1920
+
+# Specify output file
+substrata cams2video --output_mp4 output.mp4
+```
+
+## Z-intercepts calculation
+
+Find optimal box position, subdivide to grid, sample random points, and compute Z-intercepts. Optionally apply along-slope transform before processing.
+
+Usage: `substrata intercepts [--input PLY] [--box-length M] [--box-width M] [--box-size M] [--search-radius M] [--slope]`
+
+```bash
+# Using default behavior (top-down intercepts)
+substrata intercepts
+
+# With custom box dimensions
+substrata intercepts --box-length 30.0 --box-width 5.0
+
+# With custom grid cell size
+substrata intercepts --box-size 0.25
+
+# Apply along-slope transform
+substrata intercepts --slope
+
+# Custom search radius
+substrata intercepts --search-radius 0.01
+```
+
+## Intercepts plot
+
+Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. For slope intercepts, pass the orientation (4×4 `world_transform`) that was used at generation time via `--yaml` (e.g. the sibling `<id>_slope_intercepts.yaml` written by `intercepts --slope`) so the grid is axis-aligned. Without it, the coordinates are used as-is (fine for top-down intercepts). When the YAML also carries the exact generation grid (`grid_bbox` + `grid_cell_size`, written since this feature was added), those cells are replayed exactly; otherwise the grid is derived from the annotation extent at `--grid-size`.
+
+When the project point cloud can be found, it is loaded and oriented with the same transform as the annotations and scattered as a background behind the grid cells by default; pass `--hide-points` to disable that (use `--points`/`-n` to cap how many points are loaded).
+
+Each run writes three artifacts sharing the same width (1800 px): the static grid PNG (`<stem>_grid.png`, or `--output`), an animated GIF of the grid filling in cell by cell (`<stem>_grid.gif`), and a positions plot of the annotation markers over the point-cloud ortho map (`<stem>_positions.png`, rendered as `annotations.show(pcd, color=True)`). The positions plot is skipped with a warning when no point cloud is available.
+
+**Manual label colors (`--label-colors`):** supply a plain text file with one `label #hexcolor` per line (the label is everything before the last whitespace token, so labels may contain spaces) to override the automatic `tab20` palette. Any label not listed collapses into a single `OTHER` category; add an `OTHER #hex` row to set its color (default `#999999`). The colors apply consistently to the grid cells/legend, the animation, and the positions markers. Example file:
+
+```
+Coral  #e6194b
+Sand   #f0e442
+Algae  #3cb44b
+OTHER  #999999
+```
+
+**Older intercepts files without a saved `grid_bbox`:** because each intercept is sampled at a random position *within* its generation cell, deriving a fresh grid from the annotation extent phase-misaligns with the generation grid and produces spurious empty ("No data") cells (and doubled-up cells). Two recovery options:
+
+- `--fit-grid` (recommended, point-cloud independent): recovers the generation lattice directly from the intercepts by scanning the sub-cell origin offset for the best one-point-per-cell alignment (`measurements.get_bboxes_from_intercepts`). Robust and needs no point cloud. A small residual of empty cells remains — the irreducible effect of the intercept search radius nudging points across cell boundaries.
+- `--box-length`/`--box-width` (matching the values used by `intercepts`): reconstruct the exact generation grid by re-running the same deterministic optimal-box search on the point cloud and subdividing at `--grid-size`. This only reproduces the generation grid if it sees a bit-identical point cloud, so omit `--points` (decimation shifts the recovered box); `--fit-grid` is usually the safer choice. Use `--position [x,y]` to skip the box search when the box position was set manually, and `--step-size` to match a non-default search resolution.
+
+The animated GIF fills its cells column-by-column by default; `--animation-order` picks a different reveal order — `rows` (top-to-bottom raster), `scan` (columns with a moving scan line), `random` (cells pop in in random order), `spiral` (expand outward from the centre), or `categories` (reveal one label group at a time, most dominant first, ~1s per category — label grids only).
+
+Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--label-colors FILE] [--animation-order ORDER] [--title STR] [--hide-points] [--points N]`
+
+```bash
+# Plot slope intercepts, applying the generation orientation
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 0.2
+
+# Coarser grid (majority vote per larger cell)
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 1.0
+
+# Recover the grid for an older file lacking grid_bbox (fit from intercepts)
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml \
+                          --grid-size 0.2 --fit-grid
+
+# Alternative: reconstruct the exact grid via the point-cloud box search
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+                          --yaml cur_sna_20m_20230414_slope_intercepts.yaml \
+                          --grid-size 0.2 --box-length 25 --box-width 4
+
+# Auto-detect the project's files from the current directory
+substrata intercepts-plot
+
+# Cap the background scatter at 2M points (scatter is on by default)
+substrata intercepts-plot --points 2000000
+
+# Disable the background point-cloud scatter
+substrata intercepts-plot --hide-points
+
+# Custom output path
+substrata intercepts-plot --intercepts topdown_intercepts.csv --output /tmp/grid.png
+
+# Manual label colors (unlisted labels collapse into OTHER)
+substrata intercepts-plot --fit-grid --label-colors label_colors.txt
+
+# Animate the GIF one label group at a time (dominant first, ~1s per category)
+substrata intercepts-plot --fit-grid --animation-order categories
+```
+
+## Point cloud alignment
+
+Register a source PLY to a target PLY and print the alignment transform.
+
+Usage: `substrata align --source PLY --target PLY [--points N]`
+
+```bash
+# Align two point clouds
+substrata align --source source.ply --target target.ply
+
+# Limit points for faster processing
+substrata align --source source.ply --target target.ply --points 5000000
+```
+
+## Image matches
+
+Find image matches of annotations and output cropped images to PDF. Optionally apply a transform to annotation coordinates before matching.
+
+Usage: `substrata images [--input PLY] [--annotations CSV] [--transform] [--pdf-output PDF]`
+
+```bash
+# Using default behavior (auto-detects from CWD)
+substrata images
+
+# With explicit annotations file
+substrata images --annotations annotations.csv
+
+# Apply transform to annotation coordinates (interactive)
+substrata images --transform
+
+# Specify output PDF
+substrata images --pdf-output imagematches.pdf
+```
+
+## Match annotations
+
+Match random point annotations (e.g. a point-intercept CSV) to manual annotations of the same object (e.g. colony annotations in `<id>_ann.csv`). Only random points whose label starts with `--label-prefix` (default `CS`, hard corals; comma-separated list allowed, `''` for all) are considered, and only cameras are loaded (not the point cloud).
+
+For each random point, the nearest manual annotations within `--max-dist` (default 1 m, up to `--max-candidates`, default 5) are candidates. SAM2 runs two tests per candidate:
+
+- fwd: SAM2 segments the candidate in the image it was annotated on, and the test checks whether the random point falls inside.
+- rev: SAM2 segments the random point in its own image, and the test checks which candidates fall inside.
+
+If a point is outside that photo, the most relevant camera that sees both points is used. SAM2's top-scoring mask is used, plus its 2nd mask as a fallback (e.g. the whole colony when the top mask covers one plate). A 2nd mask only counts together with a top-mask agreement in the other direction. SAM2 and a checkpoint are required (default `~/Github/sam2/checkpoints/sam2.1_hiera_large.pt`, see `settings.SAM2_CHECKPOINT`).
+
+Writes a copy of the random CSV (`<random>_matched.csv`) with four added columns:
+
+- `manual_id` and `manual_label`: the matched manual annotation.
+- `manual_label_conf`: the manual annotation's `label_conf`.
+- `match_conf`, one of:
+  - `high`: one candidate agrees both ways with top masks.
+  - `medium`: one candidate agrees both ways using a 2nd mask, or agrees one way only.
+  - `low`: several candidates agree (the nearest is chosen), or none agrees but the nearest is within `--fallback-dist` (5 cm).
+  - empty: unmatched.
+
+A candidate inside the random point's mask whose own mask excludes the random point is ignored, because it is typically hidden behind the colony.
+
+A review PDF (`<random>_matches.pdf`) has one page per flagged point: every point that is not `high`, including unmatched points that had candidates. `--review-all` adds the `high` matches. Pages are ordered low, medium, unmatched, high. Each page shows:
+
+- The random point's image, with its mask in red.
+- The assigned (or nearest) candidate's image, with its mask.
+- A conflicting candidate, or else an overview that sees the most candidates.
+
+Candidates are labelled by their id suffix, with one colour per candidate. Each page also gives the approximate surface area of each colony. To correct a match, edit `manual_id` (and `manual_label`) directly in the matched CSV.
+
+Usage: `substrata match-annotations --random CSV [--manual CSV] [--label-prefix CS] [--max-dist M] [--max-candidates N] [--fallback-dist M] [--sam2-checkpoint PT] [--output CSV] [--pdf-output PDF] [--review-all] [--no-pdf] [--photo-path-replace OLD NEW] [--local]`
+
+```bash
+# Match random points to the project's manual annotations (auto-detects from CWD)
+substrata match-annotations --random ton_ko1_40m_20240930_slope_intercepts.csv
+
+# Explicit manual annotations, and include every match in the review PDF
+substrata match-annotations --random points.csv --manual colonies_ann.csv --review-all
+
+# Match hard and soft corals
+substrata match-annotations --random points.csv --label-prefix CS,SC
+```
+
+## Camera time-sync (camsync)
+
+Copy camera centers/transforms from a *pose-source* sensor (e.g. a GoPro) to an *updated-target* sensor (e.g. a macro camera) using EXIF time matching. Per-camera poses are written to the cameras meta JSON only — the `.cams.xml` is not modified (it is read for sensor calibration). The relative timing of the two sensors can be given manually (`--time-offset` / `--pose-time`) or estimated automatically (`--auto-time` / `--auto-xyz` / `--auto-offsets`); auto modes print a detailed report and prompt before saving unless you pass `--yes`.
+
+Usage: `substrata camsync [--pose-source ID] [--updated-target ID] [--pose-date DATES] [--target-date DATES] [--time-offset SEC | --pose-time TIMESTAMP] [--xyz X,Y,Z] [--auto-time] [--auto-xyz] [--auto-offsets] [--spatial-max-dist M] [--min-spatial-pairs N] [--yes]`
+
+```bash
+# Interactive: lists sensors and prompts for source/target and timing
+substrata camsync
+
+# Sync macro (sensor 1) to GoPro (sensor 0) with a known time offset
+substrata camsync --pose-source 0 --updated-target 1 --time-offset 12.5
+
+# Anchor timing by matching the earliest target image to a pose-source timestamp
+substrata camsync -s 0 -u 1 --pose-time "2020-03-03 14:21:07"
+
+# Estimate both the time offset and the pose-local xyz offset automatically
+substrata camsync -s 0 -u 1 --auto-offsets --yes
+
+# Add a fixed offset (meters) in the pose-source camera frame when copying pose
+substrata camsync -s 0 -u 1 --time-offset 12.5 --xyz 0,0.12,0
+```
+
+## Path repair (path-repair)
+
+A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. `path-repair` checks and repairs both.
+
+It runs in two phases. Phase A repairs the project file paths in the YAML; phase B repairs the per-camera image paths in the meta JSON. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` or `--cams-only` to run just one phase.
+
+Each broken path is resolved by trying, in order: the conventional filename in the project folder, then a recursive search by basename, then asking you. The YAML's `path:` key is repaired first, because every relative value beneath it resolves against that key — one stale `path:` is usually the whole problem. Repaired YAML entries that sit inside the project folder are written as **bare filenames**, so the YAML stays portable and survives the next move.
+
+The YAML is patched line by line, preserving comments, key order and any keys substrata does not itself use. (The initializer's own `save_config_to_yaml` rebuilds the file from scratch and drops anything it does not model, so it is not used here.)
+
+Both phases are planned in full before either writes, so aborting at any point leaves the project untouched. `--dry-run` prints the plan and writes nothing. For camera images, `--find` with `--replace` does a literal substring substitution and refuses to write unless every resulting path exists; `--find`, `--cams-group` and `--sensor-id` restrict which cameras are considered and apply to phase B only.
+
+**Use this instead of `--local`.** That flag rebases every path onto the working directory by basename — unverified, and discarding any nested folder structure — and on `orient`, `scalebars`, `colors` and `firefish --save_yaml` it is then persisted into the YAML as a side effect. `path-repair` changes only the paths that are actually broken, and verifies each result before writing.
+
+Related: `substrata segment --photo-path-replace OLD NEW` applies the same camera substitution for a single run without saving it; `substrata path-repair --find OLD --replace NEW` makes it permanent.
+
+Usage: `substrata path-repair [--yaml-only | --cams-only] [--find STR] [--replace STR] [--cams-group NAME] [--sensor-id ID] [--root DIR] [--dry-run] [--yes]`
+
+```bash
+# Inspect what would change, without writing anything
+substrata path-repair --dry-run
+
+# Repair a project that has been moved or copied to this machine
+substrata path-repair
+
+# Repair only the project YAML, or only the camera images
+substrata path-repair --yaml-only
+substrata path-repair --cams-only
+
+# Search elsewhere for the photos (e.g. an external drive)
+substrata path-repair --root /Volumes/ReefArchive
+
+# Only repair cameras whose stored path mentions the old drive
+substrata path-repair --find /Volumes/OldDrive
+
+# Only repair one camera group, or one sensor
+substrata path-repair --cams-group auv
+substrata path-repair --sensor-id 1
+
+# Literal find/replace on camera paths; refuses to write unless every result exists
+substrata path-repair --find "D:\photos" --replace /data/reefs/photos
+```
+
+## Transform annotations
+
+Load annotations from a CSV, apply one or more transforms (entered interactively) to each annotation's `orig_coords`, and save the result. With `--inverse` the cumulative transform is inverted before being applied.
+
+Usage: `substrata transform INPUT [--output CSV] [--no_header] [--ignore_header] [--inverse]`
+
+```bash
+# Transform annotations; prompts for the transform matrix/matrices
+substrata transform annotations.csv
+
+# Write to an explicit output path
+substrata transform annotations.csv --output annotations_world.csv
+
+# Apply the inverse of the entered transform(s)
+substrata transform annotations.csv --inverse
+```
+
+## Classifier training
+
+Train a FastAI image classifier on crops generated from labelled annotations.
+The command collates the `label` column across all annotation CSVs matching a
+glob pattern in `--csv-path` (default CWD), renders them on the CATAMI hierarchy
+from `classes.csv`, and shows which entries are **bolded** (the seed training
+classes). It then verifies each unique `cam_filepath` directory, and only when
+one is missing does it fall back to the `site/site_depth/model/<final-folder>`
+convention under `--model-path` (or prompt for a substitution), writes a
+consolidated `training_annotations.csv`, and generates `training_crops` /
+`validation_crops` / `test_crops` (80/10/10, assigned deterministically per
+annotation id). Finally it trains the model and reports validation stats
+(printed and written to a `<split>_stats.pdf` with a per-class report, a
+row-normalised confusion matrix, and example classified crops per category —
+one row per category with a red border on misclassified examples). The training
+run itself is also captured in a separate `training_summary.pdf` (the run
+settings, the per-training-class crop counts across the train/validation/test
+splits, and the final-epoch metrics) — kept separate from the evaluation PDF
+because `--validate` / `--test` can be re-run without training. Crops are cut
+at the classifier's input resolution by default (`--crop-size`). Crop filenames
+encode the annotation id, source image, and pixel centre, so a changed
+annotation's stale crop is deleted and regenerated; emptied category folders are
+cleaned up, and a few example paths are shown before any deletion as a safeguard
+against pointing `--output` at the wrong directory.
+
+**Crops are decoupled from category selection.** Folders are named by the
+*raw* label and crops are generated for every label *visible* in the tree —
+not just the trained ones — so changing which categories you consider no longer
+regenerates or deletes crops. Crop generation runs in parallel (`--jobs`,
+default all cores). Empty or unreadable crops (e.g. from a 0-byte/corrupt source
+image) are skipped at training/evaluation time with a warning of how many were
+ignored, so a single bad image can't crash the run; zero-byte crops are also
+regenerated on the next sync.
+
+**Selection and collapsing live in an editable label map.** A
+`training_label_map.csv` (`--label-map` to relocate it; default in `--output`)
+holds one `label,count,training_class` row per *selected* label (the map is not
+cluttered with the sub-threshold/excluded labels, even though their crops still
+exist on disk). It is *seeded* from the bolded tree; blanking a row's
+`training_class` by hand excludes that label. The seeding
+is controlled by `--min-count` / `--tips_only`, or by
+`--include-classes` (an explicit list of category codes from the tree brackets,
+which overrides `--min-count` / `--tips_only` and errors if any code is absent).
+By default only the selected codes themselves are trained; add `--collapse` to
+fold each selected class's non-selected descendants into it — e.g.
+`--include-classes MAF --collapse` trains `MAFG`, `MAF_T`, … as `MAF`, whereas
+without `--collapse` only `MAF` itself is trained and its descendants are
+excluded. By default each run re-seeds the map from the current selection flags,
+so changing `--include-classes` / `--collapse` / `--min-count` takes effect
+immediately. Pass `--keep-map` to instead preserve an existing (hand-edited) map
+and only append newly-seen labels. Both training and `--validate` / `--test`
+read this map, so evaluation always uses the same classes as training.
+
+**Filtering by annotation confidence.** Pass `--min_conf VALUE` to train only on
+annotations whose `label_conf` is `>= VALUE`. Annotations with an *empty* (no
+value) `label_conf` are **included by default**. Use `--min_conf_strict VALUE`
+for the same threshold but treating an empty `label_conf` as `0`, so those
+annotations are excluded whenever `VALUE > 0`. The two flags are mutually
+exclusive. The confidence filter is applied while collating, and the number of
+annotations dropped below the threshold is reported alongside those dropped for
+missing camera fields.
+
+To hand-tune before training, run `--prepare-only`: it generates the crops and
+seeds the map, then **stops**. Edit `training_label_map.csv` (re-point a label to
+another class, or blank one to exclude it), then re-run `substrata train
+--keep-map` to train on the edited map (a plain `substrata train` would re-seed
+it and discard your edits).
+
+Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+
+```bash
+# Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
+substrata train
+
+# Two-step: prepare crops + seed the label map, edit it, then train
+substrata train --include-classes MAF_T MAENRC_C CSE --prepare-only
+$EDITOR training_label_map.csv   # re-point / collapse / exclude labels
+substrata train --keep-map       # trains on the edited map (edits preserved)
+
+# Train parent classes, folding their sub-categories in (MAFG/MAF_T -> MAF)
+substrata train --include-classes MAF MAEN --collapse
+
+# Custom pattern; seed the map from labels with an aggregated count >= 50
+substrata train "*_ann.csv" --min-count 50
+
+# Only train on annotations with label_conf >= 0.8 (empty label_conf kept)
+substrata train --min_conf 0.8
+
+# Same, but treat an empty label_conf as 0 so those annotations are excluded
+substrata train --min_conf_strict 0.8
+
+# Keep a hand-edited map, only appending labels from newly added CSVs
+substrata train --keep-map
+
+# CSVs in one dir, image projects in another, output elsewhere, bigger backbone
+substrata train --csv-path /data/annotations --model-path /data/models \
+    --output /data/training --arch resnet50 --epochs 20
+
+# Re-run validation stats on an existing model (reads the same label map)
+substrata train --validate --model crop_classifier.pkl
+
+# Skip training; evaluate an existing model on the held-out test crops
+substrata train --test --model crop_classifier.pkl
+
+# Non-interactive (auto-confirm, deletions, path fallbacks)
+substrata train --yes
+```
+
