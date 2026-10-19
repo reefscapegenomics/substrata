@@ -139,6 +139,137 @@ class TestOrthoMapFillSmallGaps(unittest.TestCase):
         np.testing.assert_array_equal(om.image[0, 0], [255, 255, 255])
 
 
+try:
+    import cv2  # noqa: F401
+except ImportError:  # pragma: no cover - cv2 only in the conda env
+    cv2 = None
+
+
+class TestOrthoMapFillGaps(unittest.TestCase):
+    def _om(self):
+        """20x20 px at 0.1 m/px: block with a 1-px and a 27-px (0.27 m2) hole."""
+        om = TestOrthoMapFillSmallGaps._om(self)
+        om.resolution = 0.1
+        return om
+
+    def test_m2_limit(self):
+        om = self._om()
+        self.assertEqual(om.fill_gaps(max_gap_m2=0.26, method="average"), 1)
+        np.testing.assert_array_equal(om.image[8, 13], [255, 255, 255])
+        om = self._om()
+        self.assertEqual(om.fill_gaps(max_gap_m2=0.27, method="average"), 28)
+        np.testing.assert_array_equal(om.image[8, 13], [100, 50, 20])
+
+    def test_filled_mask_and_background(self):
+        om = self._om()
+        om.fill_gaps(max_gap_m2=1.0, method="average")
+        self.assertEqual(int(om.filled_mask.sum()), 28)
+        self.assertTrue(om.filled_mask[9, 9] and om.filled_mask[8, 13])
+        self.assertFalse(om.filled_mask[0, 0])
+        np.testing.assert_array_equal(om.image[0, 0], [255, 255, 255])
+
+    def test_average_matches_fill_small_gaps(self):
+        a, b = self._om(), self._om()
+        a.fill_small_gaps(max_gap_px=50)
+        b.fill_gaps(max_gap_px=50, method="average")
+        np.testing.assert_array_equal(a.image, b.image)
+
+    @unittest.skipUnless(cv2 is not None, "requires OpenCV")
+    def test_inpaint_uses_surrounding_colour(self):
+        om = self._om()
+        self.assertEqual(om.fill_gaps(max_gap_m2=1.0), 28)
+        np.testing.assert_allclose(om.image[8, 13], [100, 50, 20], atol=2)
+        np.testing.assert_array_equal(om.image[0, 0], [255, 255, 255])
+
+    def test_invalid_method(self):
+        with self.assertRaises(ValueError):
+            self._om().fill_gaps(method="nope")
+
+    def test_no_limit_fills_all_holes_but_not_background(self):
+        om = self._om()
+        n = om.fill_gaps(max_gap_m2=None, method="local_mean")
+        self.assertEqual(n, 28)
+        np.testing.assert_array_equal(om.image[0, 0], [255, 255, 255])
+
+    def test_no_limit_with_mask_bbox_fills_edge_holes(self):
+        om = self._om()
+        om.mask_bbox = ((0.0, 0.0), (2.0, 2.0))  # whole raster requested
+        n = om.fill_gaps(max_gap_m2=None, method="local_mean")
+        self.assertEqual(n, 400 - 16 * 16 + 28)
+        self.assertFalse(np.all(om.image == 255, axis=-1).any())
+
+    def test_local_mean_uses_surrounding_colour(self):
+        om = self._om()
+        om.fill_gaps(max_gap_m2=1.0, method="local_mean")
+        np.testing.assert_allclose(om.image[8, 13], [100, 50, 20], atol=1)
+        np.testing.assert_array_equal(om.image[0, 0], [255, 255, 255])
+
+
+def _slope_pc(n=80, span=40.0):
+    """Square cloud on [0, span]^2 with z = -60 + y (60 m deep at y=0)."""
+    g = np.mgrid[0:n, 0:n].reshape(2, -1).T / n * span
+    return _PC(np.column_stack([g[:, 0], g[:, 1], -60.0 + g[:, 1]]))
+
+
+class TestOrthoMapIsobaths(unittest.TestCase):
+    def setUp(self):
+        self.om = ortho.OrthoMap(_slope_pc(), pixel_width=200)
+
+    def test_default_isobaths_are_round_multiples(self):
+        depths, ys = self.om.isobath_positions()
+        # Range is 20.5-60 m (inclusive): 60 sits on the deep edge
+        np.testing.assert_allclose(depths, [30, 40, 50, 60])
+        np.testing.assert_allclose(ys, [30, 20, 10, 0], atol=0.5)
+
+    def test_interval_and_custom_depths(self):
+        depths, _ = self.om.isobath_positions(True, interval=5)
+        np.testing.assert_allclose(depths, np.arange(25, 61, 5))
+        depths, ys = self.om.isobath_positions([35, 5, 100])
+        np.testing.assert_allclose(depths, [35])  # out-of-range dropped
+        np.testing.assert_allclose(ys, [25], atol=0.5)
+
+    def test_profile_decreasing_with_y(self):
+        pc = _slope_pc()
+        pc.points[:, 2] = -20.0 - pc.points[:, 1]  # deeper towards +Y
+        depths, ys = ortho.OrthoMap(pc, pixel_width=200).isobath_positions()
+        np.testing.assert_allclose(depths, [20, 30, 40, 50])  # 20-59.5 m
+        np.testing.assert_allclose(ys, [0, 10, 20, 30], atol=0.5)
+
+    def test_show_with_axes_returns_framed_image(self):
+        raw = self.om.show()
+        framed = self.om.show(isobaths=True)
+        self.assertIsInstance(framed, type(raw))
+        self.assertGreater(framed.width, raw.width)
+        self.assertGreater(framed.height, raw.height)
+        cropped = self.om.show(axes=True, crop=([20, 20, 0], 10.0))
+        self.assertEqual(cropped.mode, "RGB")
+
+    def test_depth_at(self):
+        np.testing.assert_allclose(
+            self.om.depth_at(np.array([10.0, 30.0])), [50, 30], atol=0.5
+        )
+        # Outside the plot: clamped to the profile ends
+        self.assertAlmostEqual(float(self.om.depth_at(-5.0)), 60.0, delta=0.5)
+
+    def test_isobath_ends_option(self):
+        with_ends = self.om.show(isobaths=True)
+        without = self.om.show(isobaths=True, isobath_ends=False)
+        self.assertEqual(with_ends.size, without.size)
+        self.assertFalse(
+            np.array_equal(np.asarray(with_ends), np.asarray(without))
+        )
+
+    def test_axes_with_rotation_raises(self):
+        om = ortho.OrthoMap(_slope_pc(), pixel_width=100, rotation=90)
+        with self.assertRaises(ValueError):
+            om.show(axes=True)
+
+    def test_group_rejects_axes(self):
+        group = ortho.OrthoMapGroup([_slope_pc()], pixel_width=100)
+        with self.assertRaises(ValueError):
+            group.show(isobaths=True)
+
+
 class TestOrthoGridDEM(unittest.TestCase):
     def setUp(self):
         self.pc = _ramp_pc()
@@ -193,6 +324,59 @@ class TestOrthoGridReportBbox(unittest.TestCase):
         self.assertEqual(int(og.report_mask.sum()), 4)
         self.assertTrue(og.value_at(0.5, 0.5)["in_report"])
         self.assertFalse(og.value_at(3.5, 3.5)["in_report"])
+
+
+class TestMaskBbox(unittest.TestCase):
+    """``mask_bbox`` crops OrthoMap / OrthoGrid to the given box."""
+
+    def test_orthomap_covers_only_the_box(self):
+        pc = _ramp_pc()  # [0, 4)^2
+        om = ortho.OrthoMap(pc, pixel_width=200, mask_bbox=([1, 1], [3, 3]))
+        np.testing.assert_allclose(om.origin, [1.0, 1.0])
+        self.assertEqual((om.width, om.height), (200, 200))
+        self.assertAlmostEqual(om.resolution, 0.01)
+        self.assertEqual(om.mask_bbox, ((1.0, 1.0), (3.0, 3.0)))
+
+    def test_orthomap_accepts_find_optimal_box_output(self):
+        # find_optimal_box_position returns ([x0, y0], [x1, y1]) with numpy
+        # scalars; corners in any order are accepted.
+        box = ([np.float64(3.0), np.float64(3.0)], [np.float64(1.0), 1.0])
+        om = ortho.OrthoMap(_ramp_pc(), mask_bbox=box)
+        np.testing.assert_allclose(om.origin, [1.0, 1.0])
+
+    def test_orthomap_empty_mask_raises(self):
+        with self.assertRaises(ValueError):
+            ortho.OrthoMap(_ramp_pc(), mask_bbox=([10, 10], [12, 12]))
+
+    def test_orthogrid_lattice_is_the_box(self):
+        og = ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0,
+                             mask_bbox=([0.5, 0.5], [2.5, 2.5]))
+        self.assertEqual((og.x0, og.y0, og.nx, og.ny), (0.5, 0.5, 2, 2))
+        self.assertEqual(int(og.present.sum()), 4)
+        # Only points inside the box: cell [0.5, 1.5) has z == x in that range
+        self.assertAlmostEqual(og.value_at(1.0, 1.0)["value"], 0.95, places=6)
+
+    def test_orthogrid_masks_annotations(self):
+        anns = _Container([_Ann([0.5, 0.5, 0.0], "coral"),
+                           _Ann([3.5, 3.5, 0.0], "algae")])
+        og = ortho.OrthoGrid(annotations=anns, value_by="label", cell_size=1.0,
+                             mask_bbox=([0, 0], [2, 2]))
+        self.assertEqual(int(og.present.sum()), 1)
+        self.assertEqual(og.value_at(0.5, 0.5)["label"], "coral")
+
+    def test_orthogrid_mask_with_report_bbox(self):
+        og = ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0,
+                             bbox=([0, 0], [1, 1]), mask_bbox=([0, 0], [2, 2]))
+        self.assertEqual((og.nx, og.ny), (2, 2))
+        self.assertEqual(int(og.report_mask.sum()), 1)
+
+    def test_orthogrid_show_crops_background(self):
+        og = ortho.OrthoGrid(pcd=_ramp_pc(), value_by="z", cell_size=1.0,
+                             mask_bbox=([1, 1], [3, 3]))
+        fig = og.show()
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
 
 
 class TestOrthoGridLabel(unittest.TestCase):

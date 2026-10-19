@@ -291,6 +291,65 @@ class Transform:
         return cls.from_euler(0.0, 0.0, np.pi) if r < 0 else cls.identity()
 
     @classmethod
+    def align_y_upslope(
+        cls,
+        pcd: "npt.ArrayLike | object",
+        max_points: int = 1_000_000,
+        snap_to_plot_axes: bool = True,
+        min_elongation: float = 2.0,
+    ) -> "Transform":
+        """Rotate about +Z so +Y points upslope, square to the plot's footprint.
+
+        Fits a plane ``z = a*x + b*y + c`` (least squares, on a random subset
+        of at most ``max_points`` points) whose gradient ``(a, b)`` is the
+        steepest upslope direction (the fall line). Unlike align_x_to_vector +
+        ensure_pos_y_is_upslope, this works whichever way the plot is
+        elongated, so the shallow end always ends up at +Y.
+
+        Survey lines rarely run exactly along (or across) the fall line, so
+        with ``snap_to_plot_axes`` the rotation instead uses whichever of the
+        footprint's principal XY axes (long or short) is closest to the fall
+        line, signed to point upslope. The plot's edges then line up with X/Y
+        (axis-aligned bounding boxes fit snugly) while +Y still points
+        (approximately) upslope. Footprints that are not clearly elongated
+        (variance ratio below ``min_elongation``) use the fall line as-is.
+
+        Args:
+            pcd: Object exposing ``points`` or an ``(N, 3)`` array-like.
+            max_points: Cap on points used for the fits.
+            snap_to_plot_axes: Align to the footprint's principal axes rather
+                than the exact fall line (see above).
+            min_elongation: Minimum ratio of the principal XY variances for
+                the footprint axes to be used.
+
+        Returns:
+            The Z-rotation (identity if the cloud is flat).
+        """
+        pts = np.asarray(pcd.points) if hasattr(pcd, "points") else np.asarray(pcd)
+        if len(pts) > max_points:
+            rng = np.random.default_rng(0)
+            pts = pts[rng.choice(len(pts), max_points, replace=False)]
+        if len(pts) < 3:
+            return cls.identity()
+        design = np.c_[pts[:, 0], pts[:, 1], np.ones(len(pts))]
+        (a, b, _), *_ = np.linalg.lstsq(design, pts[:, 2], rcond=None)
+        if np.hypot(a, b) < 1e-12:
+            return cls.identity()
+        direction = np.array([a, b])
+
+        if snap_to_plot_axes:
+            xy = pts[:, :2] - pts[:, :2].mean(axis=0)
+            variances, axes = np.linalg.eigh(np.cov(xy.T))
+            if variances[0] > 0 and variances[1] / variances[0] >= min_elongation:
+                # Footprint axis closest to the fall line, pointing upslope
+                axis = max(axes.T, key=lambda v: abs(v @ direction))
+                direction = axis * np.sign(axis @ direction)
+
+        return cls.from_euler(
+            0.0, 0.0, np.pi / 2 - np.arctan2(direction[1], direction[0])
+        )
+
+    @classmethod
     def align_normal_to_z(cls, normal: "Vector | npt.ArrayLike") -> "Transform":
         """Rotate so *normal* becomes the global +Z axis.
 
@@ -315,6 +374,59 @@ class Transform:
         R = np.vstack((x_n, y_n, n))  # rows → new basis
         T = np.eye(4, dtype=float)
         T[:3, :3] = R
+        return cls(T)
+
+    @classmethod
+    def from_point_correspondences(
+        cls,
+        src: npt.ArrayLike,
+        dst: npt.ArrayLike,
+        with_scaling: bool = True,
+    ) -> "Transform":
+        """Least-squares transform mapping ``src`` points onto ``dst`` points.
+
+        Closed-form Umeyama (1991) solution: a similarity transform (uniform
+        scale, rotation, translation) or, with ``with_scaling=False``, a rigid
+        one. Reflections are excluded.
+
+        Args:
+            src: (N, 3) source points.
+            dst: (N, 3) corresponding destination points.
+            with_scaling: If True, also estimate a uniform scale.
+
+        Returns:
+            Transform: 4 × 4 matrix with ``dst ≈ T.apply_to_points(src)``.
+
+        Raises:
+            ValueError: If the shapes differ, fewer than 3 points are given, or
+                the source points are collinear.
+        """
+        p = np.asarray(src, dtype=float)
+        q = np.asarray(dst, dtype=float)
+        if p.ndim != 2 or p.shape[1] != 3 or p.shape != q.shape:
+            raise ValueError("`src` and `dst` must both have shape (N, 3).")
+        if len(p) < 3:
+            raise ValueError(f"At least 3 point pairs are required; got {len(p)}.")
+
+        p_mean, q_mean = p.mean(axis=0), q.mean(axis=0)
+        p_c, q_c = p - p_mean, q - q_mean
+        sv = np.linalg.svd(p_c, compute_uv=False)
+        if sv[0] == 0 or sv[1] <= 1e-9 * sv[0]:
+            raise ValueError("Source points are degenerate (coincident or collinear).")
+
+        # Cross-covariance and its SVD; D flips the last axis to avoid reflections
+        U, S, Vt = np.linalg.svd(q_c.T @ p_c / len(p))
+        D = np.eye(3)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            D[2, 2] = -1.0
+        R = U @ D @ Vt
+        s = 1.0
+        if with_scaling:
+            s = float(np.trace(np.diag(S) @ D) / (p_c**2).sum(axis=1).mean())
+
+        T = np.eye(4, dtype=float)
+        T[:3, :3] = s * R
+        T[:3, 3] = q_mean - s * R @ p_mean
         return cls(T)
 
     # --------------------------------------------------------------------- numeric operators
@@ -468,6 +580,65 @@ def calculate_vector_angle(opposite_y, adjacent_x):
     return np.degrees(np.arctan2(opposite_y, adjacent_x))
 
 
+def fit_correspondences_rejecting_outliers(
+    src: npt.ArrayLike,
+    dst: npt.ArrayLike,
+    with_scaling: bool = True,
+    max_residual: float | None = None,
+    mad_k: float = 5.0,
+    max_iter: int = 20,
+) -> Tuple[Transform, np.ndarray]:
+    """Fit ``src`` → ``dst`` while iteratively discarding outlier pairs.
+
+    Repeatedly fits :meth:`Transform.from_point_correspondences` on the current
+    inliers and recomputes the residuals of *all* pairs, keeping those within
+    the threshold, until the inlier set no longer changes. Pairs dropped in an
+    early (outlier-biased) fit can therefore return once the fit improves.
+
+    Args:
+        src: (N, 3) source points.
+        dst: (N, 3) corresponding destination points.
+        with_scaling: If True, also estimate a uniform scale.
+        max_residual: Fixed residual threshold in ``dst`` units. If None, a
+            robust threshold of ``median + mad_k * 1.4826 * MAD`` of the
+            current inlier residuals is used.
+        mad_k: Number of (MAD-based) standard deviations for the automatic
+            threshold.
+        max_iter: Maximum number of refits.
+
+    Returns:
+        (transform, inliers): the final transform and a boolean mask of the
+            pairs used for it.
+
+    Raises:
+        ValueError: If the initial fit fails (see
+            :meth:`Transform.from_point_correspondences`).
+    """
+    p = np.asarray(src, dtype=float)
+    q = np.asarray(dst, dtype=float)
+    inliers = np.ones(len(p), dtype=bool)
+    T = Transform.from_point_correspondences(p, q, with_scaling=with_scaling)
+    for _ in range(max_iter):
+        residuals = np.linalg.norm(T.apply_to_points(p) - q, axis=1)
+        if max_residual is not None:
+            threshold = max_residual
+        else:
+            r_in = residuals[inliers]
+            median = np.median(r_in)
+            threshold = median + mad_k * 1.4826 * np.median(np.abs(r_in - median))
+        new_inliers = residuals <= threshold
+        if new_inliers.sum() < 3 or np.array_equal(new_inliers, inliers):
+            break
+        try:
+            T_new = Transform.from_point_correspondences(
+                p[new_inliers], q[new_inliers], with_scaling=with_scaling
+            )
+        except ValueError:
+            break
+        T, inliers = T_new, new_inliers
+    return T, inliers
+
+
 def transform_coords(coords: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Transforms a 3D coordinate using a 4x4 homogeneous transformation matrix.
 
@@ -560,3 +731,125 @@ def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
     return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u + (
         np.sin(t * angle) / np.sin(angle)
     ) * v
+
+
+# ----------------------------------------------------------------------- geodesy
+
+# WGS84 ellipsoid (semi-major axis in metres, flattening)
+WGS84_A = 6378137.0
+WGS84_F = 1.0 / 298.257223563
+
+
+def ecef_to_geodetic(xyz: "npt.ArrayLike") -> Tuple[float, float, float]:
+    """Convert a WGS84 geocentric (ECEF) point to geodetic coordinates.
+
+    Uses Bowring's closed-form approximation (sub-millimetre for points near
+    the Earth's surface).
+
+    Args:
+        xyz: ECEF ``(x, y, z)`` in metres.
+
+    Returns:
+        Tuple of ``(lat_deg, lon_deg, height_m)`` (ellipsoidal height).
+    """
+    x, y, z = np.asarray(xyz, dtype=float)
+    a = WGS84_A
+    b = a * (1.0 - WGS84_F)
+    e2 = WGS84_F * (2.0 - WGS84_F)
+    ep2 = (a * a - b * b) / (b * b)
+    lon = np.arctan2(y, x)
+    p = np.hypot(x, y)
+    theta = np.arctan2(z * a, p * b)
+    lat = np.arctan2(
+        z + ep2 * b * np.sin(theta) ** 3, p - e2 * a * np.cos(theta) ** 3
+    )
+    n = a / np.sqrt(1.0 - e2 * np.sin(lat) ** 2)
+    h = p / np.cos(lat) - n
+    return float(np.degrees(lat)), float(np.degrees(lon)), float(h)
+
+
+def geodetic_to_ecef(lat_deg: float, lon_deg: float, h: float = 0.0) -> FloatArray:
+    """Convert WGS84 geodetic coordinates to a geocentric (ECEF) point.
+
+    Args:
+        lat_deg: Latitude in degrees.
+        lon_deg: Longitude in degrees.
+        h: Ellipsoidal height in metres.
+
+    Returns:
+        ECEF ``(x, y, z)`` in metres.
+    """
+    lat, lon = np.radians(lat_deg), np.radians(lon_deg)
+    e2 = WGS84_F * (2.0 - WGS84_F)
+    n = WGS84_A / np.sqrt(1.0 - e2 * np.sin(lat) ** 2)
+    return np.array(
+        [
+            (n + h) * np.cos(lat) * np.cos(lon),
+            (n + h) * np.cos(lat) * np.sin(lon),
+            (n * (1.0 - e2) + h) * np.sin(lat),
+        ]
+    )
+
+
+def ecef_to_enu_transform(lat_deg: float, lon_deg: float, h: float = 0.0) -> FloatArray:
+    """Build the 4x4 transform from ECEF to a local East-North-Up frame.
+
+    The ENU origin is the point ``(lat_deg, lon_deg, h)``; +X points east, +Y
+    north and +Z up (along the ellipsoid normal).
+
+    Args:
+        lat_deg: Origin latitude in degrees.
+        lon_deg: Origin longitude in degrees.
+        h: Origin ellipsoidal height in metres.
+
+    Returns:
+        4x4 homogeneous transform (metres in, metres out).
+    """
+    lat, lon = np.radians(lat_deg), np.radians(lon_deg)
+    sl, cl = np.sin(lat), np.cos(lat)
+    so, co = np.sin(lon), np.cos(lon)
+    rot = np.array(
+        [
+            [-so, co, 0.0],
+            [-sl * co, -sl * so, cl],
+            [cl * co, cl * so, sl],
+        ]
+    )
+    t = np.eye(4, dtype=float)
+    t[:3, :3] = rot
+    t[:3, 3] = -rot @ geodetic_to_ecef(lat_deg, lon_deg, h)
+    return t
+
+
+def chunk_transform_to_enu(
+    chunk_transform: "npt.ArrayLike", ref_point: "npt.ArrayLike"
+) -> Tuple[FloatArray, float, Tuple[float, float]]:
+    """Convert a Metashape chunk transform into a local metric ENU transform.
+
+    Metashape's ``chunk.transform.matrix`` maps chunk-internal coordinates to
+    geocentric (ECEF) metres. Applying it directly yields Earth-centred
+    coordinates (~6e6 m, Z along the Earth's axis), so it is composed with an
+    ECEF -> East-North-Up rotation at the geodetic position of ``ref_point``.
+    The ENU origin is placed at ellipsoidal height 0, so the resulting Z equals
+    the ellipsoidal height (i.e. -depth when camera references are depths).
+
+    Args:
+        chunk_transform: 4x4 chunk-to-ECEF transform (similarity transform).
+        ref_point: A point in chunk coordinates (e.g. the cloud centre) whose
+            latitude/longitude defines the ENU origin.
+
+    Returns:
+        Tuple of ``(transform, scale_factor, (lat_deg, lon_deg))``: the 4x4
+        chunk-to-ENU transform, the uniform scale it contains (metres per
+        chunk unit) and the ENU origin.
+    """
+    chunk = np.asarray(chunk_transform, dtype=float)
+    if chunk.shape != (4, 4):
+        raise ValueError(f"chunk_transform must have shape (4, 4); got {chunk.shape}")
+    scale = float(np.cbrt(np.linalg.det(chunk[:3, :3])))
+    if scale <= 0:
+        raise ValueError("chunk_transform has a non-positive determinant")
+    ref_ecef = transform_coords(np.asarray(ref_point, dtype=float), chunk)
+    lat, lon, _ = ecef_to_geodetic(ref_ecef)
+    enu = ecef_to_enu_transform(lat, lon, 0.0)
+    return enu @ chunk, scale, (lat, lon)

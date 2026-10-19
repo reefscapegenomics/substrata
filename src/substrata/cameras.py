@@ -278,6 +278,19 @@ class Cameras:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
+    def _filename_prefixes(self) -> set:
+        """Unique filename prefixes across all cameras (used by Camera.group).
+
+        Cached per ``data`` dict and size, so deriving every camera's group is
+        linear instead of quadratic in the number of cameras.
+        """
+        cache = getattr(self, "_prefix_cache", None)
+        if cache is None or cache[0] is not self.data or cache[1] != len(self.data):
+            prefixes = {_filename_prefix(cam.filename) for cam in self.data.values()}
+            cache = (self.data, len(self.data), prefixes)
+            self._prefix_cache = cache
+        return cache[2]
+
     @property
     def group_names(self):
         """Sorted list of unique group names across all cameras."""
@@ -539,6 +552,44 @@ class Cameras:
         ids = [getattr(cam, "cam_id", None) for cam in cams_list]
         ids = [cid for cid in ids if cid is not None]
         return self.filter_by_ids(ids)
+
+    def match_by_name(self, other: "Cameras") -> list[tuple[str, "Camera", "Camera"]]:
+        """Pair cameras in this container with same-named cameras in ``other``.
+
+        Cameras are matched on their image filename stem (case-insensitive,
+        extension ignored), irrespective of folder or camera group, so e.g. AUV
+        images included in a focal-plot model pair with the same images in the
+        AUV model. Cameras without a pose (placeholder from the meta JSON) are
+        ignored, and names occurring more than once in either container are
+        skipped as ambiguous.
+
+        Args:
+            other: Cameras container to match against.
+
+        Returns:
+            Sorted list of ``(name, self_camera, other_camera)`` tuples.
+        """
+
+        def _index(cams: "Cameras", label: str) -> dict:
+            by_name, dupes = {}, set()
+            for cam in cams.data.values():
+                if getattr(cam, "missing_pose_from_meta", False):
+                    continue
+                name = os.path.splitext(cam.filename)[0].lower()
+                if name in by_name:
+                    dupes.add(name)
+                by_name[name] = cam
+            if dupes:
+                logger.warning(
+                    "Skipping %d camera name(s) occurring more than once in %s: %s",
+                    len(dupes),
+                    label,
+                    sorted(dupes),
+                )
+            return {k: v for k, v in by_name.items() if k not in dupes}
+
+        own, theirs = _index(self, "source"), _index(other, "target")
+        return [(name, own[name], theirs[name]) for name in sorted(own.keys() & theirs)]
 
     def reset_depth_sensor_m(self):
         """Reset the depth_sensor_m attribute for all cameras to None."""
@@ -1818,6 +1869,9 @@ class Camera:
         """
         self.orig_filepath = path
         self.filename = path_basename(path)
+        # Invalidate the parent's cached filename prefixes (see Camera.group)
+        if getattr(self, "parent", None) is not None:
+            self.parent._prefix_cache = None
 
     @property
     def group(self):
@@ -1844,25 +1898,15 @@ class Camera:
 
             # Handle filename prefix extraction
             filename = self.filename
-            if "_" in filename:
-                filename_prefix = filename.split("_", 1)[0]
-            else:
-                filename_prefix = os.path.splitext(filename)[0]
+            filename_prefix = _filename_prefix(filename)
 
             # Determine if there are multiple unique filename prefixes in the parent
             parent = getattr(self, "parent", None)
-            unique_prefixes = set()
-            if parent is not None and hasattr(parent, "data"):
-                for cam in parent.data.values():
-                    fname = cam.filename
-                    if "_" in fname:
-                        prefix = fname.split("_", 1)[0]
-                    else:
-                        prefix = os.path.splitext(fname)[0]
-                    unique_prefixes.add(prefix)
+            if parent is not None and hasattr(parent, "_filename_prefixes"):
+                unique_prefixes = parent._filename_prefixes()
             else:
                 # If no parent, fallback to just this camera's prefix
-                unique_prefixes.add(filename_prefix)
+                unique_prefixes = {filename_prefix}
 
             if len(unique_prefixes) > 1 and "_" in filename:
                 group = f"{folder_group}_{filename_prefix}"
@@ -3397,6 +3441,13 @@ class Video:
 
         if len(self.frames) > max_frames:
             print(f"... and {len(self.frames) - max_frames} more frames")
+
+
+def _filename_prefix(filename: str) -> str:
+    """Prefix used for camera grouping: text before the first '_', else the stem."""
+    if "_" in filename:
+        return filename.split("_", 1)[0]
+    return os.path.splitext(filename)[0]
 
 
 def _sensor_offset_units(sensor_offset, scale_factor=1.0):

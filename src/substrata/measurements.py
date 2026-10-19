@@ -1109,11 +1109,9 @@ def calc_benthic_fraction(
     learn = classification.get_image_classifier(classifier) \
         if isinstance(classifier, str) else classifier
 
-    # Sample the surface at each grid XY -> InterceptAnnotations. Align the
-    # container transform with the pcd so the annotation/pcd/cam frames agree
-    # (get_image_matches enforces this).
+    # Sample the surface at each grid XY -> InterceptAnnotations (in the pcd's
+    # frame, with its world_transform, as get_image_matches requires).
     intercepts = pcd.get_z_intercepts(xy_coords, intercept_search_radius)
-    intercepts.world_transform = pcd.world_transform
     result["n_intercepts"] = len(intercepts)
     if len(intercepts) == 0:
         logger.info(
@@ -1218,7 +1216,6 @@ def calc_benthic_fraction(
                 focal_anns = pcd.get_z_intercepts(
                     np.array([focal_xy]), intercept_search_radius
                 )
-                focal_anns.world_transform = pcd.world_transform
                 for fann in focal_anns.data.values():
                     fann.get_image_matches(
                         cam_list, max_cams=1, pcd=pcd, use_orig_coords=False,

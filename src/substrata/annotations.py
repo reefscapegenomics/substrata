@@ -1117,6 +1117,74 @@ class Annotations:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
 
+    def subset_by_depth_range(
+        self, min_depth: float, max_depth: float
+    ) -> "Annotations":
+        """Return annotations whose ``depth_in_m`` lies within a depth range.
+
+        Depth comes from the depth regression (``up_vector``/``depth_offset``),
+        not from ``z``. It is compared as a magnitude, so the range is in positive
+        metres whether the project stores depth as positive or as negative height
+        (e.g. after ``orient --use_chunk_transform``). Both bounds are inclusive
+        and may be given in either order.
+
+        If the regression is not set, ``z`` of the transformed coordinates is
+        used instead (again as a magnitude), with a warning. This fallback needs
+        transformed coordinates: annotations whose ``coords`` are still their
+        ``orig_coords`` are left out, because their ``z`` is in the arbitrary
+        model frame.
+
+        Args:
+            min_depth: Shallow bound in metres (e.g. ``8``).
+            max_depth: Deep bound in metres (e.g. ``12``).
+
+        Returns:
+            New container (keeping this one's metadata) with the annotations in
+            range. Annotations without coordinates are left out.
+
+        Raises:
+            ValueError: If the regression is not set and no annotation has
+                transformed coordinates.
+        """
+        low, high = sorted((abs(min_depth), abs(max_depth)))
+        annotations_subset = self._empty_like()
+        if (
+            getattr(self, "up_vector", None) is not None
+            and getattr(self, "depth_offset", None) is not None
+        ):
+            for ann in self.data.values():
+                if ann.orig_coords is None:
+                    continue
+                if low <= abs(ann.depth_in_m) <= high:
+                    annotations_subset.data[ann.id] = ann
+            return annotations_subset
+
+        transformed = [
+            ann
+            for ann in self.data.values()
+            if ann.coords is not None
+            and ann.orig_coords is not None
+            and not np.allclose(ann.coords, ann.orig_coords)
+        ]
+        if not transformed:
+            raise ValueError(
+                "Annotations 'up_vector' and/or 'depth_offset' not set and no "
+                "transformed coordinates available; cannot filter by depth"
+            )
+        logger.warning(
+            "Annotations 'up_vector' and/or 'depth_offset' not set; "
+            "filtering on z of the transformed coords instead of depth_in_m"
+        )
+        if len(transformed) < len(self.data):
+            logger.warning(
+                f"{len(self.data) - len(transformed)} annotation(s) without "
+                "transformed coordinates left out"
+            )
+        for ann in transformed:
+            if low <= abs(ann.coords[2]) <= high:
+                annotations_subset.data[ann.id] = ann
+        return annotations_subset
+
     def _empty_like(self) -> "Annotations":
         """Return an empty Annotations container inheriting this instance's metadata."""
         subset = Annotations()

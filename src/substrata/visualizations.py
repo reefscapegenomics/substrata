@@ -5902,3 +5902,426 @@ def plot_views(
         ax.tick_params(pad=2)
 
     return fig
+
+
+# --------------------------------------------------------------------------
+# Point-cloud correspondence QC (e.g. a focal plot aligned onto an AUV model)
+# --------------------------------------------------------------------------
+
+
+def _pcd_xyz_rgb(pcd):
+    """Return ``(points, colors)`` arrays for any supported point cloud type."""
+    pts = np.asarray(pcd.points, dtype=float)
+    cols = getattr(pcd, "colors", None)
+    cols = None if cols is None else np.asarray(cols, dtype=float)
+    if cols is None or cols.shape != pts.shape:
+        cols = np.full_like(pts, 0.5)
+    return pts, cols
+
+
+def _subsample_idx(n, k, rng):
+    """Indices of at most ``k`` of ``n`` items (all of them if ``n <= k``)."""
+    if n <= k:
+        return np.arange(n)
+    return np.sort(rng.choice(n, size=k, replace=False))
+
+
+def plot_pcd_context(
+    src,
+    tgt,
+    labels=("source", "target"),
+    units="m",
+    title=None,
+    max_output_points=200_000,
+    ortho_pixel_width=2000,
+    width=12,
+    height=11,
+):
+    """Show where ``src`` sits within the whole of ``tgt``.
+
+    Both clouds must already be in the same frame. Intended for e.g. a focal
+    plot aligned onto a large AUV model: a top-down RGB ortho of the target
+    with the source footprint outlined, plus XZ and YZ side profiles of the
+    target with the source overlaid, to check that the source lies at the
+    expected position and z (depth).
+
+    Args:
+        src: Source point cloud (PointCloud, SimplePointCloud or Open3D).
+        tgt: Target point cloud, same frame as ``src``.
+        labels: Names used for ``src`` and ``tgt`` in legends.
+        units: Coordinate unit label.
+        title: Optional figure title.
+        max_output_points: Maximum points per cloud in the profile scatters.
+        ortho_pixel_width: Width in pixels of the target ortho raster.
+        width: Figure width in inches.
+        height: Figure height in inches.
+
+    Returns:
+        matplotlib.figure.Figure: The generated figure.
+    """
+    from matplotlib.path import Path
+    from scipy.spatial import ConvexHull
+
+    from types import SimpleNamespace
+
+    from substrata.ortho import OrthoMap
+
+    rng = np.random.default_rng(0)
+    s_pts, _ = _pcd_xyz_rgb(src)
+    t_pts, t_cols = _pcd_xyz_rgb(tgt)
+    s_lab, t_lab = labels
+
+    s_sub = s_pts[_subsample_idx(len(s_pts), max_output_points, rng)]
+    t_sub = t_pts[_subsample_idx(len(t_pts), max_output_points, rng)]
+    hull = s_sub[ConvexHull(s_sub[:, :2]).vertices, :2]
+    hull_closed = np.vstack([hull, hull[:1]])
+    centroid = s_pts.mean(axis=0)
+
+    # Target z within the source footprint (convex hull)
+    in_fp = Path(hull).contains_points(t_sub[:, :2])
+    t_z_fp = t_sub[in_fp, 2]
+
+    fig = plt.figure(figsize=(width, height))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.4, 1.0])
+
+    # Top-down ortho of the full target, and zoomed on the source footprint
+    ortho = OrthoMap(
+        SimpleNamespace(points=t_pts, colors=t_cols), pixel_width=ortho_pixel_width
+    )
+    x0, y0 = ortho.origin
+    extent = (
+        x0,
+        x0 + ortho.width * ortho.resolution,
+        y0,
+        y0 + ortho.height * ortho.resolution,
+    )
+    s_lo, s_hi = s_sub.min(axis=0), s_sub.max(axis=0)
+    half = 0.75 * max(s_hi[0] - s_lo[0], s_hi[1] - s_lo[1])
+    for col, zoom in enumerate((False, True)):
+        ax_map = fig.add_subplot(gs[0, col])
+        ax_map.imshow(ortho.image, extent=extent, interpolation="nearest")
+        ax_map.fill(hull[:, 0], hull[:, 1], color="tab:red", alpha=0.2, lw=0)
+        ax_map.plot(hull_closed[:, 0], hull_closed[:, 1], color="tab:red", lw=1.5,
+                    label=f"{s_lab} footprint")
+        ax_map.plot(*centroid[:2], marker="+", color="tab:red", ms=12, mew=2)
+        if zoom:
+            ax_map.set_xlim(centroid[0] - half, centroid[0] + half)
+            ax_map.set_ylim(centroid[1] - half, centroid[1] + half)
+            ax_map.set_title("Zoomed on footprint")
+        else:
+            ax_map.set_title("Source footprint within target")
+            ax_map.legend(loc="upper right", fontsize=8)
+        ax_map.set_aspect("equal")
+        ax_map.set_xlabel(f"x ({units})")
+        ax_map.set_ylabel(f"y ({units})")
+
+    lines = [
+        f"{s_lab} centroid: ({centroid[0]:.2f}, {centroid[1]:.2f}, "
+        f"{centroid[2]:.2f}) {units}",
+        f"{s_lab} z range: {s_pts[:, 2].min():.2f} to {s_pts[:, 2].max():.2f}",
+    ]
+    if len(t_z_fp):
+        lines.append(
+            f"{t_lab} z in footprint: {t_z_fp.min():.2f} to {t_z_fp.max():.2f}"
+        )
+    lines.append(
+        f"{t_lab} z range (all): {t_pts[:, 2].min():.2f} to {t_pts[:, 2].max():.2f}"
+    )
+    ax_map.text(
+        0.01, 0.01, "\n".join(lines), transform=ax_map.transAxes, fontsize=8,
+        va="bottom", ha="left",
+        bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9),
+    )
+
+    # Side profiles of the target in a band through the source footprint
+    # (full length along the profile axis), with the source overlaid
+    for col, (axis, across, name, other) in enumerate(
+        ((0, 1, "x", "y"), (1, 0, "y", "x"))
+    ):
+        ax = fig.add_subplot(gs[1, col])
+        band = (t_pts[:, across] >= s_lo[across]) & (
+            t_pts[:, across] <= s_hi[across]
+        )
+        t_band = t_pts[band]
+        t_band = t_band[_subsample_idx(len(t_band), max_output_points, rng)]
+        ax.scatter(t_band[:, axis], t_band[:, 2], s=0.2, c="0.6", lw=0,
+                   label=t_lab, rasterized=True)
+        ax.scatter(s_sub[:, axis], s_sub[:, 2], s=0.2, c="tab:red", lw=0,
+                   label=s_lab, rasterized=True)
+        ax.set_xlabel(f"{name} ({units})")
+        ax.set_ylabel(f"z ({units})")
+        ax.set_title(f"{name}–z profile (target within source {other}-range)")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.legend(loc="best", fontsize=8, markerscale=20)
+        ax.grid(True, alpha=0.3)
+
+    if title is not None:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_pcd_correspondence(
+    src,
+    tgt,
+    labels=("source", "target"),
+    units="m",
+    title=None,
+    max_sample_points=1_000_000,
+    max_output_points=200_000,
+    margin=0.05,
+    width=14,
+    height=14,
+    return_stats=False,
+):
+    """Show how well ``src`` coincides with ``tgt`` in their overlap.
+
+    Both clouds must already be in the same frame. The target is cropped to
+    the source bounding box (plus ``margin`` of its extent) and, for a sample
+    of source points, two distances are computed:
+
+    - C2C: distance to the nearest target point (3-D).
+    - dz: signed vertical difference, source z minus the z of a plane fitted
+      to the 8 nearest target points (undefined on near-vertical surfaces and
+      over target gaps); a systematic vertical offset shows up directly here.
+
+    Panels: top-down maps of C2C and dz, their histograms (with the target
+    point spacing in the overlap, which bounds the attainable C2C), and two
+    thin cross-sections through the overlap centre with both clouds overlaid.
+
+    Args:
+        src: Source point cloud (PointCloud, SimplePointCloud or Open3D).
+        tgt: Target point cloud, same frame as ``src``.
+        labels: Names used for ``src`` and ``tgt`` in legends.
+        units: Coordinate unit label; with ``"m"`` the share of points within
+            2/5/10 cm is reported.
+        title: Optional figure title.
+        max_sample_points: Source points used for the distance statistics.
+        max_output_points: Maximum points drawn in the map panels.
+        margin: Fraction of the source extent added around it when cropping
+            the target.
+        width: Figure width in inches.
+        height: Figure height in inches.
+        return_stats: If True, also return the statistics dict.
+
+    Returns:
+        matplotlib.figure.Figure, or ``(fig, stats)`` if ``return_stats``.
+    """
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(0)
+    s_pts, _ = _pcd_xyz_rgb(src)
+    t_pts, _ = _pcd_xyz_rgb(tgt)
+    s_lab, t_lab = labels
+
+    lo, hi = s_pts.min(axis=0), s_pts.max(axis=0)
+    pad = margin * (hi - lo)
+    in_box = np.all((t_pts >= lo - pad) & (t_pts <= hi + pad), axis=1)
+    t_crop = t_pts[in_box]
+    if len(t_crop) == 0:
+        raise ValueError(f"No {t_lab} points overlap the {s_lab} bounding box")
+
+    s_sample = s_pts[_subsample_idx(len(s_pts), max_sample_points, rng)]
+    t_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(t_crop))
+    s_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(s_sample))
+    c2c = np.asarray(s_o3d.compute_point_cloud_distance(t_o3d))
+    spacing_idx = _subsample_idx(len(t_crop), 200_000, rng)
+    spacing, _ = cKDTree(t_crop).query(t_crop[spacing_idx], k=2)
+    spacing = float(np.median(spacing[:, 1]))
+
+    # dz: vertical distance from each source point to a plane fitted to its
+    # 8 nearest target points (3-D neighbours keep the matching surface
+    # under overhangs; the plane stops a slope from absorbing the offset).
+    # NaN on near-vertical surfaces and where the target has a gap.
+    d_nn, i_nn = cKDTree(t_crop).query(s_sample, k=8)
+    nbrs = t_crop[i_nn]
+    nb_mean = nbrs.mean(axis=1)
+    rel = nbrs - nb_mean[:, None, :]
+    _, vecs = np.linalg.eigh(np.einsum("nki,nkj->nij", rel, rel))
+    normal = vecs[:, :, 0]
+    tilt = np.einsum("ni,ni->n", normal[:, :2], s_sample[:, :2] - nb_mean[:, :2])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z_plane = nb_mean[:, 2] - tilt / normal[:, 2]
+    dz = s_sample[:, 2] - z_plane
+    dz[(np.abs(normal[:, 2]) < 0.3) | (d_nn[:, -1] > 10 * spacing)] = np.nan
+    dz_ok = dz[np.isfinite(dz)]
+
+    stats = {
+        "n_sample": int(len(s_sample)),
+        "n_target_overlap": int(len(t_crop)),
+        "target_spacing": spacing,
+        "c2c_median": float(np.median(c2c)),
+        "c2c_p90": float(np.percentile(c2c, 90)),
+        "dz_median": float(np.median(dz_ok)) if len(dz_ok) else float("nan"),
+        "dz_iqr": (
+            float(np.subtract(*np.percentile(dz_ok, [75, 25])))
+            if len(dz_ok)
+            else float("nan")
+        ),
+        "dz_coverage": float(len(dz_ok) / len(dz)),
+    }
+    if units == "m":
+        for cm in (2, 5, 10):
+            stats[f"c2c_within_{cm}cm"] = float(np.mean(c2c < cm / 100))
+
+    fig = plt.figure(figsize=(width, height))
+    gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 0.8, 0.9])
+    draw = _subsample_idx(len(s_sample), max_output_points, rng)
+    xy = s_sample[draw, :2]
+
+    # Top-down maps
+    ax = fig.add_subplot(gs[0, 0])
+    vmax = float(np.percentile(c2c, 95))
+    sc = ax.scatter(xy[:, 0], xy[:, 1], c=c2c[draw], s=0.3, lw=0,
+                    cmap="magma_r", vmin=0, vmax=vmax, rasterized=True)
+    fig.colorbar(sc, ax=ax, shrink=0.8, label=f"C2C ({units})")
+    ax.set_title("C2C distance source → target")
+    ax.set_aspect("equal")
+    ax.set_xlabel(f"x ({units})")
+    ax.set_ylabel(f"y ({units})")
+
+    ax = fig.add_subplot(gs[0, 1])
+    # Robust colour/histogram range: walls and edges give a few large |dz|
+    dz_lim = (
+        abs(stats["dz_median"]) + 3 * stats["dz_iqr"] if len(dz_ok) else 1.0
+    ) or 1.0
+    dz_draw = dz[draw]
+    ok = np.isfinite(dz_draw)
+    ax.scatter(xy[~ok, 0], xy[~ok, 1], s=0.3, lw=0, c="0.85", rasterized=True)
+    sc = ax.scatter(xy[ok, 0], xy[ok, 1], c=dz_draw[ok], s=0.3, lw=0,
+                    cmap="RdBu_r", vmin=-dz_lim, vmax=dz_lim, rasterized=True)
+    fig.colorbar(sc, ax=ax, shrink=0.8, label=f"dz ({units})")
+    ax.set_title("Vertical offset dz = z(source) − z(target)  [grey: n/a]")
+    ax.set_aspect("equal")
+    ax.set_xlabel(f"x ({units})")
+    ax.set_ylabel(f"y ({units})")
+
+    # Histograms
+    ax = fig.add_subplot(gs[1, 0])
+    ax.hist(c2c, bins=100, range=(0, float(np.percentile(c2c, 99))), color="0.4")
+    ax.axvline(stats["c2c_median"], color="tab:red", lw=1.5)
+    ax.axvline(spacing, color="tab:blue", lw=1, ls="--")
+    txt = [
+        f"median {stats['c2c_median']:.4f}, p90 {stats['c2c_p90']:.4f} {units}",
+        f"{t_lab} spacing in overlap {spacing:.4f} {units} (dashed)",
+    ]
+    if units == "m":
+        txt.append(
+            "within 2/5/10 cm: "
+            + " / ".join(f"{stats[f'c2c_within_{cm}cm']:.0%}" for cm in (2, 5, 10))
+        )
+    ax.text(0.98, 0.95, "\n".join(txt), transform=ax.transAxes, ha="right",
+            va="top", fontsize=8)
+    ax.set_xlabel(f"C2C ({units})")
+    ax.set_ylabel("points")
+
+    ax = fig.add_subplot(gs[1, 1])
+    lim = 2 * dz_lim
+    ax.hist(dz_ok, bins=100, range=(-lim, lim), color="0.4")
+    ax.axvline(0, color="k", lw=0.8)
+    ax.axvline(stats["dz_median"], color="tab:red", lw=1.5)
+    ax.text(0.98, 0.95,
+            f"median {stats['dz_median']:+.4f} {units}\nIQR {stats['dz_iqr']:.4f}"
+            f"\ncoverage {stats['dz_coverage']:.0%}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=8)
+    ax.set_xlabel(f"dz ({units})")
+    ax.set_ylabel("points")
+
+    # Thin cross-sections through the overlap centre
+    centre = (lo + hi) / 2
+    thickness = max(0.005 * float(np.linalg.norm(hi - lo)), 3 * spacing)
+    for col, (along, across, name) in enumerate(((0, 1, "x"), (1, 0, "y"))):
+        ax = fig.add_subplot(gs[2, col])
+        t_sl = t_crop[np.abs(t_crop[:, across] - centre[across]) < thickness / 2]
+        s_sl = s_pts[np.abs(s_pts[:, across] - centre[across]) < thickness / 2]
+        t_sl = t_sl[_subsample_idx(len(t_sl), max_output_points, rng)]
+        s_sl = s_sl[_subsample_idx(len(s_sl), max_output_points, rng)]
+        ax.scatter(t_sl[:, along], t_sl[:, 2], s=0.5, lw=0, c="0.3", label=t_lab,
+                   rasterized=True)
+        ax.scatter(s_sl[:, along], s_sl[:, 2], s=0.5, lw=0, c="tab:red",
+                   label=s_lab, rasterized=True)
+        other = "y" if name == "x" else "x"
+        ax.set_title(
+            f"Cross-section along {name} ({other} = {centre[across]:.2f} "
+            f"± {thickness / 2:.3f} {units})"
+        )
+        ax.set_xlabel(f"{name} ({units})")
+        ax.set_ylabel(f"z ({units})")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.legend(loc="best", fontsize=8, markerscale=10)
+        ax.grid(True, alpha=0.3)
+
+    if title is not None:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return (fig, stats) if return_stats else fig
+
+
+def plot_camera_correspondence(
+    src_xyz,
+    tgt_xyz,
+    inliers=None,
+    units="m",
+    labels=("source", "target"),
+    title=None,
+    width=12,
+    height=6,
+):
+    """Plot residuals between matched camera positions in a common frame.
+
+    Args:
+        src_xyz: (N, 3) source camera centres, already transformed into the
+            target frame.
+        tgt_xyz: (N, 3) corresponding target camera centres.
+        inliers: Optional boolean mask of pairs used for the fit; the others
+            are drawn as rejected outliers.
+        units: Coordinate unit label.
+        labels: Names used for source and target.
+        title: Optional figure title.
+        width: Figure width in inches.
+        height: Figure height in inches.
+
+    Returns:
+        matplotlib.figure.Figure: The generated figure.
+    """
+    src_xyz = np.asarray(src_xyz, dtype=float)
+    tgt_xyz = np.asarray(tgt_xyz, dtype=float)
+    residuals = np.linalg.norm(src_xyz - tgt_xyz, axis=1)
+    inl = np.ones(len(residuals), bool) if inliers is None else np.asarray(inliers)
+    r_in = residuals[inl]
+
+    fig, (ax_map, ax_hist) = plt.subplots(
+        1, 2, figsize=(width, height), gridspec_kw={"width_ratios": [1.4, 1]}
+    )
+    sc = ax_map.scatter(tgt_xyz[inl, 0], tgt_xyz[inl, 1], c=r_in, s=12,
+                        cmap="viridis", vmin=0, vmax=float(r_in.max()))
+    fig.colorbar(sc, ax=ax_map, shrink=0.8, label=f"residual ({units})")
+    if (~inl).any():
+        ax_map.scatter(tgt_xyz[~inl, 0], tgt_xyz[~inl, 1], marker="x", s=20,
+                       c="tab:red", label=f"rejected ({int((~inl).sum())})")
+        ax_map.legend(loc="best", fontsize=8)
+    ax_map.set_aspect("equal", adjustable="datalim")
+    ax_map.set_xlabel(f"x ({units})")
+    ax_map.set_ylabel(f"y ({units})")
+    ax_map.set_title(f"Matched cameras at {labels[1]} positions")
+
+    rms = float(np.sqrt(np.mean(r_in**2)))
+    ax_hist.hist(r_in, bins=40, color="0.4", label=f"inliers ({int(inl.sum())})")
+    ax_hist.axvline(rms, color="tab:red", lw=1.5)
+    txt = f"inlier RMS {rms:.4f} {units}\nmedian {np.median(r_in):.4f} {units}"
+    if (~inl).any():
+        txt += (
+            f"\nrejected: {residuals[~inl].min():.3f} to "
+            f"{residuals[~inl].max():.3f} {units}"
+        )
+    ax_hist.text(0.98, 0.95, txt, transform=ax_hist.transAxes, ha="right",
+                 va="top", fontsize=8)
+    ax_hist.set_xlabel(f"residual ({units})")
+    ax_hist.set_ylabel("cameras")
+    ax_hist.set_title("Inlier residuals")
+
+    if title is not None:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig

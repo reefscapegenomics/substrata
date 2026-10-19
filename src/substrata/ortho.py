@@ -97,6 +97,7 @@ class OrthoMap:
         pixel_height: Optional[int] = None,
         rotation: int = 0,
         color_mode: str = "mean",
+        mask_bbox=None,
     ) -> None:
         """Initialize an OrthoMap from a point cloud.
 
@@ -121,6 +122,12 @@ class OrthoMap:
                 over darker points below or behind them and gives a
                 brighter, crisper image (at the cost of more sensitivity
                 to stray bright points).
+            mask_bbox: Optional ``([xmin, ymin], [xmax, ymax])`` box in the
+                projected frame (world XY for the default top-down view),
+                e.g. the output of
+                :func:`substrata.measurements.find_optimal_box_position`.
+                Points outside it are dropped and the image covers exactly
+                the box.
         """
         if color_mode not in ("mean", "brightest"):
             raise ValueError(
@@ -137,21 +144,30 @@ class OrthoMap:
         self.rotation: np.ndarray = self._rotation_to_z(up)
         points = np.asarray(pcd.points)
         rotated = (self.rotation @ points.T).T
-        xs, ys = rotated[:, 0], rotated[:, 1]
+        xs, ys, zs = rotated[:, 0], rotated[:, 1], rotated[:, 2]
+        colors = self._get_colors(pcd, len(points))
 
-        min_x, max_x = float(xs.min()), float(xs.max())
-        min_y, max_y = float(ys.min()), float(ys.max())
+        self.mask_bbox = None
+        if mask_bbox is not None:
+            min_x, min_y, max_x, max_y = _bbox_bounds(mask_bbox)
+            self.mask_bbox = ((min_x, min_y), (max_x, max_y))
+            keep = (xs >= min_x) & (xs <= max_x) & (ys >= min_y) & (ys <= max_y)
+            if not keep.any():
+                raise ValueError("OrthoMap: no points inside mask_bbox")
+            xs, ys, zs, colors = xs[keep], ys[keep], zs[keep], colors[keep]
+        else:
+            min_x, max_x = float(xs.min()), float(xs.max())
+            min_y, max_y = float(ys.min()), float(ys.max())
         extent_x = max(max_x - min_x, 1e-9)
         extent_y = max(max_y - min_y, 1e-9)
         self.origin = np.array([min_x, min_y])
         self.width, self.height, self.resolution = (
             self._compute_dimensions(
-                extent_x, extent_y, len(points),
+                extent_x, extent_y, len(xs),
                 pixel_width, pixel_height,
             )
         )
 
-        colors = self._get_colors(pcd, len(points))
         self.image: np.ndarray = self._rasterize(
             xs, ys, colors,
             min_x, min_y,
@@ -159,10 +175,11 @@ class OrthoMap:
             self.width, self.height,
             color_mode=color_mode,
         )
+        self.z_profile = self._depth_profile(ys, zs, min_y, max_y)
 
         logger.info(
             "OrthoMap created: %d x %d px  (%.6f m/px, %d points)",
-            self.width, self.height, self.resolution, len(points),
+            self.width, self.height, self.resolution, len(xs),
         )
 
     # ------------------------------------------------------------------
@@ -218,7 +235,8 @@ class OrthoMap:
         ``max_gap_px`` pixels are filled with the mean colour of their
         filled neighbours, growing inwards until closed. Larger empty areas,
         including the background around the cloud, are left untouched. The
-        raster is modified in place.
+        raster is modified in place. See :meth:`fill_gaps` for a size limit
+        in square metres and a cleaner (inpainting) fill for larger holes.
 
         Args:
             max_gap_px: Largest empty patch (in pixels) that is filled.
@@ -226,21 +244,161 @@ class OrthoMap:
         Returns:
             int: Number of pixels filled.
         """
-        from scipy import ndimage
+        return self.fill_gaps(
+            max_gap_m2=None, max_gap_px=max_gap_px, method="average"
+        )
 
-        img = self.image
-        empty = np.all(img == 255, axis=-1)
-        labels, n = ndimage.label(empty)
-        if n == 0:
-            return 0
-        sizes = np.bincount(labels.ravel())
-        small = sizes <= max_gap_px
-        small[0] = False  # label 0 = filled pixels
-        todo = small[labels]
+    def fill_gaps(
+        self,
+        max_gap_m2: Optional[float] = 4.0,
+        max_gap_px: Optional[int] = None,
+        method: str = "inpaint",
+        inpaint_radius_px: int = 5,
+        local_mean_sigma_m: float = 0.5,
+    ) -> int:
+        """Fill holes in the raster (e.g. unreconstructed patches between lines).
+
+        Empty (pure white) patches, 4-connected, up to a maximum area are
+        filled from their surroundings; larger empty areas, including the
+        background around the cloud, are left untouched. With
+        ``max_gap_m2=None`` every hole is filled regardless of size; the
+        background is then recognised as empty areas touching the image edge
+        (unless the map was built with ``mask_bbox``, in which case the whole
+        raster is the requested area and edge holes are filled too). The
+        raster is
+        modified in place and the filled pixels are recorded in
+        ``self.filled_mask``. This is cosmetic: the fill is interpolated from
+        neighbouring colours, not taken from the photos.
+
+        Args:
+            max_gap_m2: Largest hole (in square metres) that is filled, or
+                ``None`` for no limit (see above). Ignored when *max_gap_px*
+                is given.
+            max_gap_px: Largest hole in pixels (overrides *max_gap_m2*).
+            method: ``"inpaint"`` (default) uses OpenCV's Telea inpainting,
+                which continues colours and structure inwards from the hole
+                edge (clean and fast, also for large holes); falls back to
+                ``"average"`` if OpenCV is not installed. ``"average"`` grows
+                the hole closed with the mean colour of filled neighbours
+                (smoother; slow for large holes). ``"local_mean"`` fills each
+                pixel with the Gaussian-weighted mean colour of the filled
+                pixels around it (doubling the radius where none are in
+                reach): a smooth, streak-free fill suited to large holes.
+            inpaint_radius_px: Neighbourhood radius for ``"inpaint"``.
+            local_mean_sigma_m: Initial Gaussian sigma (metres) for
+                ``"local_mean"``.
+
+        Returns:
+            int: Number of pixels filled.
+        """
+        if method not in ("inpaint", "average", "local_mean"):
+            raise ValueError(
+                "method must be 'inpaint', 'average' or 'local_mean', "
+                f"got {method!r}"
+            )
+        if max_gap_px is None and max_gap_m2 is not None:
+            max_gap_px = int(np.ceil(max_gap_m2 / self.resolution**2))
+
+        empty, todo = self._gap_mask(max_gap_px)
         n_fill = int(todo.sum())
+        self.filled_mask = todo
         if n_fill == 0:
             return 0
 
+        if method == "inpaint":
+            try:
+                import cv2
+            except ImportError:
+                logger.warning("OpenCV not available; using method='average'")
+                method = "average"
+        if method == "inpaint":
+            from scipy import ndimage
+
+            # Empty pixels near a hole (background, larger holes) must not be
+            # used as source colour: mark them unknown too, but only write
+            # back the hole pixels themselves.
+            near = ndimage.binary_dilation(
+                todo, iterations=inpaint_radius_px + 1
+            )
+            painted = cv2.inpaint(
+                np.ascontiguousarray(self.image),
+                (todo | (empty & near)).astype(np.uint8),
+                inpaint_radius_px,
+                cv2.INPAINT_TELEA,
+            )
+            self.image[todo] = painted[todo]
+        elif method == "local_mean":
+            self._fill_local_mean(todo, empty, local_mean_sigma_m)
+        else:
+            self._fill_average(todo, empty)
+        logger.info(
+            "Filled %d gap pixels (holes <= %s px, method=%s)",
+            n_fill, max_gap_px, method,
+        )
+        return n_fill
+
+    def _gap_mask(
+        self, max_px: Optional[int]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return ``(empty, todo)``: all white pixels, and those in holes.
+
+        Holes are empty components of at most *max_px* pixels; with
+        ``max_px=None`` all components except those touching the image edge
+        (the background) unless the map is cropped to a ``mask_bbox``.
+        """
+        from scipy import ndimage
+
+        empty = np.all(self.image == 255, axis=-1)
+        labels, n = ndimage.label(empty)
+        if n == 0:
+            return empty, np.zeros_like(empty)
+        if max_px is None:
+            fill = np.ones(n + 1, dtype=bool)
+            if getattr(self, "mask_bbox", None) is None:
+                edge = np.concatenate(
+                    [labels[0], labels[-1], labels[:, 0], labels[:, -1]]
+                )
+                fill[np.unique(edge)] = False
+        else:
+            fill = np.bincount(labels.ravel()) <= max_px
+        fill[0] = False  # label 0 = filled pixels
+        return empty, fill[labels]
+
+    def _fill_local_mean(
+        self, todo: np.ndarray, empty: np.ndarray, sigma_m: float
+    ) -> None:
+        """Fill *todo* with the Gaussian-weighted mean of nearby filled pixels.
+
+        Normalised convolution: blur the colours of filled pixels and their
+        weights, and divide. Pixels with no filled pixel in reach are retried
+        with a doubled sigma.
+        """
+        from scipy import ndimage
+
+        img = self.image
+        valid = (~empty).astype(np.float64)
+        rgb = img.astype(np.float64) * valid[..., None]
+        sigma = max(sigma_m / self.resolution, 1.0)
+        left = todo.copy()
+        while left.any():
+            weight = ndimage.gaussian_filter(valid, sigma, truncate=3.0)
+            ready = left & (weight > 1e-6)
+            for c in range(3):
+                total = ndimage.gaussian_filter(rgb[..., c], sigma, truncate=3.0)
+                img[..., c][ready] = np.clip(
+                    np.round(total[ready] / weight[ready]), 0, 255
+                ).astype(np.uint8)
+            left &= ~ready
+            if sigma > max(img.shape[:2]):
+                break
+            sigma *= 2.0
+
+    def _fill_average(self, todo: np.ndarray, empty: np.ndarray) -> None:
+        """Grow *todo* closed with the mean colour of filled neighbours."""
+        from scipy import ndimage
+
+        img = self.image
+        todo = todo.copy()
         valid = ~empty
         acc = img.astype(np.float64) * valid[..., None]
         kernel = np.ones((3, 3))
@@ -257,8 +415,6 @@ class OrthoMap:
             todo &= ~ready
         filled = empty & valid
         img[filled] = np.clip(np.round(acc[filled]), 0, 255).astype(np.uint8)
-        logger.info("Filled %d gap pixels (patches <= %d px)", n_fill, max_gap_px)
-        return n_fill
 
     def show(
         self,
@@ -286,6 +442,10 @@ class OrthoMap:
         grayscale: bool = False,
         image_opacity: float = 1.0,
         crop: Optional[Tuple] = None,
+        axes: bool = False,
+        isobaths: Union[bool, List[float], np.ndarray, None] = None,
+        isobath_interval: float = 10.0,
+        isobath_ends: bool = True,
     ) -> Image.Image:
         """Return the ortho map as a PIL Image with optional highlights.
 
@@ -345,11 +505,30 @@ class OrthoMap:
                 drawn afterward and are unaffected.
             crop: ``(center, size_metres)`` window to crop to, where
                 *center* is a coordinate (used for zoom-to-annotation).
+            axes: Frame the map with X/Y axes in metres (rendered with
+                matplotlib; the result is still returned as a PIL Image).
+                Not available together with an in-plane ``rotation``.
+            isobaths: Add a depth axis on the right, parallel to Y, with a
+                tick where the plot's mean depth (along Y) crosses each
+                isobath. ``True`` uses multiples of *isobath_interval*
+                (0, 10, 20, ... m); a list/array gives custom depths. Depths
+                are metres below the surface (positive), i.e. ``z = -depth``;
+                only isobaths within the plot's depth range are shown.
+                Implies *axes*.
+            isobath_interval: Spacing in metres for ``isobaths=True``.
+            isobath_ends: Also label the mean depth at the top and bottom of
+                the shown window (lighter, one decimal, no tick), so the depth
+                axis covers the whole plot. An end label too close to an
+                isobath tick is skipped.
 
         Returns:
             PIL ``Image`` with the orthographic map and any requested
             highlights rendered.
         """
+        if isobaths is not None and isobaths is not False:
+            axes = True
+        if axes and self._rotation:
+            raise ValueError("axes/isobaths are not supported with rotation")
         if background_color is not None:
             arr = self.image.copy()
             bg_mask = np.all(arr == 255, axis=-1)
@@ -415,13 +594,167 @@ class OrthoMap:
                     point_shape, point_size_metres, point_outline_width,
                 )
 
+        display_size = img.size
+        box = (0, 0, img.width, img.height)
         if crop is not None:
-            img = self._crop_to(img, crop)
+            box = self._crop_box(img, crop)
+            img = img.crop(box)
 
         if self._rotation:
             img = img.rotate(-self._rotation, expand=True)
 
+        if axes:
+            img = self._render_axes(
+                img, box, display_size, isobaths, isobath_interval, isobath_ends
+            )
         return img
+
+    # ------------------------------------------------------------------
+    # Axes / isobaths
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _depth_profile(ys, zs, min_y: float, max_y: float, n_bins: int = 200):
+        """Mean z per Y bin, as ``(y_centres, z_means)`` (empty bins dropped)."""
+        if len(ys) == 0 or max_y <= min_y:
+            return None
+        edges = np.linspace(min_y, max_y, n_bins + 1)
+        idx = np.clip(np.searchsorted(edges, ys, side="right") - 1, 0, n_bins - 1)
+        counts = np.bincount(idx, minlength=n_bins)
+        sums = np.bincount(idx, weights=zs, minlength=n_bins)
+        ok = counts > 0
+        centres = (edges[:-1] + edges[1:]) / 2.0
+        return centres[ok], sums[ok] / counts[ok]
+
+    def isobath_positions(
+        self,
+        depths: Union[bool, List[float], np.ndarray, None] = True,
+        interval: float = 10.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Y position (projected frame) where the mean depth crosses each isobath.
+
+        Uses the mean z per Y bin recorded when the map was built, made
+        monotonic in the direction of its overall trend, so each isobath maps
+        to a single Y.
+
+        Args:
+            depths: ``True`` for multiples of *interval*, or custom depths in
+                metres below the surface (positive; ``z = -depth``).
+            interval: Isobath spacing for ``depths=True``.
+
+        Returns:
+            ``(depths, ys)`` for the isobaths within the plot's depth range.
+        """
+        y, z_mono = self._monotonic_profile()
+        d_lo, d_hi = -z_mono[-1], -z_mono[0]  # shallowest / deepest
+        if depths is True:
+            if interval <= 0:
+                raise ValueError("isobath_interval must be positive")
+            first = np.ceil(d_lo / interval) * interval
+            depths = np.arange(first, d_hi + 1e-9, interval)
+        depths = np.asarray(depths, dtype=float).reshape(-1)
+        depths = depths[(depths >= d_lo) & (depths <= d_hi)]
+        return depths, np.interp(-depths, z_mono, y)
+
+    def depth_at(self, y: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        """Mean plot depth (metres, positive) at projected Y position(s).
+
+        Read from the same monotonic depth profile as
+        :meth:`isobath_positions`; Y outside the plot is clamped to its ends.
+        """
+        y_prof, z_mono = self._monotonic_profile()
+        order = np.argsort(y_prof)
+        return -np.interp(y, y_prof[order], z_mono[order])
+
+    def _monotonic_profile(self) -> Tuple[np.ndarray, np.ndarray]:
+        """``(y, z)`` profile with z made monotonic increasing (y reordered).
+
+        The mean z per Y bin is turned into a running maximum along the
+        overall trend (z rising or falling with Y), so each depth maps to a
+        single Y despite small bumps.
+        """
+        profile = getattr(self, "z_profile", None)
+        if profile is None or len(profile[0]) < 2:
+            raise ValueError("No depth profile available for isobaths")
+        y, z = profile
+        if np.polyfit(y, z, 1)[0] >= 0:
+            return y, np.maximum.accumulate(z)
+        return y[::-1], np.maximum.accumulate(z[::-1])
+
+    def _render_axes(
+        self, img, box, display_size, isobaths, isobath_interval,
+        isobath_ends=True,
+    ) -> Image.Image:
+        """Frame *img* with metre X/Y axes (and isobath ticks) via matplotlib.
+
+        *box* is the shown window in pixels of the (resized) display raster
+        of size *display_size*.
+        """
+        from io import BytesIO
+
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        # Metre extent of the shown window (box is in display pixels)
+        left, top, right, bottom = box
+        m_per_px_x = self.width * self.resolution / display_size[0]
+        m_per_px_y = self.height * self.resolution / display_size[1]
+        y_top = self.origin[1] + self.height * self.resolution
+        extent = [
+            self.origin[0] + left * m_per_px_x,
+            self.origin[0] + right * m_per_px_x,
+            y_top - bottom * m_per_px_y,
+            y_top - top * m_per_px_y,
+        ]
+
+        dpi = 100.0
+        margin_l, margin_r, margin_b, margin_t = 0.9, 1.0, 0.7, 0.2
+        w_in, h_in = img.width / dpi, img.height / dpi
+        fig = Figure(
+            figsize=(w_in + margin_l + margin_r, h_in + margin_b + margin_t),
+            dpi=dpi,
+        )
+        FigureCanvasAgg(fig)
+        fw, fh = fig.get_size_inches()
+        ax = fig.add_axes(
+            [margin_l / fw, margin_b / fh, w_in / fw, h_in / fh]
+        )
+        ax.imshow(np.asarray(img), extent=extent, origin="upper",
+                  interpolation="nearest")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+
+        if isobaths is not None and isobaths is not False:
+            depths, ys = self.isobath_positions(isobaths, isobath_interval)
+            inside = (ys >= extent[2]) & (ys <= extent[3])
+            if not inside.any():
+                logger.warning("No isobaths within the shown depth range")
+            ticks = list(ys[inside])
+            labels = [f"{d:g}" for d in depths[inside]]
+            n_iso = len(ticks)
+            if isobath_ends:
+                # Mean depth at the window's bottom and top edges, unless an
+                # isobath tick is already close by (within 3% of the axis)
+                min_gap = 0.03 * (extent[3] - extent[2])
+                for y_end in (extent[2], extent[3]):
+                    if all(abs(y_end - t) >= min_gap for t in ticks[:n_iso]):
+                        ticks.append(y_end)
+                        labels.append(f"{float(self.depth_at(y_end)):.1f}")
+            ax2 = ax.twinx()
+            ax2.set_ylim(ax.get_ylim())
+            ax2.set_yticks(ticks)
+            ax2.set_yticklabels(labels)
+            ax2.tick_params(axis="y", length=6)
+            for tick in ax2.yaxis.get_major_ticks()[n_iso:]:
+                tick.tick2line.set_markersize(0)
+                tick.label2.set_color("0.5")
+                tick.label2.set_fontstyle("italic")
+            ax2.set_ylabel("Depth (m)")
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -703,10 +1036,11 @@ class OrthoMap:
                 outline_colors.append(col)
         return fill_colors, outline_colors
 
-    def _crop_to(self, img: Image.Image, crop: Tuple) -> Image.Image:
-        """Crop *img* to a metre-space window ``(center, size_metres)``.
+    def _crop_box(self, img: Image.Image, crop: Tuple) -> Tuple[int, int, int, int]:
+        """Pixel box ``(left, top, right, bottom)`` for a crop of *img*.
 
-        The box is clamped to the image bounds so no padding is added.
+        *crop* is a metre-space window ``(center, size_metres)``. The box is
+        clamped to the image bounds so no padding is added.
         """
         center, size_m = crop
         center = np.asarray(center, dtype=np.float64).reshape(-1)
@@ -724,8 +1058,8 @@ class OrthoMap:
         right = min(img.width, int(round(cx + half_w)))
         bottom = min(img.height, int(round(cy + half_h)))
         if right <= left or bottom <= top:
-            return img
-        return img.crop((left, top, right, bottom))
+            return (0, 0, img.width, img.height)
+        return (left, top, right, bottom)
 
     @staticmethod
     def _resize(
@@ -1228,6 +1562,11 @@ class OrthoMapGroup(OrthoMap):
         if label_colors is not None:
             kwargs["label_colors"] = label_colors
 
+        if kwargs.get("axes") or kwargs.get("isobaths") not in (None, False):
+            raise ValueError(
+                "axes/isobaths are not supported for OrthoMapGroup (its layout "
+                "frame is not a shared metric frame)"
+            )
         highlights = self._build_highlights(annotations_list)
         img = super().show(highlights=highlights, color_by=color_by, **kwargs)
 
@@ -1497,6 +1836,21 @@ def _resolve_label(ann) -> Optional[str]:
     return str(lbl) if lbl not in (None, "") else None
 
 
+def _bbox_bounds(bbox) -> Tuple[float, float, float, float]:
+    """Return ``(xmin, ymin, xmax, ymax)`` from a ``([x, y], [x, y])`` bbox.
+
+    Accepts any nested form (lists, tuples, arrays; extra coordinates such as
+    z are ignored) and corners in either order.
+    """
+    a, b = bbox
+    a = np.asarray(a, dtype=float).reshape(-1)
+    b = np.asarray(b, dtype=float).reshape(-1)
+    return (
+        float(min(a[0], b[0])), float(min(a[1], b[1])),
+        float(max(a[0], b[0])), float(max(a[1], b[1])),
+    )
+
+
 def _optional_point_array(pcd, attr: str) -> Optional[np.ndarray]:
     """Return ``pcd.<attr>`` as an ``(N, k)`` array, or ``None`` if absent/empty.
 
@@ -1572,6 +1926,7 @@ class OrthoGrid:
         neighborhood_scale: float = 1.0,
         min_points: int = 10,
         value_label: Optional[str] = None,
+        mask_bbox=None,
     ) -> None:
         """Build the grid and reduce every cell.
 
@@ -1617,6 +1972,14 @@ class OrthoGrid:
                 warnings and nonsense values). Must be ``>= 1``.
             value_label: Optional colorbar/axis label (defaults to *metric* in
                 custom mode).
+            mask_bbox: Optional ``([xmin, ymin], [xmax, ymax])`` box in the
+                projected frame, e.g. the output of
+                :func:`substrata.measurements.find_optimal_box_position`.
+                Unlike *bbox* (which only limits the reporting area), points
+                and annotations outside it are dropped, the lattice covers
+                exactly the box (aligned to its min corner unless *bbox* or
+                *intercepts* set the alignment) and the background is cropped
+                to it.
         """
         if bbox is not None and intercepts is not None:
             raise ValueError("Provide either bbox or intercepts, not both")
@@ -1658,6 +2021,16 @@ class OrthoGrid:
         self.min_points = int(min_points)
         self.value_label = value_label
         self.info: dict = {}
+        self.mask_bbox = None
+        if mask_bbox is not None:
+            mx0, my0, mx1, my1 = _bbox_bounds(mask_bbox)
+            self.mask_bbox = ((mx0, my0), (mx1, my1))
+
+        def _in_mask(xy: np.ndarray) -> np.ndarray:
+            return (
+                (xy[:, 0] >= mx0) & (xy[:, 0] <= mx1)
+                & (xy[:, 1] >= my0) & (xy[:, 1] <= my1)
+            )
 
         if cell_size is None:
             try:
@@ -1683,12 +2056,21 @@ class OrthoGrid:
             world_pts = np.asarray(pcd.points, dtype=float)
             proj = (self.rotation @ world_pts.T).T
             pts_xy, pts_z = proj[:, :2], proj[:, 2]
+            keep = _in_mask(pts_xy) if self.mask_bbox is not None else None
+            if keep is not None:
+                pts_xy, pts_z = pts_xy[keep], pts_z[keep]
             if value_by == "custom":
                 # Keep the world-frame arrays so per-cell neighbourhoods can be
                 # sliced out for the measurement (see _reduce_custom).
                 self._world_points = world_pts
                 self._world_colors = _optional_point_array(pcd, "colors")
                 self._world_normals = _optional_point_array(pcd, "normals")
+                if keep is not None:
+                    self._world_points = world_pts[keep]
+                    if self._world_colors is not None:
+                        self._world_colors = self._world_colors[keep]
+                    if self._world_normals is not None:
+                        self._world_normals = self._world_normals[keep]
 
         # Projected annotation coordinates + labels.
         ann_src = annotations if annotations is not None else intercepts
@@ -1702,6 +2084,12 @@ class OrthoGrid:
                 )
                 ann_xy = (self.rotation @ coords.T).T[:, :2]
                 ann_labels = [_resolve_label(a) for a in items]
+                if self.mask_bbox is not None:
+                    keep_ann = _in_mask(ann_xy)
+                    ann_xy = ann_xy[keep_ann]
+                    ann_labels = [
+                        lab for lab, k in zip(ann_labels, keep_ann) if k
+                    ]
 
         # Reporting area + lattice phase anchor.
         if intercepts is not None:
@@ -1727,7 +2115,12 @@ class OrthoGrid:
 
         xs_min, ys_min = ext_xy.min(axis=0)
         xs_max, ys_max = ext_xy.max(axis=0)
-        if self.report_bbox is not None:
+        if self.mask_bbox is not None:
+            # Lattice spans exactly the mask (cells beyond it would be empty)
+            (xs_min, ys_min), (xs_max, ys_max) = self.mask_bbox
+            if px is None:
+                px, py = xs_min, ys_min
+        elif self.report_bbox is not None:
             (rx0, ry0), (rx1, ry1) = self.report_bbox
             xs_min, ys_min = min(xs_min, rx0), min(ys_min, ry0)
             xs_max, ys_max = max(xs_max, rx1), max(ys_max, ry1)
@@ -1738,8 +2131,14 @@ class OrthoGrid:
 
         i_min = int(np.floor((xs_min - px) / cs))
         j_min = int(np.floor((ys_min - py) / cs))
-        i_max = int(np.floor((xs_max - px) / cs))
-        j_max = int(np.floor((ys_max - py) / cs))
+        if self.mask_bbox is not None:
+            # Last cell that starts inside the mask (no extra edge cell when
+            # the mask is a whole number of cells)
+            i_max = int(np.ceil((xs_max - px) / cs - 1e-9)) - 1
+            j_max = int(np.ceil((ys_max - py) / cs - 1e-9)) - 1
+        else:
+            i_max = int(np.floor((xs_max - px) / cs))
+            j_max = int(np.floor((ys_max - py) / cs))
         self.x0 = px + i_min * cs
         self.y0 = py + j_min * cs
         self.nx = i_max - i_min + 1
@@ -2173,7 +2572,9 @@ class OrthoGrid:
         if self.pcd is None:
             return None
         try:
-            om = OrthoMap(self.pcd, up_vector=self._up_vector)
+            om = OrthoMap(
+                self.pcd, up_vector=self._up_vector, mask_bbox=self.mask_bbox
+            )
         except Exception:  # pragma: no cover - context is best-effort
             return None
         gray = np.asarray(om.image, dtype=float).mean(axis=2) / 255.0

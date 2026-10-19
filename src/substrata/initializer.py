@@ -404,8 +404,6 @@ class ProjectInitializer:
             self.cams = cameras.Cameras(
                 self.cams_meta_json_filepath, self.cams_xml_filepath
             )
-            self.cams.offset = self.depth_offset
-            self.cams.per_unit = self.depth_per_unit
 
         if self.markers_filepath is not None and os.path.exists(self.markers_filepath):
             print(f"Loading markers from {self.markers_filepath}")
@@ -435,6 +433,8 @@ class ProjectInitializer:
             )
             self.apply_world_transform()
 
+        self.propagate_depth_model()
+
         if (
             apply_color_correction
             and self.color_correction is not None
@@ -442,6 +442,36 @@ class ProjectInitializer:
         ):
             print("Applying colour correction from YAML config")
             self.pcd.apply_color_correction(self.color_correction)
+
+    def propagate_depth_model(self):
+        """Pass the depth regression on to the loaded objects.
+
+        Sets ``up_vector``, ``depth_offset`` and ``depth_per_unit`` (on the
+        point cloud: ``depth_scale_factor``) on the point cloud, cameras,
+        markers and annotations, so ``depth_in_m`` works on them and on objects
+        derived from them (e.g. ``pcd.get_z_intercepts``). Fields that are not
+        set on the initializer are left untouched on the objects.
+        """
+        if self.up_vector is None and self.depth_offset is None:
+            return
+        up_vector = self.up_vector
+        if up_vector is not None:
+            up_vector = np.asarray(getattr(up_vector, "xyz", up_vector), dtype=float)
+        values = {
+            "up_vector": up_vector,
+            "depth_offset": self.depth_offset,
+            "depth_per_unit": self.depth_per_unit,
+        }
+        for attr_name in ("pcd", "cams", "markers", "annotations"):
+            obj = getattr(self, attr_name, None)
+            if obj is None:
+                continue
+            for key, value in values.items():
+                if value is None:
+                    continue
+                if attr_name == "pcd" and key == "depth_per_unit":
+                    key = "depth_scale_factor"
+                setattr(obj, key, value)
 
     def apply_world_transform(self, skip_pcd=False):
         """
@@ -522,10 +552,8 @@ class ProjectInitializer:
         self.world_transform = self.pcd.world_transform
         self.apply_world_transform(skip_pcd=True)
 
-        # Set camera attributes
-        self.cams.up_vector = self.up_vector
-        self.cams.depth_offset = self.depth_offset
-        self.cams.depth_per_unit = self.depth_per_unit
+        # Set depth attributes on pcd, cameras, markers and annotations
+        self.propagate_depth_model()
         # Set depth_markers attributes if depth_markers were used
         if depth_markers is not None:
             depth_markers.up_vector = self.up_vector
@@ -534,6 +562,100 @@ class ProjectInitializer:
             depth_markers.apply_transform(self.world_transform)
 
         return self.up_vector, self.depth_offset, self.depth_per_unit
+
+    def orient_from_chunk_transform(self, north_up=False, shift_to_positive_xy=True):
+        """Orient and scale the project using the Metashape chunk transform.
+
+        Alternative to scale_and_orient(): instead of fitting an up vector to
+        depths and a scale to scalebars, use the ``chunk_transform`` stored in
+        the cameras meta JSON. For georeferenced chunks this maps to geocentric
+        (ECEF) metres, so it is composed with an ECEF -> East-North-Up rotation
+        (see geom.chunk_transform_to_enu): +X east, +Y north, +Z ellipsoidal
+        height. For chunks in a local CRS the transform is applied as-is.
+
+        Unless ``north_up`` is set, the cloud is then rotated about Z only so
+        +Y points upslope (shallow end at the top of top-down views, whichever
+        way the plot is elongated), with the plot's footprint axes squared to
+        X/Y (see geom.Transform.align_y_upslope). Scale and Z (true depth) are
+        unaffected.
+
+        The scale factor is the uniform scale contained in the transform. The
+        depth fields (up_vector, depth_offset, depth_per_unit) are set to the
+        exact linear model implied by the transform (z = up_vector . orig +
+        depth_offset), so camera depth residuals can be checked as usual.
+
+        Args:
+            north_up (bool): If True, keep the georeferenced orientation (+X
+                east, +Y north) instead of aligning +Y upslope.
+            shift_to_positive_xy (bool): If True, translate the cloud so its
+                minimum X/Y are non-negative (Z is left untouched).
+
+        Returns:
+            np.ndarray: The resulting 4x4 world_transform.
+        """
+        import json
+
+        if self.pcd is None:
+            raise ValueError("Pointcloud is not initialized")
+        if not self.cams_meta_json_filepath or not os.path.isfile(
+            self.cams_meta_json_filepath
+        ):
+            raise ValueError(
+                "No cameras meta JSON found (needed for chunk_transform): "
+                f"{self.cams_meta_json_filepath}"
+            )
+        with open(self.cams_meta_json_filepath, "r") as f:
+            chunk_transform = json.load(f).get("chunk_transform")
+        if chunk_transform is None:
+            raise ValueError(
+                f"No chunk_transform in {self.cams_meta_json_filepath} "
+                "(was the Metashape chunk georeferenced?)"
+            )
+        chunk_transform = np.asarray(chunk_transform, dtype=float)
+
+        if not self.pcd.world_transform_is_identity:
+            print(
+                "Warning: Pointcloud already has a world_transform, this will add "
+                f"to it: {self.pcd.world_transform}"
+            )
+
+        # Reference point (cloud centre) defines the local ENU origin
+        pts = self.pcd.points
+        ref_point = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
+        ref_mapped = geom.transform_coords(ref_point, chunk_transform)
+        is_geocentric = 6.0e6 < np.linalg.norm(ref_mapped) < 6.6e6
+        if is_geocentric:
+            transform, scale, (lat, lon) = geom.chunk_transform_to_enu(
+                chunk_transform, ref_point
+            )
+            print(
+                "chunk_transform maps to geocentric (ECEF) coordinates; using "
+                f"local ENU frame with origin lat={lat:.7f}, lon={lon:.7f}, h=0"
+            )
+        else:
+            transform = chunk_transform
+            scale = float(np.cbrt(np.linalg.det(chunk_transform[:3, :3])))
+            print("chunk_transform is not geocentric; applying it as-is")
+        print(f"  Scale factor (from chunk_transform): {scale:.6f}")
+
+        self.pcd.apply_transform(transform)
+        if not north_up:
+            # Z-rotation only: +Y upslope, footprint squared to X/Y
+            self.pcd.apply_transform(geom.Transform.align_y_upslope(self.pcd).mat)
+        if shift_to_positive_xy:
+            self.pcd.apply_transform(geom.Transform.shift_to_positive_xy(self.pcd).mat)
+        self.pcd.scale_factor = scale
+
+        # Store results and propagate to cameras/markers/annotations
+        self.world_transform = self.pcd.world_transform
+        self.scale_factor = scale
+        self.up_vector = np.array(self.world_transform[2, :3])
+        self.depth_offset = float(self.world_transform[2, 3])
+        self.depth_per_unit = float(np.linalg.norm(self.up_vector))
+        self.apply_world_transform(skip_pcd=True)
+        self.propagate_depth_model()
+
+        return self.world_transform
 
     def __set_derived_ply_paths(self):
         """Populate ``ply_dec_path`` and ``ply_full_path`` from the conventions.

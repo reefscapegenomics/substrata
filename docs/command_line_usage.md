@@ -123,7 +123,7 @@ substrata views --input pointcloud.ply --output_pdf views.pdf
 
 Calculate and apply scale and orientation transforms, then save to YAML. Also generates composite views and camera depth residuals PDFs.
 
-Usage: `substrata orient [--input PLY]`
+Usage: `substrata orient [--input PLY] [--use_chunk_transform [--north_up]] [--markers CSV] [--transform] [--manual]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -131,7 +131,15 @@ substrata orient
 
 # With explicit PLY path
 substrata orient --input pointcloud.ply
+
+# Use the Metashape chunk transform instead of fitting scale/orientation
+substrata orient --use_chunk_transform
+
+# Same, but keep the map north-up (+Y north) instead of +Y upslope
+substrata orient --use_chunk_transform --north_up
 ```
+
+With `--use_chunk_transform`, scale and orientation are taken from the `chunk_transform` stored in `<id>.meta.json` (written by `substrata metashape-export`) instead of being fitted to scalebars and camera depths. For a georeferenced chunk this transform maps to geocentric (ECEF) metres, so it is combined with a rotation into a local East-North-Up frame centred on the point cloud: +X east, +Y north, +Z ellipsoidal height (i.e. −depth when the camera references are depths). The cloud is then rotated about Z so +Y points upslope (shallow end at the top of top-down views, also for plots that are elongated downslope): of the plot footprint's long and short axes, the one closest to the fall line of a plane fitted to the terrain is aligned with +Y, so the plot edges stay parallel to X/Y (axis-aligned boxes fit snugly). The cloud is then shifted to positive X/Y; this rotation leaves scale and depth untouched. Add `--north_up` to skip the rotation and keep the georeferenced orientation (+X east, +Y north). The scale factor saved to the YAML is the uniform scale inside the chunk transform, and `up_vector`/`depth_offset`/`depth_per_unit` describe the same transform, so the depth residuals PDF still compares recorded and model depths. This option cannot be combined with `--manual` or `--markers`.
 
 ## Segmentation
 
@@ -335,9 +343,34 @@ substrata intercepts-plot --fit-grid --animation-order categories
 
 ## Point cloud alignment
 
-Register a source PLY to a target PLY and print the alignment transform.
+Register a source to a target and print the alignment transform. `--source` and `--target` each take a PLY file, a project YAML (detected by the `.yaml`/`.yml` extension) or a project directory (resolved like other subcommands: its `<dirname>.yaml` if present, otherwise filename conventions).
 
-Usage: `substrata align --source PLY --target PLY [--points N]`
+Usage: `substrata align --source PLY|YAML|DIR --target PLY|YAML|DIR [--cameras [--max-residual M] [--refine]] [--pdf PDF] [--no-scaling] [--voxel-size V] [--points N] [--output-yaml YAML]`
+
+The transform is always fitted between the **raw** (untransformed) models. Two matrices are printed:
+
+- **raw source → raw target**: the fitted registration.
+- **raw source → oriented target**: the same transform with the target's `world_transform` applied on top. This is only printed when the target YAML has a non-identity `world_transform`. It can be applied directly to source `orig_coords` (e.g. source annotations) to place them in the oriented target frame.
+
+Alignment methods:
+
+- **Point clouds** (default): statistical outlier removal, then FPFH features with global RANSAC (rigid), then ICP refinement. ICP also estimates a uniform scale unless `--no-scaling` is given. The global stage is rigid and FPFH uses fixed radii, so it can fail when the two raw models differ a lot in scale. Check `ransac_fitness`/`fitness` in the printed metrics, or use `--cameras`.
+- **Matching cameras** (`--cameras`, project YAMLs only): uses the centres of cameras whose image names match in both projects. Names are compared by filename stem, case-insensitively, regardless of folder or camera group. The command then fits a least-squares similarity transform to those centres (rigid with `--no-scaling`). It needs at least 3 non-collinear shared cameras. Names that occur more than once in a project, and cameras without a pose, are skipped. Outlier pairs are rejected iteratively: fit, keep the cameras within the threshold, refit, until the inlier set is stable. This matters when a whole AUV run is placed differently in the two models, which shows up as a block of cameras with a near-constant offset. The default threshold is `median + 5 × 1.4826 × MAD` of the residuals; `--max-residual` sets a fixed threshold instead, in metres if the target has a `scale_factor`, otherwise in target units. The command lists the rejected cameras with their residuals, plus the RMS, median and maximum residual of the inliers. Add `--refine` to refine the camera-based fit with point-cloud ICP. The source is first moved into the target frame with the camera fit, then the target is cropped to the overlap (so a small plot inside a large model works), and the default voxel size is 0.5% of the overlap extent. Camera centres and reconstructed surfaces don't always agree exactly between two models (e.g. a few cm vertically), so use `--refine` when the surfaces should coincide, e.g. for annotations on the point cloud.
+
+`--pdf` writes a QC report. Everything in it is drawn in the oriented target frame (metres when the target is scaled and oriented). The target cloud is loaded without the `--points` cap, so the overlap is dense enough for meaningful distances. The pages are:
+
+1. **Summary**: inputs, method, camera counts and RMS, scale, and both matrices.
+2. **Camera residuals** (`--cameras` only): matched cameras on a top-down map coloured by residual under the final transform, with rejected cameras marked, plus a histogram.
+3. **Location in target**: the source footprint on a top-down RGB ortho of the whole target (full and zoomed), and x–z / y–z profiles of the target through the footprint with the source overlaid. Use this to check that the source sits where you expect, at the expected depth.
+4. **Correspondence in the overlap**:
+   - **C2C**: the distance from each source point to the nearest target point.
+   - **dz**: the vertical distance from each source point to a plane fitted to its nearest target points. dz isn't computed on near-vertical surfaces or over gaps in the target.
+   - Top-down maps and histograms of both. The histograms report the target point spacing in the overlap, which is the lowest C2C you can expect.
+   - Two thin cross-sections with both clouds overlaid.
+
+The plots come from `visualizations.plot_pcd_context`, `plot_pcd_correspondence` and `plot_camera_correspondence`. These take any two point clouds already in the same frame, so you can also use them outside `align`.
+
+`--output-yaml` writes a copy of the source project YAML whose `world_transform` is the raw source → oriented target transform. This replaces the source's previous `world_transform`, so loading that YAML puts the source in the target's oriented frame.
 
 ```bash
 # Align two point clouds
@@ -345,6 +378,18 @@ substrata align --source source.ply --target target.ply
 
 # Limit points for faster processing
 substrata align --source source.ply --target target.ply --points 5000000
+
+# Focal plot onto the oriented AUV model, using AUV images included in both models
+# (project directories work as well as YAMLs)
+substrata align --source focal/ --target auv/auv.yaml --cameras \
+    --output-yaml focal/focal_aligned.yaml
+
+# Fixed 5 cm outlier threshold instead of the automatic one
+substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --max-residual 0.05
+
+# Same, refined with point-cloud ICP, with a QC report
+substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --refine \
+    --pdf focal/focal_align_qc.pdf
 ```
 
 ## Image matches

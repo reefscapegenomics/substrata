@@ -1022,6 +1022,19 @@ class PointCloud:
                     intercept_point.id = idx
                 intercept_points.append(intercept_point)
 
+        # Intercepts are in this cloud's (transformed) frame: record its
+        # world_transform and the matching original coords, so they line up
+        # with cameras/pcd (e.g. get_image_matches checks the transforms)
+        if not self.world_transform_is_identity:
+            intercept_points.get_original_coords(self.world_transform)
+
+        # Carry over the depth regression so depth_in_m works on the intercepts
+        for attr in ("up_vector", "depth_offset"):
+            if getattr(self, attr, None) is not None:
+                setattr(intercept_points, attr, getattr(self, attr))
+        if getattr(self, "depth_scale_factor", None) is not None:
+            intercept_points.depth_per_unit = self.depth_scale_factor
+
         # Provide a short output summary
         print(f"Intercept points returned: {len(intercept_points)}/{len(xy_coords)}")
         if always_return:
@@ -1362,28 +1375,42 @@ class PointCloud:
         outlier_std_ratio: float = 2.0,
         allow_scaling: bool = True,
         visualize: bool = False,
+        init_transform: np.ndarray | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Automatically register this point cloud to ``target`` using Open3D.
 
-        The routine is robust to differing orientation/scale and noisy borders:
+        The returned transform maps this cloud (``self``) onto ``target``.
+        The routine is robust to differing orientation and noisy borders:
         - optional statistical outlier removal
         - voxel downsampling + FPFH features
-        - global RANSAC feature matching for an initial transform (rigid)
+        - global RANSAC feature matching for an initial transform (rigid;
+          skipped when ``init_transform`` is given)
         - ICP refinement (optionally estimating a global scale)
+
+        Because RANSAC is rigid and FPFH uses fixed radii, the global stage can
+        fail when the two clouds differ substantially in scale; supply an
+        ``init_transform`` (e.g. from matched cameras) in that case.
 
         Args:
             target: Destination cloud to align to (remains fixed).
-            voxel_size: Downsample size for features; if None, derives from scene size.
+            voxel_size: Downsample size for features; if None, 2% of the smaller
+                cloud's extent (or 0.5% of the overlap with ``init_transform``).
+                Both clouds should be in comparable units.
             remove_outliers: Apply statistical outlier removal before registration.
             outlier_std_ratio: Std-dev multiplier for outlier removal.
             allow_scaling: If True, refinement can estimate uniform scale.
-            apply: If True, applies the resulting transform to ``self``.
             visualize: If True, prints metrics and sizes.
+            init_transform: Optional 4x4 initial transform (self → target); if
+                given, the FPFH/RANSAC global registration is skipped, ``target``
+                is cropped to the overlap with the transformed cloud, and ICP
+                refines from there (default voxel size: 0.5% of the overlap
+                extent).
 
         Returns:
-            (T, metrics): 4x4 transform matrix and a metrics dictionary
-                         with keys: fitness, inlier_rmse, stage ("icp"), and
-                         sizes of the downsampled inputs.
+            (T, metrics): 4x4 transform matrix (self → target) and a metrics
+                dictionary with keys: fitness, inlier_rmse, stage ("icp"),
+                voxel_size, sizes of the downsampled inputs and, when RANSAC ran,
+                ransac_fitness.
         """
         import copy as _copy
 
@@ -1414,50 +1441,87 @@ class PointCloud:
         src = _statistical_filter(src)
         dst = _statistical_filter(dst)
 
-        # Derive a reasonable voxel size from the scene if not provided
-        if voxel_size is None:
-            bb = dst.get_axis_aligned_bounding_box()
-            diag = np.linalg.norm(bb.get_extent())
-            voxel_size = max(
-                diag * 0.02, 1e-3
-            )  # 2% of scene extent, with a small floor
+        T_pre = np.eye(4)
+        if init_transform is not None:
+            # Refinement: move src into the target frame (so both clouds share
+            # units for downsampling/ICP) and restrict dst to the overlap, so a
+            # small plot inside a large model is not swamped by its extent.
+            T_pre = np.asarray(init_transform, dtype=float)
+            src.transform(T_pre)
+            bb = src.get_axis_aligned_bounding_box()
+            pad = 0.05 * bb.get_extent()
+            dst = dst.crop(
+                o3d.geometry.AxisAlignedBoundingBox(
+                    bb.get_min_bound() - pad, bb.get_max_bound() + pad
+                )
+            )
+            if len(dst.points) == 0:
+                raise ValueError("init_transform leaves no overlap with target")
+            if voxel_size is None:
+                # 0.5% of the overlap extent: fine enough for a close start
+                voxel_size = max(np.linalg.norm(bb.get_extent()) * 0.005, 1e-3)
+        elif voxel_size is None:
+            # 2% of the smaller cloud's extent (small floor), so a small plot
+            # registered into a large model keeps enough points for features
+            diag = min(
+                np.linalg.norm(p.get_axis_aligned_bounding_box().get_extent())
+                for p in (src, dst)
+            )
+            voxel_size = max(diag * 0.02, 1e-3)
 
         if visualize:
             print(
                 f"auto_align: voxel_size={voxel_size:.4f}, allow_scaling={allow_scaling}"
             )
 
-        src_down, src_fpfh = _prepare(src, voxel_size)
-        dst_down, dst_fpfh = _prepare(dst, voxel_size)
+        ransac_fitness = None
+        if init_transform is not None:
+            T_init = np.eye(4)  # src already moved by init_transform
+        else:
+            src_down, src_fpfh = _prepare(src, voxel_size)
+            dst_down, dst_fpfh = _prepare(dst, voxel_size)
 
-        if visualize:
-            print(
-                f"Downsampled sizes: src={len(src_down.points)}, dst={len(dst_down.points)}"
+            if visualize:
+                print(
+                    f"Downsampled sizes: src={len(src_down.points)}, "
+                    f"dst={len(dst_down.points)}"
+                )
+
+            # Global registration via RANSAC over FPFH matches (rigid init)
+            distance_threshold = voxel_size * 1.5
+            ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                src_down,
+                dst_down,
+                src_fpfh,
+                dst_fpfh,
+                mutual_filter=True,
+                max_correspondence_distance=distance_threshold,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(
+                    False
+                ),
+                ransac_n=4,
+                checkers=[
+                    o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(
+                        0.9
+                    ),
+                    o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
+                        distance_threshold
+                    ),
+                ],
+                criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                    100000, 0.999
+                ),
             )
 
-        # Global registration via RANSAC over FPFH matches (rigid init)
-        distance_threshold = voxel_size * 1.5
-        ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-            src_down,
-            dst_down,
-            src_fpfh,
-            dst_fpfh,
-            mutual_filter=True,
-            max_correspondence_distance=distance_threshold,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(
-                False
-            ),
-            ransac_n=4,
-            checkers=[
-                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
-                    distance_threshold
-                ),
-            ],
-            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 1000),
-        )
-
-        T_init = ransac_result.transformation
+            T_init = ransac_result.transformation
+            ransac_fitness = float(ransac_result.fitness)
+            if ransac_fitness < 0.05:
+                logger.warning(
+                    "Global RANSAC registration is poor (fitness=%.3f); the "
+                    "ICP result is likely unreliable. If the clouds differ in "
+                    "scale, align on matching cameras instead.",
+                    ransac_fitness,
+                )
 
         # ICP refinement (with optional global scale estimation)
         # Build normals on (slightly) denser versions for refinement
@@ -1489,14 +1553,20 @@ class PointCloud:
             ),
         )
 
-        T = icp.transformation
+        T = np.asarray(icp.transformation) @ T_pre
         metrics = {
             "stage": "icp",
             "fitness": float(icp.fitness),
             "inlier_rmse": float(icp.inlier_rmse),
-            "src_down": int(len(src_down.points)),
-            "dst_down": int(len(dst_down.points)),
+            "voxel_size": float(voxel_size),
         }
+        if ransac_fitness is not None:
+            metrics["ransac_fitness"] = ransac_fitness
+            metrics["src_down"] = int(len(src_down.points))
+            metrics["dst_down"] = int(len(dst_down.points))
+        else:
+            metrics["src_down"] = int(len(src_ref.points))
+            metrics["dst_down"] = int(len(dst_ref.points))
 
         if visualize:
             print(

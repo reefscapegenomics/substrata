@@ -936,7 +936,9 @@ def handle_orient(args):
     """Compute and apply scale and orientation, saving results to YAML.
 
     Runs the scale_and_orient workflow (using marker depths from --markers
-    or camera depths otherwise) unless --manual is set, optionally applies
+    or camera depths otherwise) unless --manual is set, or applies the
+    Metashape chunk_transform (as a local ENU frame) with --use_chunk_transform.
+    Optionally applies
     an interactively entered manual transform, and propagates the world
     transform to cameras/markers/annotations. Writes the project YAML plus
     composite-views and depth-residuals PDFs.
@@ -957,14 +959,26 @@ def handle_orient(args):
     # Initialize project (loads PCD, cameras/markers if available)
     init.initialize(apply_transform=False)
 
+    use_chunk = getattr(args, "use_chunk_transform", False)
+    if getattr(args, "north_up", False) and not use_chunk:
+        raise SystemExit("--north_up requires --use_chunk_transform")
+    if use_chunk and (getattr(args, "manual", False) or args.markers):
+        raise SystemExit(
+            "--use_chunk_transform cannot be combined with --manual or --markers"
+        )
+
+    depth_markers = None
+    if use_chunk:
+        # Apply the Metashape chunk transform (scale derived from it)
+        init.orient_from_chunk_transform(
+            north_up=getattr(args, "north_up", False)
+        )
     # Run scale_and_orient workflow (skip if --manual flag is set)
-    if not getattr(args, "manual", False):
+    elif not getattr(args, "manual", False):
         # Use markers CSV filepath if provided, otherwise use camera depths
         depth_markers_filepath = getattr(args, "markers", None)
         if depth_markers_filepath is not None:
             depth_markers = Annotations(depth_markers_filepath, orig_coords_only=True)
-        else:
-            depth_markers = None
         init.scale_and_orient(depth_markers=depth_markers)
 
     # Handle optional manual transform
@@ -1238,9 +1252,6 @@ def handle_intercepts(args):
         random_points, args.search_radius, always_return=True, id_prefix=init.id
     )
 
-    # Back-compute original coords and get first image matches if cameras are available
-    intercepts.get_original_coords(init.pcd.world_transform)
-
     # Save intercepts to CSV (and YAML only for --slope)
     if getattr(args, "slope", False):
         fig.savefig(_get_output_filepath(init, "slope_bbox.png"))
@@ -1459,31 +1470,356 @@ def handle_intercepts_plot(args):
         )
 
 
-def handle_align(args):
-    """Register a source PLY to a target PLY and print the transform.
+def _load_align_input(path: str, label: str) -> dict:
+    """Resolve an align --source/--target argument (PLY, project YAML or dir).
 
-    Loads both point clouds (optionally stream-decimated to --points),
-    computes the auto-alignment transform mapping source to target space,
-    and prints the transform and its metrics.
+    A project directory is resolved like other subcommands do (its
+    ``<dirname>.yaml`` if present, else filename conventions).
+
+    Returns a dict with ``ply``, ``cams_meta_json``, ``world_transform`` (4x4,
+    identity for a bare PLY), ``scale_factor`` and ``init`` (the
+    ProjectInitializer, or None for a bare PLY). Nothing heavy is loaded.
+    """
+    is_dir = os.path.isdir(path)
+    if not is_dir and not os.path.isfile(path):
+        raise SystemExit(f"align: {label} not found: {path}")
+    if is_dir or os.path.splitext(path)[1].lower() in (".yaml", ".yml"):
+        init = (
+            ProjectInitializer(path=path) if is_dir else ProjectInitializer(yaml=path)
+        )
+        return {
+            "ply": init.ply_filepath,
+            "cams_meta_json": init.cams_meta_json_filepath,
+            "world_transform": np.asarray(init.world_transform, dtype=float),
+            "scale_factor": init.scale_factor,
+            "init": init,
+        }
+    return {
+        "ply": path,
+        "cams_meta_json": None,
+        "world_transform": np.eye(4),
+        "scale_factor": None,
+        "init": None,
+    }
+
+
+def _align_on_cameras(
+    src: dict, tgt: dict, with_scaling: bool, max_residual: float | None = None
+) -> dict:
+    """Fit the raw source → raw target transform from same-named cameras.
+
+    Returns a dict with the 4x4 transform ``T`` and, for reporting, the raw
+    matched camera centres ``src_xyz``/``tgt_xyz``, the ``inliers`` mask and
+    the matched ``names``.
+
+    Outlier pairs are rejected iteratively (see
+    ``geom.fit_correspondences_rejecting_outliers``). ``max_residual`` is in
+    metres when the target has a ``scale_factor``, else in target raw units;
+    if None, a robust (median/MAD-based) threshold is used.
+    """
+    from substrata.cameras import Cameras
+    from substrata.geom import fit_correspondences_rejecting_outliers
+
+    for label, info in (("source", src), ("target", tgt)):
+        if info["init"] is None:
+            raise SystemExit(
+                f"align --cameras requires a project YAML or directory as {label}"
+            )
+        meta = info["cams_meta_json"]
+        if not meta or not os.path.isfile(meta):
+            raise SystemExit(
+                f"align --cameras: {label} project has no cameras meta JSON ({meta})"
+            )
+    src_cams = Cameras(src["cams_meta_json"])
+    tgt_cams = Cameras(tgt["cams_meta_json"])
+    matches = src_cams.match_by_name(tgt_cams)
+    print(f"Matched {len(matches)} camera(s) by name")
+    if len(matches) < 3:
+        raise SystemExit(
+            "align --cameras needs at least 3 cameras with matching names in "
+            f"source and target; found {len(matches)}"
+        )
+
+    # Fit on the raw (untransformed) camera centres
+    p = np.array([np.asarray(s.orig_coords, dtype=float) for _, s, _ in matches])
+    q = np.array([np.asarray(t.orig_coords, dtype=float) for _, _, t in matches])
+    to_m = tgt["scale_factor"]
+    threshold_raw = None
+    if max_residual is not None:
+        threshold_raw = max_residual / to_m if to_m else max_residual
+    try:
+        T, inliers = fit_correspondences_rejecting_outliers(
+            p, q, with_scaling=with_scaling, max_residual=threshold_raw
+        )
+    except ValueError as e:
+        raise SystemExit(f"align --cameras: {e}")
+
+    # Residuals in target raw units (and metres when the target is scaled)
+    residuals = np.linalg.norm(T.apply_to_points(p) - q, axis=1)
+    unit = "raw" + (" / m" if to_m else "")
+
+    def _fmt(r):
+        return f"{r:.4f}" + (f" / {r * to_m:.4f}" if to_m else "")
+
+    rejected = [(m[0], r) for m, r, ok in zip(matches, residuals, inliers) if not ok]
+    print(f"Rejected {len(rejected)} outlier camera(s) (residual, {unit}):")
+    for name, r in sorted(rejected, key=lambda x: x[1], reverse=True):
+        print(f"  {name}: {_fmt(r)}")
+    r_in = residuals[inliers]
+    print(f"Fit on {int(inliers.sum())} inlier camera(s), residuals ({unit}):")
+    print(f"  RMS:    {_fmt(float(np.sqrt(np.mean(r_in**2))))}")
+    print(f"  median: {_fmt(float(np.median(r_in)))}")
+    print(f"  max:    {_fmt(float(r_in.max()))}")
+    scale = np.cbrt(np.linalg.det(T.mat[:3, :3]))
+    print(f"  Scale (source → target raw): {scale:.6f}")
+    return {
+        "T": T.as_ndarray(),
+        "src_xyz": p,
+        "tgt_xyz": q,
+        "inliers": inliers,
+        "names": [m[0] for m in matches],
+    }
+
+
+def handle_align(args):
+    """Register a source to a target and print the transform.
+
+    ``--source``/``--target`` are PLY files or project YAMLs. The transform is
+    fitted between the raw (untransformed) models, either by point-cloud
+    registration (FPFH/RANSAC + ICP) or, with ``--cameras``, from camera centres
+    with matching image names (optionally refined by ICP with ``--refine``).
+
+    Two matrices are printed: raw source → raw target, and raw source →
+    oriented target (target ``world_transform`` applied on top). The latter can
+    be applied directly to source ``orig_coords`` and is what ``--output-yaml``
+    stores as the source project's ``world_transform``.
 
     Args:
         args: Parsed CLI arguments.
     """
     from substrata.pointclouds import PointCloud
 
-    if not args.source or not args.target:
-        raise SystemExit("align requires --source and --target PLY paths")
+    if args.refine and not args.cameras:
+        raise SystemExit("align --refine is only valid together with --cameras")
+    if args.max_residual is not None and not args.cameras:
+        raise SystemExit("align --max-residual is only valid together with --cameras")
 
-    # Load with optional stream decimation
-    src = PointCloud(args.source, max_points=args.points)
-    tgt = PointCloud(args.target, max_points=args.points)
+    src = _load_align_input(args.source, "source")
+    tgt = _load_align_input(args.target, "target")
+    if args.output_yaml and src["init"] is None:
+        raise SystemExit(
+            "align --output-yaml requires a project YAML or directory as --source"
+        )
 
-    # Compute transform that maps source → target space
-    T, metrics = tgt.get_auto_align_transform(src)
+    def _load_pcds():
+        for label, info in (("source", src), ("target", tgt)):
+            if not info["ply"] or not os.path.isfile(info["ply"]):
+                raise SystemExit(f"align: {label} PLY not found ({info['ply']})")
+        # Raw clouds (world_transform not applied), optional stream decimation
+        return (
+            PointCloud(src["ply"], max_points=args.points),
+            PointCloud(tgt["ply"], max_points=args.points),
+        )
 
-    # Print and optionally show
-    print("Metrics:", metrics)
-    print("Alignment transform (source → target):\n", T)
+    allow_scaling = not args.no_scaling
+    cam_fit = None
+    metrics = None
+    src_pcd = tgt_pcd = None
+    if args.cameras:
+        cam_fit = _align_on_cameras(
+            src, tgt, with_scaling=allow_scaling, max_residual=args.max_residual
+        )
+        T_raw = cam_fit["T"]
+        if args.refine:
+            src_pcd, tgt_pcd = _load_pcds()
+            try:
+                T_raw, metrics = src_pcd.get_auto_align_transform(
+                    tgt_pcd,
+                    voxel_size=args.voxel_size,
+                    allow_scaling=allow_scaling,
+                    init_transform=T_raw,
+                )
+            except ValueError as e:
+                raise SystemExit(f"align --refine: {e}")
+            print("ICP refinement metrics:", metrics)
+    else:
+        src_pcd, tgt_pcd = _load_pcds()
+        # Transform that maps source → target space
+        T_raw, metrics = src_pcd.get_auto_align_transform(
+            tgt_pcd, voxel_size=args.voxel_size, allow_scaling=allow_scaling
+        )
+        print("Metrics:", metrics)
+
+    T_raw = np.asarray(T_raw, dtype=float)
+    W_t = tgt["world_transform"]
+    T_final = W_t @ T_raw
+    with np.printoptions(precision=8, suppress=True):
+        print("Alignment transform (raw source → raw target):\n", T_raw)
+        if not np.allclose(W_t, np.eye(4)):
+            print(
+                "Alignment transform (raw source → oriented target, i.e. target "
+                "world_transform applied):\n",
+                T_final,
+            )
+
+    if args.output_yaml:
+        init = src["init"]
+        old = np.asarray(init.world_transform, dtype=float)
+        if not np.allclose(old, np.eye(4)):
+            print(f"Replacing source world_transform:\n{old}")
+        init.world_transform = T_final
+        init.save_config_to_yaml(args.output_yaml)
+        print(f"Wrote aligned source project YAML: {args.output_yaml}")
+
+    if args.pdf:
+        _save_align_qc_pdf(
+            args, src, tgt, T_raw, T_final, cam_fit, metrics, src_pcd, tgt_pcd
+        )
+
+
+def _save_align_qc_pdf(
+    args, src, tgt, T_raw, T_final, cam_fit, metrics, src_pcd, tgt_pcd
+):
+    """Write the align QC PDF (summary, cameras, context, correspondence).
+
+    Everything is drawn in the oriented target frame (metres when the target
+    has a scale/orientation). The target is (re)loaded without the --points
+    cap so the overlap is dense enough for meaningful point distances.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    from substrata import visualizations
+    from substrata.geom import Transform
+    from substrata.pointclouds import PointCloud, SimplePointCloud
+
+    W_t = tgt["world_transform"]
+    oriented = not np.allclose(W_t, np.eye(4))
+    units = "m" if oriented and tgt["scale_factor"] else "target units"
+    labels = (_align_label(args.source, src), _align_label(args.target, tgt))
+
+    for label, info in (("source", src), ("target", tgt)):
+        if not info["ply"] or not os.path.isfile(info["ply"]):
+            raise SystemExit(f"align --pdf: {label} PLY not found ({info['ply']})")
+    if src_pcd is None:
+        src_pcd = PointCloud(src["ply"], max_points=args.points)
+    print("Loading target point cloud for the QC report (no --points cap)")
+    tgt_pcd = PointCloud(tgt["ply"])
+
+    src_qc = SimplePointCloud(
+        Transform(T_final).apply_to_points(np.asarray(src_pcd.points)),
+        src_pcd.colors,
+    )
+    tgt_qc = SimplePointCloud(
+        Transform(W_t).apply_to_points(np.asarray(tgt_pcd.points)),
+        tgt_pcd.colors,
+    )
+
+    figs = []
+    summary = [
+        "substrata align QC",
+        "",
+        f"source: {args.source}",
+        f"target: {args.target}",
+        f"method: {_align_method(args)}",
+        f"frame:  {'oriented target' if oriented else 'raw target'} ({units})",
+    ]
+    if cam_fit is not None:
+        inl = cam_fit["inliers"]
+        res = np.linalg.norm(
+            Transform(T_final).apply_to_points(cam_fit["src_xyz"])
+            - Transform(W_t).apply_to_points(cam_fit["tgt_xyz"]),
+            axis=1,
+        )
+        summary += [
+            "",
+            f"cameras matched: {len(inl)}, kept: {int(inl.sum())}, "
+            f"rejected: {int((~inl).sum())}",
+            f"camera residual RMS (kept, final transform): "
+            f"{np.sqrt(np.mean(res[inl] ** 2)):.4f} {units}",
+        ]
+    if metrics is not None:
+        stage = "ICP refinement" if cam_fit is not None else "registration"
+        summary += ["", f"{stage} metrics (target raw units):"] + [
+            f"  {k}: {round(v, 4) if isinstance(v, float) else v}"
+            for k, v in metrics.items()
+        ]
+    scale = np.cbrt(np.linalg.det(T_raw[:3, :3]))
+    with np.printoptions(precision=6, suppress=True):
+        summary += [
+            "",
+            f"scale (source → target raw): {scale:.6f}",
+            "",
+            "raw source → raw target:",
+            str(T_raw),
+        ]
+        if oriented:
+            summary += ["", "raw source → oriented target:", str(T_final)]
+    fig = visualizations.plot_text("\n".join(summary), width=11, height=8.5)
+    fig.axes[0].texts[0].set_fontfamily("monospace")
+    fig.axes[0].texts[0].set_fontsize(9)
+    figs.append(fig)
+
+    if cam_fit is not None:
+        figs.append(
+            visualizations.plot_camera_correspondence(
+                Transform(T_final).apply_to_points(cam_fit["src_xyz"]),
+                Transform(W_t).apply_to_points(cam_fit["tgt_xyz"]),
+                inliers=cam_fit["inliers"],
+                units=units,
+                labels=labels,
+                title="Matched camera residuals (final transform)",
+            )
+        )
+    figs.append(
+        visualizations.plot_pcd_context(
+            src_qc, tgt_qc, labels=labels, units=units, title="Location in target"
+        )
+    )
+    fig, stats = visualizations.plot_pcd_correspondence(
+        src_qc,
+        tgt_qc,
+        labels=labels,
+        units=units,
+        title="Correspondence in the overlap",
+        return_stats=True,
+    )
+    figs.append(fig)
+    print("Point-cloud correspondence:", {k: round(v, 4) for k, v in stats.items()})
+
+    with PdfPages(args.pdf) as pdf:
+        for fig in figs:
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"Wrote align QC PDF: {args.pdf}")
+
+
+def _align_label(path: str, info: dict) -> str:
+    """Short display name for an align input (project id or file name)."""
+    init = info.get("init")
+    if init is not None and init.id:
+        return str(init.id)
+    return os.path.splitext(os.path.basename(os.path.normpath(path)))[0]
+
+
+def _align_method(args) -> str:
+    """Human-readable description of the align method used."""
+    if args.cameras:
+        method = "matching cameras"
+        if args.max_residual is not None:
+            method += f" (max residual {args.max_residual})"
+        else:
+            method += " (automatic outlier rejection)"
+        if args.refine:
+            method += " + ICP refinement"
+    else:
+        method = "point clouds (FPFH/RANSAC + ICP)"
+    if args.no_scaling:
+        method += ", rigid"
+    return method
 
 
 def _parse_transform_from_input(transform_str: str) -> np.ndarray:
@@ -3275,6 +3611,28 @@ def main():
         ),
     )
     p_orient.add_argument(
+        "--use_chunk_transform",
+        "--use-chunk-transform",
+        dest="use_chunk_transform",
+        action="store_true",
+        help=(
+            "Instead of fitting scale/orientation, apply the Metashape "
+            "chunk_transform from the cameras meta JSON (converted to a local "
+            "East-North-Up frame in metres) and derive the scale factor from it. "
+            "The cloud is then rotated about Z so +Y points upslope."
+        ),
+    )
+    p_orient.add_argument(
+        "--north_up",
+        "--north-up",
+        dest="north_up",
+        action="store_true",
+        help=(
+            "With --use_chunk_transform: keep the georeferenced orientation "
+            "(+X east, +Y north) instead of rotating +Y upslope."
+        ),
+    )
+    p_orient.add_argument(
         "--markers",
         dest="markers",
         type=str,
@@ -3660,14 +4018,23 @@ def main():
     p_align = subparsers.add_parser(
         "align",
         help=(
-            "Register a source PLY to a target PLY and print transform (optionally save aligned source)."
+            "Register a source (PLY or project YAML) to a target and print the "
+            "transform; optionally write an aligned source project YAML."
         ),
     )
     p_align.add_argument(
-        "--source", dest="source", type=str, required=True, help="Source PLY path"
+        "--source",
+        dest="source",
+        type=str,
+        required=True,
+        help="Source PLY or project YAML",
     )
     p_align.add_argument(
-        "--target", dest="target", type=str, required=True, help="Target PLY path"
+        "--target",
+        dest="target",
+        type=str,
+        required=True,
+        help="Target PLY or project YAML",
     )
     p_align.add_argument(
         "--points",
@@ -3676,7 +4043,63 @@ def main():
         default=5_000_000,
         help="Max points to stream-load",
     )
-    # No output or visualization flags
+    p_align.add_argument(
+        "--cameras",
+        action="store_true",
+        help=(
+            "Align on centres of cameras with matching image names (any group); "
+            "requires project YAMLs"
+        ),
+    )
+    p_align.add_argument(
+        "--max-residual",
+        dest="max_residual",
+        type=float,
+        default=None,
+        help=(
+            "With --cameras: reject cameras whose residual exceeds this (metres "
+            "if the target has a scale_factor, else target units); default: "
+            "automatic median/MAD threshold"
+        ),
+    )
+    p_align.add_argument(
+        "--refine",
+        action="store_true",
+        help="With --cameras: refine the camera-based fit with point-cloud ICP",
+    )
+    p_align.add_argument(
+        "--no-scaling",
+        dest="no_scaling",
+        action="store_true",
+        help="Estimate a rigid transform only (no uniform scale)",
+    )
+    p_align.add_argument(
+        "--voxel-size",
+        dest="voxel_size",
+        type=float,
+        default=None,
+        help="Registration voxel size (default: 2%% of target extent)",
+    )
+    p_align.add_argument(
+        "--pdf",
+        dest="pdf",
+        type=str,
+        default=None,
+        help=(
+            "Write a QC PDF: summary, camera residuals (--cameras), location of "
+            "the source within the target, and point-cloud correspondence"
+        ),
+    )
+    p_align.add_argument(
+        "--output-yaml",
+        dest="output_yaml",
+        type=str,
+        default=None,
+        help=(
+            "Write a copy of the source project YAML with world_transform set "
+            "to the raw source → oriented target transform"
+        ),
+    )
     p_intercepts.add_argument(
         "--box-length",
         dest="box_length",
