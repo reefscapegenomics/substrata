@@ -87,7 +87,7 @@ substrata head --input pointcloud.ply -n 10
 
 ## Visual assessment of scalebars
 
-Generate a scalebar PDF from a point cloud and marker annotations. Optionally save the computed scale factor to YAML.
+Generate a scalebar PDF from a point cloud and marker annotations. Optionally save the computed scale factor to YAML. By default the project's point cloud is used: `<id>_dec50M.ply` when present, otherwise `<id>.ply` (or the `ply:` entry of the project YAML). The point cloud is only used for the figures; the scale factor comes from the marker coordinates.
 
 Usage: `substrata scalebars [--input PLY] [--markers CSV] [--output_pdf PDF] [--points N] [--save_yaml]`
 

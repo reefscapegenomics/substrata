@@ -699,8 +699,9 @@ def handle_scalebars(args):
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
-    # 1) resolve inputs
-    pcd_path = args.input or init.ply_full_path
+    # 1) resolve inputs (the PLY only feeds the figures, so prefer the
+    #    decimated <id>_dec50M.ply when present)
+    pcd_path = args.input or init.ply_filepath
     if not pcd_path:
         raise SystemExit(
             "No input PLY found. Provide --input/--ply or ensure initializer finds a PLY in CWD."
