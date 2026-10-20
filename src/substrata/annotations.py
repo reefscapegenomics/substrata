@@ -5,7 +5,18 @@ import logging
 import os
 import random
 import re
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -460,6 +471,7 @@ class Annotations:
         fallback_dist: float = settings.MATCH_FALLBACK_DISTANCE,
         max_mask_fraction: float = settings.MATCH_MAX_MASK_FRACTION,
         tolerance_px: float = settings.MATCH_MASK_TOLERANCE_PX,
+        skip_ids: Optional[Iterable[Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Match these (random point) annotations to manual colony annotations.
 
@@ -512,10 +524,14 @@ class Annotations:
             max_mask_fraction: Masks covering a larger image fraction are
                 ignored (SAM2 occasionally segments the whole reef).
             tolerance_px: Full-resolution pixel tolerance of the in-mask test.
+            skip_ids: Ids of random points to leave out (e.g. already matched in
+                a previous run, see :func:`get_matched_annotation_ids`). Their
+                records are not ``considered`` and have ``skipped`` set.
 
         Returns:
             One match record (dict) per annotation in ``self``, in order. Keys:
-            ``id``, ``label``, ``considered``, ``manual_id``, ``manual_label``,
+            ``id``, ``label``, ``considered``, ``skipped``, ``manual_id``,
+            ``manual_label``,
             ``manual_label_conf``, ``match_conf``, ``flagged``, ``orig_coords``,
             ``candidates`` (list of dicts with ``id``, ``label``,
             ``label_conf``, ``dist``, ``orig_coords``, ``fwd``/``rev``: tuple
@@ -534,15 +550,18 @@ class Annotations:
         prefixes = tuple(p for p in prefixes if p)
         rand_anns = list(self.data.values())
         man_anns = list(manual.data.values())
+        skip = {str(k) for k in skip_ids or ()}
+        skipped = {i for i, a in enumerate(rand_anns) if str(a.id) in skip}
         considered = [
             i
             for i, a in enumerate(rand_anns)
-            if not prefixes or str(a.label or "").startswith(prefixes)
+            if i not in skipped
+            and (not prefixes or str(a.label or "").startswith(prefixes))
         ]
         logger.info(
             f"Matching {len(considered)}/{len(rand_anns)} random points "
-            f"(label prefix {', '.join(prefixes) or 'any'}) to "
-            f"{len(man_anns)} manual annotations"
+            f"(label prefix {', '.join(prefixes) or 'any'}; {len(skipped)} "
+            f"skipped) to {len(man_anns)} manual annotations"
         )
         world_scale = float(np.cbrt(abs(np.linalg.det(self.world_transform[:3, :3]))))
         cam_list = [c for c in cams if getattr(c, "sensor", None) is not None]
@@ -657,6 +676,7 @@ class Annotations:
                 "label": ann.label,
                 "orig_coords": np.asarray(ann.orig_coords, dtype=float),
                 "considered": i in considered,
+                "skipped": i in skipped,
                 "manual_id": "",
                 "manual_label": "",
                 "manual_label_conf": "",
@@ -701,9 +721,9 @@ class Annotations:
                 record["overview"] = _best_camera_for_points(
                     cam_list, np.array(pts, dtype=float), prefix=True
                 )
-            for key in ("manual_id", "manual_label", "manual_label_conf",
-                        "match_conf"):
-                ann.meta_data[key] = record[key]
+            if not record["skipped"]:
+                for key in settings.MATCH_CSV_COLUMNS:
+                    ann.meta_data[key] = record[key]
             records.append(record)
 
         counts: Dict[str, int] = {}
@@ -2940,16 +2960,20 @@ def save_annotation_matches_csv(
     Appended columns: ``manual_id``, ``manual_label``, ``manual_label_conf``
     (the manual annotation's ``label_conf``) and ``match_conf``. All original
     columns and rows are kept verbatim; rows are matched to records by their
-    ``id`` column. Existing match columns (e.g. when re-running on a matched
-    file) are overwritten.
+    ``id`` column. When re-running on a matched file, the existing match
+    columns are overwritten only for ``considered`` records; other rows
+    (skipped, outside the label prefix, or without a record) keep their values,
+    so the output can again be used as input.
 
     Args:
         src_filepath: The (random point) annotation CSV that was matched.
         records: Output of :meth:`Annotations.match_annotations`.
         output_filepath: Where to write the matched CSV.
     """
-    new_cols = ["manual_id", "manual_label", "manual_label_conf", "match_conf"]
-    by_id = {str(rec["id"]): rec for rec in records}
+    new_cols = list(settings.MATCH_CSV_COLUMNS)
+    by_id = {
+        str(rec["id"]): rec for rec in records if rec.get("considered", True)
+    }
     with open(src_filepath, newline="") as f:
         rows = list(csv.reader(f))
     if not rows:
@@ -2968,12 +2992,42 @@ def save_annotation_matches_csv(
         for row in rows[1:]:
             if not row:
                 continue
-            rec = by_id.get(row[id_col].strip(), {})
+            rec = by_id.get(row[id_col].strip())
             row = list(row) + [""] * (len(rows[0]) - len(row))
             for col, i in zip(new_cols, cols):
-                value = rec.get(col, "")
                 if i is None:
-                    row.append(value)
-                else:
-                    row[i] = value
+                    row.append(rec.get(col, "") if rec else "")
+                elif rec is not None:
+                    row[i] = rec.get(col, "")
             writer.writerow(row)
+
+
+def get_matched_annotation_ids(filepath: str) -> Set[str]:
+    """Ids of rows in a matched annotation CSV that already have a match.
+
+    A row counts as matched when its ``manual_id`` or ``match_conf`` is
+    non-empty, whatever the value (e.g. ``"manual"`` for a match added by
+    hand, or a marker for a point reviewed as having no match).
+
+    Args:
+        filepath: Annotation CSV, typically written by
+            :func:`save_annotation_matches_csv`.
+
+    Returns:
+        Set of ids (stripped strings); empty if the file has no match columns.
+    """
+    with open(filepath, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return set()
+    header = [c.strip().strip('"') for c in rows[0]]
+    if "id" not in header:
+        return set()
+    id_col = header.index("id")
+    cols = [header.index(c) for c in ("manual_id", "match_conf") if c in header]
+    return {
+        row[id_col].strip()
+        for row in rows[1:]
+        if len(row) > id_col
+        and any(i < len(row) and row[i].strip() for i in cols)
+    }

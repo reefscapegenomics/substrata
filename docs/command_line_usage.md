@@ -443,7 +443,9 @@ A review PDF (`<random>_matches.pdf`) has one page per flagged point: every poin
 
 Candidates are labelled by their id suffix, with one colour per candidate. Each page also gives the approximate surface area of each colony. To correct a match, edit `manual_id` (and `manual_label`) directly in the matched CSV.
 
-Usage: `substrata match-annotations --random CSV [--manual CSV] [--label-prefix CS] [--max-dist M] [--max-candidates N] [--fallback-dist M] [--sam2-checkpoint PT] [--output CSV] [--pdf-output PDF] [--review-all] [--no-pdf] [--photo-path-replace OLD NEW] [--local]`
+The matched CSV can be passed back as `--random`. Rows that already have a `manual_id` or a `match_conf` are kept as they are, and only the remaining rows are matched. This covers matches from a previous run and matches you added by hand (e.g. with `match_conf` set to `manual`). Use `--redo-all` to re-match every row instead. Rows outside `--label-prefix` are never changed.
+
+Usage: `substrata match-annotations --random CSV [--manual CSV] [--label-prefix CS] [--max-dist M] [--max-candidates N] [--fallback-dist M] [--sam2-checkpoint PT] [--output CSV] [--pdf-output PDF] [--review-all] [--redo-all] [--no-pdf] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
 # Match random points to the project's manual annotations (auto-detects from CWD)
@@ -454,13 +456,18 @@ substrata match-annotations --random points.csv --manual colonies_ann.csv --revi
 
 # Match hard and soft corals
 substrata match-annotations --random points.csv --label-prefix CS,SC
+
+# Re-run on a (hand-edited) matched CSV: only rows without a match are assessed
+substrata match-annotations --random points_matched.csv --output points_matched_v2.csv
 ```
 
 ## Camera time-sync (camsync)
 
 Copy camera centers/transforms from a *pose-source* sensor (e.g. a GoPro) to an *updated-target* sensor (e.g. a macro camera) using EXIF time matching. Per-camera poses are written to the cameras meta JSON only — the `.cams.xml` is not modified (it is read for sensor calibration). The relative timing of the two sensors can be given manually (`--time-offset` / `--pose-time`) or estimated automatically (`--auto-time` / `--auto-xyz` / `--auto-offsets`); auto modes print a detailed report and prompt before saving unless you pass `--yes`.
 
-Usage: `substrata camsync [--pose-source ID] [--updated-target ID] [--pose-date DATES] [--target-date DATES] [--time-offset SEC | --pose-time TIMESTAMP] [--xyz X,Y,Z] [--auto-time] [--auto-xyz] [--auto-offsets] [--spatial-max-dist M] [--min-spatial-pairs N] [--yes]`
+Each run writes a sanity-check PDF (`<id>_camsync.pdf`): a summary page, followed by the first time-matched pose/target image pairs side by side (five per page). `--pdf-pairs N` sets how many pairs to render (default 9).
+
+Usage: `substrata camsync [--pose-source ID] [--updated-target ID] [--pose-date DATES] [--target-date DATES] [--time-offset SEC | --pose-time TIMESTAMP] [--xyz X,Y,Z] [--auto-time] [--auto-xyz] [--auto-offsets] [--spatial-max-dist M] [--min-spatial-pairs N] [--pdf-pairs N] [--yes]`
 
 ```bash
 # Interactive: lists sensors and prompts for source/target and timing
@@ -477,6 +484,9 @@ substrata camsync -s 0 -u 1 --auto-offsets --yes
 
 # Add a fixed offset (meters) in the pose-source camera frame when copying pose
 substrata camsync -s 0 -u 1 --time-offset 12.5 --xyz 0,0.12,0
+
+# Render 20 image pairs in the sanity PDF instead of the default 9
+substrata camsync -s 0 -u 1 --time-offset 12.5 --pdf-pairs 20
 ```
 
 ## Path repair (path-repair)

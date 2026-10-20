@@ -221,6 +221,53 @@ class TestSaveAnnotationMatchesCsv(unittest.TestCase):
         self.assertEqual(lines[0].count("manual_id"), 1)
         self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_002,POR,0.9,low")
 
+    def test_rerun_keeps_rows_that_were_not_considered(self):
+        a.save_annotation_matches_csv(self.src, self.records, self.out)
+        # Row 0 skipped (already matched); row 1 matched in the re-run
+        records = [
+            {"id": "0", "considered": False, "skipped": True, "manual_id": "",
+             "manual_label": "", "manual_label_conf": "", "match_conf": ""},
+            {"id": "1", "considered": True, "manual_id": "m_003",
+             "manual_label": "AGA", "manual_label_conf": "", "match_conf": "medium"},
+        ]
+        rerun = os.path.join(self.tmp.name, "rerun.csv")
+        a.save_annotation_matches_csv(self.out, records, rerun)
+        with open(rerun, newline="") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_001,POR,0.9,high")
+        self.assertEqual(lines[2], "1,4,5,6,MAF_T,,m_003,AGA,,medium")
+
+
+@unittest.skipUnless(a is not None, "requires the open3d/substrata environment")
+class TestGetMatchedAnnotationIds(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "rand_matched.csv")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, text):
+        with open(self.path, "w", newline="") as f:
+            f.write(text)
+
+    def test_any_manual_id_or_match_conf_counts(self):
+        self.write(
+            "id,x,y,z,label,manual_id,manual_label,manual_label_conf,match_conf\n"
+            "0,1,2,3,CSF,m_001,POR,0.9,high\n"
+            "1,1,2,3,CSF,,,,\n"
+            "2,1,2,3,CSF,m_002,AGA,,manual\n"
+            "3,1,2,3,CSF,m_004,,,\n"
+            "4,1,2,3,CSF,,,,none\n"
+            "5,1,2,3,CSF\n"
+        )
+        self.assertEqual(a.get_matched_annotation_ids(self.path),
+                         {"0", "2", "3", "4"})
+
+    def test_unmatched_file_has_no_ids(self):
+        self.write("id,x,y,z,label\n0,1,2,3,CSF\n")
+        self.assertEqual(a.get_matched_annotation_ids(self.path), set())
+
 
 if __name__ == "__main__":
     unittest.main()

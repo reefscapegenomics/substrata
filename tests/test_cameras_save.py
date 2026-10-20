@@ -155,6 +155,35 @@ class TestCamerasSave(unittest.TestCase):
             cb = out["cameras"]["cam_b"]
             self.assertEqual(cb["center"], [0.0, 0.0, 0.0])
 
+    def test_save_keeps_null_pose_for_unposed_placeholder(self) -> None:
+        Cameras = _load_cameras_class()
+
+        meta = {
+            "cameras": {
+                "cam_u": {
+                    "center": None,
+                    "transform": None,
+                    "path": "/tmp/placeholder_u.jpg",
+                    "enabled": True,
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "test.meta.json")
+            with open(path, "w") as f:
+                json.dump(meta, f)
+
+            cams = Cameras(cams_meta_filepath=path, cams_xml_filepath=None)
+            self.assertTrue(cams.data["cam_u"].missing_pose_from_meta)
+            cams.data["cam_u"].enabled = False
+            cams.save()
+
+            with open(path) as f:
+                cu = json.load(f)["cameras"]["cam_u"]
+            self.assertIsNone(cu["center"])
+            self.assertIsNone(cu["transform"])
+            self.assertFalse(cu["enabled"])
+
 
 class TestParseXyzCsv(unittest.TestCase):
     def test_parse(self) -> None:

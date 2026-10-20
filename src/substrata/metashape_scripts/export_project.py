@@ -151,21 +151,24 @@ def _mat4_to_list(matrix):
 def output_camera_metadata(path, chunk) -> None:
     """Write ``<id>.meta.json`` for the chunk's cameras (raw/local frame).
 
-    Cameras without a resolved ``center`` or ``transform`` are skipped, matching
-    the original workflow exporter; substrata tolerates their absence.
+    Cameras without a resolved ``center`` or ``transform`` (unaligned, e.g.
+    closeups) are still written, with null ``center``/``transform``, so that
+    substrata loads them with a placeholder pose and ``camsync`` can give them
+    one. This matches the ``05_create_densecloud.py`` workflow exporter.
     """
     import Metashape as ms  # noqa: F401  (kept for parity / future use)
 
     cameras: dict = {}
     for cam in chunk.cameras or []:
-        if cam is None or cam.center is None or cam.transform is None:
+        if cam is None:
             continue
 
-        center = [cam.center.x, cam.center.y, cam.center.z]
-        transform = _mat4_to_list(cam.transform)
+        aligned = cam.center is not None and cam.transform is not None
+        center = [cam.center.x, cam.center.y, cam.center.z] if aligned else None
+        transform = _mat4_to_list(cam.transform) if aligned else None
 
         center_crs = None
-        if chunk.transform is not None and chunk.crs:
+        if aligned and chunk.transform is not None and chunk.crs:
             world = chunk.transform.matrix.mulp(cam.center)
             projected = chunk.crs.project(world)
             if projected:

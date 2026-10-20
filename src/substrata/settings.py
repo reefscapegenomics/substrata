@@ -258,6 +258,11 @@ PATHREPAIR_IMAGE_EXTS = (
 PATHREPAIR_SKIP_DIR_NAMES = ("__pycache__", "node_modules") + TRAIN_CROP_DIRS
 PATHREPAIR_MAX_REPORT_ROWS = 10  # example rows printed per old-dir -> new-dir mapping
 
+# Camsync sanity PDF: pose/target image pairs rendered (--pdf-pairs), and how
+# many pair rows fit on one PDF page
+CAMSYNC_PDF_PAIRS = 9
+CAMSYNC_PDF_PAIRS_PER_PAGE = 5
+
 # Gap fraction: colour of the connected sky region in the projection image
 # (display only). RdBu_r at -0.2 on a +-0.3 scale, i.e. the blue side of the
 # TPI plot's colour map.
@@ -279,5 +284,8 @@ MATCH_MAX_CANDIDATES = 5  # nearest manual annotations tested per random point
 MATCH_FALLBACK_DISTANCE = 0.05  # metres; nearest-only match when no mask agrees
 MATCH_MASK_TOLERANCE_PX = 10  # full-res px; point counts as inside a mask within this
 MATCH_MAX_MASK_FRACTION = 0.5  # masks covering more of the image are ignored
+# Columns appended to the matched CSV; a row with a non-empty manual_id or
+# match_conf counts as matched (skipped on a re-run unless --redo-all)
+MATCH_CSV_COLUMNS = ("manual_id", "manual_label", "manual_label_conf", "match_conf")
 MATCH_REVIEW_CROP_PX = 600  # px; size of each image panel in the review PDF
 MATCH_REVIEW_MIN_CROP_PX = 1000  # full-res px; minimum crop side (context)

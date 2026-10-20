@@ -705,6 +705,11 @@ class Cameras:
                     cam_id,
                 )
                 continue
+            if getattr(cam, "missing_pose_from_meta", False):
+                # Still only the placeholder pose from load; keep the null pose
+                if hasattr(cam, "enabled"):
+                    cameras_out[cam_id]["enabled"] = bool(cam.enabled)
+                continue
             center = cam.orig_coords if cam.orig_coords is not None else cam.coords
             transform = (
                 cam.orig_camera_transform

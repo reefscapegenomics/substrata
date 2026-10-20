@@ -336,10 +336,13 @@ def _write_camsync_sanity_pdf(
     time_offset_sec: float,
     pcd=None,
     camsync_summary: dict | None = None,
-    max_pairs: int = 5,
+    max_pairs: int = settings.CAMSYNC_PDF_PAIRS,
     intercept_search_radius: float = 0.01,
 ) -> None:
     """Write a PDF: first a text summary page, then pose/target image pairs.
+
+    Pairs are spread over pages of at most ``settings.CAMSYNC_PDF_PAIRS_PER_PAGE``
+    rows each.
 
     Titles use raw EXIF from each file (``get_datetime_original(None)``). Brackets
     label ``dt`` (seconds) applied for sync on the target side only (pose uses 0 s).
@@ -356,7 +359,8 @@ def _write_camsync_sanity_pdf(
         pcd: Optional loaded :class:`~substrata.pointclouds.PointCloud` for intercepts.
         camsync_summary: Optional dict for the first-page run summary (see
             :func:`_camsync_summary_figure`).
-        max_pairs: Number of match rows to render (default 5).
+        max_pairs: Number of match rows to render (default
+            ``settings.CAMSYNC_PDF_PAIRS``).
         intercept_search_radius: Step radius for :meth:`PointCloud.get_intercept`
             (default 0.01, same as sandbox notebook).
     """
@@ -426,66 +430,73 @@ def _write_camsync_sanity_pdf(
             )
         return np.asarray(image)
 
-    n = len(pairs)
-    fig, axes = plt.subplots(n, 2, figsize=(10, max(2.5, 2.6 * n)))
-    axes = np.atleast_2d(axes)
-
-    for i, (pose_cam, tgt_cam) in enumerate(pairs):
-        pose_hl = None
-        tgt_hl = None
-        if pcd is not None:
-            origin = np.asarray(tgt_cam.coords, dtype=float).ravel()[:3]
-            icpt = pcd.get_intercept(
-                origin,
-                intercept_search_radius,
-                vector=tgt_cam.vector,
-            )
-            if icpt is not None:
-                world_pt = np.asarray(icpt.coords, dtype=float).ravel()[:3]
-                pose_hl = _pixel_highlight_from_cam(pose_cam, world_pt)
-                tgt_hl = _pixel_highlight_from_cam(tgt_cam, world_pt)
-
-        for j, (cam, col_title, is_tgt, hl) in enumerate(
-            (
-                (pose_cam, "source (pose)", False, pose_hl),
-                (tgt_cam, "target", True, tgt_hl),
-            )
-        ):
-            ax = axes[i, j]
-            fp = cam.filepath
-            rgb = _rgb_with_highlight(fp, hl) if fp else None
-            if rgb is not None:
-                ax.imshow(rgb)
-            else:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "(missing or unreadable image)",
-                    ha="center",
-                    va="center",
-                    transform=ax.transAxes,
-                    fontsize=9,
-                )
-            ax.set_axis_off()
-            short = os.path.basename(fp) if fp else "(no path)"
-            dt_line = _exif_title_line(cam, is_tgt)
-            ax.set_title(f"{col_title}\n{dt_line}\n{short}", fontsize=7)
-
-    fig.suptitle(
-        "Camsync sanity check: first pose vs target pairs (EXIF time match)",
-        fontsize=10,
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-
     pdf = PdfPages(output_path)
     if camsync_summary is not None:
         fig_sum = _camsync_summary_figure(camsync_summary)
         pdf.savefig(fig_sum)
         plt.close(fig_sum)
-    pdf.savefig(fig)
+
+    n_total = len(pairs)
+    per_page = max(1, int(settings.CAMSYNC_PDF_PAIRS_PER_PAGE))
+    for start in range(0, n_total, per_page):
+        page_pairs = pairs[start : start + per_page]
+        n = len(page_pairs)
+        fig, axes = plt.subplots(n, 2, figsize=(10, max(2.5, 2.6 * n)))
+        axes = np.atleast_2d(axes)
+
+        for i, (pose_cam, tgt_cam) in enumerate(page_pairs):
+            pose_hl = None
+            tgt_hl = None
+            if pcd is not None:
+                origin = np.asarray(tgt_cam.coords, dtype=float).ravel()[:3]
+                icpt = pcd.get_intercept(
+                    origin,
+                    intercept_search_radius,
+                    vector=tgt_cam.vector,
+                )
+                if icpt is not None:
+                    world_pt = np.asarray(icpt.coords, dtype=float).ravel()[:3]
+                    pose_hl = _pixel_highlight_from_cam(pose_cam, world_pt)
+                    tgt_hl = _pixel_highlight_from_cam(tgt_cam, world_pt)
+
+            for j, (cam, col_title, is_tgt, hl) in enumerate(
+                (
+                    (pose_cam, "source (pose)", False, pose_hl),
+                    (tgt_cam, "target", True, tgt_hl),
+                )
+            ):
+                ax = axes[i, j]
+                fp = cam.filepath
+                rgb = _rgb_with_highlight(fp, hl) if fp else None
+                if rgb is not None:
+                    ax.imshow(rgb)
+                else:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "(missing or unreadable image)",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                        fontsize=9,
+                    )
+                ax.set_axis_off()
+                short = os.path.basename(fp) if fp else "(no path)"
+                dt_line = _exif_title_line(cam, is_tgt)
+                ax.set_title(f"{col_title}\n{dt_line}\n{short}", fontsize=7)
+
+        page_range = f"pairs {start + 1}-{start + n} of {n_total}"
+        fig.suptitle(
+            "Camsync sanity check: pose vs target pairs (EXIF time match), "
+            f"{page_range}",
+            fontsize=10,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        pdf.savefig(fig)
+        plt.close(fig)
+
     pdf.close()
-    plt.close(fig)
-    print(f"Wrote camsync sanity PDF: {output_path}")
+    print(f"Wrote camsync sanity PDF: {output_path} ({n_total} pairs)")
 
 
 def _print_spatial_time_report(report: dict, scale_factor: float) -> None:
@@ -2240,6 +2251,7 @@ def handle_camsync(args):
         time_offset_sec=float(time_offset),
         pcd=getattr(init, "pcd", None),
         camsync_summary=camsync_summary,
+        max_pairs=max(1, int(args.pdf_pairs)),
         intercept_search_radius=intercept_r,
     )
 
@@ -2771,12 +2783,20 @@ def handle_match_annotations(args):
     annotation CSV with ``manual_id``, ``manual_label``, ``manual_label_conf``
     and ``match_conf`` columns, and a PDF to review flagged matches.
 
+    The matched CSV can be passed back as ``--random``: rows that already have
+    a ``manual_id`` or ``match_conf`` (from a previous run, or added by hand)
+    are then kept as they are, and only the remaining rows are matched, unless
+    ``--redo-all`` is given.
+
     Args:
         args: Arguments from argparse.
     """
     from substrata.initializer import ProjectInitializer
     from substrata import segmentation, visualizations
-    from substrata.annotations import save_annotation_matches_csv
+    from substrata.annotations import (
+        get_matched_annotation_ids,
+        save_annotation_matches_csv,
+    )
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
@@ -2806,6 +2826,12 @@ def handle_match_annotations(args):
         anns.transform_coords(init.world_transform)
     print(f"Random annotations: {len(random_anns)} ({args.random})")
     print(f"Manual annotations: {len(manual_anns)} ({manual_path})")
+    skip_ids = set() if args.redo_all else get_matched_annotation_ids(args.random)
+    if skip_ids:
+        print(
+            f"Skipping {len(skip_ids)} already matched random points "
+            "(use --redo-all to match all)"
+        )
 
     predictor = segmentation.get_sam2_predictor(sam2_checkpoint=args.sam2_checkpoint)
     records = random_anns.match_annotations(
@@ -2816,6 +2842,7 @@ def handle_match_annotations(args):
         max_dist=args.max_dist,
         max_candidates=args.max_candidates,
         fallback_dist=args.fallback_dist,
+        skip_ids=skip_ids,
     )
 
     stem = os.path.splitext(args.random)[0]
@@ -4380,7 +4407,11 @@ def main():
         dest="random",
         type=str,
         required=True,
-        help="Random point annotations CSV (the file that gets matched).",
+        help=(
+            "Random point annotations CSV (the file that gets matched). A "
+            "previously matched CSV can be given to only match the rows without "
+            "a manual_id/match_conf."
+        ),
     )
     p_match.add_argument(
         "--manual",
@@ -4456,6 +4487,15 @@ def main():
         dest="review_all",
         action="store_true",
         help="Include every match in the review PDF (default: flagged only).",
+    )
+    p_match.add_argument(
+        "--redo-all",
+        dest="redo_all",
+        action="store_true",
+        help=(
+            "Re-match all random points, overwriting existing manual_id/"
+            "match_conf values (default: skip rows that already have one)."
+        ),
     )
     p_match.add_argument(
         "--no-pdf",
@@ -4625,6 +4665,17 @@ def main():
         default=3,
         metavar="N",
         help="Minimum inlier pairs required for spatial auto time. Default: 3.",
+    )
+    p_camsync.add_argument(
+        "--pdf-pairs",
+        dest="pdf_pairs",
+        type=int,
+        default=settings.CAMSYNC_PDF_PAIRS,
+        metavar="N",
+        help=(
+            "Number of time-matched pose/target image pairs to render in the "
+            f"sanity PDF. Default: {settings.CAMSYNC_PDF_PAIRS}."
+        ),
     )
     p_camsync.add_argument(
         "--yes",
