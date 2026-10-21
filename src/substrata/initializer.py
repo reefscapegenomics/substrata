@@ -210,6 +210,19 @@ class ProjectInitializer:
         self.ply_filepath = value
 
     @property
+    def thumbnails_root(self) -> str | None:
+        """Thumbnails directory: ``thumbnails_path`` or ``<path>/<id>.thumbnails``.
+
+        Thumbnails belong to the model (unlike crops, which belong to an
+        annotations file), so the default sits in the model folder.
+        """
+        if self.thumbnail_path:
+            return self.thumbnail_path
+        if self.path is None or self.id is None:
+            return None
+        return os.path.join(self.path, f"{self.id}{settings.THUMBNAILS_DIR_SUFFIX}")
+
+    @property
     def world_transform_is_identity(self) -> bool:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
@@ -422,6 +435,9 @@ class ProjectInitializer:
             self.annotations = annotations.Annotations(
                 self.annotations_filepath, orig_coords_only=True
             )
+            # An explicit cropped_path wins over the <csv stem>.cropped default
+            if self.cropped_path:
+                self.annotations.crops_root = self.cropped_path
         elif self.annotations_filepath is not None and not os.path.exists(
             self.annotations_filepath
         ):

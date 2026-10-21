@@ -17,6 +17,7 @@ dependencies:
   - tqdm
   - ipywidgets
   - PyYAML
+  - pillow
   - ffmpeg
   - pip
   - pip:
@@ -27,3 +28,4 @@ dependencies:
       - exifread
       - joblib
       - fastai
+      - piexif

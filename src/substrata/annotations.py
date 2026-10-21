@@ -63,6 +63,9 @@ class Annotations:
         ("cam_x", ["cam_x"], False),
         ("cam_y", ["cam_y"], False),
         ("depth_sensor_m", ["depth"], False),
+        ("pred_label", ["pred_label"], False),
+        ("pred_conf", ["pred_conf"], False),
+        ("pred_n", ["pred_n"], False),
     ]
 
     def __init__(
@@ -78,6 +81,8 @@ class Annotations:
         self.data = {}
         self.measurements = {}
         self.world_transform = np.eye(4)
+        self.filepath: Optional[str] = None  # CSV the annotations were loaded from
+        self._crops_root: Optional[str] = None
 
         if filepath is not None:
             self.get_annotations_from_file(
@@ -116,6 +121,34 @@ class Annotations:
     def coords(self) -> List[np.ndarray]:
         """List of each annotation's coordinates, in insertion order."""
         return [annotation.coords for annotation in self.data.values()]
+
+    @property
+    def crops_root(self) -> Optional[str]:
+        """Directory holding the crops for these annotations.
+
+        An explicitly set value (e.g. the project YAML's ``cropped_path``, set by
+        ``ProjectInitializer``) takes precedence. Otherwise the crops sit next to
+        the annotations CSV, in ``<csv stem>.cropped`` - so crops belong to the
+        annotation set, not to the model, and annotation sets never mix.
+
+        Returns:
+            The crops directory, or None if neither is known.
+        """
+        explicit = getattr(self, "_crops_root", None)
+        if explicit:
+            return explicit
+        filepath = getattr(self, "filepath", None)
+        if not filepath:
+            return None
+        csv_path = os.path.abspath(filepath)
+        stem = os.path.splitext(os.path.basename(csv_path))[0]
+        return os.path.join(
+            os.path.dirname(csv_path), stem + settings.CROPS_DIR_SUFFIX
+        )
+
+    @crops_root.setter
+    def crops_root(self, value: Optional[str]) -> None:
+        self._crops_root = value
 
     @property
     def classifications(self) -> List[Optional[str]]:
@@ -228,6 +261,7 @@ class Annotations:
             ignore_header: If True, skip the first line and ignore the header argument.
         """
         annotations_file = open(annotations_filepath, "r")
+        self.filepath = annotations_filepath
 
         # If ignore_header is True, skip first line and treat as no header
         if ignore_header:
@@ -241,6 +275,7 @@ class Annotations:
             elif line_no == 0 and not header:
                 self.col_order = settings.ANN_DEFAULT_COL_ORDER
 
+            cols = line.rstrip("\r\n").split(",")
             (
                 id,
                 orig_x,
@@ -256,7 +291,7 @@ class Annotations:
                 cam_y,
                 other_cols,
                 depth_sensor_m,
-            ) = self.__get_annotation_fields(line.rstrip("\r\n").split(","))
+            ) = self.__get_annotation_fields(cols)
             ann_id = self.__strip_post_fixes(id)
             if ann_id not in self.data:
                 # New annotation
@@ -278,6 +313,7 @@ class Annotations:
                     float(depth_sensor_m) if depth_sensor_m not in [None, ""] else None
                 )
                 self.data[id].other_cols = other_cols
+                self.__set_prediction_fields(self.data[id], cols)
             else:
                 # Additional coordinates for existing annotation
                 self.data[ann_id].add_extra_coords(line.rstrip("\r\n"))
@@ -818,6 +854,141 @@ class Annotations:
             else:
                 ann.label = None
                 ann.label_conf = None
+
+    def _ordered(
+        self, ids: Optional[Iterable[str]] = None,
+        priority_ids: Optional[Iterable[str]] = None,
+    ) -> List["Annotation"]:
+        """Annotations (all, or ``ids``), with ``priority_ids`` moved to the front."""
+        anns = (
+            [self.data[i] for i in ids if i in self.data]
+            if ids is not None else list(self.data.values())
+        )
+        if not priority_ids:
+            return anns
+        priority = [i for i in priority_ids if i in self.data]
+        priority_set = set(priority)
+        selected = {ann.id for ann in anns}
+        first = [self.data[i] for i in priority if i in selected]
+        return first + [ann for ann in anns if ann.id not in priority_set]
+
+    def _collect_image_matches(
+        self, anns: List["Annotation"], cams: Any, max_cams: Optional[int],
+        pcd: Optional[Any],
+    ) -> List[Tuple["Annotation", List[Any]]]:
+        """Image matches per annotation (sequential; occlusion checks use pcd)."""
+        groups = []
+        for ann in tqdm(anns, desc="Finding image matches"):
+            try:
+                groups.append((ann, ann._matches_for_crops(cams, max_cams, pcd)))
+            except Exception as e:  # noqa: BLE001 - skip, keep going
+                logger.warning("Image matching failed for %s: %s", ann.id, e)
+        return groups
+
+    def save_crops(
+        self,
+        cams: Any,
+        root: Optional[str] = None,
+        crop_size: Union[int, Tuple[int, int]] = settings.CROP_SIZE_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        pcd: Optional[Any] = None,
+        ids: Optional[Iterable[str]] = None,
+        priority_ids: Optional[Iterable[str]] = None,
+        overwrite: bool = False,
+        n_jobs: int = -1,
+    ) -> Dict[str, int]:
+        """Save crops for many annotations (see :meth:`Annotation.save_crops`).
+
+        Image matches are found per annotation, then all crops are written in
+        one pool of threads (photo decoding releases the GIL).
+
+        Args:
+            cams: Cameras to match against.
+            root: Crops directory; defaults to :attr:`crops_root`.
+            crop_size: Crop size ``(w, h)`` or int.
+            max_cams: Maximum image matches cropped per annotation (None = all).
+            pcd: Optional point cloud, used to drop occluded matches.
+            ids: Only these annotation ids (default: all).
+            priority_ids: Annotation ids to process first (e.g. those in view).
+            overwrite: Replace existing crops.
+            n_jobs: Threads for writing crops (-1 = all cores, 1 = sequential).
+
+        Returns:
+            Number of crops per status (``generated``, ``skipped``, ``rejected``,
+            ``failed``).
+        """
+        root = root if root is not None else self.crops_root
+        if root is None:
+            raise ValueError("No crops directory: pass root= or set crops_root.")
+        groups = self._collect_image_matches(
+            self._ordered(ids, priority_ids), cams, max_cams, pcd
+        )
+        matches = [im for _ann, ims in groups for im in ims]
+        with tqdm_joblib(tqdm(total=len(matches), desc="Saving crops")):
+            statuses = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(im.save_crop)(root, crop_size, overwrite) for im in matches
+            )
+        return cameras._count_statuses(statuses)
+
+    def predict(
+        self,
+        cams: Any,
+        classifier: Any,
+        crop_size: Union[int, Tuple[int, int]] = settings.PREDICTION_CROP_SIZE_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        pcd: Optional[Any] = None,
+        root: Optional[str] = None,
+        ids: Optional[Iterable[str]] = None,
+        write_crops: bool = True,
+        method: str = settings.PREDICTION_AGGREGATION,
+        batch_size: int = 64,
+        n_jobs: int = -1,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Predict labels for many annotations (see :meth:`Annotation.predict`).
+
+        All crops of all annotations go through the classifier in one batched
+        pass, which keeps the GPU busy. Each annotation's ``pred_label``,
+        ``pred_conf`` and ``pred_n`` are set; the CSV is not saved.
+
+        Args:
+            cams: Cameras to match against.
+            classifier: Loaded fastai learner or path to a ``.pkl``.
+            crop_size: Classifier input crop size ``(w, h)`` or int.
+            max_cams: Maximum image matches used per annotation (None = all).
+            pcd: Optional point cloud, used to drop occluded matches.
+            root: Crops directory; defaults to :attr:`crops_root`. Stored crops
+                are used as classifier input where large enough.
+            ids: Only these annotation ids (default: all).
+            write_crops: Also store each crop's own prediction in its EXIF.
+            method: Aggregation method (see
+                :func:`classification.aggregate_predictions`).
+            batch_size: Inference batch size.
+            n_jobs: Threads for loading crops (-1 = all cores).
+
+        Returns:
+            Mapping of annotation id to its consensus prediction
+            (``{"label", "confidence", "n"}``) or None.
+        """
+        from substrata import classification
+
+        root = root if root is not None else self.crops_root
+        groups = self._collect_image_matches(
+            self._ordered(ids), cams, max_cams, pcd
+        )
+        matches = [im for _ann, ims in groups for im in ims]
+        results = classification.classify_image_matches_batch(
+            matches, classifier, crop_size,
+            batch_size=batch_size, n_jobs=n_jobs, crops_root=root,
+        )
+        consensus = {}
+        start = 0
+        for ann, ims in groups:
+            end = start + len(ims)
+            consensus[ann.id] = ann._apply_predictions(
+                ims, results[start:end], root, write_crops, method
+            )
+            start = end
+        return consensus
 
     def _print_classification_summary(
         self, results: Dict[str, Optional[Dict[str, Any]]]
@@ -1631,6 +1802,13 @@ class Annotations:
         if not orig_coords_only:
             col_headers.extend(["world_x", "world_y", "world_z"])
         col_headers.extend(["cam_filepath", "cam_x", "cam_y", "depth"])
+        # Consensus-prediction columns, only once predictions exist (or were loaded)
+        loaded_preds = (getattr(self, "col_order", None) or {}).get("pred_label")
+        with_preds = loaded_preds is not None or any(
+            getattr(ann, "pred_label", None) is not None for ann in self.data.values()
+        )
+        if with_preds:
+            col_headers.extend(["pred_label", "pred_conf", "pred_n"])
         # Header - specific to InterceptAnnotation instances
         first_annotation = next(iter(self.data.values()), None)
         if isinstance(first_annotation, InterceptAnnotation):
@@ -1693,6 +1871,10 @@ class Annotations:
             row.append(cam_y if cam_y is not None else "")
             depth_sensor_m = getattr(ann, "depth_sensor_m", None)
             row.append(depth_sensor_m if depth_sensor_m is not None else "")
+            if with_preds:
+                for name in ("pred_label", "pred_conf", "pred_n"):
+                    value = getattr(ann, name, None)
+                    row.append(value if value is not None else "")
 
             # Columns specific to InterceptAnnotation instances
             if isinstance(ann, InterceptAnnotation):
@@ -1718,6 +1900,10 @@ class Annotations:
 
         with open(filepath, "w", newline="") as f:
             csv.writer(f).writerows(output_lines)
+        # Remember the file for in-memory annotations; a later save elsewhere
+        # (e.g. a backup) must not move the crops_root of loaded annotations.
+        if getattr(self, "filepath", None) is None:
+            self.filepath = filepath
 
     def __determine_col_order(self, line: str) -> Dict[str, Optional[int]]:
         """Determine column order from either header or a line of data.
@@ -1814,6 +2000,20 @@ class Annotations:
             field_values["depth_sensor_m"],
         )
 
+    def __set_prediction_fields(self, ann: "Annotation", cols: List[str]) -> None:
+        """Load the optional consensus-prediction columns into ``ann``."""
+
+        def get_value(key: str) -> Optional[str]:
+            idx = self.col_order.get(key)
+            value = cols[idx] if idx is not None and idx < len(cols) else None
+            return value if value not in (None, "") else None
+
+        ann.pred_label = get_value("pred_label")
+        pred_conf = get_value("pred_conf")
+        ann.pred_conf = float(pred_conf) if pred_conf is not None else None
+        pred_n = get_value("pred_n")
+        ann.pred_n = int(float(pred_n)) if pred_n is not None else None
+
     @staticmethod
     def __strip_post_fixes(ann_id: str) -> str:
         """Remove postfixes from annotation id.
@@ -1855,6 +2055,10 @@ class Annotation:
         self.cam_x: Optional[float] = None
         self.cam_y: Optional[float] = None
         self.depth_sensor_m: Optional[float] = None
+        # Consensus prediction across this annotation's crops (see predict)
+        self.pred_label: Optional[str] = None
+        self.pred_conf: Optional[float] = None
+        self.pred_n: Optional[int] = None
 
     @property
     def depth_in_m(self) -> float:
@@ -2236,6 +2440,146 @@ class Annotation:
             return image_matches[0]
         else:
             return None
+
+    def _matches_for_crops(
+        self, cams: Any, max_cams: Optional[int], pcd: Optional[Any],
+        image_matches: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        """``image_matches`` if given, else freshly computed matches."""
+        if image_matches is not None:
+            return list(image_matches)
+        return self.get_image_matches(cams, max_cams, pcd=pcd) or []
+
+    def _resolve_crops_root(self, root: Optional[str]) -> Optional[str]:
+        """``root`` or the parent's crops root (None if neither is known)."""
+        if root is not None:
+            return root
+        return getattr(self.parent, "crops_root", None)
+
+    def crops_dir(self, root: Optional[str] = None) -> Optional[str]:
+        """Directory holding this annotation's crops: ``<crops root>/<id>``."""
+        root = self._resolve_crops_root(root)
+        return os.path.join(root, str(self.id)) if root is not None else None
+
+    def save_crops(
+        self,
+        cams: Any,
+        root: Optional[str] = None,
+        crop_size: Union[int, Tuple[int, int]] = settings.CROP_SIZE_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        pcd: Optional[Any] = None,
+        image_matches: Optional[List[Any]] = None,
+        overwrite: bool = False,
+    ) -> Dict[str, int]:
+        """Save a crop for each of this annotation's image matches.
+
+        Runs sequentially; use :meth:`Annotations.save_crops` for many
+        annotations.
+
+        Args:
+            cams: Cameras to match against.
+            root: Crops directory; defaults to the parent's ``crops_root``.
+            crop_size: Crop size ``(w, h)`` or int.
+            max_cams: Maximum image matches to crop (None = all).
+            pcd: Optional point cloud, used to drop occluded matches.
+            image_matches: Matches already computed by the caller, to avoid
+                recomputing them (they must be current, e.g. after a move).
+            overwrite: Replace existing crops.
+
+        Returns:
+            Number of crops per status (``generated``, ``skipped``, ``rejected``,
+            ``failed``).
+        """
+        root = self._resolve_crops_root(root)
+        if root is None:
+            raise ValueError("No crops directory: pass root= or set crops_root.")
+        matches = self._matches_for_crops(cams, max_cams, pcd, image_matches)
+        return cameras._count_statuses(
+            im.save_crop(root, crop_size, overwrite) for im in matches
+        )
+
+    def remove_crops(self, root: Optional[str] = None) -> None:
+        """Delete this annotation's crops (e.g. after it moved)."""
+        import shutil
+
+        crops_dir = self.crops_dir(root)
+        if crops_dir is not None and os.path.isdir(crops_dir):
+            shutil.rmtree(crops_dir)
+
+    def predict(
+        self,
+        cams: Any,
+        classifier: Any,
+        crop_size: Union[int, Tuple[int, int]] = settings.PREDICTION_CROP_SIZE_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        pcd: Optional[Any] = None,
+        image_matches: Optional[List[Any]] = None,
+        root: Optional[str] = None,
+        write_crops: bool = True,
+        method: str = settings.PREDICTION_AGGREGATION,
+        batch_size: int = 64,
+        n_jobs: int = -1,
+    ) -> Optional[Dict[str, Any]]:
+        """Predict this annotation's label from all of its image matches.
+
+        Each match is classified (from the centre of its stored crop where that
+        is large enough, otherwise from the source photo), and the per-crop
+        predictions are combined with
+        :func:`classification.aggregate_predictions`. Sets ``pred_label``,
+        ``pred_conf`` and ``pred_n``; does not save the CSV.
+
+        Args:
+            cams: Cameras to match against.
+            classifier: Loaded fastai learner or path to a ``.pkl``.
+            crop_size: Classifier input crop size ``(w, h)`` or int.
+            max_cams: Maximum image matches to use (None = all).
+            pcd: Optional point cloud, used to drop occluded matches.
+            image_matches: Matches already computed by the caller.
+            root: Crops directory; defaults to the parent's ``crops_root``.
+            write_crops: Also store each crop's own prediction in its EXIF.
+            method: ``"weighted"`` or ``"first"``.
+            batch_size: Inference batch size.
+            n_jobs: Threads for loading crops (-1 = all cores).
+
+        Returns:
+            The consensus ``{"label", "confidence", "n"}``, or None.
+        """
+        from substrata import classification
+
+        root = self._resolve_crops_root(root)
+        matches = self._matches_for_crops(cams, max_cams, pcd, image_matches)
+        results = classification.classify_image_matches_batch(
+            matches, classifier, crop_size,
+            batch_size=batch_size, n_jobs=n_jobs, crops_root=root,
+        )
+        return self._apply_predictions(matches, results, root, write_crops, method)
+
+    def _apply_predictions(
+        self,
+        image_matches: List[Any],
+        results: List[Optional[Dict[str, Any]]],
+        root: Optional[str],
+        write_crops: bool,
+        method: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Store the consensus on this annotation and per-crop results in EXIF."""
+        from substrata import classification
+
+        consensus = classification.aggregate_predictions(
+            image_matches, results, method
+        )
+        self.pred_label = consensus["label"] if consensus else None
+        self.pred_conf = consensus["confidence"] if consensus else None
+        self.pred_n = consensus["n"] if consensus else None
+        if write_crops and root is not None:
+            for im, res in zip(image_matches, results):
+                path = im.find_crop(root) if res else None
+                if path:
+                    cameras._update_crop_metadata(path, {
+                        "pred_label": res["label"],
+                        "pred_conf": float(res.get("confidence") or 0.0),
+                    })
+        return consensus
 
     def measure(
         self, measurement_func: Callable, *args: Any, **kwargs: Any

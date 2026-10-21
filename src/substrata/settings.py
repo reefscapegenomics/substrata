@@ -134,6 +134,21 @@ TRAIN_BOLD = "\033[1m"
 TRAIN_RESET = "\033[0m"
 TRAIN_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
+# --- Annotation crops, thumbnails and predictions (substrata crops/predict) ---
+CROP_SIZE_DEFAULT = (800, 800)  # pixels (w, h); centred on the image match
+# Prediction input: a centre crop of the stored crop when it is large enough,
+# otherwise cut from the source photo. Matches the training crop size.
+PREDICTION_CROP_SIZE_DEFAULT = (TRAIN_CROP_SIZE, TRAIN_CROP_SIZE)
+CROP_JPEG_QUALITY = TRAIN_CROP_JPEG_QUALITY  # avoid extra loss vs training crops
+CROPS_DIR_SUFFIX = ".cropped"  # default crops dir: <annotations csv stem>.cropped
+THUMBNAIL_MAX_SIZE = (1024, 768)  # pixels; bounding box, aspect ratio is kept
+THUMBNAILS_DIR_SUFFIX = ".thumbnails"  # default thumbnails dir: <id>.thumbnails
+MAX_PHOTOS_TO_CROP_DEFAULT = 10  # image matches cropped per annotation
+# How per-crop predictions combine into one prediction per annotation:
+# "weighted" (relevance-weighted mean of class probabilities) or "first".
+PREDICTION_AGGREGATION = "weighted"
+CROP_METADATA_VERSION = 1  # version of the JSON stored in a crop's EXIF
+
 RGL_SCALEBARS = [
     ["target 3", "target 4", 0.500],
     ["target 5", "target 6", 0.500],  # w/ yellow ruler

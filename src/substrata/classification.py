@@ -112,15 +112,64 @@ def _ensure_learner(classifier: Union[str, Any]):
     return classifier
 
 
-def _crop_for_match(image_match, crop_size) -> Optional[Image.Image]:
+def _crop_from_stored_crop(
+    image_match, crop_size: Union[int, Tuple[int, int]], crops_root: str
+) -> Optional[Image.Image]:
+    """Cut the classifier input out of the match's stored crop, if possible.
+
+    Stored crops (:meth:`~substrata.cameras.ImageMatch.save_crop`) are centred
+    on the match and never resized, so cutting ``crop_size`` from their centre
+    (with the same box arithmetic as ``visualizations.get_crop_img``) yields the
+    same pixels as cropping the source photo, but decodes a far smaller JPEG.
+
+    Returns:
+        The crop, or None if there is no stored crop or it is too small.
+    """
+    try:
+        path = image_match.find_crop(crops_root)
+    except (AttributeError, ValueError):
+        return None
+    if not path:
+        return None
+    crop_w, crop_h = (
+        (crop_size, crop_size) if isinstance(crop_size, int) else crop_size
+    )
+    x, y = image_match.x, image_match.y
+    try:
+        with Image.open(path) as stored:
+            stored_w, stored_h = stored.size
+            left = int(x - crop_w / 2) - int(x - stored_w / 2)
+            top = int(y - crop_h / 2) - int(y - stored_h / 2)
+            if (
+                left < 0
+                or top < 0
+                or left + crop_w > stored_w
+                or top + crop_h > stored_h
+            ):
+                return None
+            return stored.crop(
+                (left, top, left + crop_w, top + crop_h)
+            ).convert("RGB")
+    except OSError:
+        return None
+
+
+def _crop_for_match(
+    image_match, crop_size, crops_root: Optional[str] = None
+) -> Optional[Image.Image]:
     """Return the classifier-input crop for an ImageMatch (or None on failure).
 
     Crops centred on the matched pixel ``(image_match.x, image_match.y)`` at
     ``crop_size`` (matching how training crops are cut); with ``crop_size=None``
     uses the whole image. Shared by :func:`classify_image_match` and the batched
     :func:`classify_image_matches_batch` so both feed the classifier the same
-    pixels.
+    pixels. With ``crops_root``, the centre of the match's stored crop is used
+    when it is at least ``crop_size``; otherwise the source photo is cropped.
     """
+    if crops_root is not None and crop_size is not None:
+        crop = _crop_from_stored_crop(image_match, crop_size, crops_root)
+        if crop is not None:
+            return crop
     fp = getattr(image_match, "filepath", None)
     if not fp or not os.path.isfile(fp):
         return None
@@ -173,6 +222,7 @@ def classify_image_matches_batch(
     image_matches: List[Any], classifier: Union[str, Any],
     crop_size: Optional[Union[int, Tuple[int, int]]] = None,
     batch_size: int = 64, n_jobs: int = -1,
+    crops_root: Optional[str] = None,
 ) -> List[Optional[Dict[str, Any]]]:
     """Classify many ImageMatches in batched GPU passes (fast path).
 
@@ -194,6 +244,9 @@ def classify_image_matches_batch(
         crop_size: Crop size (int or ``(w, h)``); ``None`` uses the full image.
         batch_size: Inference batch size.
         n_jobs: Threads for parallel crop loading (-1 = all cores).
+        crops_root: Optional crops directory; matches with a stored crop at
+            least ``crop_size`` are classified from its centre instead of the
+            source photo (same pixels, much faster to decode).
 
     Returns:
         List of result dicts (or ``None``) aligned with ``image_matches``.
@@ -231,7 +284,8 @@ def classify_image_matches_batch(
         desc=f"Cropping image matches ({device})", unit="img",
     )):
         loaded = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_crop_for_match)(im, crop_size) for im in image_matches
+            delayed(_crop_for_match)(im, crop_size, crops_root)
+            for im in image_matches
         )
     crops, idx_map = [], []
     for i, crop in enumerate(loaded):
@@ -256,7 +310,7 @@ def classify_image_matches_batch(
         )
         for pos in idx_map:
             results[pos] = classify_image_match(
-                image_matches[pos], learn, crop_size
+                image_matches[pos], learn, crop_size, crops_root=crops_root
             )
     return results
 
@@ -266,6 +320,7 @@ def classify_image_match(
     classifier: Union[str, Any],
     crop_size: Optional[Union[int, Tuple[int, int]]] = None,
     show: bool = False,
+    crops_root: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Run an image classifier on an ImageMatch and attach the result to the instance.
@@ -281,6 +336,8 @@ def classify_image_match(
         crop_size: Optional int (square) or (width, height) tuple for center crop.
         show: If True, display the image crop and classification result
             (Jupyter notebook).
+        crops_root: Optional crops directory; a stored crop at least
+            ``crop_size`` is used instead of the source photo.
 
     Returns:
         A dict with keys: 'label', 'confidence', 'probs', 'pred_idx'.
@@ -292,17 +349,15 @@ def classify_image_match(
         logger.error(str(e))
         return None
 
-    if not hasattr(image_match, "filepath") or not image_match.filepath:
-        logger.error("ImageMatch has no valid filepath.")
-        return None
-    if not os.path.isfile(image_match.filepath):
-        logger.error(f"Image file not found: {image_match.filepath}")
-        return None
-
     try:
         # Crop centred on the matched pixel (image_match.x, image_match.y),
         # matching how training crops are cut (generate_crop -> get_crop_img).
-        img = _crop_for_match(image_match, crop_size)
+        img = _crop_for_match(image_match, crop_size, crops_root)
+        if img is None and not os.path.isfile(
+            getattr(image_match, "filepath", None) or ""
+        ):
+            logger.error(f"Image file not found: {image_match.filepath}")
+            return None
         if img is None:
             logger.error(f"Could not crop image: {image_match.filepath}")
             return None
@@ -360,6 +415,69 @@ def classify_image_match(
     except Exception as e:
         logger.error(f"Classification failed for {image_match.filepath}: {e}")
         return None
+
+
+def aggregate_predictions(
+    image_matches: List[Any],
+    results: List[Optional[Dict[str, Any]]],
+    method: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Combine per-crop predictions for one annotation into a single prediction.
+
+    Methods:
+
+    - ``"first"``: the prediction for the top-ranked match (matches are sorted
+      by obstruction, then ``relevance``).
+    - ``"weighted"``: the mean of the class-probability vectors, each crop
+      weighted by ``relevance_min / relevance``. ``relevance`` (lower is better)
+      scores how close the camera is and how central the point is in the image.
+      Crops flagged ``potentially_obstructed`` are left out unless every crop
+      is. Averaging probabilities keeps a single overconfident crop from
+      outvoting several consistent ones.
+
+    Args:
+        image_matches: The annotation's ImageMatch objects.
+        results: Classification result dicts aligned with ``image_matches``
+            (``None`` where classification failed).
+        method: ``"weighted"`` or ``"first"``. Default:
+            ``settings.PREDICTION_AGGREGATION``.
+
+    Returns:
+        ``{"label", "confidence", "n"}`` (``n`` = number of crops used), or None
+        if there is no result.
+    """
+    method = method or settings.PREDICTION_AGGREGATION
+    pairs = [(im, res) for im, res in zip(image_matches, results) if res]
+    if not pairs:
+        return None
+    if method == "first":
+        _im, res = pairs[0]
+        return {
+            "label": res["label"],
+            "confidence": float(res.get("confidence") or 0.0),
+            "n": 1,
+        }
+    if method != "weighted":
+        raise ValueError(f"Unknown prediction aggregation method: {method}")
+
+    clear = [p for p in pairs if not getattr(p[0], "potentially_obstructed", False)]
+    used = clear or pairs
+    relevances = [
+        max(float(getattr(im, "relevance", 1.0) or 0.0), 1e-12) for im, _ in used
+    ]
+    min_relevance = min(relevances)
+    totals: Dict[str, float] = {}
+    weight_sum = 0.0
+    for (_im, res), relevance in zip(used, relevances):
+        weight = min_relevance / relevance
+        probs = res.get("probs") or {
+            res["label"]: float(res.get("confidence") or 0.0)
+        }
+        for label, prob in probs.items():
+            totals[label] = totals.get(label, 0.0) + weight * float(prob)
+        weight_sum += weight
+    label = max(totals, key=totals.get)
+    return {"label": label, "confidence": totals[label] / weight_sum, "n": len(used)}
 
 
 # ---------------------------------------------------------------------------

@@ -412,6 +412,59 @@ substrata images --transform
 substrata images --pdf-output imagematches.pdf
 ```
 
+## Thumbnails
+
+Write a downscaled copy of every camera photo, for annotation tools such as reefcat. Thumbnails belong to the model, so they go in `thumbnails_path` from the YAML, or `<id>.thumbnails/` in the model folder by default. They mirror the photo folders: `<thumbnails>/<photo folder>/<filename>`, e.g. `<id>.thumbnails/<id>.auv/IMG_0001.jpg`. Existing thumbnails are skipped, including old ones stored directly in the thumbnails folder.
+
+Usage: `substrata thumbnails [--size W H] [--output DIR] [--overwrite] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+
+```bash
+# Default 1024x768 bounding box (aspect ratio is kept)
+substrata thumbnails
+
+# Regenerate all thumbnails at a different size
+substrata thumbnails --size 1280 960 --overwrite
+```
+
+## Crops
+
+Save a crop centred on each image match of every annotation (up to `--max-photos` per annotation, best matches first). Crops belong to an annotations file, not to the model: they go in `cropped_path` from the YAML, or next to the annotations CSV in `<annotations csv stem>.cropped/` by default. The layout is `<crops>/<ann_id>/<photo folder>/<filename>`, so photos from `.photos`, `.auv` and `.closeup` folders never collide. Old crops stored as `<crops>/<ann_id>/<filename>` are still found and skipped.
+
+Matches whose crop would extend past the image edge are rejected, so every crop is centred on its annotation. With a point cloud, occluded matches are dropped and possibly obstructed ones are flagged in the crop's EXIF; `--no-ply` skips this for speed. Crops keep the photo's EXIF and are saved at JPEG quality 95.
+
+Usage: `substrata crops [--size W H] [--max-photos N] [--output DIR] [--overwrite] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+
+```bash
+# Default 800x800 crops (or the YAML crop_size), up to 10 photos per annotation
+substrata crops
+
+# Larger crops for a specific annotations file, regenerating existing ones
+substrata crops --annotations other_ann.csv --size 1000 --overwrite
+```
+
+## Predict
+
+Predict a label for every annotation with a trained classifier (`substrata train`). Each image match is classified, and the results are combined into one prediction per annotation:
+
+- `weighted` (default): the mean of the class probabilities across crops, each crop weighted by its relevance (how close the camera is and how central the point is in the photo). Possibly obstructed crops are left out unless all crops are. A single overconfident crop cannot outvote several consistent ones.
+- `first`: the prediction for the best-ranked crop only.
+
+The combined prediction is written to the `pred_label`, `pred_conf` and `pred_n` (number of crops used) columns of the annotations CSV; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF, unless `--no-write-crops` is given.
+
+The classifier input is cut from the centre of the stored crop when that crop is at least `--size` (default 224x224), giving the same pixels as cropping the photo but much faster, and without needing the photos. Otherwise it is cut from the photo.
+
+Do not run this while the same annotations file is open in reefcat, as both write the CSV.
+
+Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--batch-size N] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+
+```bash
+# Classifier from the YAML; crops from `substrata crops`
+substrata predict
+
+# Explicit classifier, using only the best crop per annotation
+substrata predict --classifier crop_classifier.pkl --method first
+```
+
 ## Match annotations
 
 Match random point annotations (e.g. a point-intercept CSV) to manual annotations of the same object (e.g. colony annotations in `<id>_ann.csv`). Only random points whose label starts with `--label-prefix` (default `CS`, hard corals; comma-separated list allowed, `''` for all) are considered, and only cameras are loaded (not the point cloud).

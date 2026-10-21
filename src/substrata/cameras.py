@@ -112,6 +112,144 @@ def _sync_camera_enabled_to_cams_xml(cameras: Cameras, xml_path: str) -> None:
     print(f"Updated {updated} <camera enabled> flags in {xml_abs}")
 
 
+# --- Crop / thumbnail files ----------------------------------------------------
+
+# EXIF UserComment payloads start with an 8-byte character-code prefix.
+_EXIF_ASCII_PREFIX = b"ASCII\x00\x00\x00"
+_CROP_STATUSES = ("generated", "skipped", "rejected", "failed")
+
+
+def _size_pair(size) -> tuple:
+    """Return ``(w, h)`` for an int (square) or a ``(w, h)`` pair."""
+    if isinstance(size, (int, float)):
+        return int(size), int(size)
+    w, h = size
+    return int(w), int(h)
+
+
+def _photo_folder_name(filepath: str) -> str | None:
+    """Name of the folder holding a photo (e.g. ``ton_tof.auv``), if any.
+
+    Handles both ``/`` and ``\\`` separators, as Metashape may store Windows
+    paths.
+    """
+    parts = [p for p in re.split(r"[\\/]", filepath or "") if p]
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def _first_existing(*paths) -> str | None:
+    """Return the first of ``paths`` that is an existing file, else None."""
+    for path in paths:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _count_statuses(statuses) -> dict:
+    """Count crop/thumbnail statuses, always including every status key."""
+    counts = {status: 0 for status in _CROP_STATUSES}
+    for status in statuses:
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _save_image_atomic(img, out_path: str, **save_kwargs) -> None:
+    """Save a PIL image as JPEG via a temp file, so readers never see a partial file."""
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".jpg.tmp", prefix=".crop_", dir=out_dir)
+    os.close(fd)
+    try:
+        img.save(tmp_path, format="JPEG", **save_kwargs)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _exif_with_crop_metadata(exif_source, data: dict) -> bytes:
+    """Return EXIF bytes carrying ``data`` as JSON in the UserComment tag.
+
+    Keeps the other tags of ``exif_source`` (EXIF bytes or a filepath) where
+    possible, but drops the embedded thumbnail, which shows the whole photo.
+
+    Args:
+        exif_source: Existing EXIF bytes or a JPEG filepath; may be empty/None.
+        data: JSON-serializable crop metadata.
+
+    Returns:
+        bytes: EXIF block for ``PIL.Image.save(exif=...)`` or ``piexif.insert``.
+    """
+    import piexif
+
+    payload = dict(data)
+    payload.setdefault("v", settings.CROP_METADATA_VERSION)
+    comment = _EXIF_ASCII_PREFIX + json.dumps(payload).encode("ascii")
+
+    exif_dict = None
+    if exif_source:
+        try:
+            exif_dict = piexif.load(exif_source)
+        except Exception:  # noqa: BLE001 - unreadable EXIF: start afresh
+            exif_dict = None
+    if exif_dict:
+        exif_dict["thumbnail"] = None
+        exif_dict["1st"] = {}
+        exif_dict.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = comment
+        # piexif expects rationals; some cameras store plain ints here
+        for tag in (piexif.ImageIFD.XResolution, piexif.ImageIFD.YResolution):
+            value = exif_dict.get("0th", {}).get(tag)
+            if isinstance(value, int):
+                exif_dict["0th"][tag] = (value, 1)
+        try:
+            return piexif.dump(exif_dict)
+        except Exception:  # noqa: BLE001 - malformed tags: keep only ours
+            pass
+    return piexif.dump({"Exif": {piexif.ExifIFD.UserComment: comment}})
+
+
+def read_crop_metadata(path: str) -> dict | None:
+    """Read the metadata JSON stored in a crop's EXIF UserComment.
+
+    Reads crops written by reefcat (no ``"v"`` key) and by
+    :meth:`ImageMatch.save_crop` alike. Typical keys: ``potentially_obstructed``,
+    ``pred_label`` and ``pred_conf``.
+
+    Args:
+        path: Crop image filepath.
+
+    Returns:
+        dict | None: The metadata, or None if absent or unreadable.
+    """
+    try:
+        import piexif
+
+        exif_dict = piexif.load(path)
+        raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.UserComment)
+    except Exception:  # noqa: BLE001 - missing file or EXIF
+        return None
+    if not raw or not raw.startswith(b"ASCII"):
+        return None
+    try:
+        text = raw[len(_EXIF_ASCII_PREFIX):].decode("ascii").rstrip("\x00")
+        data = json.loads(text) if text else None
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _update_crop_metadata(path: str, updates: dict) -> None:
+    """Merge ``updates`` into a crop's metadata without re-encoding the JPEG."""
+    import piexif
+
+    data = read_crop_metadata(path) or {}
+    data.update(updates)
+    piexif.insert(_exif_with_crop_metadata(path, data), path)
+
+
 class Sensor:
     """Class that holds calibration parameters for a specific camera sensor."""
 
@@ -1253,6 +1391,38 @@ class Cameras:
             for cam, dist in zip(cams_list, dists):
                 cam.camdist = dist * scale_factor
 
+    def make_thumbnails(
+        self,
+        root: str,
+        max_size=None,
+        overwrite: bool = False,
+        n_jobs: int = -1,
+    ) -> dict:
+        """Write a thumbnail for every camera (see :meth:`Camera.make_thumbnail`).
+
+        Photos are decoded in parallel threads (JPEG decoding releases the GIL).
+
+        Args:
+            root: Thumbnails directory (typically ``<id>.thumbnails``).
+            max_size: Bounding box ``(w, h)`` (or int); the aspect ratio is kept.
+                Default: ``settings.THUMBNAIL_MAX_SIZE``.
+            overwrite: Replace existing thumbnails.
+            n_jobs: Number of threads (-1 = all cores, 1 = sequential).
+
+        Returns:
+            dict: Number of thumbnails per status (``generated``, ``skipped``,
+            ``failed``).
+        """
+        cams_list = list(self.data.values())
+        with tqdm_joblib(tqdm(total=len(cams_list), desc="Creating thumbnails")):
+            statuses = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(cam.make_thumbnail)(root, max_size, overwrite)
+                for cam in cams_list
+            )
+        counts = _count_statuses(statuses)
+        counts.pop("rejected", None)
+        return counts
+
     def get_datetime_originals(self, offset_secs=None):
         """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""
         for cam in tqdm(
@@ -1920,6 +2090,76 @@ class Camera:
             return group
         except Exception:
             return None
+
+    def thumbnail_path(self, root: str) -> str:
+        """Path of this camera's thumbnail: ``<root>/<photo folder>/<filename>``.
+
+        Args:
+            root: Thumbnails directory (typically ``<id>.thumbnails`` in the model
+                folder).
+
+        Returns:
+            str: The thumbnail filepath (which may not exist yet).
+        """
+        folder = _photo_folder_name(self.filepath)
+        if folder is None:
+            return os.path.join(root, self.filename)
+        return os.path.join(root, folder, self.filename)
+
+    def find_thumbnail(self, root: str) -> str | None:
+        """Existing thumbnail for this camera, in the current or legacy layout.
+
+        The legacy layout stored every thumbnail directly in ``root``.
+
+        Args:
+            root: Thumbnails directory.
+
+        Returns:
+            str | None: The thumbnail filepath, or None if there is none.
+        """
+        return _first_existing(
+            self.thumbnail_path(root), os.path.join(root, self.filename)
+        )
+
+    def make_thumbnail(
+        self,
+        root: str,
+        max_size=None,
+        overwrite: bool = False,
+    ) -> str:
+        """Write a downscaled copy of this camera's photo to :meth:`thumbnail_path`.
+
+        Args:
+            root: Thumbnails directory.
+            max_size: Bounding box ``(w, h)`` (or int); the aspect ratio is kept.
+                Default: ``settings.THUMBNAIL_MAX_SIZE``.
+            overwrite: Replace an existing thumbnail (a legacy-layout one is
+                removed).
+
+        Returns:
+            str: ``"generated"``, ``"skipped"`` (already exists) or ``"failed"``.
+        """
+        existing = self.find_thumbnail(root)
+        if existing and not overwrite:
+            return "skipped"
+        src = self.filepath
+        if not src or not os.path.isfile(src):
+            return "failed"
+        if max_size is None:
+            max_size = settings.THUMBNAIL_MAX_SIZE
+        out_path = self.thumbnail_path(root)
+        try:
+            with Image.open(src) as img:
+                img.thumbnail(_size_pair(max_size))
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                _save_image_atomic(img, out_path, quality=90)
+        except (OSError, ValueError) as e:
+            logger.warning("Could not create thumbnail for %s: %s", src, e)
+            return "failed"
+        if existing and os.path.abspath(existing) != os.path.abspath(out_path):
+            os.remove(existing)
+        return "generated"
 
     @property
     def depth_in_m(self) -> float:
@@ -2788,6 +3028,143 @@ class ImageMatch:
         from substrata.classification import classify_image_match
 
         return classify_image_match(self, classifier, crop_size)
+
+    def _crops_root(self, root: str | None) -> str:
+        """Resolve the crops directory: ``root`` or the annotations' crops root."""
+        if root is not None:
+            return root
+        parent = getattr(self.annotation, "parent", None)
+        root = getattr(parent, "crops_root", None)
+        if root is None:
+            raise ValueError(
+                "No crops directory known: pass root=, set Annotations.crops_root, "
+                "or load the annotations from a file."
+            )
+        return root
+
+    def crop_path(self, root: str | None = None) -> str:
+        """Path of this match's crop: ``<root>/<ann_id>/<photo folder>/<filename>``.
+
+        Args:
+            root: Crops directory. Defaults to the ``crops_root`` of the
+                annotation's parent :class:`~substrata.annotations.Annotations`.
+
+        Returns:
+            str: The crop filepath (which may not exist yet).
+        """
+        root = self._crops_root(root)
+        folder = _photo_folder_name(self.cam.filepath)
+        parts = [root, str(self.annotation.id)]
+        if folder is not None:
+            parts.append(folder)
+        return os.path.join(*parts, self.filename)
+
+    def find_crop(self, root: str | None = None) -> str | None:
+        """Existing crop for this match, in the current or legacy layout.
+
+        The legacy layout stored crops as ``<root>/<ann_id>/<filename>``.
+
+        Args:
+            root: Crops directory (defaults as in :meth:`crop_path`).
+
+        Returns:
+            str | None: The crop filepath, or None if there is none.
+        """
+        root = self._crops_root(root)
+        legacy = os.path.join(root, str(self.annotation.id), self.filename)
+        return _first_existing(self.crop_path(root), legacy)
+
+    def crop_metadata(self, root: str | None = None) -> dict | None:
+        """Metadata stored in this match's crop (see :func:`read_crop_metadata`)."""
+        path = self.find_crop(root)
+        return read_crop_metadata(path) if path else None
+
+    def is_clear_from_image_edge(self, crop_size, image_size=None) -> bool:
+        """Whether a ``crop_size`` crop centred on this match fits in the image.
+
+        Args:
+            crop_size: Crop size ``(w, h)`` or int.
+            image_size: Image ``(w, h)``; defaults to the camera sensor size.
+
+        Returns:
+            bool: True if the crop lies fully inside the image.
+        """
+        crop_w, crop_h = _size_pair(crop_size)
+        if image_size is None:
+            image_size = (self.cam.sensor.width, self.cam.sensor.height)
+        img_w, img_h = image_size
+        return (
+            self.x - crop_w / 2 > 0
+            and self.x + crop_w / 2 <= img_w
+            and self.y - crop_h / 2 > 0
+            and self.y + crop_h / 2 <= img_h
+        )
+
+    def save_crop(
+        self,
+        root: str | None = None,
+        crop_size=None,
+        overwrite: bool = False,
+    ) -> str:
+        """Save the crop centred on this match to :meth:`crop_path`.
+
+        Crops that would extend past the image edge are rejected, so every
+        stored crop is centred on the match. The source photo's EXIF is kept
+        (minus its thumbnail), with ``potentially_obstructed`` stored in the
+        UserComment. Crops are saved at ``settings.CROP_JPEG_QUALITY``.
+
+        Args:
+            root: Crops directory (defaults as in :meth:`crop_path`).
+            crop_size: Crop size ``(w, h)`` or int. Default:
+                ``settings.CROP_SIZE_DEFAULT``.
+            overwrite: Replace an existing crop (a legacy-layout one is removed).
+
+        Returns:
+            str: ``"generated"``, ``"skipped"`` (already exists), ``"rejected"``
+            (too close to the image edge) or ``"failed"`` (photo missing or
+            unreadable).
+        """
+        root = self._crops_root(root)
+        existing = self.find_crop(root)
+        if existing and not overwrite:
+            return "skipped"
+        src = self.cam.filepath
+        if not src or not os.path.isfile(src):
+            return "failed"
+        if crop_size is None:
+            crop_size = settings.CROP_SIZE_DEFAULT
+        crop_w, crop_h = _size_pair(crop_size)
+        out_path = self.crop_path(root)
+        try:
+            with Image.open(src) as img:
+                if not self.is_clear_from_image_edge((crop_w, crop_h), img.size):
+                    return "rejected"
+                # Same box arithmetic as visualizations.get_crop_img, so a centre
+                # crop of this crop equals a crop cut from the photo directly.
+                left = int(self.x - crop_w / 2)
+                top = int(self.y - crop_h / 2)
+                crop = img.crop((left, top, left + crop_w, top + crop_h))
+                exif_bytes = _exif_with_crop_metadata(
+                    img.info.get("exif"),
+                    {
+                        "potentially_obstructed": bool(
+                            getattr(self, "potentially_obstructed", False)
+                        ),
+                        "pred_label": "",
+                        "pred_conf": 0.0,
+                    },
+                )
+            if crop.mode not in ("RGB", "L"):
+                crop = crop.convert("RGB")
+            _save_image_atomic(
+                crop, out_path, quality=settings.CROP_JPEG_QUALITY, exif=exif_bytes
+            )
+        except (OSError, ValueError) as e:
+            logger.warning("Could not crop %s: %s", src, e)
+            return "failed"
+        if existing and os.path.abspath(existing) != os.path.abspath(out_path):
+            os.remove(existing)
+        return "generated"
 
     def get_mask_surface_area(self, predictor=None):
         """

@@ -2687,6 +2687,181 @@ def _plan_camera_paths(args, cams, meta_path, project_dir, interactive, pr):
         )
 
 
+def _size_arg(values, default):
+    """Turn a ``--size`` value (``[N]`` or ``[W, H]``) into ``(w, h)``."""
+    if not values:
+        return default
+    if len(values) == 1:
+        return (values[0], values[0])
+    if len(values) == 2:
+        return tuple(values)
+    raise SystemExit("--size takes one value (square) or two values (W H).")
+
+
+def _load_annotation_project(args, need_annotations=True, use_ply=True):
+    """Initialize the project in the CWD for the thumbnails/crops/predict commands.
+
+    Applies ``--annotations``, ``--photo-path-replace`` and ``--local``, skips the
+    point cloud unless ``use_ply`` and checks that cameras (and annotations) are
+    available.
+    """
+    from substrata.initializer import ProjectInitializer
+
+    _base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+    if getattr(args, "annotations", None):
+        init.annotations_filepath = args.annotations
+    if not need_annotations:
+        init.annotations_filepath = None
+    if not use_ply:
+        init.ply_filepath = None
+    if need_annotations and not init.annotations_filepath:
+        raise SystemExit(
+            "No annotations file found. Provide --annotations or run from a "
+            "project folder with an annotations CSV."
+        )
+    init.initialize()
+    if init.cams is None:
+        raise SystemExit("No cameras found (cams_xml / cams_meta_json).")
+    if getattr(args, "photo_path_replace", None):
+        init.cams.set_filepath_replace(*args.photo_path_replace)
+    return init
+
+
+def _print_status_counts(what, counts, where):
+    """Print a one-line summary of crop/thumbnail status counts."""
+    summary = ", ".join(f"{k}: {v}" for k, v in counts.items())
+    print(f"{what} in {where} - {summary}")
+
+
+def handle_thumbnails(args):
+    """Handle the thumbnails CLI command.
+
+    Writes a downscaled copy of every camera photo to the model's thumbnails
+    directory (``thumbnails_path`` or ``<id>.thumbnails``), mirroring the photo
+    folders: ``<thumbnails>/<photo folder>/<filename>``.
+
+    Args:
+        args: Arguments from argparse.
+    """
+    init = _load_annotation_project(args, need_annotations=False, use_ply=False)
+    root = args.output or init.thumbnails_root
+    if root is None:
+        raise SystemExit("No thumbnails directory known; pass --output.")
+    max_size = _size_arg(args.size, settings.THUMBNAIL_MAX_SIZE)
+    counts = init.cams.make_thumbnails(
+        root, max_size=max_size, overwrite=args.overwrite, n_jobs=args.jobs
+    )
+    _print_status_counts("Thumbnails", counts, root)
+
+
+def handle_crops(args):
+    """Handle the crops CLI command.
+
+    Saves crops centred on each annotation's image matches to the annotations'
+    crops directory (``cropped_path`` or ``<annotations csv stem>.cropped``):
+    ``<crops>/<ann_id>/<photo folder>/<filename>``.
+
+    Args:
+        args: Arguments from argparse.
+    """
+    init = _load_annotation_project(args, use_ply=not args.no_ply)
+    anns = init.annotations
+    root = args.output or anns.crops_root
+    crop_size = _size_arg(
+        args.size,
+        (init.crop_size, init.crop_size) if init.crop_size
+        else settings.CROP_SIZE_DEFAULT,
+    )
+    print(f"Saving {crop_size[0]}x{crop_size[1]} crops to {root}")
+    counts = anns.save_crops(
+        init.cams,
+        root=root,
+        crop_size=crop_size,
+        max_cams=args.max_photos,
+        pcd=init.pcd,
+        overwrite=args.overwrite,
+        n_jobs=args.jobs,
+    )
+    _print_status_counts("Crops", counts, root)
+
+
+def handle_predict(args):
+    """Handle the predict CLI command.
+
+    Classifies every image match of every annotation (from the centre of the
+    stored crop where it is large enough, otherwise from the source photo),
+    combines the per-crop predictions per annotation, writes the consensus to
+    the ``pred_label``/``pred_conf``/``pred_n`` columns of the annotations CSV
+    (after backing it up to ``backup/``) and each crop's own prediction to its
+    EXIF.
+
+    Args:
+        args: Arguments from argparse.
+    """
+    import shutil
+    from datetime import datetime
+
+    from substrata import classification
+
+    init = _load_annotation_project(args, use_ply=not args.no_ply)
+    classifier_path = args.classifier or init.classifier_filepath
+    if not classifier_path:
+        raise SystemExit("No classifier: pass --classifier or set it in the YAML.")
+    anns = init.annotations
+    root = args.crops or anns.crops_root
+    crop_size = _size_arg(args.size, settings.PREDICTION_CROP_SIZE_DEFAULT)
+
+    learn = classification.get_image_classifier(classifier_path)
+    consensus = anns.predict(
+        init.cams,
+        learn,
+        crop_size=crop_size,
+        max_cams=args.max_photos,
+        pcd=init.pcd,
+        root=root,
+        write_crops=not args.no_write_crops,
+        method=args.method,
+        batch_size=args.batch_size,
+        n_jobs=args.jobs,
+    )
+    predicted = sum(1 for c in consensus.values() if c)
+    print(f"Predicted {predicted} of {len(consensus)} annotations ({args.method}).")
+
+    csv_path = init.annotations_filepath
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(csv_path)), "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = os.path.join(
+        backup_dir, f"{os.path.basename(csv_path)}_{timestamp}.bak"
+    )
+    shutil.copy(csv_path, backup)
+    anns.save(csv_path)
+    print(f"Saved predictions to {csv_path} (backup: {backup})")
+
+
+def _add_annotation_project_args(parser, annotations=True):
+    """Arguments shared by the thumbnails/crops/predict commands."""
+    if annotations:
+        parser.add_argument(
+            "--annotations", dest="annotations", type=str, default=None,
+            help="Explicit annotations CSV (overrides initializer).",
+        )
+    parser.add_argument(
+        "--photo-path-replace", dest="photo_path_replace", nargs=2,
+        default=None, metavar=("OLD", "NEW"),
+        help="Remap camera photo paths (substring OLD -> NEW).",
+    )
+    parser.add_argument(
+        "--jobs", dest="jobs", type=int, default=-1,
+        help="Parallel threads (-1 = all cores, 1 = sequential). Default: -1.",
+    )
+    parser.add_argument(
+        "--local", dest="local", action="store_true",
+        help="Reset all paths to local (relative to project path).",
+    )
+
+
 def handle_images(args):
     """Handle the image matching CLI command.
 
@@ -4393,6 +4568,105 @@ def main():
         help="Reset all paths to local (relative to project path).",
     )
 
+    # thumbnails
+    p_thumbs = subparsers.add_parser(
+        "thumbnails",
+        help="Write a downscaled copy of every camera photo (model thumbnails).",
+    )
+    p_thumbs.add_argument(
+        "--size", dest="size", type=int, nargs="+", default=None,
+        metavar="PX",
+        help="Bounding box W H (or one value for a square); aspect ratio is kept. "
+             f"Default: {settings.THUMBNAIL_MAX_SIZE[0]} "
+             f"{settings.THUMBNAIL_MAX_SIZE[1]}.",
+    )
+    p_thumbs.add_argument(
+        "--output", dest="output", type=str, default=None,
+        help="Thumbnails directory. Default: thumbnails_path or <id>.thumbnails.",
+    )
+    p_thumbs.add_argument(
+        "--overwrite", dest="overwrite", action="store_true",
+        help="Regenerate existing thumbnails.",
+    )
+    _add_annotation_project_args(p_thumbs, annotations=False)
+
+    # crops
+    p_crops = subparsers.add_parser(
+        "crops",
+        help="Save crops centred on each annotation's image matches.",
+    )
+    p_crops.add_argument(
+        "--size", dest="size", type=int, nargs="+", default=None,
+        metavar="PX",
+        help="Crop size W H (or one value for a square). Default: YAML crop_size "
+             f"or {settings.CROP_SIZE_DEFAULT[0]} {settings.CROP_SIZE_DEFAULT[1]}.",
+    )
+    p_crops.add_argument(
+        "--max-photos", dest="max_photos", type=int,
+        default=settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        help="Maximum image matches cropped per annotation. "
+             f"Default: {settings.MAX_PHOTOS_TO_CROP_DEFAULT}.",
+    )
+    p_crops.add_argument(
+        "--output", dest="output", type=str, default=None,
+        help="Crops directory. Default: cropped_path or <annotations stem>.cropped.",
+    )
+    p_crops.add_argument(
+        "--overwrite", dest="overwrite", action="store_true",
+        help="Regenerate existing crops.",
+    )
+    p_crops.add_argument(
+        "--no-ply", dest="no_ply", action="store_true",
+        help="Skip loading the point cloud (faster, but no occlusion filtering).",
+    )
+    _add_annotation_project_args(p_crops)
+
+    # predict
+    p_predict = subparsers.add_parser(
+        "predict",
+        help="Predict annotation labels from their crops with a trained classifier.",
+    )
+    p_predict.add_argument(
+        "--classifier", dest="classifier", type=str, default=None,
+        help="fastai classifier (.pkl). Default: classifier in the YAML.",
+    )
+    p_predict.add_argument(
+        "--size", dest="size", type=int, nargs="+", default=None,
+        metavar="PX",
+        help="Classifier input crop size W H (or one value). Default: "
+             f"{settings.PREDICTION_CROP_SIZE_DEFAULT[0]} "
+             f"{settings.PREDICTION_CROP_SIZE_DEFAULT[1]}.",
+    )
+    p_predict.add_argument(
+        "--max-photos", dest="max_photos", type=int,
+        default=settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        help="Maximum image matches used per annotation. "
+             f"Default: {settings.MAX_PHOTOS_TO_CROP_DEFAULT}.",
+    )
+    p_predict.add_argument(
+        "--method", dest="method", choices=["weighted", "first"],
+        default=settings.PREDICTION_AGGREGATION,
+        help="Combine crops by relevance-weighted mean probability, or use the "
+             f"top-ranked crop only. Default: {settings.PREDICTION_AGGREGATION}.",
+    )
+    p_predict.add_argument(
+        "--crops", dest="crops", type=str, default=None,
+        help="Crops directory. Default: cropped_path or <annotations stem>.cropped.",
+    )
+    p_predict.add_argument(
+        "--no-write-crops", dest="no_write_crops", action="store_true",
+        help="Do not store each crop's own prediction in its EXIF.",
+    )
+    p_predict.add_argument(
+        "--batch-size", dest="batch_size", type=int, default=64,
+        help="Inference batch size. Default: 64.",
+    )
+    p_predict.add_argument(
+        "--no-ply", dest="no_ply", action="store_true",
+        help="Skip loading the point cloud (faster, but no occlusion filtering).",
+    )
+    _add_annotation_project_args(p_predict)
+
     # match-annotations
     p_match = subparsers.add_parser(
         "match-annotations",
@@ -5060,6 +5334,9 @@ def main():
         "intercepts-plot": handle_intercepts_plot,
         "align": handle_align,
         "images": handle_images,
+        "thumbnails": handle_thumbnails,
+        "crops": handle_crops,
+        "predict": handle_predict,
         "match-annotations": handle_match_annotations,
         "camsync": handle_camsync,
         "path-repair": handle_path_repair,
