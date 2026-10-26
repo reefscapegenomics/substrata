@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import csv
 import datetime
+import importlib
 import json
 import logging
 import os
@@ -740,6 +741,120 @@ class Cameras:
             cam = self.data.get(cam_id)
             if cam is not None:
                 cam.depth_sensor_m = float(depth)
+
+    @classmethod
+    def from_image_dir(
+        cls,
+        image_dir: str,
+        exts: tuple = (".jpg", ".jpeg", ".png", ".tif", ".tiff"),
+        recursive: bool = False,
+    ) -> "Cameras":
+        """Build a Cameras container from a folder of photographs (no poses).
+
+        Each image becomes a pose-less :class:`Camera` (``camera_transform`` and
+        ``coords`` are None, ``missing_pose_from_meta`` is True), keyed by its
+        filename stem. Useful for 2D-only workflows, e.g. classifying random
+        points on photos with :meth:`get_random_image_points`.
+
+        Args:
+            image_dir: Directory containing the images.
+            exts: Image file extensions to include (case-insensitive).
+            recursive: Whether to include images in subdirectories.
+
+        Returns:
+            Cameras: Container with one camera per image, sorted by filepath.
+        """
+        exts = tuple(ext.lower() for ext in exts)
+        filepaths = []
+        if recursive:
+            for root, _dirs, files in os.walk(image_dir):
+                filepaths.extend(os.path.join(root, f) for f in files)
+        else:
+            filepaths = [os.path.join(image_dir, f) for f in os.listdir(image_dir)]
+        filepaths = sorted(
+            os.path.abspath(f)
+            for f in filepaths
+            if os.path.isfile(f) and f.lower().endswith(exts)
+        )
+
+        cams = cls()
+        for filepath in filepaths:
+            cam_id = os.path.splitext(os.path.relpath(filepath, image_dir))[0]
+            cams.data[cam_id] = Camera(cams, cam_id, path=filepath)
+            cams.data[cam_id].missing_pose_from_meta = True
+        if not cams.data:
+            logger.warning("No images %s found in %s", exts, image_dir)
+        return cams
+
+    @classmethod
+    def from_annotation_images(cls, annotations) -> "Cameras":
+        """Build pose-less cameras for the images that annotations were placed on.
+
+        The counterpart of :meth:`get_random_image_points` for reloaded points:
+        each annotation with ``cam_filepath``/``cam_x``/``cam_y`` (e.g. from a
+        saved points CSV) gets an :class:`ImageMatch` at that pixel, on a
+        pose-less :class:`Camera` per image. Annotations without these fields
+        are left without an image match.
+
+        Args:
+            annotations: Annotations whose image positions to attach.
+
+        Returns:
+            Cameras: One camera per referenced image, keyed by its filepath.
+        """
+        cams = cls()
+        for ann in annotations:
+            if not ann.cam_filepath or ann.cam_x is None or ann.cam_y is None:
+                continue
+            cam = cams.data.get(ann.cam_filepath)
+            if cam is None:
+                cam = Camera(cams, ann.cam_filepath, path=ann.cam_filepath)
+                cam.missing_pose_from_meta = True
+                cams.data[ann.cam_filepath] = cam
+            ann.image_match = ImageMatch(cam, ann.cam_x, ann.cam_y, None, None, ann)
+            ann.image_matches = [ann.image_match]
+        return cams
+
+    def get_random_image_points(
+        self,
+        n_points_per_image: int,
+        margin: int = 0,
+        stratified: bool = False,
+        seed: int | None = None,
+    ):
+        """Sample random 2D points on every camera's image.
+
+        See :meth:`Camera.get_random_image_points`. Each camera gets its own
+        seed derived from ``seed``, so the result is reproducible.
+
+        Args:
+            n_points_per_image: Number of points per image.
+            margin: Minimum distance (pixels) of points from the image edges,
+                e.g. ``crop_size // 2`` so that crops stay within the image.
+            stratified: Use stratified random sampling (one point per grid cell).
+            seed: Optional random seed.
+
+        Returns:
+            Annotations: All sampled points, each with an ``image_match``.
+        """
+        # Via sys.modules: the package attribute is shadowed by `__future__`
+        annotations = importlib.import_module("substrata.annotations")
+
+        image_points = annotations.Annotations()
+        cams = list(self.data.values())
+        cam_seeds = np.random.SeedSequence(seed).spawn(len(cams))
+        for cam, cam_seed in zip(tqdm(cams), cam_seeds):
+            for ann in cam.get_random_image_points(
+                n_points_per_image, margin=margin, stratified=stratified,
+                seed=cam_seed,
+            ):
+                image_points.append(ann)
+
+        print(
+            f"Image points returned: {len(image_points)} "
+            f"({n_points_per_image} per image, {len(cams)} images)"
+        )
+        return image_points
 
     def get_cams_from_file(self, cams_meta_filepath):
         """Load cameras from a JSON file and store them in the container.
@@ -2030,6 +2145,80 @@ class Camera:
             return self.orig_filepath
         else:
             return self._get_updated_filepath()
+
+    def get_random_image_points(
+        self,
+        n_points: int,
+        margin: int = 0,
+        stratified: bool = False,
+        seed=None,
+        id_prefix: str | None = None,
+    ):
+        """Sample random 2D points on this camera's image.
+
+        Requires only the image itself (no pose or point cloud). Each point is
+        returned as an :class:`~substrata.annotations.Annotation` with NaN 3D
+        coords and an :class:`ImageMatch` at the sampled pixel, so it can be
+        classified with ``Annotations.classify_image_matches`` and saved as an
+        annotations CSV (pixel positions in ``cam_filepath``/``cam_x``/``cam_y``).
+
+        Args:
+            n_points: Number of points to sample.
+            margin: Minimum distance (pixels) of points from the image edges,
+                e.g. ``crop_size // 2`` so that crops stay within the image.
+            stratified: If True, use stratified random sampling: the image is
+                divided into a near-square grid with at least ``n_points`` cells
+                and one point is drawn in each of ``n_points`` random cells.
+                Otherwise use simple random sampling.
+            seed: Optional seed (int or ``np.random.SeedSequence``).
+            id_prefix: Prefix for annotation IDs (defaults to the cam_id or the
+                image filename stem); IDs are ``<prefix>_<index>``.
+
+        Returns:
+            Annotations: The sampled points.
+        """
+        # Via sys.modules: the package attribute is shadowed by `__future__`
+        annotations = importlib.import_module("substrata.annotations")
+
+        with Image.open(self.filepath) as img:
+            img_w, img_h = img.size
+        x_min, y_min = margin, margin
+        x_max, y_max = img_w - margin, img_h - margin
+        if x_max <= x_min or y_max <= y_min:
+            raise ValueError(
+                f"Margin {margin} too large for image {self.filename} "
+                f"({img_w}x{img_h})"
+            )
+
+        rng = np.random.default_rng(seed)
+        if stratified:
+            # Near-square grid matching the sampling area's aspect ratio
+            aspect = (x_max - x_min) / (y_max - y_min)
+            n_cols = max(1, int(round(np.sqrt(n_points * aspect))))
+            n_rows = int(np.ceil(n_points / n_cols))
+            cells = rng.choice(n_rows * n_cols, size=n_points, replace=False)
+            rows, cols = np.divmod(np.sort(cells), n_cols)
+            cell_w = (x_max - x_min) / n_cols
+            cell_h = (y_max - y_min) / n_rows
+            xs = x_min + (cols + rng.random(n_points)) * cell_w
+            ys = y_min + (rows + rng.random(n_points)) * cell_h
+        else:
+            xs = rng.uniform(x_min, x_max, n_points)
+            ys = rng.uniform(y_min, y_max, n_points)
+
+        if id_prefix is None:
+            id_prefix = self.cam_id or os.path.splitext(self.filename)[0]
+        image_points = annotations.Annotations()
+        for idx, (x, y) in enumerate(zip(xs, ys)):
+            ann = annotations.Annotation(
+                [np.nan, np.nan, np.nan], id=f"{id_prefix}_{idx}"
+            )
+            ann.image_match = ImageMatch(self, float(x), float(y), None, None, ann)
+            ann.image_matches = [ann.image_match]
+            ann.cam_filepath = self.filepath
+            ann.cam_x, ann.cam_y = float(x), float(y)
+            image_points.append(ann)
+        return image_points
 
     def set_filepath(self, path: str) -> None:
         """Set this camera's stored image filepath and refresh derived state.

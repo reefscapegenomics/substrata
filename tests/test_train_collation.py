@@ -525,6 +525,130 @@ class TestSplitAndCrops(unittest.TestCase):
             tmp.cleanup()
 
 
+    def test_plan_split_key_groups_rows(self):
+        tmp = tempfile.TemporaryDirectory()
+        d = tmp.name
+        try:
+            ann = os.path.join(d, "training_annotations.csv")
+            with open(ann, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(_ANN_HEADER + ["split_key"])
+                for i in range(200):
+                    key = f"IMG_{i // 5}"  # 5 points per image
+                    w.writerow(
+                        _ann_row(f"a{i}", "CB", f"/imgs/{key}.jpg", "10", "20")
+                        + [key]
+                    )
+            splits = {}
+            for p, info in cl.plan_crops(ann, d).items():
+                split_dir = os.path.relpath(p, d).split(os.sep)[0]
+                splits.setdefault(info["cam_filepath"], set()).add(split_dir)
+            # Every image's points share a single split...
+            self.assertTrue(all(len(s) == 1 for s in splits.values()))
+            # ...which follows the key rather than the annotation id.
+            self.assertEqual(
+                splits["/imgs/IMG_0.jpg"],
+                {cl.settings.TRAIN_CROP_DIRS[cl.split_for_id("IMG_0", (80, 10, 10))]},
+            )
+        finally:
+            tmp.cleanup()
+
+
+class TestCoralNet(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        # Two datasets in subfolders that share an image filename.
+        for sub, names in (("siteA", ["a1.png", "same.jpg"]), ("siteB", ["same.jpg"])):
+            os.makedirs(os.path.join(self.d, "imgs", sub, "frames"))
+            for name in names:
+                open(os.path.join(self.d, "imgs", sub, "frames", name), "wb").close()
+        self.index = cl.index_image_dir(os.path.join(self.d, "imgs"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _coralnet(self, name, rows, label_col="Label code"):
+        path = os.path.join(self.d, name)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Name", "Row", "Column", label_col, "Label ID"])
+            w.writerows(rows)
+        return path
+
+    def test_link_prefers_subfolder_holding_the_images(self):
+        root = os.path.join(self.d, "imgs")
+        folder, files, n = cl.link_image_dir({"a1.png", "same.jpg"}, self.index)
+        self.assertEqual((folder, n), (os.path.join(root, "siteA"), 2))
+        self.assertIn(os.sep + "siteA" + os.sep, files["same.jpg"])
+        folder, _files, n = cl.link_image_dir({"nope.jpg"}, self.index)
+        self.assertEqual((folder, n), (None, 0))
+
+    def test_flat_image_dir(self):
+        flat = os.path.join(self.d, "flat")
+        os.makedirs(flat)
+        open(os.path.join(flat, "x.jpg"), "wb").close()
+        folder, _files, n = cl.link_image_dir({"x.jpg"}, cl.index_image_dir(flat))
+        self.assertEqual((folder, n), (os.path.abspath(flat), 1))
+
+    def test_convert(self):
+        src = self._coralnet("ann.csv", [
+            ["a1.png", "10", "20", "SP", "1"],
+            ["a1.png", "30", "40", "CCA", "2"],
+            ["missing.png", "1", "2", "SP", "1"],
+        ], label_col="Label")  # older exports
+        out = os.path.join(self.d, "ann_points.csv")
+        info = cl.convert_coralnet_csv(src, self.index, out)
+        self.assertEqual(
+            (info["n_points"], info["n_written"], info["n_missing"]), (3, 2, 1)
+        )
+        with open(out, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(list(rows[0]), cl.settings.TRAIN_ANN_COLUMNS)
+        self.assertEqual(
+            (rows[0]["id"], rows[0]["label"], rows[0]["cam_x"], rows[0]["cam_y"]),
+            ("ann_0", "SP", "20", "10"),  # Column -> x, Row -> y
+        )
+        self.assertEqual({r["split_key"] for r in rows}, {"a1"})
+        self.assertTrue(os.path.isfile(rows[0]["cam_filepath"]))
+
+    def test_convert_rejects_non_coralnet(self):
+        path = os.path.join(self.d, "other.csv")
+        _write_ann(path, [_ann_row("a0", "CB")])
+        with self.assertRaises(ValueError):
+            cl.convert_coralnet_csv(path, self.index, path + ".out")
+
+    def test_flat_labels(self):
+        src = self._coralnet("ann.csv", [["a1.png", "1", "1", "SP", "1"]] * 3 + [
+            ["a1.png", "1", "1", "CCA", "1"],
+            ["a1.png", "1", "1", "Unc", "1"],
+        ])
+        out = os.path.join(self.d, "ann_points.csv")
+        cl.convert_coralnet_csv(src, self.index, out)
+        _lines, selected, counts, _unknown, cmap = cl.build_flat_labels(
+            [out], min_count=2, exclude_labels={"Unc"}
+        )
+        self.assertEqual(selected, {"SP"})
+        self.assertEqual(dict(counts), {"SP": 3, "CCA": 1})
+        self.assertEqual(cmap, {"SP": "SP"})
+        _lines, selected, *_ = cl.build_flat_labels(
+            [out], include_labels={"CCA", "absent"}
+        )
+        self.assertEqual(selected, {"CCA"})
+
+    def test_collate_keeps_split_key(self):
+        src = self._coralnet("ann.csv", [["a1.png", "1", "2", "SP", "1"]])
+        pts = os.path.join(self.d, "ann_points.csv")
+        cl.convert_coralnet_csv(src, self.index, pts)
+        out = os.path.join(self.d, "training_annotations.csv")
+        cl.collate_training_annotations(
+            [pts], "*_points.csv", {"SP"}, out, self.d, prompt=False
+        )
+        with open(out, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["split_key"], "a1")
+
+
 class TestCropCounts(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

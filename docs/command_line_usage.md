@@ -465,6 +465,25 @@ substrata predict
 substrata predict --classifier crop_classifier.pkl --method first
 ```
 
+### Image-only mode (plain photos)
+
+With `--image-dir` or `--points`, `predict` works on plain photos instead of a 3-D project (no point cloud, cameras or YAML; `--classifier` is required). Each point is classified from a `--size` crop centred on it.
+
+- `--image-dir DIR`: random points are sampled on every image in `DIR` (searched recursively): `--n-points` per image (default 25), simple random or `--stratified` (one point per grid cell), kept at least half a crop from the image edges, reproducible with `--seed`. They are saved to `<output>/<DIR name>_points.csv` (`--output`, default CWD) and **reused** on later runs, so different classifiers are compared on the same points. Images added to the folder later get their own new points. `--resample` draws new points (the old file is backed up).
+- `--points CSV`: predict at given points instead: a points CSV from an earlier run (updated in place), or a CoralNet export (`Name`, `Row`, `Column`, `Label code`). For a CoralNet export the images are searched in `--image-dir` (default: the CSV's folder), the result is written to `<output>/<CSV name>_points.csv`, and the predictions are compared with the CoralNet labels (agreement and a per-class report). Labels the classifier does not predict are reported and left out of the comparison.
+
+The points CSV has the image (`cam_filepath`) and pixel position (`cam_x`, `cam_y`) of each point plus `pred_label`/`pred_conf` (the 3-D coordinate columns are `nan`); an existing file is backed up to `backup/` first. A `<points>_cover.csv` next to it gives, per image, the number of points and the percent cover of each predicted label, plus an `ALL` row over all points.
+
+Usage: `substrata predict (--image-dir DIR | --points CSV) --classifier PKL [--n-points N] [--stratified] [--seed N] [--resample] [--output DIR] [--size W H] [--batch-size N] [--jobs N]`
+
+```bash
+# 25 stratified random points per photo; reused on later runs
+substrata predict --image-dir photos --classifier crop_classifier.pkl --stratified
+
+# Check a model against CoralNet's own annotations (images in frames/)
+substrata predict --points annotations.csv --image-dir frames --classifier crop_classifier.pkl
+```
+
 ## Match annotations
 
 Match random point annotations (e.g. a point-intercept CSV) to manual annotations of the same object (e.g. colony annotations in `<id>_ann.csv`). Only random points whose label starts with `--label-prefix` (default `CS`, hard corals; comma-separated list allowed, `''` for all) are considered, and only cameras are loaded (not the point cloud).
@@ -613,7 +632,9 @@ one is missing does it fall back to the `site/site_depth/model/<final-folder>`
 convention under `--model-path` (or prompt for a substitution), writes a
 consolidated `training_annotations.csv`, and generates `training_crops` /
 `validation_crops` / `test_crops` (80/10/10, assigned deterministically per
-annotation id). Finally it trains the model and reports validation stats
+annotation id, or per `split_key` when the annotations CSV has one, so that e.g.
+all points of one image share a split). Finally it trains the model and
+reports validation stats
 (printed and written to a `<split>_stats.pdf` with a per-class report, a
 row-normalised confusion matrix, and example classified crops per category —
 one row per category with a red border on misclassified examples). The training
@@ -664,13 +685,35 @@ exclusive. The confidence filter is applied while collating, and the number of
 annotations dropped below the threshold is reported alongside those dropped for
 missing camera fields.
 
+**Without a classes file.** `classes.csv` is only needed for the hierarchical
+(CATAMI) tree. When `--classes` is not given and there is no `classes.csv` in the
+CWD, the labels are listed as a flat table of counts instead and selected by
+`--min-count` (or exactly `--include-classes`); `--tips_only` and `--collapse`
+need the hierarchy and are unavailable. Use `--exclude-classes LABEL ...` (in
+either mode) to leave labels out entirely, so no crops are generated for them.
+
+**CoralNet point exports (image-only data).** With `--coralnet`, the matched
+CSVs (default pattern `*.csv`) are CoralNet exports with `Name`, `Row`,
+`Column` and `Label code` (or `Label`) columns: points on plain images, without
+point cloud or cameras. The images are searched (recursively) in `--image-dir`
+(default `--csv-path`); when it holds one subfolder per dataset, each CSV is
+linked to the subfolder containing most of its images, and the link is reported
+(`annotations_site.csv -> Site (213/213 images, 1065 points)`). Each export is
+converted into a standard annotations CSV in `<output>/coralnet_points/`
+(`Column` → `cam_x`, `Row` → `cam_y`, `split_key` = image), and points on
+missing images are dropped. From there the run is identical to the 3-D workflow
+(label tree or flat counts, label map, crops, training, stats). The split is
+per image, so the points of one image never end up in both training and
+validation. CoralNet label codes are matched against `classes.csv` as usual;
+without a classes file they are used as-is.
+
 To hand-tune before training, run `--prepare-only`: it generates the crops and
 seeds the map, then **stops**. Edit `training_label_map.csv` (re-point a label to
 another class, or blank one to exclude it), then re-run `substrata train
 --keep-map` to train on the edited map (a plain `substrata train` would re-seed
 it and discard your edits).
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
@@ -699,6 +742,11 @@ substrata train --keep-map
 # CSVs in one dir, image projects in another, output elsewhere, bigger backbone
 substrata train --csv-path /data/annotations --model-path /data/models \
     --output /data/training --arch resnet50 --epochs 20
+
+# CoralNet exports in /data/coralnet, images in per-dataset subfolders of
+# /data/coralnet_images; no classes.csv, so labels are selected by count
+substrata train --coralnet --csv-path /data/coralnet \
+    --image-dir /data/coralnet_images --exclude-classes Unc --min-count 20
 
 # Re-run validation stats on an existing model (reads the same label map)
 substrata train --validate --model crop_classifier.pkl

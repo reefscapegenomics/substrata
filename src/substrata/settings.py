@@ -127,7 +127,14 @@ TRAIN_ANN_COLUMNS = [
     "cam_x",
     "cam_y",
     "depth",
+    "split_key",  # optional: rows sharing a key share a split (see plan_crops)
 ]
+
+# CoralNet point exports (`substrata train --coralnet`)
+CORALNET_DEFAULT_PATTERN = "*.csv"
+CORALNET_LABEL_COLUMNS = ("Label code", "Label")  # newer / older exports
+CORALNET_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+CORALNET_POINTS_DIR = "coralnet_points"  # converted CSVs, under --output
 
 # ANSI styling for bolded (training-label) entries in terminal tree output.
 TRAIN_BOLD = "\033[1m"
@@ -147,6 +154,7 @@ MAX_PHOTOS_TO_CROP_DEFAULT = 10  # image matches cropped per annotation
 # How per-crop predictions combine into one prediction per annotation:
 # "weighted" (relevance-weighted mean of class probabilities) or "first".
 PREDICTION_AGGREGATION = "weighted"
+IMAGE_POINTS_DEFAULT = 25  # points per image for image-only predict
 CROP_METADATA_VERSION = 1  # version of the JSON stored in a crop's EXIF
 
 RGL_SCALEBARS = [

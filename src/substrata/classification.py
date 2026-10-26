@@ -546,14 +546,14 @@ def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
 
 
 def count_labels(
-    files: List[str], class_codes: Set[str]
+    files: List[str], class_codes: Optional[Set[str]]
 ) -> Tuple[Counter, Counter]:
     """Tally ``label`` column values across the given annotation CSVs.
 
     Args:
         files: Annotation CSV paths to scan.
         class_codes: Set of valid CPC codes (labels not in this set are
-            collected separately as ``unknown``).
+            collected separately as ``unknown``), or None to count every label.
 
     Returns:
         Tuple ``(counts, unknown)`` of Counters keyed by label/CPC code.
@@ -569,7 +569,7 @@ def count_labels(
                 label = (row.get(settings.TRAIN_LABEL_COLUMN) or "").strip()
                 if not label:
                     continue
-                if label in class_codes:
+                if class_codes is None or label in class_codes:
                     counts[label] += 1
                 else:
                     unknown[label] += 1
@@ -858,6 +858,54 @@ def build_label_tree(
         nodes, children, roots, direct, total, min_count, tips_only,
         include_labels=include_labels, collapse=collapse,
     )
+    return lines, training_labels, counts, unknown, collapse_map
+
+
+def build_flat_labels(
+    csv_files: List[str], min_count: int = 1,
+    include_labels: Optional[Set[str]] = None,
+    exclude_labels: Optional[Set[str]] = None,
+) -> Tuple[List[str], Set[str], Counter, Counter, Dict[str, str]]:
+    """Flat (non-hierarchical) counterpart of :func:`build_label_tree`.
+
+    Used when no classes file is available: every label found in the CSVs is
+    listed by count, and labels are selected by ``min_count`` (or exactly
+    ``include_labels``) without any hierarchy or collapsing.
+
+    Args:
+        csv_files: Annotation CSV paths to count labels across.
+        min_count: Select labels whose count reaches this.
+        include_labels: Explicit set of labels to train on; overrides
+            ``min_count`` (restricted to labels present).
+        exclude_labels: Labels to drop entirely (e.g. "unclear" codes).
+
+    Returns:
+        Same tuple as :func:`build_label_tree`, with an empty ``unknown`` and
+        an identity ``collapse_map`` over the selected labels.
+    """
+    counts, unknown = count_labels(csv_files, None)
+    for label in exclude_labels or ():
+        counts.pop(label, None)
+    if include_labels is not None:
+        training_labels = set(include_labels) & set(counts)
+    else:
+        training_labels = {lab for lab, n in counts.items() if n >= min_count}
+
+    lines: List[str] = [
+        f"Scanned {len(csv_files)} CSV file(s).",
+        f"Total annotations counted: {sum(counts.values())}",
+        f"Distinct labels found: {len(counts)}",
+        "",
+        "Label occurrences (no classes file; bolded = used for training):",
+        "",
+    ]
+    for label, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        text = f"[{label}]: {n}"
+        if label in training_labels:
+            text = f"{settings.TRAIN_BOLD}{text}{settings.TRAIN_RESET}"
+        lines.append(f"  {text}")
+
+    collapse_map = {lab: lab for lab in training_labels}
     return lines, training_labels, counts, unknown, collapse_map
 
 
@@ -1196,9 +1244,145 @@ def collate_training_annotations(
                 cam_x,
                 cam_y,
                 row.get("depth", ""),
+                row.get("split_key", ""),
             ])
             n_written += 1
     return n_written, n_dropped, n_dropped_conf
+
+
+# ---------------------------------------------------------------------------
+# CoralNet-style (image-only) point annotations
+# ---------------------------------------------------------------------------
+#
+# A CoralNet export lists points per image (``Name,Row,Column,Label code``)
+# without any 3-D information. Each export is converted into a standard
+# training annotations CSV (``settings.TRAIN_ANN_COLUMNS``) so the rest of the
+# training pipeline is shared; ``split_key`` is the image, so the points of one
+# image never straddle train/validation/test.
+
+
+def index_image_dir(image_dir: str) -> Dict[str, Dict[str, str]]:
+    """Index the images under ``image_dir`` per candidate folder.
+
+    Args:
+        image_dir: Root directory holding the images, either directly or in
+            one subfolder per dataset (searched recursively).
+
+    Returns:
+        Mapping ``folder -> {basename: path}`` for ``image_dir`` itself (all
+        images below it) and for each of its direct subfolders.
+    """
+    image_dir = os.path.abspath(image_dir)
+    index: Dict[str, Dict[str, str]] = {image_dir: {}}
+    for root, _dirs, files in os.walk(image_dir):
+        rel = os.path.relpath(root, image_dir)
+        top = None if rel == "." else os.path.join(image_dir, rel.split(os.sep)[0])
+        for name in files:
+            if not name.lower().endswith(settings.CORALNET_IMAGE_EXTS):
+                continue
+            path = os.path.join(root, name)
+            index[image_dir].setdefault(name, path)
+            if top is not None:
+                index.setdefault(top, {}).setdefault(name, path)
+    return index
+
+
+def link_image_dir(
+    names: Set[str], image_index: Dict[str, Dict[str, str]],
+) -> Tuple[Optional[str], Dict[str, str], int]:
+    """Pick the indexed folder that holds most of the given image names.
+
+    Ties favour a subfolder over the root, so datasets whose images share
+    filenames resolve to their own folder.
+
+    Args:
+        names: Image filenames referenced by one annotations CSV.
+        image_index: Output of :func:`index_image_dir` (root listed first).
+
+    Returns:
+        Tuple ``(folder, {basename: path}, n_found)``; ``folder`` is None when
+        none of the names are found.
+    """
+    best, best_n = None, 0
+    for folder, files in image_index.items():
+        n_found = len(names.intersection(files))
+        if n_found > best_n or (n_found and n_found == best_n):
+            best, best_n = folder, n_found
+    if best is None:
+        return None, {}, 0
+    return best, image_index[best], best_n
+
+
+def convert_coralnet_csv(
+    csv_path: str, image_index: Dict[str, Dict[str, str]], out_path: str,
+) -> Dict[str, Any]:
+    """Convert a CoralNet point export into a training annotations CSV.
+
+    Reads ``Name`` (image filename), ``Row`` (pixel y), ``Column`` (pixel x)
+    and ``Label code`` (or ``Label`` in older exports). Points on images that
+    cannot be found are dropped.
+
+    Args:
+        csv_path: CoralNet annotations export.
+        image_index: Output of :func:`index_image_dir`.
+        out_path: Destination CSV (``settings.TRAIN_ANN_COLUMNS``).
+
+    Returns:
+        Dict with ``folder`` (linked image folder), ``n_points``, ``n_written``,
+        ``n_images``/``n_images_found`` and ``n_missing`` (points dropped).
+
+    Raises:
+        ValueError: If the CSV lacks the CoralNet columns.
+    """
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        label_col = next(
+            (c for c in settings.CORALNET_LABEL_COLUMNS if c in fields), None
+        )
+        if label_col is None or not {"Name", "Row", "Column"} <= set(fields):
+            raise ValueError(
+                f"{csv_path} is not a CoralNet export (needs Name, Row, Column "
+                f"and one of {settings.CORALNET_LABEL_COLUMNS}); got {fields}"
+            )
+        rows = list(reader)
+
+    names = {(row.get("Name") or "").strip() for row in rows} - {""}
+    folder, files, n_images_found = link_image_dir(names, image_index)
+    csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+    # No 3-D position: NaN coords (as for image-only points elsewhere)
+    blank = {col: "" for col in settings.TRAIN_ANN_COLUMNS}
+    for axis in "xyz":
+        blank[f"orig_{axis}"] = blank[f"world_{axis}"] = "nan"
+    n_written = 0
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=settings.TRAIN_ANN_COLUMNS)
+        writer.writeheader()
+        for i, row in enumerate(rows):
+            name = (row.get("Name") or "").strip()
+            label = (row.get(label_col) or "").strip()
+            if not label or name not in files:
+                continue
+            writer.writerow({
+                **blank,
+                "id": f"{csv_stem}_{i}",
+                "label": label,
+                "cam_filepath": files[name],
+                "cam_x": row["Column"].strip(),
+                "cam_y": row["Row"].strip(),
+                "split_key": os.path.splitext(name)[0],
+            })
+            n_written += 1
+    return {
+        "folder": folder,
+        "n_points": len(rows),
+        "n_written": n_written,
+        "n_images": len(names),
+        "n_images_found": n_images_found,
+        "n_missing": sum(
+            1 for row in rows if (row.get("Name") or "").strip() not in files
+        ),
+    }
 
 
 def split_for_id(ann_id: str, split: Tuple[int, int, int]) -> int:
@@ -1237,6 +1421,10 @@ def plan_crops(
 ) -> Dict[str, Dict[str, Any]]:
     """Compute the expected crop file for every annotation.
 
+    Each annotation's split is drawn from its ``id``, unless the CSV has an
+    optional ``split_key`` column: rows sharing a ``split_key`` (e.g. the same
+    image) then all land in the same split, avoiding train/validation leakage.
+
     Args:
         annotations_path: Consolidated training annotations CSV.
         output_dir: Base output directory holding the crop folders.
@@ -1257,7 +1445,8 @@ def plan_crops(
             if not (ann_id and label and cam_fp and cam_x and cam_y):
                 continue
             cx, cy = float(cam_x), float(cam_y)
-            split_dir = crop_dirs[split_for_id(ann_id, split)]
+            split_key = (row.get("split_key") or "").strip() or ann_id
+            split_dir = crop_dirs[split_for_id(split_key, split)]
             fname = crop_filename(ann_id, cam_fp, cx, cy)
             abs_path = os.path.join(output_dir, split_dir, label, fname)
             expected[abs_path] = {

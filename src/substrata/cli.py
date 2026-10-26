@@ -2786,6 +2786,187 @@ def handle_crops(args):
     _print_status_counts("Crops", counts, root)
 
 
+def _backup_file(path):
+    """Copy ``path`` to ``backup/<name>_<timestamp>.bak`` next to it."""
+    import shutil
+    from datetime import datetime
+
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = os.path.join(backup_dir, f"{os.path.basename(path)}_{timestamp}.bak")
+    shutil.copy(path, backup)
+    return backup
+
+
+def _is_coralnet_csv(path):
+    """Whether a CSV has the CoralNet export columns (Name, Row, Column)."""
+    import csv
+
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+    return {"Name", "Row", "Column"} <= set(header)
+
+
+def _write_cover_table(anns, out_path):
+    """Write per-image percent cover of the predicted labels (plus an ALL row)."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        [
+            (os.path.basename(ann.cam_filepath), ann.pred_label)
+            for ann in anns
+            if ann.pred_label is not None
+        ],
+        columns=["image", "pred_label"],
+    )
+    if df.empty:
+        return None
+    cover = pd.crosstab(df["image"], df["pred_label"], normalize="index") * 100
+    cover.loc["ALL"] = df["pred_label"].value_counts(normalize=True) * 100
+    cover = cover.fillna(0).round(1)
+    n_points = df["image"].value_counts()
+    cover.insert(0, "n_points", n_points.reindex(cover.index).fillna(len(df)))
+    cover["n_points"] = cover["n_points"].astype(int)
+    cover.to_csv(out_path)
+    return cover
+
+
+def _print_label_agreement(anns, vocab):
+    """Compare predictions with existing labels (e.g. CoralNet annotations)."""
+    from sklearn.metrics import classification_report
+
+    pairs = [
+        (str(ann.label), ann.pred_label)
+        for ann in anns
+        if ann.pred_label is not None
+        and getattr(ann, "label", None) not in (None, "", "None")
+    ]
+    if not pairs:
+        return
+    known = [(y, p) for y, p in pairs if y in vocab]
+    n_other = len(pairs) - len(known)
+    if n_other:
+        other = sorted({y for y, _p in pairs if y not in vocab})
+        print(
+            f"{n_other} labelled point(s) have labels the classifier does not "
+            f"predict ({', '.join(other)}); left out of the comparison."
+        )
+    if not known:
+        return
+    y_true, y_pred = zip(*known)
+    accuracy = sum(y == p for y, p in known) / len(known)
+    print(
+        f"\nAgreement with existing labels: {accuracy:.1%} "
+        f"({len(known)} point(s))"
+    )
+    print(classification_report(y_true, y_pred, zero_division=0))
+
+
+def _predict_images(args):
+    """Image-only predict: classify (random) points on plain photos.
+
+    Points come from ``--points`` (a substrata points CSV or a CoralNet
+    export) or are sampled on the images in ``--image-dir`` and saved to
+    ``<output>/<image dir name>_points.csv``. An existing points file is
+    reused (new images get their own points) unless ``--resample``. The
+    predictions are written to the points CSV, with a per-image cover table
+    next to it.
+    """
+    from substrata import classification
+    from substrata.annotations import Annotations
+    from substrata.cameras import Cameras
+
+    if not args.classifier:
+        raise SystemExit("Image-only predict needs --classifier.")
+    crop_size = _size_arg(args.size, settings.PREDICTION_CROP_SIZE_DEFAULT)
+    margin = max(crop_size) // 2
+    output_dir = args.output or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    image_dir = args.image_dir
+
+    def _sample(cams):
+        return cams.get_random_image_points(
+            args.n_points, margin=margin, stratified=args.stratified,
+            seed=args.seed,
+        )
+
+    if args.points and args.resample:
+        raise SystemExit("--resample only applies to sampled points, not --points.")
+    fresh_file = False
+    if args.points and _is_coralnet_csv(args.points):
+        # CoralNet export: predict at its annotated points (labels kept)
+        image_dir = image_dir or os.path.dirname(os.path.abspath(args.points))
+        stem = os.path.splitext(os.path.basename(args.points))[0]
+        points_path = os.path.join(output_dir, f"{stem}_points.csv")
+        if os.path.isfile(points_path):
+            print(f"Backup of previous points file: {_backup_file(points_path)}")
+        fresh_file = True  # (re)converted below; no backup needed when saving
+        info = classification.convert_coralnet_csv(
+            args.points, classification.index_image_dir(image_dir), points_path
+        )
+        print(
+            f"CoralNet points: {info['n_written']}/{info['n_points']} on "
+            f"{info['n_images_found']}/{info['n_images']} images found in "
+            f"{info['folder'] or image_dir}"
+        )
+        anns = Annotations(points_path)
+        Cameras.from_annotation_images(anns)
+    elif args.points:
+        points_path = args.points
+        anns = Annotations(points_path)
+        Cameras.from_annotation_images(anns)
+        print(f"Loaded {len(anns)} points from {points_path}")
+    else:
+        if not image_dir:
+            raise SystemExit("Pass --image-dir (or --points).")
+        name = os.path.basename(os.path.normpath(image_dir))
+        points_path = os.path.join(output_dir, f"{name}_points.csv")
+        all_cams = Cameras.from_image_dir(image_dir, recursive=True)
+        if not all_cams.data:
+            raise SystemExit(f"No images found in {image_dir}")
+        if os.path.isfile(points_path) and not args.resample:
+            anns = Annotations(points_path)
+            used = {os.path.abspath(a.cam_filepath) for a in anns if a.cam_filepath}
+            Cameras.from_annotation_images(anns)
+            print(f"Reusing {len(anns)} points from {points_path}")
+            new_cams = Cameras()
+            new_cams.data = {
+                cam_id: cam for cam_id, cam in all_cams.data.items()
+                if cam.filepath not in used
+            }
+            if new_cams.data:
+                print(f"Sampling points on {len(new_cams.data)} new image(s)")
+                for ann in _sample(new_cams):
+                    anns.append(ann)
+        else:
+            if os.path.isfile(points_path):
+                backup = _backup_file(points_path)
+                print(f"Resampling; old points backed up to {backup}")
+            anns = _sample(all_cams)
+
+    learn = classification.get_image_classifier(args.classifier)
+    results = anns.classify_image_matches(
+        learn, crop_size=crop_size, batch_size=args.batch_size, n_jobs=args.jobs,
+    )
+    for ann_id, res in results.items():
+        if res is not None:
+            anns[ann_id].pred_label = res["label"]
+            anns[ann_id].pred_conf = round(res["confidence"], 4)
+            anns[ann_id].pred_n = 1
+    predicted = sum(1 for res in results.values() if res is not None)
+    print(f"Predicted {predicted} of {len(results)} points.")
+
+    if os.path.isfile(points_path) and not fresh_file:
+        print(f"Backup of previous points file: {_backup_file(points_path)}")
+    anns.save(points_path, orig_coords_only=True)
+    print(f"Saved points and predictions to {points_path}")
+    cover_path = os.path.splitext(points_path)[0] + "_cover.csv"
+    if _write_cover_table(anns, cover_path) is not None:
+        print(f"Saved per-image cover (% of points) to {cover_path}")
+    _print_label_agreement(anns, {str(v) for v in learn.dls.vocab})
+
+
 def handle_predict(args):
     """Handle the predict CLI command.
 
@@ -2799,10 +2980,10 @@ def handle_predict(args):
     Args:
         args: Arguments from argparse.
     """
-    import shutil
-    from datetime import datetime
-
     from substrata import classification
+
+    if args.image_dir or args.points:
+        return _predict_images(args)
 
     init = _load_annotation_project(args, use_ply=not args.no_ply)
     classifier_path = args.classifier or init.classifier_filepath
@@ -2829,13 +3010,7 @@ def handle_predict(args):
     print(f"Predicted {predicted} of {len(consensus)} annotations ({args.method}).")
 
     csv_path = init.annotations_filepath
-    backup_dir = os.path.join(os.path.dirname(os.path.abspath(csv_path)), "backup")
-    os.makedirs(backup_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = os.path.join(
-        backup_dir, f"{os.path.basename(csv_path)}_{timestamp}.bak"
-    )
-    shutil.copy(csv_path, backup)
+    backup = _backup_file(csv_path)
     anns.save(csv_path)
     print(f"Saved predictions to {csv_path} (backup: {backup})")
 
@@ -3276,8 +3451,11 @@ def handle_train(args):
     """Handle the 'train' command: collate labels, build crops, train/evaluate.
 
     Pipeline:
-      1. Glob annotation CSVs from --csv-path and render the CATAMI label tree;
-         the bolded entries are the training labels (confirm with the user).
+      0. With --coralnet, convert CoralNet point exports (image-only) into
+         standard annotation CSVs, linking each to its images in --image-dir.
+      1. Glob annotation CSVs from --csv-path and render the CATAMI label tree
+         (or, without a classes file, a flat list of label counts); the bolded
+         entries are the training labels (confirm with the user).
       2. Verify the unique ``cam_filepath`` directories, falling back to the
          --model-path convention only when a hard-coded directory is missing.
       3. Write a consolidated training annotations CSV (exact-match labels,
@@ -3302,7 +3480,11 @@ def handle_train(args):
     model_path = args.model_path or cwd
     output_dir = args.output or cwd
     classes_path = args.classes or os.path.join(cwd, settings.TRAIN_CLASSES_FILE)
-    pattern = args.pattern or settings.TRAIN_DEFAULT_PATTERN
+    coralnet = bool(getattr(args, "coralnet", False))
+    pattern = args.pattern or (
+        settings.CORALNET_DEFAULT_PATTERN if coralnet
+        else settings.TRAIN_DEFAULT_PATTERN
+    )
     crop_size = args.crop_size or settings.TRAIN_CROP_SIZE
     model_file = args.model or os.path.join(
         output_dir, settings.TRAIN_DEFAULT_MODEL_FILE
@@ -3338,30 +3520,97 @@ def handle_train(args):
         )
         return
 
-    if not os.path.isfile(classes_path):
+    # The classes file (CATAMI hierarchy) is optional unless given explicitly
+    use_tree = os.path.isfile(classes_path)
+    if args.classes and not use_tree:
         raise SystemExit(f"Classes file not found: {classes_path}")
+    if not use_tree:
+        if args.tips_only or getattr(args, "collapse", False):
+            raise SystemExit(
+                "--tips_only/--collapse need a classes file (--classes)."
+            )
+        print(
+            f"No classes file ({classes_path}); selecting labels from a flat "
+            "list of counts."
+        )
 
+    own_outputs = {
+        os.path.basename(classes_path),
+        settings.TRAIN_ANNOTATIONS_FILE,
+        settings.TRAIN_LABEL_MAP_FILE,
+    }
     csv_files = sorted(
         f
         for f in glob.glob(os.path.join(csv_path, pattern))
-        if os.path.basename(f) != os.path.basename(classes_path)
+        if os.path.basename(f) not in own_outputs
     )
     if not csv_files:
         raise SystemExit(
             f"No annotation CSVs match {pattern!r} in {csv_path}."
         )
 
-    # --- Step 1: label tree + seed collapse map ---
+    # --- Step 0 (--coralnet): convert point exports into standard CSVs ---
+    if coralnet:
+        image_dir = args.image_dir or csv_path
+        points_dir = os.path.join(output_dir, settings.CORALNET_POINTS_DIR)
+        os.makedirs(points_dir, exist_ok=True)
+        image_index = classification.index_image_dir(image_dir)
+        print(f"Converting {len(csv_files)} CoralNet export(s); images: {image_dir}")
+        converted = []
+        for path in csv_files:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            out_path = os.path.join(points_dir, f"{stem}_points.csv")
+            try:
+                info = classification.convert_coralnet_csv(
+                    path, image_index, out_path
+                )
+            except ValueError as e:
+                raise SystemExit(str(e))
+            folder = (
+                os.path.relpath(info["folder"], image_dir)
+                if info["folder"] else "(no images found)"
+            )
+            missing = (
+                f", {info['n_missing']} on missing images dropped"
+                if info["n_missing"] else ""
+            )
+            print(
+                f"  {os.path.basename(path)} -> {folder} "
+                f"({info['n_images_found']}/{info['n_images']} images, "
+                f"{info['n_written']} points{missing})"
+            )
+            converted.append(out_path)
+        csv_files, pattern = converted, "*_points.csv"
+
+    # --- Step 1: label tree (or flat label counts) + seed collapse map ---
     include_classes = getattr(args, "include_classes", None)
     include_set = set(include_classes) if include_classes else None
-    lines, training_labels, counts, _unknown, collapse_map = (
-        classification.build_label_tree(
-            classes_path, csv_files, args.min_count, args.tips_only,
-            include_labels=include_set,
-            collapse=bool(getattr(args, "collapse", False)),
+    exclude_set = set(getattr(args, "exclude_classes", None) or ())
+    if use_tree:
+        lines, training_labels, counts, _unknown, collapse_map = (
+            classification.build_label_tree(
+                classes_path, csv_files, args.min_count, args.tips_only,
+                include_labels=include_set,
+                collapse=bool(getattr(args, "collapse", False)),
+            )
         )
-    )
+    else:
+        lines, training_labels, counts, _unknown, collapse_map = (
+            classification.build_flat_labels(
+                csv_files, args.min_count, include_labels=include_set,
+                exclude_labels=exclude_set,
+            )
+        )
     print("\n".join(lines))
+    if exclude_set:
+        for label in exclude_set:
+            counts.pop(label, None)
+            collapse_map.pop(label, None)
+        training_labels -= exclude_set
+        collapse_map = {
+            lab: cls for lab, cls in collapse_map.items() if cls not in exclude_set
+        }
+        print(f"\nExcluded: {', '.join(sorted(exclude_set))}")
     if include_set is not None:
         missing = include_set - training_labels
         if missing:
@@ -3489,6 +3738,12 @@ def handle_train(args):
             "(none)" if min_conf is None
             else f"{min_conf}{' (strict)' if conf_is_strict else ''}",
         ),
+        (
+            "Selection: exclude_classes",
+            " ".join(sorted(exclude_set)) if exclude_set else "(none)",
+        ),
+        ("Classes file", classes_path if use_tree else "(none; flat labels)"),
+        ("Input format", "CoralNet" if coralnet else "substrata"),
         ("Map mode", "keep-map" if getattr(args, "keep_map", False) else "reseed"),
         ("Annotation pattern", pattern),
         ("CSV files scanned", len(csv_files)),
@@ -4665,6 +4920,49 @@ def main():
         "--no-ply", dest="no_ply", action="store_true",
         help="Skip loading the point cloud (faster, but no occlusion filtering).",
     )
+    img_group = p_predict.add_argument_group(
+        "image-only mode (plain photos, no project)",
+        "Classify points on plain images instead of a 3-D project's "
+        "annotations. Needs --classifier; --max-photos/--method/--crops/--no-ply "
+        "do not apply.",
+    )
+    img_group.add_argument(
+        "--image-dir", dest="image_dir", type=str, default=None,
+        help="Folder of images (searched recursively) to sample points on. "
+             "Points are saved to <output>/<folder name>_points.csv and reused "
+             "on later runs (new images get their own points). With a "
+             "CoralNet --points file: where its images are (default: the "
+             "CSV's folder).",
+    )
+    img_group.add_argument(
+        "--points", dest="points", type=str, default=None,
+        help="Predict at these points instead of sampling: a substrata points "
+             "CSV (updated in place) or a CoralNet export (Name, Row, Column, "
+             "Label code; predictions are compared with its labels).",
+    )
+    img_group.add_argument(
+        "--n-points", dest="n_points", type=int,
+        default=settings.IMAGE_POINTS_DEFAULT,
+        help=f"Points per image. Default: {settings.IMAGE_POINTS_DEFAULT}.",
+    )
+    img_group.add_argument(
+        "--stratified", dest="stratified", action="store_true",
+        help="Stratified random points (one per grid cell) instead of simple "
+             "random points.",
+    )
+    img_group.add_argument(
+        "--seed", dest="seed", type=int, default=None,
+        help="Random seed for reproducible points.",
+    )
+    img_group.add_argument(
+        "--resample", dest="resample", action="store_true",
+        help="Draw new points even if the points file exists (old one is "
+             "backed up).",
+    )
+    img_group.add_argument(
+        "--output", dest="output", type=str, default=None,
+        help="Folder for the points and cover CSVs. Default: CWD.",
+    )
     _add_annotation_project_args(p_predict)
 
     # match-annotations
@@ -5124,17 +5422,42 @@ def main():
     p_train.add_argument(
         "pattern",
         nargs="?",
-        default=settings.TRAIN_DEFAULT_PATTERN,
+        default=None,
         help=(
             "Glob pattern of annotation CSVs to collate, matched inside "
-            f"--csv-path. Default: {settings.TRAIN_DEFAULT_PATTERN!r}."
+            f"--csv-path. Default: {settings.TRAIN_DEFAULT_PATTERN!r} "
+            f"({settings.CORALNET_DEFAULT_PATTERN!r} with --coralnet)."
         ),
     )
     p_train.add_argument(
         "--classes",
         type=str,
         default=None,
-        help="Classes CSV path (default: classes.csv in CWD).",
+        help=(
+            "Classes CSV path with the CATAMI hierarchy (default: classes.csv "
+            "in CWD). Optional: without one, labels are selected from a flat "
+            "list of counts (no --tips_only/--collapse)."
+        ),
+    )
+    p_train.add_argument(
+        "--coralnet",
+        action="store_true",
+        help=(
+            "The CSVs are CoralNet point exports (Name, Row, Column, Label "
+            "code) on plain images, without 3-D data. They are converted into "
+            f"<output>/{settings.CORALNET_POINTS_DIR}/ and split per image."
+        ),
+    )
+    p_train.add_argument(
+        "--image-dir",
+        dest="image_dir",
+        type=str,
+        default=None,
+        help=(
+            "With --coralnet: directory holding the images, directly or in "
+            "subfolders (searched recursively); each CSV is linked to the "
+            "subfolder containing most of its images (default: --csv-path)."
+        ),
     )
     p_train.add_argument(
         "--csv-path",
@@ -5188,6 +5511,17 @@ def main():
             "brackets in the tree). Overrides --min-count/--tips_only: exactly "
             "these are bolded and trained. Errors if any is absent from the "
             "tree."
+        ),
+    )
+    p_train.add_argument(
+        "--exclude-classes",
+        dest="exclude_classes",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Labels to leave out entirely (e.g. CoralNet's 'Unc'); no crops "
+            "are generated for them and they are never trained."
         ),
     )
     p_train.add_argument(
