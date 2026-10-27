@@ -707,13 +707,15 @@ per image, so the points of one image never end up in both training and
 validation. CoralNet label codes are matched against `classes.csv` as usual;
 without a classes file they are used as-is.
 
+**Starting weights.** By default the network (`--arch`) starts from torchvision's ImageNet weights. `--pretrained-weights CKPT` starts from another encoder checkpoint instead, such as the self-supervised BenthicNet ResNet-50 trained on seafloor imagery (`MLIsaac/benthicnet_bt_rn50_e600_prod` on HuggingFace); use a matching `--arch` (`resnet50`). Plain state dicts and training checkpoints (weights under `state_dict` with a `backbone.`/`encoder.` prefix) are both accepted, and a file that doesn't fit the architecture is refused.
+
 To hand-tune before training, run `--prepare-only`: it generates the crops and
 seeds the map, then **stops**. Edit `training_label_map.csv` (re-point a label to
 another class, or blank one to exclude it), then re-run `substrata train
 --keep-map` to train on the edited map (a plain `substrata train` would re-seed
 it and discard your edits).
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--pretrained-weights CKPT] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
@@ -747,6 +749,9 @@ substrata train --csv-path /data/annotations --model-path /data/models \
 # /data/coralnet_images; no classes.csv, so labels are selected by count
 substrata train --coralnet --csv-path /data/coralnet \
     --image-dir /data/coralnet_images --exclude-classes Unc --min-count 20
+
+# Start from BenthicNet's seafloor-pretrained ResNet-50 instead of ImageNet
+substrata train --arch resnet50 --pretrained-weights "bt-600e-prod_rn50_epoch=599.ckpt"
 
 # Re-run validation stats on an existing model (reads the same label map)
 substrata train --validate --model crop_classifier.pkl

@@ -649,6 +649,40 @@ class TestCoralNet(unittest.TestCase):
         self.assertEqual(rows[0]["split_key"], "a1")
 
 
+class TestEncoderWeights(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+            import torchvision
+        except ImportError:
+            self.skipTest("requires torch/torchvision")
+        self.torch, self.tv = torch, torchvision
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_backbone_checkpoint(self):
+        src = self.tv.models.resnet18(weights=None)
+        # Training-checkpoint layout: prefixed encoder keys, no fc, extras
+        state = {f"backbone.{k}": v for k, v in src.state_dict().items()
+                 if not k.startswith("fc.")}
+        state["projector.0.weight"] = self.torch.zeros(2, 2)
+        path = os.path.join(self.tmp.name, "enc.ckpt")
+        self.torch.save({"state_dict": state}, path)
+        model = cl.PretrainedArch("resnet18", path)(weights="ignored")
+        self.assertTrue(self.torch.equal(
+            model.conv1.weight, src.conv1.weight
+        ))
+
+    def test_wrong_architecture_raises(self):
+        state = self.tv.models.resnet18(weights=None).state_dict()
+        path = os.path.join(self.tmp.name, "r18.pth")
+        self.torch.save(state, path)
+        with self.assertRaises(ValueError):
+            cl._load_encoder_weights(self.tv.models.resnet34(weights=None), path)
+
+
 class TestCropCounts(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -3715,13 +3715,15 @@ def handle_train(args):
 
     # --- Step 5: train ---
     learn = classification.train_classifier(
-        output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs
+        output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs,
+        pretrained_weights=args.pretrained_weights,
     )
 
     # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
     counts_by_split = classification.count_crops_by_class(output_dir, label_map)
     info = [
         ("Model architecture", args.arch),
+        ("Pretrained weights", args.pretrained_weights or "ImageNet (torchvision)"),
         ("Epochs", args.epochs),
         ("Crop size (px)", crop_size),
         ("Input size (px)", settings.TRAIN_IMAGE_SIZE),
@@ -5606,6 +5608,18 @@ def main():
         type=str,
         default=settings.TRAIN_DEFAULT_ARCH,
         help=f"torchvision architecture. Default: {settings.TRAIN_DEFAULT_ARCH}.",
+    )
+    p_train.add_argument(
+        "--pretrained-weights",
+        dest="pretrained_weights",
+        type=str,
+        default=None,
+        metavar="CKPT",
+        help=(
+            "Encoder checkpoint to start from instead of the ImageNet weights, "
+            "e.g. BenthicNet's ResNet-50 (use with a matching --arch, such as "
+            "resnet50)."
+        ),
     )
     p_train.add_argument(
         "--epochs",

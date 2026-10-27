@@ -2083,9 +2083,8 @@ class Annotation:
             print("Annotations 'up_vector' and/or depth_offset not set")
             return None
 
-        return float(
-            self.parent.depth_offset
-            + float(np.dot(self.parent.up_vector, self.orig_coords))
+        return depth_in_m(
+            self.orig_coords, self.parent.up_vector, self.parent.depth_offset
         )
 
     def show(self) -> None:
@@ -3375,3 +3374,154 @@ def get_matched_annotation_ids(filepath: str) -> Set[str]:
         if len(row) > id_col
         and any(i < len(row) and row[i].strip() for i in cols)
     }
+
+
+# ---------------------------------------------------------------------------
+# In-place edits of an annotation CSV (one row at a time, e.g. from a viewer)
+# ---------------------------------------------------------------------------
+
+
+def _read_csv_rows(path: str) -> Tuple[List[List[str]], str, List[str]]:
+    """Read a CSV as rows of strings.
+
+    Args:
+        path: CSV file path.
+
+    Returns:
+        The rows (header first), the file's line ending and the lower-cased,
+        stripped header names.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        text = fh.read()
+    rows = list(csv.reader(text.splitlines()))
+    eol = "\r\n" if "\r\n" in text[:4096] else "\n"
+    return rows, eol, [h.strip().lower() for h in rows[0]]
+
+
+def _write_csv_rows(path: str, rows: List[List[str]], eol: str) -> None:
+    """Write rows to a temp file next to `path`, then swap it in."""
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", newline="") as fh:
+        csv.writer(fh, lineterminator=eol).writerows(rows)
+    os.replace(tmp, path)
+
+
+def annotation_csv_columns(path: str) -> List[str]:
+    """Return the lower-cased column names of an annotation CSV.
+
+    Args:
+        path: CSV file path.
+    """
+    return _read_csv_rows(path)[2]
+
+
+def update_annotation_csv_row(path: str, ann_id: str, values: Dict[str, Any]) -> None:
+    """Set columns of one annotation's row, leaving the rest of the file as is.
+
+    Columns are matched by lower-case name; missing ones are added (blank for
+    the other rows). None writes an empty cell. Line endings are kept.
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        ann_id: The row to change.
+        values: Column name -> new value.
+
+    Raises:
+        KeyError: If no row has this id.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    head = rows[0]
+    for c in values:
+        if c not in low:
+            head.append(c)
+            low.append(c)
+            for r in rows[1:]:
+                if r:
+                    r.extend([""] * (len(head) - len(r)))
+    idc = low.index("id")
+    hit = False
+    for r in rows[1:]:
+        if len(r) > idc and r[idc].strip() == ann_id:
+            r.extend([""] * (len(head) - len(r)))
+            for c, v in values.items():
+                r[low.index(c)] = "" if v is None else str(v)
+            hit = True
+    if not hit:
+        raise KeyError(ann_id)
+    _write_csv_rows(path, rows, eol)
+
+
+def append_annotation_csv_row(path: str, values: Dict[str, Any]) -> None:
+    """Add a row to an annotation CSV.
+
+    Args:
+        path: Annotation CSV.
+        values: Column name (lower case) -> value; columns the file does not
+            have are left out, columns not given are left blank.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    rows.append(["" if values.get(c) is None else str(values[c]) for c in low])
+    _write_csv_rows(path, rows, eol)
+
+
+def delete_annotation_csv_row(path: str, ann_id: str) -> None:
+    """Remove an annotation's row(s) from a CSV.
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        ann_id: The row to remove.
+
+    Raises:
+        KeyError: If no row has this id.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    idc = low.index("id")
+    keep = [rows[0]] + [
+        r for r in rows[1:] if not (len(r) > idc and r[idc].strip() == ann_id)
+    ]
+    if len(keep) == len(rows):
+        raise KeyError(ann_id)
+    _write_csv_rows(path, keep, eol)
+
+
+def backup_annotation_csv(path: str) -> str:
+    """Copy an annotation CSV to ``<folder>/backup/<name>_<YYYYmmdd_HHMMSS>.bak``.
+
+    Args:
+        path: Annotation CSV.
+
+    Returns:
+        The backup's path.
+    """
+    from datetime import datetime
+
+    d = os.path.join(os.path.dirname(os.path.abspath(path)), "backup")
+    os.makedirs(d, exist_ok=True)
+    out = os.path.join(
+        d, f"{os.path.basename(path)}_{datetime.now():%Y%m%d_%H%M%S}.bak"
+    )
+    with open(path, "rb") as src, open(out, "wb") as dst:
+        dst.write(src.read())
+    return out
+
+
+def depth_in_m(
+    orig_coords: Union[List[float], np.ndarray],
+    up_vector: Union[List[float], np.ndarray, Any],
+    depth_offset: float,
+) -> Union[float, np.ndarray]:
+    """Depth in metres from the project's depth regression (orig frame).
+
+    depth ≈ depth_offset + up_vector · orig_coords
+
+    Args:
+        orig_coords: One point (3,) or several (N, 3) in orig coordinates.
+        up_vector: The regression's up vector (array or ``geom.Vector``).
+        depth_offset: The regression's offset.
+
+    Returns:
+        A float for one point, else an (N,) array.
+    """
+    up = np.asarray(getattr(up_vector, "xyz", up_vector), dtype=float).ravel()[:3]
+    d = float(depth_offset) + np.asarray(orig_coords, dtype=float) @ up
+    return float(d) if np.ndim(d) == 0 else d

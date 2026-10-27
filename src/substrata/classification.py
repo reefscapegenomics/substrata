@@ -1853,11 +1853,72 @@ def write_training_summary_pdf(
     logger.info("Wrote training summary PDF: %s", pdf_path)
 
 
+def _load_encoder_weights(model: Any, path: str) -> Any:
+    """Load an encoder checkpoint (e.g. BenthicNet's ResNet-50) into a model.
+
+    Accepts a plain state dict or a training checkpoint holding one under
+    ``state_dict``/``model``; when the keys carry a ``backbone.``,
+    ``encoder.`` or ``module.`` prefix, only those keys are used, with the
+    prefix stripped. The classification head (``fc``) may be missing.
+
+    Args:
+        model: torchvision model to load the weights into.
+        path: Checkpoint path.
+
+    Returns:
+        The model, with the encoder weights loaded.
+
+    Raises:
+        ValueError: If any non-head weight of the model is not in the file.
+    """
+    import torch  # lazy
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    state = ckpt.get("state_dict", ckpt.get("model", ckpt))
+    for prefix in ("backbone.", "encoder.", "module."):
+        if any(k.startswith(prefix) for k in state):
+            state = {
+                k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)
+            }
+            break
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if not k.startswith("fc.")]
+    if missing:
+        raise ValueError(
+            f"{path} does not fit this architecture: {len(missing)} weight(s) "
+            f"missing (e.g. {missing[:3]})"
+        )
+    logger.info(
+        "Loaded encoder weights from %s (%d unused key(s))", path, len(unexpected)
+    )
+    return model
+
+
+class PretrainedArch:
+    """A torchvision architecture initialised from an encoder checkpoint.
+
+    Used as the ``arch`` of a fastai ``vision_learner``: called by fastai to
+    build the model (its ImageNet ``weights`` argument is ignored). A
+    module-level class so that exported learners stay picklable.
+    """
+
+    def __init__(self, arch: str, weights_path: str) -> None:
+        self.arch = arch
+        self.weights_path = weights_path
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        import torchvision  # lazy
+
+        model = getattr(torchvision.models, self.arch)(weights=None)
+        return _load_encoder_weights(model, self.weights_path)
+
+
 def train_classifier(
     output_dir: str, model_path: str, label_map: Dict[str, str],
     arch: str = settings.TRAIN_DEFAULT_ARCH,
     epochs: int = settings.TRAIN_DEFAULT_EPOCHS,
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
+    pretrained_weights: Optional[str] = None,
 ) -> Any:
     """Train a fastai image classifier on the generated crops.
 
@@ -1877,6 +1938,9 @@ def train_classifier(
         arch: torchvision architecture name (e.g. ``resnet34``).
         epochs: Number of fine-tuning epochs.
         crop_dirs: Folder names for the three splits.
+        pretrained_weights: Optional encoder checkpoint (e.g. BenthicNet's
+            ResNet-50) to start from instead of the ImageNet weights; it must
+            match ``arch``.
 
     Returns:
         The trained fastai Learner.
@@ -1921,6 +1985,14 @@ def train_classifier(
     dls = dblock.dataloaders(output_dir)
 
     arch_fn = getattr(torchvision.models, arch)
+    if pretrained_weights:
+        from fastai.vision.all import model_meta
+
+        # Same body cut, layer groups and (ImageNet) input normalisation as
+        # the plain torchvision arch, but other starting weights
+        custom = PretrainedArch(arch, pretrained_weights)
+        model_meta[custom] = model_meta[arch_fn]
+        arch_fn = custom
     learn = vision_learner(dls, arch_fn, metrics=[accuracy, error_rate])
     learn.fine_tune(epochs)
     learn.export(model_path)
