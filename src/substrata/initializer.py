@@ -210,6 +210,17 @@ class ProjectInitializer:
         self.ply_filepath = value
 
     @property
+    def ply_stratified(self) -> bool:
+        """Whether the full-resolution PLY is stratified.
+
+        True when :attr:`ply_full_path` has a matching ``<id>.strat.npz`` next to
+        it (see ``substrata.stratified``; build it with ``substrata stratify``).
+        """
+        from substrata.stratified import is_stratified
+
+        return is_stratified(self.ply_full_path)
+
+    @property
     def thumbnails_root(self) -> str | None:
         """Thumbnails directory: ``thumbnails_path`` or ``<path>/<id>.thumbnails``.
 

@@ -21,6 +21,32 @@ substrata decimate --input cur_sna_20m_20200303.ply --output cur_sna_20m_2020030
 substrata decimate --ply input.ply -n 10000000
 ```
 
+## Interactive viewer (explore)
+
+`substrata explore` opens the interactive viewer (point cloud, photos, annotations, classification) for the project in the current folder, in a browser. It runs the separate `substrata-explore` package (same as the `substrata-explore` command) and takes its arguments, e.g. `substrata explore --edit`; see `substrata explore -h`.
+
+## Stratifying PLY files
+
+Reorder a PLY so it can be read progressively and by region. The file stays the project's ordinary `<id>.ply` (same header, byte-identical points, only reordered) with a small index `<id>.strat.npz` next to it; a PLY counts as stratified when that index exists and matches it (`ProjectInitializer.ply_stratified`). The points are split into spatially compact clusters, each shuffled and written coarse-to-fine, so:
+
+- the first N points of the file are a uniform random subsample (a decimated cloud is just a prefix read, `StratifiedPly(path).read_prefix(n)`);
+- a region can be read at any density without scanning the whole file (`StratifiedPly(path).query_box(lo, hi)`);
+- other PLY readers (Open3D, Metashape, CloudCompare) still read it as before.
+
+With no arguments, stratifies `<id>.ply` of the project in the CWD in place (it is written next to it first and checksummed, then swapped in). Needs free space for two copies of the PLY (`--tmp-dir` can hold one of them).
+
+Usage: `substrata stratify [--input PLY] [--out-dir DIR] [--tmp-dir DIR] [--cluster-size N] [--keep-original] [--force]`
+
+`--keep-original` keeps the unstratified PLY as `backup_<name>.ply` next to it (a rename, so it costs no copy, but the disk space stays used).
+
+```bash
+# In place, auto-detected from CWD
+substrata stratify
+
+# A stratified copy on a fast local disk (same file name), temp file there too
+substrata stratify --out-dir /fast/plots --tmp-dir /fast/tmp
+```
+
 ## Metashape project export
 
 Initialize a substrata project directly from an Agisoft Metashape project (`.psx`). This writes the point cloud (`<id>.ply`), a decimated copy (`<id>_dec50M.ply`), camera calibration/poses (`<id>.cams.xml`, `<id>.meta.json`), markers (`<id>_markers.csv`), and a starter project file (`<id>.yaml`) — everything in raw chunk-local coordinates. Scale and orientation are left for `substrata orient` (or `substrata firefish`) to compute afterward.
@@ -73,7 +99,7 @@ substrata ply-repair --input pointcloud.ply --output pointcloud_fixed.ply
 
 ## PLY file preview (head)
 
-Show the first N vertex rows from a PLY file.
+Show the first N vertex rows from a PLY file. For a stratified PLY (see `substrata stratify`) it also prints the index summary: point count and properties, bounding box, clusters, rounds and the prefix ends (how many leading points form each uniform subsample).
 
 Usage: `substrata head [--input PLY] [-n N]`
 

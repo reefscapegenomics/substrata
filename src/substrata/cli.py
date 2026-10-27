@@ -611,6 +611,47 @@ def handle_decimate(args):
     )
 
 
+def handle_stratify(args):
+    """Stratify a PLY: reorder it for progressive and regional reads.
+
+    Resolves the input from the project initializer (CWD) when not given and
+    reorders it in place (writing ``<id>.strat.npz`` next to it), or writes a
+    stratified copy into --out-dir (e.g. a fast local disk).
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    from substrata.stratified import is_stratified, stratify_ply
+
+    input_path = args.input
+    if not input_path:
+        from substrata.initializer import ProjectInitializer
+
+        base, cwd = _cwd_base()
+        init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+        input_path = init.ply_full_path
+    if not input_path:
+        raise SystemExit(
+            "No input PLY found. Provide --input or run in a project folder with "
+            "<id>.ply."
+        )
+    output_path = None
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        output_path = os.path.join(args.out_dir, os.path.basename(input_path))
+    target = output_path or input_path
+    if is_stratified(target) and not args.force:
+        raise SystemExit(f"{target} is already stratified (use --force to redo it).")
+    stratify_ply(
+        input_path,
+        output_path,
+        cluster_size=args.cluster_size,
+        tmp_dir=args.tmp_dir,
+        progress=True,
+        keep_original=args.keep_original,
+    )
+
+
 def handle_ply_repair(args):
     """Rewrite a PLY into a strict Open3D-compatible form.
 
@@ -669,9 +710,27 @@ def handle_ply_repair(args):
     print(f"Repaired PLY written to: {out_path}")
 
 
+def handle_explore(argv):
+    """Run substrata-explore (the interactive viewer) with these arguments.
+
+    Args:
+        argv: Its command-line arguments (after ``explore``).
+    """
+    try:
+        from substrata_explore.cli import main as explore_main
+    except ImportError:
+        raise SystemExit(
+            "substrata explore needs the substrata-explore package: "
+            "pip install -e <path to substrata-explore>"
+        )
+    explore_main(argv)
+
+
 def handle_head(args):
     """Print the first N vertex rows of a PLY for a quick preview.
 
+    For a stratified PLY (``<id>.strat.npz`` next to it) the index summary
+    follows: clusters, rounds and the prefix sizes of its uniform subsamples.
     Resolves the input PLY from the project initializer (CWD) when not given
     explicitly.
 
@@ -691,6 +750,12 @@ def handle_head(args):
         )
 
     ply_head(input_path, n=args.num, print_output=True)
+    # a stratified PLY: also its index (clusters, rounds, prefix sizes)
+    from substrata.stratified import StratifiedPly, is_stratified
+
+    if is_stratified(input_path):
+        print()
+        print(StratifiedPly(input_path).summary())
 
 
 def handle_scalebars(args):
@@ -3776,8 +3841,17 @@ def main():
     match-annotations, camsync, path-repair, transform, train, metashape-export),
     parses the arguments, and calls the matching handle_* function.
     """
+    # explore: the interactive viewer (the substrata-explore package), its own arguments
+    if len(sys.argv) > 1 and sys.argv[1] == "explore":
+        return handle_explore(sys.argv[2:])
+
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser(
+        "explore",
+        help="Open the interactive viewer for the project in the CWD (needs the "
+        "substrata-explore package; `substrata explore -h` for its options).",
+    )
 
     # decimate (initializer-driven defaults)
     p_dec = subparsers.add_parser(
@@ -3826,6 +3900,63 @@ def main():
             "Apply color_correction from the project YAML while writing the output "
             "PLY (requires `substrata colors -s` or equivalent). No second load."
         ),
+    )
+
+    # stratify (reorder a PLY for progressive / regional reads)
+    p_strat = subparsers.add_parser(
+        "stratify",
+        help=(
+            "Stratify a PLY in place (<id>.ply + <id>.strat.npz): its first N points "
+            "are then a uniform subsample and regions can be read without a full "
+            "scan. With no args, uses initializer on CWD."
+        ),
+    )
+    p_strat.add_argument(
+        "--input",
+        "--ply",
+        dest="input",
+        type=str,
+        default=None,
+        help="Optional explicit input PLY path (overrides initializer).",
+    )
+    p_strat.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=str,
+        default=None,
+        help="Write a stratified copy (same file name) here instead of in place.",
+    )
+    p_strat.add_argument(
+        "--tmp-dir",
+        dest="tmp_dir",
+        type=str,
+        default=None,
+        help="Folder for the temporary file (as large as the PLY; default: next to "
+        "the output).",
+    )
+    p_strat.add_argument(
+        "--cluster-size",
+        dest="cluster_size",
+        type=int,
+        default=2_000_000,
+        help="Target points per cluster (default: 2,000,000).",
+    )
+    p_strat.add_argument(
+        "--keep-original",
+        dest="keep_original",
+        action="store_true",
+        help="In place: keep the unstratified PLY as backup_<name>.ply next to it.",
+    )
+    p_strat.add_argument(
+        "--force",
+        action="store_true",
+        help="Stratify again even if the PLY already is.",
+    )
+    p_strat.add_argument(
+        "--local",
+        dest="local",
+        action="store_true",
+        help="Reset all paths to local (relative to project path).",
     )
 
     # metashape-export (initialize a substrata project folder from a .psx)
@@ -3940,7 +4071,9 @@ def main():
 
     # head (PLY preview)
     p_head = subparsers.add_parser(
-        "head", help="Show first N vertex rows from a PLY file."
+        "head",
+        help="Show first N vertex rows from a PLY file (and, for a stratified PLY, "
+        "its index summary).",
     )
     p_head.add_argument(
         "--input",
@@ -5668,6 +5801,7 @@ def main():
 
     handlers = {
         "decimate": handle_decimate,
+        "stratify": handle_stratify,
         "metashape-export": handle_metashape_export,
         "ply-repair": handle_ply_repair,
         "head": handle_head,
