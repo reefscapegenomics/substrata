@@ -621,7 +621,7 @@ def handle_stratify(args):
     Args:
         args: Parsed CLI arguments.
     """
-    from substrata.stratified import is_stratified, stratify_ply
+    from substrata.stratified import is_stratified, stratify_ply, stratify_space
 
     input_path = args.input
     if not input_path:
@@ -642,11 +642,37 @@ def handle_stratify(args):
     target = output_path or input_path
     if is_stratified(target) and not args.force:
         raise SystemExit(f"{target} is already stratified (use --force to redo it).")
+    work_dir = args.work_dir or os.environ.get("SUBSTRATA_WORK_DIR") or None
+    if output_path is None:
+        sp = stratify_space(
+            input_path, args.tmp_dir, work_dir=work_dir, mode=args.mode
+        )
+        gb = 1e9
+        print(
+            f"stratify: {sp['mode']} mode (RAM {sp['mem_need'] / gb:.0f} GB, "
+            f"{sp['mem_free'] / gb:.0f} GB available); disk {sp['need'] / gb:.0f} GB "
+            f"needed, {sp['free'] / gb:.0f} GB free"
+            + (
+                f"; work disk {sp['work_need'] / gb:.0f} GB needed, "
+                f"{sp['work_free'] / gb:.0f} GB free"
+                if "work_need" in sp
+                else ""
+            )
+        )
+        if not sp["ok"]:
+            raise SystemExit("stratify: not enough disk space.")
+        if sp["mode"] == "memory" and sp["mem_need"] > sp["mem_free"]:
+            raise SystemExit(
+                "stratify: not enough RAM available for --mode memory "
+                "(use --mode stream, or free memory first)."
+            )
     stratify_ply(
         input_path,
         output_path,
+        mode=args.mode,
         cluster_size=args.cluster_size,
         tmp_dir=args.tmp_dir,
+        work_dir=work_dir,
         progress=True,
         keep_original=args.keep_original,
     )
@@ -3931,8 +3957,26 @@ def main():
         dest="tmp_dir",
         type=str,
         default=None,
-        help="Folder for the temporary file (as large as the PLY; default: next to "
-        "the output).",
+        help="Stream mode: folder for the temporary file (as large as the PLY; "
+        "default: the work dir, else next to the output).",
+    )
+    p_strat.add_argument(
+        "--mode",
+        choices=["auto", "memory", "stream"],
+        default="auto",
+        help="memory: read the whole PLY into RAM (records + 8 B per point; one "
+        "sequential read and write, fastest by far on hard disks); stream: three "
+        "passes through a temp file, little RAM; auto (default): memory if it fits "
+        "in the RAM available.",
+    )
+    p_strat.add_argument(
+        "--work-dir",
+        dest="work_dir",
+        type=str,
+        default=None,
+        help="Write the new PLY (and the temp file) on this disk first, e.g. an SSD "
+        "when the PLY is on a hard disk, then copy it next to the PLY "
+        "(default: $SUBSTRATA_WORK_DIR).",
     )
     p_strat.add_argument(
         "--cluster-size",

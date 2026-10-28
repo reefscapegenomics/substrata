@@ -33,18 +33,27 @@ Reorder a PLY so it can be read progressively and by region. The file stays the 
 - a region can be read at any density without scanning the whole file (`StratifiedPly(path).query_box(lo, hi)`);
 - other PLY readers (Open3D, Metashape, CloudCompare) still read it as before.
 
-With no arguments, stratifies `<id>.ply` of the project in the CWD in place (it is written next to it first and checksummed, then swapped in). Needs free space for two copies of the PLY (`--tmp-dir` can hold one of them).
+With no arguments, stratifies `<id>.ply` of the project in the CWD in place (it is written next to it first and checksummed, then swapped in). It prints the mode it will use and the RAM and disk space that needs.
 
-Usage: `substrata stratify [--input PLY] [--out-dir DIR] [--tmp-dir DIR] [--cluster-size N] [--keep-original] [--force]`
+Two modes, same result:
 
-`--keep-original` keeps the unstratified PLY as `backup_<name>.ply` next to it (a rename, so it costs no copy, but the disk space stays used).
+- `memory`: reads the whole PLY into RAM, orders it there and writes it back in one sequential pass. Needs RAM for the points plus 8 B per point (~100 GB for 2.7 B points of 28 B), and disk space for one copy of the PLY. Fastest by far on hard disks (about 20 min for 75 GB on a ~190 MB/s disk, where `stream` takes hours).
+- `stream`: three passes through a cluster-sorted temp file, little RAM. Needs disk space for two copies of the PLY (`--tmp-dir` or `--work-dir` can hold one of them).
+- `auto` (default): `memory` if it fits in the RAM available (within any systemd / container / job memory limit), else `stream`.
+
+Usage: `substrata stratify [--input PLY] [--out-dir DIR] [--mode auto|memory|stream] [--work-dir DIR] [--tmp-dir DIR] [--cluster-size N] [--keep-original] [--force]`
+
+`--work-dir` (or `$SUBSTRATA_WORK_DIR`) writes the new PLY, and the temp file, on another disk first (e.g. an SSD when the PLY is on a hard disk) and then copies it next to the PLY. `--keep-original` keeps the unstratified PLY as `backup_<name>.ply` next to it (a rename, so it costs no copy, but the disk space stays used).
 
 ```bash
 # In place, auto-detected from CWD
 substrata stratify
 
-# A stratified copy on a fast local disk (same file name), temp file there too
-substrata stratify --out-dir /fast/plots --tmp-dir /fast/tmp
+# Low on RAM: stream, with the temp file on a fast local disk
+substrata stratify --mode stream --work-dir /fast/tmp
+
+# A stratified copy on a fast local disk (same file name)
+substrata stratify --out-dir /fast/plots
 ```
 
 ## Metashape project export

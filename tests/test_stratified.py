@@ -159,9 +159,60 @@ class TestStratifiedPly(unittest.TestCase):
             os.remove(f)
 
     def test_space(self):
-        sp = st.stratify_space(self.src)
-        self.assertEqual(sp["need"], 2 * os.path.getsize(self.src))
+        size = os.path.getsize(self.src)
+        sp = st.stratify_space(self.src, mode="stream")  # + the temp file
+        self.assertEqual((sp["mode"], sp["need"]), ("stream", 2 * size))
+        sp = st.stratify_space(self.src, mode="memory")  # only the new PLY
+        self.assertEqual((sp["mode"], sp["need"]), ("memory", size))
         self.assertGreater(sp["free"], 0)
+        self.assertGreater(sp["mem_need"], N * (27 + 8))
+        self.assertGreater(sp["mem_free"], 0)
+
+    def test_modes(self):
+        self.assertEqual(st.stratify_mode(self.src), "memory")  # small: fits in RAM
+        self.assertEqual(st.stratify_mode(self.src, "stream"), "stream")
+        with self.assertRaises(ValueError):
+            st.stratify_mode(self.src, "fast")
+
+    def test_modes_write_the_same_file(self):
+        out = os.path.join(self.dir, "modes")
+        os.makedirs(out)
+        with open(self.copy, "rb") as f:
+            expect = f.read()
+        runs = {
+            "memory": dict(mode="memory", chunk=7_000),
+            "stream": dict(mode="stream"),
+            "stream_small": dict(mode="stream", chunk=7_000, buffer_bytes=1 << 16),
+        }
+        for name, kw in runs.items():
+            os.makedirs(os.path.join(out, name))
+            path = st.stratify_ply(self.src, os.path.join(out, name, "plot.ply"),
+                                   cluster_size=10_000, progress=False, **kw)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), expect, name)
+            self.assertEqual(sorted(os.listdir(os.path.dirname(path))),
+                             ["plot.ply", "plot.strat.npz"], name)
+        shutil.rmtree(out)
+
+    def test_work_dir(self):
+        out = os.path.join(self.dir, "wd")
+        work = os.path.join(self.dir, "wd_work")
+        os.makedirs(out)
+        os.makedirs(work)
+        path = os.path.join(out, "plot.ply")
+        for mode in ("memory", "stream"):
+            shutil.copy(self.src, path)
+            seen = []
+            st.stratify_ply(path, mode=mode, work_dir=work, cluster_size=10_000,
+                            progress=False, on_progress=lambda f, stage: seen.append(f))
+            with open(path, "rb") as a, open(self.copy, "rb") as b:
+                self.assertEqual(a.read(), b.read(), mode)
+            self.assertEqual(os.listdir(work), [], mode)  # nothing left behind
+            self.assertEqual(sorted(os.listdir(out)), ["plot.ply", "plot.strat.npz"])
+            self.assertEqual(seen[-1], 1.0)
+            self.assertTrue(all(a <= b for a, b in zip(seen, seen[1:])))
+        shutil.rmtree(out)
+        shutil.rmtree(work)
 
     def test_not_stratified_when_index_missing_or_stale(self):
         path = os.path.join(self.dir, "stale.ply")
