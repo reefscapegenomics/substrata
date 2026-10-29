@@ -21,7 +21,7 @@ from substrata.pointclouds import (
 )
 from substrata.initializer import ProjectInitializer
 from substrata.annotations import Annotations, Scalebars
-from substrata import settings
+from substrata import settings, sidecars
 
 # ---------------------------- helpers: parents & defaults ----------------------------
 
@@ -1289,7 +1289,7 @@ def handle_intercepts(args):
     slope first, places a bounding box (automatically or from --position),
     subdivides it into cells, samples a random XY point per cell, and
     computes the point-cloud Z-intercepts. Writes a grid image and an
-    intercepts CSV (plus a generation YAML for --slope).
+    intercepts CSV with its sidecar YAML (``<csv>.yaml``).
 
     Args:
         args: Parsed CLI arguments.
@@ -1355,26 +1355,46 @@ def handle_intercepts(args):
         random_points, args.search_radius, always_return=True, id_prefix=init.id
     )
 
-    # Save intercepts to CSV (and YAML only for --slope)
-    if getattr(args, "slope", False):
-        fig.savefig(_get_output_filepath(init, "slope_bbox.png"))
-        csv_path = _get_output_filepath(init, "slope_intercepts.csv")
-        intercepts.save(csv_path)
-        yaml_path = os.path.splitext(csv_path)[0] + ".yaml"
-        payload = {
-            "world_transform": init.pcd.world_transform.tolist(),
-            "slope_normal": [float(x) for x in slope_normal],
-            "slope_elevation_deg": float(slope_elev),
-            # Exact generation grid, so intercepts-plot can replay the same cells
-            # (rather than re-deriving them from the point extent).
-            "grid_bbox": [
-                [float(optimal_bbox[0][0]), float(optimal_bbox[0][1])],
-                [float(optimal_bbox[1][0]), float(optimal_bbox[1][1])],
-            ],
-            "grid_cell_size": float(args.box_size),
-        }
-        with open(yaml_path, "w") as f:
-            yaml.safe_dump(payload, f)
+    # Save the grid image and intercepts CSV, plus the CSV's sidecar YAML
+    slope = getattr(args, "slope", False)
+    mode = "slope" if slope else "topdown"
+    fig.savefig(_get_output_filepath(init, f"{mode}_bbox.png"))
+    csv_path = _get_output_filepath(init, f"{mode}_intercepts.csv")
+    intercepts.save(csv_path)
+
+    # Grid frame = grid_transform @ world_transform @ orig, where grid_transform
+    # is the slope alignment (identity for topdown)
+    grid_transform = init.pcd.world_transform @ np.linalg.inv(init.world_transform)
+    (x0, y0), (x1, y1) = [[float(v) for v in xy] for xy in optimal_bbox]
+    # bbox corners in orig coords (for display), at the intercepts' median height
+    z = float(np.nanmedian([c[2] for c in intercepts.coords])) if intercepts else 0.0
+    corners = np.array([[x0, y0, z, 1], [x1, y0, z, 1], [x1, y1, z, 1], [x0, y1, z, 1]])
+    bbox_orig = (np.linalg.inv(init.pcd.world_transform) @ corners.T)[:3].T
+    grid = {
+        "mode": mode,
+        "grid_transform": grid_transform if slope else None,
+        "grid_bbox": [[x0, y0], [x1, y1]],
+        "cell_size": float(args.box_size),
+        "box_length": float(args.box_length),
+        "box_width": float(args.box_width),
+        "search_radius": float(args.search_radius),
+        "position": [x0, y0] if getattr(args, "position", None) else "auto",
+        "slope_elevation_deg": float(slope_elev) if slope else None,
+        "bbox_orig": bbox_orig,
+    }
+    sidecar_path = sidecars.write_annotation_sidecar(
+        csv_path,
+        {
+            "type": "intercepts",
+            "plot_id": init.id,
+            "classes": init.classes_filepath,
+            "world_transform": init.world_transform,
+            "intercepts": grid,
+        },
+    )
+    print(f"Saved intercepts to {csv_path} (settings: {sidecar_path})")
+
+    if slope:
         # additional visualization for sanity check
         a, b, c, d, inliers_idx = measurements.get_best_fit_plane_PCA(init.pcd)
         visualizations.visualize_elevation_angle(
@@ -1383,10 +1403,6 @@ def handle_intercepts(args):
             point_size=1,
             output_filename=_get_output_filepath(init, "slope_pca.png"),
         )
-    else:
-        fig.savefig(_get_output_filepath(init, "topdown_bbox.png"))
-        csv_path = _get_output_filepath(init, "topdown_intercepts.csv")
-        intercepts.save(csv_path)
 
 
 def handle_intercepts_plot(args):
@@ -1407,17 +1423,28 @@ def handle_intercepts_plot(args):
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
-    # Read the generation YAML (world_transform + optional exact grid). Prefer a
-    # custom YAML (e.g. the sibling <id>_slope_intercepts.yaml written by
-    # `intercepts --slope`), else fall back to the project's own world_transform.
-    transform = None
-    grid_bbox = None
+    ann_path = args.annotations or init.annotations_filepath
+    if not ann_path:
+        raise SystemExit("intercepts-plot requires an annotations/intercepts file")
+
+    # Read the generation settings (orientation + optional exact grid) from --yaml,
+    # else from the CSV's sidecar (<csv>.yaml written by `intercepts`), else fall
+    # back to the project's own world_transform. Sidecars keep the grid in an
+    # `intercepts:` block (grid frame = grid_transform @ world_transform); older
+    # <id>_slope_intercepts.yaml files hold the combined world_transform and
+    # grid_bbox at the top level.
     if getattr(args, "yaml", None):
         with open(args.yaml) as f:
             cfg = yaml.safe_load(f) or {}
-        if cfg.get("world_transform") is not None:
-            transform = np.array(cfg["world_transform"], dtype=float)
-        grid_bbox = cfg.get("grid_bbox")
+    else:
+        cfg = sidecars.read_annotation_sidecar(ann_path)
+    grid_cfg = cfg.get("intercepts") or cfg
+    transform = None
+    if cfg.get("world_transform") is not None:
+        transform = np.array(cfg["world_transform"], dtype=float)
+        if grid_cfg.get("grid_transform") is not None:
+            transform = np.array(grid_cfg["grid_transform"], dtype=float) @ transform
+    grid_bbox = grid_cfg.get("grid_bbox")
     if transform is None:
         transform = init.world_transform
     if np.allclose(transform, np.eye(4)):
@@ -1425,10 +1452,6 @@ def handle_intercepts_plot(args):
             "Warning: orientation transform is identity; the grid may be warped "
             "for slope intercepts (pass --yaml with the generation world_transform)."
         )
-
-    ann_path = args.annotations or init.annotations_filepath
-    if not ann_path:
-        raise SystemExit("intercepts-plot requires an annotations/intercepts file")
 
     # Load in the original frame, then apply the orientation exactly once so the
     # grid becomes axis-aligned (transform_coords compounds, so do not re-apply).
@@ -4813,8 +4836,9 @@ def main():
         type=str,
         default=None,
         help=(
-            "Optional project YAML holding the world_transform (orientation) used "
-            "to generate the intercepts, e.g. <id>_slope_intercepts.yaml."
+            "Optional YAML holding the world_transform (orientation) used to "
+            "generate the intercepts. Default: the CSV's sidecar <csv>.yaml, else "
+            "the project's world_transform."
         ),
     )
     p_intercepts_plot.add_argument(

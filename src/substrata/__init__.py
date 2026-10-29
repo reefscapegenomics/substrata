@@ -29,6 +29,7 @@ from typing import List
 from .logging import logger
 
 from .annotations import *
+from .sidecars import *
 from .color_calibration import *
 from .pathrepair import *
 from .cameras import *

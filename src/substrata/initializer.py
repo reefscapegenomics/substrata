@@ -6,7 +6,7 @@ import yaml
 import numpy as np
 
 # Local Modules
-from substrata import geom, settings, annotations
+from substrata import geom, settings, annotations, sidecars
 import substrata.annotations as annotations
 
 
@@ -44,6 +44,8 @@ class ProjectInitializer:
         self.thumbnail_path = None
         self.classes_filepath = None
         self.classifier_filepath = None
+        # Sidecar YAML of the annotations CSV (see apply_annotation_sidecar)
+        self.annotation_sidecar = {}
         self.world_transform = np.eye(4)
         self.scale_factor = None
         self.up_vector = None
@@ -86,6 +88,9 @@ class ProjectInitializer:
             print(f"Resetting paths to local folder!")
             self.reset_paths_to_local()
 
+        # Per-annotation-set settings from the annotations CSV's sidecar
+        self.apply_annotation_sidecar()
+
     def __str__(self) -> str:
         """
         Returns a summary of all attributes set on the ProjectInitializer instance.
@@ -127,6 +132,12 @@ class ProjectInitializer:
         - [0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 1.00000000e+00]
         firefish_depth_sensor_offset: [0.0, 0.0, -0.152]  # optional, record only
         firefish_water_level: -0.32  # optional, record only
+
+        ``annotations`` names the project's default annotation set. Settings of
+        an annotation set (``classes``, ``cropped_path``, ``crop_size``,
+        ``classifier``, ``annotations_last_highest_id``) preferably live in that
+        CSV's sidecar (``<annotations csv>.yaml``, see :mod:`substrata.sidecars`),
+        which overrides these legacy project keys.
         """
         with open(filepath, "r") as f:
             yaml_config = yaml.safe_load(f)
@@ -246,6 +257,8 @@ class ProjectInitializer:
             filepath (str, optional): Path where the YAML file should be saved.
         """
         config = {}
+        # Annotation-set keys set by the sidecar stay in the sidecar
+        sidecar_keys = set(self.annotation_sidecar or {})
         if self.path is not None:
             config["path"] = self.path
         if self.id is not None:
@@ -264,17 +277,17 @@ class ProjectInitializer:
             config["annotations_last_highest_id"] = int(
                 self.annotations_last_highest_id
             )
-        if self.classifier_filepath is not None:
+        if self.classifier_filepath is not None and "classifier" not in sidecar_keys:
             config["classifier"] = self.classifier_filepath
         if self.photos_path is not None:
             config["photos_path"] = self.photos_path
-        if self.cropped_path is not None:
+        if self.cropped_path is not None and "cropped_path" not in sidecar_keys:
             config["cropped_path"] = self.cropped_path
-        if self.crop_size is not None:
+        if self.crop_size is not None and "crop_size" not in sidecar_keys:
             config["crop_size"] = int(self.crop_size)
         if self.thumbnail_path is not None:
             config["thumbnails_path"] = self.thumbnail_path
-        if self.classes_filepath is not None:
+        if self.classes_filepath is not None and "classes" not in sidecar_keys:
             config["classes"] = self.classes_filepath
         if self.scale_factor is not None:
             config["scale_factor"] = float(self.scale_factor)
@@ -310,6 +323,48 @@ class ProjectInitializer:
             filepath = self.yaml_path
         with open(filepath, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
+
+    def apply_annotation_sidecar(self) -> None:
+        """Take annotation-set settings from the annotations CSV's sidecar YAML.
+
+        The sidecar (``<annotations csv>.yaml``, see :mod:`substrata.sidecars`)
+        sets ``classes``, ``cropped_path``, ``crop_size`` and ``classifier`` per
+        annotation set, overriding the (legacy) project YAML keys and the folder
+        conventions. ``last_highest_id`` only ever raises
+        ``annotations_last_highest_id``, so deleted ids are never reused. Called
+        on construction; call again after changing ``annotations_filepath``.
+        """
+        if not self.annotations_filepath:
+            return
+        sidecar = sidecars.read_annotation_sidecar(self.annotations_filepath)
+        self.annotation_sidecar = sidecar
+        if not sidecar:
+            return
+        print(
+            "Loading annotation settings from "
+            f"{sidecars.annotation_sidecar_path(self.annotations_filepath)}"
+        )
+        if sidecar.get("classes"):
+            self.classes_filepath = sidecar["classes"]
+        if sidecar.get("cropped_path"):
+            self.cropped_path = sidecar["cropped_path"]
+        if sidecar.get("crop_size") is not None:
+            self.crop_size = int(sidecar["crop_size"])
+        if sidecar.get("classifier"):
+            self.classifier_filepath = sidecar["classifier"]
+        last_id = sidecar.get("last_highest_id")
+        if last_id is not None:
+            self.annotations_last_highest_id = max(
+                int(last_id), int(self.annotations_last_highest_id or 0)
+            )
+        world_transform = sidecar.get("world_transform")
+        if world_transform is not None and not np.allclose(
+            np.array(world_transform, dtype=float), self.world_transform
+        ):
+            print(
+                "Warning: the annotations sidecar world_transform differs from "
+                "the project's; the annotations may come from another orientation."
+            )
 
     def init_with_path(self, filepath):
         """

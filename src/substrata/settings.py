@@ -148,6 +148,9 @@ CROP_SIZE_DEFAULT = (800, 800)  # pixels (w, h); centred on the image match
 PREDICTION_CROP_SIZE_DEFAULT = (TRAIN_CROP_SIZE, TRAIN_CROP_SIZE)
 CROP_JPEG_QUALITY = TRAIN_CROP_JPEG_QUALITY  # avoid extra loss vs training crops
 CROPS_DIR_SUFFIX = ".cropped"  # default crops dir: <annotations csv stem>.cropped
+# Per-annotation-set metadata: <annotations csv filename>.yaml (e.g. x_ann.csv.yaml),
+# keeping the .csv so it never clashes with the project's <id>.yaml
+ANNOTATION_SIDECAR_SUFFIX = ".yaml"
 THUMBNAIL_MAX_SIZE = (1024, 768)  # pixels; bounding box, aspect ratio is kept
 THUMBNAILS_DIR_SUFFIX = ".thumbnails"  # default thumbnails dir: <id>.thumbnails
 MAX_PHOTOS_TO_CROP_DEFAULT = 10  # image matches cropped per annotation

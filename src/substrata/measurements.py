@@ -250,6 +250,25 @@ def get_plane_angles(pcd, vis=False, generate_image=True):
     )
 
 
+def slope_normal_from_transform(transform) -> np.ndarray:
+    """Return the slope-plane normal in the source frame of a slope transform.
+
+    A slope-aligning transform (e.g. ``PointCloud.apply_along_slope_transform``,
+    or a sidecar's ``grid_transform``) maps the plane normal to +Z; its final
+    x-alignment only rotates about Z. For a similarity transform the normal in
+    the source frame is therefore the normalized third row of the linear part.
+    Pass ``grid_transform @ world_transform`` to get the normal in orig coords.
+
+    Args:
+        transform: 4x4 (or 3x3) transform from the source frame to the grid frame.
+
+    Returns:
+        Unit normal (length 3) in the source frame.
+    """
+    n = np.asarray(transform, dtype=float)[2, :3]
+    return n / np.linalg.norm(n)
+
+
 def get_elevation_angle(normal) -> float:
     """
     Return the elevation angle (degrees) of a plane given its normal vector.

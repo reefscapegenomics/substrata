@@ -312,9 +312,32 @@ substrata intercepts --slope
 substrata intercepts --search-radius 0.01
 ```
 
+Writes `<id>_{topdown,slope}_bbox.png`, the intercepts CSV `<id>_{topdown,slope}_intercepts.csv` and, next to it, its sidecar YAML `<id>_{topdown,slope}_intercepts.csv.yaml`. The sidecar records how the intercepts were generated, so `intercepts-plot` (and other tools) can replay the exact grid:
+
+```yaml
+type: intercepts
+plot_id: cur_sna_20m_20200303
+world_transform: [...]        # the project's world_transform at generation
+intercepts:
+  mode: slope                 # slope | topdown
+  grid_transform: [...]       # slope alignment (world -> grid frame); slope only
+  grid_bbox: [[x0, y0], [x1, y1]]   # in the grid frame
+  cell_size: 0.2
+  box_length: 25.0
+  box_width: 4.0
+  search_radius: 0.005
+  position: auto              # or the --position [x, y]
+  slope_elevation_deg: 23.4   # slope only
+  bbox_orig: [...]            # the 4 box corners in orig coords (for display)
+```
+
+The grid frame is `grid_transform @ world_transform @ orig`. The CSV's `orig_*` columns are the reference; its `world_*` columns are in the grid frame. The slope normal is not stored: `substrata.slope_normal_from_transform(grid_transform)` gives it in world coords, or pass `grid_transform @ world_transform` to get it in orig coords.
+
+**Annotation sidecars in general:** any annotations CSV may have an optional `<csv filename>.yaml` (the `.csv` is kept in the name, so a `<id>.csv` never clashes with the project's `<id>.yaml`). It holds the settings of that annotation set rather than the plot: `type`, `plot_id`, `classes`, `world_transform`, `last_highest_id` (the id high-water mark, so deleted ids are never reused) and, when not the default, `cropped_path` (default `<csv stem>.cropped`), `crop_size` and `classifier`. Paths are relative to the sidecar's folder. For the project's `annotations` file, `ProjectInitializer` takes these from the sidecar in preference to the legacy keys in `<id>.yaml`. A CSV without a sidecar works as before. Helpers: `substrata.read_annotation_sidecar` / `write_annotation_sidecar`.
+
 ## Intercepts plot
 
-Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. For slope intercepts, pass the orientation (4×4 `world_transform`) that was used at generation time via `--yaml` (e.g. the sibling `<id>_slope_intercepts.yaml` written by `intercepts --slope`) so the grid is axis-aligned. Without it, the coordinates are used as-is (fine for top-down intercepts). When the YAML also carries the exact generation grid (`grid_bbox` + `grid_cell_size`, written since this feature was added), those cells are replayed exactly; otherwise the grid is derived from the annotation extent at `--grid-size`.
+Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. The orientation and exact generation grid are read from the CSV's sidecar (`<csv>.yaml`, written by `intercepts`) automatically, so the grid is axis-aligned and the generation cells (`grid_bbox`) are replayed exactly. `--yaml` overrides this, e.g. for an older `<id>_slope_intercepts.yaml` (which holds the combined `world_transform` and, if recent enough, `grid_bbox` at the top level). Without either, the project's `world_transform` is used (fine for top-down intercepts) and the grid is derived from the annotation extent at `--grid-size`.
 
 When the project point cloud can be found, it is loaded and oriented with the same transform as the annotations and scattered as a background behind the grid cells by default; pass `--hide-points` to disable that (use `--points`/`-n` to cap how many points are loaded).
 
@@ -339,7 +362,10 @@ The animated GIF fills its cells column-by-column by default; `--animation-order
 Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size M] [--fit-grid] [--box-length M --box-width M] [--position [x,y]] [--step-size M] [--output PNG] [--label-colors FILE] [--animation-order ORDER] [--title STR] [--hide-points] [--points N]`
 
 ```bash
-# Plot slope intercepts, applying the generation orientation
+# Plot slope intercepts (orientation + grid from the CSV's sidecar YAML)
+substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv --grid-size 0.2
+
+# Older slope intercepts: pass the generation YAML explicitly
 substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
                           --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 0.2
 

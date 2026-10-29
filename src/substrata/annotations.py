@@ -39,6 +39,7 @@ from substrata import (
     visualizations,
     geom,
     pointclouds,
+    sidecars,
 )
 from substrata.logging import logger
 
@@ -83,6 +84,8 @@ class Annotations:
         self.world_transform = np.eye(4)
         self.filepath: Optional[str] = None  # CSV the annotations were loaded from
         self._crops_root: Optional[str] = None
+        # Optional <csv>.yaml metadata of the annotation set (see sidecars.py)
+        self.sidecar: Dict[str, Any] = {}
 
         if filepath is not None:
             self.get_annotations_from_file(
@@ -126,10 +129,11 @@ class Annotations:
     def crops_root(self) -> Optional[str]:
         """Directory holding the crops for these annotations.
 
-        An explicitly set value (e.g. the project YAML's ``cropped_path``, set by
-        ``ProjectInitializer``) takes precedence. Otherwise the crops sit next to
-        the annotations CSV, in ``<csv stem>.cropped`` - so crops belong to the
-        annotation set, not to the model, and annotation sets never mix.
+        An explicitly set value (the sidecar's ``cropped_path``, or the project
+        YAML's ``cropped_path`` set by ``ProjectInitializer``) takes precedence.
+        Otherwise the crops sit next to the annotations CSV, in
+        ``<csv stem>.cropped`` - so crops belong to the annotation set, not to
+        the model, and annotation sets never mix.
 
         Returns:
             The crops directory, or None if neither is known.
@@ -262,6 +266,9 @@ class Annotations:
         """
         annotations_file = open(annotations_filepath, "r")
         self.filepath = annotations_filepath
+        self.sidecar = sidecars.read_annotation_sidecar(annotations_filepath)
+        if self.sidecar.get("cropped_path"):
+            self._crops_root = self.sidecar["cropped_path"]
 
         # If ignore_header is True, skip first line and treat as no header
         if ignore_header:
