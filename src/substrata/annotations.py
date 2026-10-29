@@ -3491,6 +3491,36 @@ def delete_annotation_csv_row(path: str, ann_id: str) -> None:
     _write_csv_rows(path, keep, eol)
 
 
+def replace_annotation_csv_values(
+    path: str, column: str, mapping: Dict[str, str]
+) -> int:
+    """Replace the cells of one column whose value is a key of `mapping`.
+
+    Only those cells change; other cells, the column order and the line ending
+    are kept (e.g. for ``path-repair`` of ``cam_filepath``).
+
+    Args:
+        path: Annotation CSV.
+        column: Column name (case-insensitive).
+        mapping: Old cell value to new cell value.
+
+    Returns:
+        The number of cells changed (the file is only rewritten if > 0).
+    """
+    rows, eol, low = _read_csv_rows(path)
+    if column.lower() not in low:
+        return 0
+    i = low.index(column.lower())
+    n = 0
+    for r in rows[1:]:
+        if len(r) > i and r[i] in mapping and mapping[r[i]] != r[i]:
+            r[i] = mapping[r[i]]
+            n += 1
+    if n:
+        _write_csv_rows(path, rows, eol)
+    return n
+
+
 def backup_annotation_csv(path: str) -> str:
     """Copy an annotation CSV to ``<folder>/backup/<name>_<YYYYmmdd_HHMMSS>.bak``.
 

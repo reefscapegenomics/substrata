@@ -62,6 +62,19 @@ class TestAnnotationCsvEdit(unittest.TestCase):
         self.assertTrue(lines[1].endswith(",keep me,PORI"))
         self.assertTrue(lines[2].endswith(","))
 
+    def test_replace_column_values_only_touches_those_cells(self):
+        with open(self.path, "w", newline="") as fh:
+            fh.write(CSV.replace(",,,,,keep me", ",/old/IMG_1.JPG,,,,keep me"))
+        n = a.replace_annotation_csv_values(
+            self.path, "cam_filepath", {"/old/IMG_1.JPG": "/new/IMG_1.JPG"}
+        )
+        self.assertEqual(n, 1)
+        expected = CSV.replace(",,,,,keep me", ",/new/IMG_1.JPG,,,,keep me")
+        self.assertEqual(self.read(), expected)  # CRLF and other cells kept
+        self.assertEqual(
+            a.replace_annotation_csv_values(self.path, "nope", {"a": "b"}), 0
+        )
+
     def test_update_unknown_id(self):
         with self.assertRaises(KeyError):
             a.update_annotation_csv_row(self.path, "nope", {"label": "X"})

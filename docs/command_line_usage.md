@@ -624,21 +624,21 @@ substrata camsync -s 0 -u 1 --time-offset 12.5 --pdf-pairs 20
 
 ## Path repair (path-repair)
 
-A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. `path-repair` checks and repairs both.
+A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. Annotation sets add two more: the path keys of their sidecar YAMLs (`<csv>.yaml`: `classes`, `cropped_path`, `classifier`) and the `cam_filepath` column of the CSVs (the image each point was placed on). `path-repair` checks and repairs all of them.
 
-It runs in two phases. Phase A repairs the project file paths in the YAML; phase B repairs the per-camera image paths in the meta JSON. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` or `--cams-only` to run just one phase.
+Phase A repairs the project file paths in the YAML, and the path keys of each annotation sidecar (written relative to the sidecar, e.g. `classes.csv` or `../classes.csv`). Phase B repairs the per-camera image paths in the meta JSON. Phase C repairs the `cam_filepath` cells of the point CSVs directly in the project folder (any CSV with `id` and `x`/`orig_x`, `y`/`orig_y`, `z`/`orig_z` columns); it reuses phase B's folder mappings, so a folder answered once fixes both, and writes a backup of each changed CSV to `backup/`. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` (phase A) or `--cams-only` (phases B and C) to run part of it, and `--no-annotations` to leave the annotation sets alone.
 
 Each broken path is resolved by trying, in order: the conventional filename in the project folder, then a recursive search by basename, then asking you. The YAML's `path:` key is repaired first, because every relative value beneath it resolves against that key — one stale `path:` is usually the whole problem. Repaired YAML entries that sit inside the project folder are written as **bare filenames**, so the YAML stays portable and survives the next move.
 
 The YAML is patched line by line, preserving comments, key order and any keys substrata does not itself use. (The initializer's own `save_config_to_yaml` rebuilds the file from scratch and drops anything it does not model, so it is not used here.)
 
-Both phases are planned in full before either writes, so aborting at any point leaves the project untouched. `--dry-run` prints the plan and writes nothing. For camera images, `--find` with `--replace` does a literal substring substitution and refuses to write unless every resulting path exists; `--find`, `--cams-group` and `--sensor-id` restrict which cameras are considered and apply to phase B only.
+All phases are planned in full before any writes, so aborting at any point leaves the project untouched. `--dry-run` prints the plan and writes nothing. For camera images, `--find` with `--replace` does a literal substring substitution and refuses to write unless every resulting path exists; `--find`, `--cams-group` and `--sensor-id` restrict which cameras are considered and apply to phase B only. `--find`/`--replace` also apply to the annotation images; with `--cams-group` or `--sensor-id`, phase C is skipped.
 
 **Use this instead of `--local`.** That flag rebases every path onto the working directory by basename — unverified, and discarding any nested folder structure — and on `orient`, `scalebars`, `colors` and `firefish --save_yaml` it is then persisted into the YAML as a side effect. `path-repair` changes only the paths that are actually broken, and verifies each result before writing.
 
 Related: `substrata segment --photo-path-replace OLD NEW` applies the same camera substitution for a single run without saving it; `substrata path-repair --find OLD --replace NEW` makes it permanent.
 
-Usage: `substrata path-repair [--yaml-only | --cams-only] [--find STR] [--replace STR] [--cams-group NAME] [--sensor-id ID] [--root DIR] [--dry-run] [--yes]`
+Usage: `substrata path-repair [--yaml-only | --cams-only] [--no-annotations] [--find STR] [--replace STR] [--cams-group NAME] [--sensor-id ID] [--root DIR] [--dry-run] [--yes]`
 
 ```bash
 # Inspect what would change, without writing anything
@@ -650,6 +650,9 @@ substrata path-repair
 # Repair only the project YAML, or only the camera images
 substrata path-repair --yaml-only
 substrata path-repair --cams-only
+
+# Leave the annotation sidecars and CSVs alone
+substrata path-repair --no-annotations
 
 # Search elsewhere for the photos (e.g. an external drive)
 substrata path-repair --root /Volumes/ReefArchive

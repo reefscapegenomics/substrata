@@ -2466,9 +2466,9 @@ def _pr_prompt_manual():
         print(f"  Not an existing file or directory: {path}")
 
 
-def _print_yaml_report(yplan):
-    """Print the project-file section of the path-repair report."""
-    print(f"\nProject files ({os.path.basename(yplan.yaml_path)}):")
+def _print_yaml_report(yplan, title="Project files"):
+    """Print a YAML section (project or sidecar) of the path-repair report."""
+    print(f"\n{title} ({os.path.basename(yplan.yaml_path)}):")
     width = max((len(e.key) for e in yplan.entries), default=4)
     for entry in yplan.entries:
         if entry.new is not None:
@@ -2482,9 +2482,13 @@ def _print_yaml_report(yplan):
             print(f"  {entry.key:<{width}}  ok")
 
 
-def _print_cams_report(plan, max_rows):
-    """Print the camera-image section, grouped by folder mapping."""
+def _print_cams_report(plan, max_rows, title="Camera images", unit="cameras"):
+    """Print an image-path section, grouped by folder mapping."""
     from substrata.pathrepair import path_basename, path_dirname
+
+    def name(cam_id):
+        # Annotation image plans are keyed by the stored path itself
+        return path_basename(cam_id) if cam_id == plan.stored.get(cam_id) else cam_id
 
     by_mapping = {}
     individual = []
@@ -2496,17 +2500,17 @@ def _print_cams_report(plan, max_rows):
         else:
             individual.append((cam_id, new_path))
 
-    print(f"\nCamera images ({len(plan.changes)} to update):")
+    print(f"\n{title} ({len(plan.changes)} to update):")
     for (old_dir, new_dir), rows in sorted(by_mapping.items()):
-        print(f"  {old_dir}  ->  {new_dir}   ({len(rows)} cameras)")
+        print(f"  {old_dir}  ->  {new_dir}   ({len(rows)} {unit})")
         for cam_id, new_path in rows[:max_rows]:
-            print(f"      {cam_id}  {path_basename(new_path)}")
+            print(f"      {name(cam_id)}  {path_basename(new_path)}")
         if len(rows) > max_rows:
             print(f"      ... {len(rows) - max_rows} more")
     if individual:
         print("  (individual)")
         for cam_id, new_path in individual[:max_rows]:
-            print(f"      {cam_id}  {new_path}")
+            print(f"      {name(cam_id)}  {new_path}")
         if len(individual) > max_rows:
             print(f"      ... {len(individual) - max_rows} more")
 
@@ -2514,10 +2518,12 @@ def _print_cams_report(plan, max_rows):
 def handle_path_repair(args):
     """Check and repair every stale path in a project.
 
-    Runs in two phases. Phase A repairs the project's own file paths in
-    ``<id>.yaml``; phase B repairs the per-camera image paths in
-    ``<id>.meta.json``. Both phases are planned in full before either writes, so
-    aborting at any point leaves the project untouched.
+    Phase A repairs the project's own file paths in ``<id>.yaml`` (and the
+    path keys of the annotation sidecars, ``<csv>.yaml``); phase B repairs the
+    per-camera image paths in ``<id>.meta.json``; phase C repairs the
+    ``cam_filepath`` cells of the point CSVs in the project folder. All phases
+    are planned in full before any writes, so aborting at any point leaves the
+    project untouched.
 
     Phase A deliberately works on the raw YAML and never constructs a
     :class:`ProjectInitializer`: ``initialize()`` guards the point cloud and the
@@ -2547,6 +2553,7 @@ def handle_path_repair(args):
 
     do_yaml = not getattr(args, "cams_only", False)
     do_cams = not getattr(args, "yaml_only", False)
+    do_anns = not getattr(args, "no_annotations", False)
     interactive = sys.stdin.isatty()
     max_rows = settings.PATHREPAIR_MAX_REPORT_ROWS
 
@@ -2556,6 +2563,16 @@ def handle_path_repair(args):
     has_yaml = os.path.isfile(yaml_path)
 
     print(f"Project:   {base}   ({project_dir})")
+    ann_csvs = pr.find_annotation_csvs(project_dir) if do_anns else []
+
+    # One image index (a single walk under --root) for phases B and C
+    _index = {}
+
+    def get_index():
+        if "index" not in _index:
+            root = os.path.abspath(getattr(args, "root", None) or project_dir)
+            _index["index"] = pr.build_image_index(root)
+        return _index["index"]
 
     def on_dup(key, old, cands):
         if not interactive:
@@ -2588,6 +2605,35 @@ def handle_path_repair(args):
     elif do_yaml:
         print("No project YAML found; project files follow naming conventions.")
 
+    # ---- Phase A2: path keys of the annotation sidecars (<csv>.yaml) ------
+    splans = []
+    if do_yaml:
+        for csv_path in ann_csvs:
+            sidecar = sidecars.annotation_sidecar_path(csv_path)
+            if not os.path.isfile(sidecar):
+                continue
+            with open(sidecar, "r") as f:
+                sconfig = yaml.safe_load(f) or {}
+            if not isinstance(sconfig, dict):
+                print(f"Skipping {sidecar}: not a mapping.")
+                continue
+            stem = os.path.splitext(os.path.basename(csv_path))[0]
+            try:
+                splan = pr.plan_yaml_repair(
+                    sidecar, sconfig, on_dup, on_miss,
+                    keys=pr.SIDECAR_YAML_PATH_KEYS, fix_path_key=False,
+                    project_id=stem, keep_relative=True,
+                )
+            except pr.PathAborted:
+                raise SystemExit("Aborted; nothing written.")
+            except RuntimeError as e:
+                raise SystemExit(
+                    f"{e}\n  Re-run in an interactive terminal, or repair "
+                    f"{os.path.basename(sidecar)} by hand."
+                )
+            if splan.entries:
+                splans.append(splan)
+
     # ---- Resolve where the cameras live, from the plan (not from disk) ----
     if yplan is not None:
         meta_path = yplan.resolved.get("cams_meta_json")
@@ -2613,7 +2659,53 @@ def handle_path_repair(args):
                 print("\nSkipping camera images: no cameras loaded.")
             else:
                 cplan = _plan_camera_paths(
-                    args, cams, meta_path, project_dir, interactive, pr
+                    args, cams, meta_path, project_dir, interactive, pr,
+                    get_index=get_index,
+                )
+
+    # ---- Phase C: image paths (cam_filepath) in the annotation CSVs -------
+    aplan = None
+    csv_values = {}
+    camera_filters = (
+        getattr(args, "cams_group", None) is not None
+        or getattr(args, "sensor_id", None) is not None
+    )
+    if do_cams and ann_csvs and camera_filters:
+        print("\nSkipping annotation image paths: camera filters given.")
+    elif do_cams and ann_csvs:
+        for csv_path in ann_csvs:
+            values = set(pr.read_csv_column(csv_path, "cam_filepath"))
+            if find is not None:
+                values = {v for v in values if find in v}
+            if values:
+                csv_values[csv_path] = values
+        stored = {v: v for values in csv_values.values() for v in values}
+        if stored and replace is not None:
+            aplan = pr.plan_find_replace(stored, find, replace)
+        elif stored:
+            try:
+                aplan = pr.resolve_image_paths(
+                    stored,
+                    get_index(),
+                    on_duplicate=(
+                        (lambda v, old, c: _pr_prompt_duplicate(
+                            "Annotation image", pr.path_basename(v), old, c))
+                        if interactive else None
+                    ),
+                    on_missing=(
+                        (lambda v, old: _pr_prompt_missing(
+                            "Annotation image", pr.path_basename(v), old))
+                        if interactive else (lambda v, old: ("skip", None))
+                    ),
+                    # Folders already mapped for the cameras need no new answer
+                    dir_map=cplan.dir_map if cplan is not None else None,
+                )
+            except pr.PathAborted:
+                raise SystemExit("Aborted; nothing written.")
+            except RuntimeError as e:
+                raise SystemExit(
+                    f"{e}\n  Re-run in an interactive terminal, or use "
+                    "--find/--replace to set the paths explicitly."
                 )
 
     # ---- Gates ------------------------------------------------------------
@@ -2634,11 +2726,30 @@ def handle_path_repair(args):
             raise SystemExit(
                 f"Refusing to write: {len(collisions)} path collision(s)."
             )
+    # Several stored paths may legitimately name the same image in the CSVs
+    # (e.g. different old mounts), so only the --replace gate applies here
+    if aplan is not None and replace is not None and aplan.missing:
+        print(f"\n{len(aplan.missing)} resolved annotation image(s) do not exist:")
+        for old, path in sorted(aplan.missing.items())[:max_rows]:
+            print(f"  {old}  ->  {path}")
+        raise SystemExit(
+            f"{len(aplan.missing)} resolved annotation image(s) do not exist; "
+            "nothing written."
+        )
 
     yaml_changes = yplan.changes if yplan is not None else {}
     cam_changes = cplan.changes if cplan is not None else {}
-    if not yaml_changes and not cam_changes:
-        print("\nNothing to repair; all paths already resolve.")
+    sidecar_changes = {p.yaml_path: p.changes for p in splans if p.changes}
+    ann_changes = aplan.changes if aplan is not None else {}
+    n_sidecar_keys = sum(len(c) for c in sidecar_changes.values())
+    if not (yaml_changes or cam_changes or sidecar_changes or ann_changes):
+        if aplan is not None and aplan.skipped:
+            print(
+                f"\nNothing to repair; {len(aplan.skipped)} annotation image "
+                "path(s) could not be found under the search root."
+            )
+        else:
+            print("\nNothing to repair; all paths already resolve.")
         return
 
     # ---- Report -----------------------------------------------------------
@@ -2652,6 +2763,16 @@ def handle_path_repair(args):
         empty = pr.zero_byte_paths(list(cam_changes.values()))
         if empty:
             print(f"Warning: {len(empty)} matched image(s) are zero bytes.")
+    for splan in splans:
+        _print_yaml_report(splan, title="Annotation settings")
+    if ann_changes:
+        _print_cams_report(
+            aplan, max_rows, title="Annotation images", unit="images"
+        )
+        n_csvs = sum(1 for v in csv_values.values() if v & ann_changes.keys())
+        print(f"  in {n_csvs} annotation CSV(s)")
+        if aplan.skipped:
+            print(f"Annotation images not found:  {len(aplan.skipped)}")
 
     if getattr(args, "dry_run", False):
         print("\nDry run: nothing written.")
@@ -2663,8 +2784,10 @@ def handle_path_repair(args):
                 "Confirmation required; re-run with --yes in non-interactive use."
             )
         ans = input(
-            f"\nProceed? {len(yaml_changes)} YAML key(s) and "
-            f"{len(cam_changes)} camera path(s) will be updated. [y/N]: "
+            f"\nProceed? {len(yaml_changes)} YAML key(s), "
+            f"{n_sidecar_keys} annotation-settings key(s), "
+            f"{len(cam_changes)} camera path(s) and {len(ann_changes)} "
+            "annotation image path(s) will be updated. [y/N]: "
         )
         if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("Aborted.")
@@ -2681,10 +2804,35 @@ def handle_path_repair(args):
         n = cams.save_paths(cams_meta_filepath=meta_path,
                             only_cam_ids=set(cam_changes))
         print(f"Updated {n} camera path(s).")
+    for sidecar, changes in sidecar_changes.items():
+        with open(sidecar, "r") as f:
+            text = f.read()
+        out = pr.atomic_write_text(pr.patch_yaml_paths(text, changes), sidecar)
+        print(f"Updated {len(changes)} path(s) in {out}")
+    if ann_changes:
+        from substrata.annotations import (
+            backup_annotation_csv,
+            replace_annotation_csv_values,
+        )
+
+        for csv_path, values in csv_values.items():
+            mapping = {v: ann_changes[v] for v in values if v in ann_changes}
+            if not mapping:
+                continue
+            backup = backup_annotation_csv(csv_path)
+            n = replace_annotation_csv_values(csv_path, "cam_filepath", mapping)
+            print(
+                f"Updated {n} cam_filepath cell(s) in "
+                f"{os.path.basename(csv_path)} (backup: "
+                f"{os.path.relpath(backup, project_dir)})"
+            )
     logger.info(
-        "path-repair: %s YAML key(s), %s camera path(s)",
+        "path-repair: %s YAML key(s), %s sidecar key(s), %s camera path(s), "
+        "%s annotation image path(s)",
         len(yaml_changes),
+        n_sidecar_keys,
         len(cam_changes),
+        len(ann_changes),
     )
 
     # ---- Post-write verification -----------------------------------------
@@ -2692,6 +2840,15 @@ def handle_path_repair(args):
         print(f"Warning: {len(yplan.unresolved)} project path(s) still missing:")
         for entry in yplan.unresolved[:max_rows]:
             print(f"  {entry.key}  {entry.old}")
+    for splan in splans:
+        for entry in splan.unresolved[:max_rows]:
+            print(
+                f"Warning: {os.path.basename(splan.yaml_path)}: {entry.key} "
+                f"still missing: {entry.old}"
+            )
+    if aplan is not None and (aplan.skipped or aplan.missing):
+        n_left = len(aplan.skipped) + len(aplan.missing)
+        print(f"Warning: {n_left} annotation image path(s) still missing.")
     if cams is not None:
         still = cams.missing_image_paths(use_orig=True)
         if still:
@@ -2702,7 +2859,9 @@ def handle_path_repair(args):
             print(f"All {len(cams.data)} camera images now resolve on disk.")
 
 
-def _plan_camera_paths(args, cams, meta_path, project_dir, interactive, pr):
+def _plan_camera_paths(
+    args, cams, meta_path, project_dir, interactive, pr, get_index=None
+):
     """Plan the camera-image half of a path repair.
 
     The camera selection is frozen to a set of ids before anything mutates,
@@ -2715,6 +2874,8 @@ def _plan_camera_paths(args, cams, meta_path, project_dir, interactive, pr):
         project_dir (str): Absolute project directory.
         interactive (bool): Whether prompting is possible.
         pr: The :mod:`substrata.pathrepair` module.
+        get_index (callable, optional): Returns the (shared) image index;
+            default builds one under ``--root``.
 
     Returns:
         PathPlan: The planned camera path changes.
@@ -2776,7 +2937,7 @@ def _plan_camera_paths(args, cams, meta_path, project_dir, interactive, pr):
     if replace is not None:
         return pr.plan_find_replace(sel_paths, find, replace)
 
-    index = pr.build_image_index(root)
+    index = get_index() if get_index is not None else pr.build_image_index(root)
     try:
         return pr.resolve_image_paths(
             sel_paths,
@@ -5508,13 +5669,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         help=(
             "Check and repair stale paths in a project: the project files "
-            "listed in the YAML and the per-camera image paths."
+            "listed in the YAML, the per-camera image paths and the "
+            "annotation sets (sidecar YAMLs, cam_filepath)."
         ),
         epilog=(
-            "Runs in two phases. Phase A repairs the project's own file paths\n"
-            "in <id>.yaml; phase B repairs the per-camera image paths in\n"
-            "<id>.meta.json. The .cams.xml is never modified (it stores image\n"
-            "labels, not paths).\n"
+            "Phase A repairs the project's own file paths in <id>.yaml, and\n"
+            "the path keys (classes, cropped_path, classifier) of each\n"
+            "annotation sidecar <csv>.yaml; phase B repairs the per-camera\n"
+            "image paths in <id>.meta.json; phase C repairs the cam_filepath\n"
+            "column of the point CSVs in the project folder (a backup of each\n"
+            "changed CSV goes to backup/). The .cams.xml is never modified (it\n"
+            "stores image labels, not paths).\n"
             "\n"
             "Each broken path is resolved by trying, in order: the conventional\n"
             "filename in the project folder, a recursive search by basename,\n"
@@ -5523,7 +5688,7 @@ def main():
             "The YAML is patched line by line, preserving comments, key order\n"
             "and any keys substrata does not itself use.\n"
             "\n"
-            "Both phases are planned in full before either writes, so aborting\n"
+            "All phases are planned in full before any writes, so aborting\n"
             "leaves the project untouched. --find/--replace does a literal\n"
             "substitution on camera paths and refuses to write unless every\n"
             "resulting path exists.\n"
@@ -5542,13 +5707,28 @@ def main():
         "--yaml-only",
         dest="yaml_only",
         action="store_true",
-        help="Repair the project YAML only; leave camera image paths alone.",
+        help=(
+            "Repair the project YAML (and annotation sidecars) only; leave "
+            "image paths alone."
+        ),
     )
     _pr_scope.add_argument(
         "--cams-only",
         dest="cams_only",
         action="store_true",
-        help="Repair camera image paths only; leave the project YAML alone.",
+        help=(
+            "Repair image paths only (cameras and annotation cam_filepath); "
+            "leave the YAMLs alone."
+        ),
+    )
+    p_pathrepair.add_argument(
+        "--no-annotations",
+        dest="no_annotations",
+        action="store_true",
+        help=(
+            "Leave the annotation sets alone: the sidecar YAMLs (<csv>.yaml) "
+            "and the cam_filepath column of the point CSVs."
+        ),
     )
     p_pathrepair.add_argument(
         "--find",
@@ -5557,8 +5737,9 @@ def main():
         default=None,
         metavar="STR",
         help=(
-            "Camera images only: consider cameras whose stored path contains "
-            "STR. With --replace, STR is also the substring that is replaced."
+            "Image paths only: consider cameras/annotation images whose "
+            "stored path contains STR. With --replace, STR is also the "
+            "substring that is replaced."
         ),
     )
     p_pathrepair.add_argument(

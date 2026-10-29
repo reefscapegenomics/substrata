@@ -14,6 +14,7 @@ module for :func:`path_basename`.
 from __future__ import annotations
 
 # Standard Library
+import csv
 import os
 import re
 import tempfile
@@ -203,6 +204,7 @@ def resolve_image_paths(
     index: Dict[str, List[str]],
     on_duplicate: Optional[DuplicateCallback] = None,
     on_missing: Optional[MissingCallback] = None,
+    dir_map: Optional[Dict[str, str]] = None,
 ) -> PathPlan:
     """Resolve each camera's stored path to a file found under the search root.
 
@@ -234,6 +236,8 @@ def resolve_image_paths(
             ``("skip", None)`` or ``("abort", None)``.
         on_missing: Called as ``(cam_id, stored_path)`` when no file matches.
             Same return contract.
+        dir_map: Old-to-new directory mappings to start from (e.g. those of
+            an earlier plan), so a folder already answered is not asked again.
 
     Returns:
         PathPlan: The planned changes.
@@ -244,6 +248,7 @@ def resolve_image_paths(
             ``None`` (a non-interactive context).
     """
     plan = PathPlan(stored=dict(paths))
+    plan.dir_map.update(dir_map or {})
     for cam_id in sorted(paths):
         stored = paths[cam_id]
         if not stored:
@@ -401,6 +406,15 @@ YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
     YamlPathKey("photos_path", True, ("{id}.photos",)),
     YamlPathKey("cropped_path", True, ("{id}.cropped",)),
     YamlPathKey("thumbnails_path", True, ("{id}.thumbnails",)),
+)
+
+# Path-bearing keys of an annotation sidecar (``<csv>.yaml``, see
+# substrata.sidecars). Planned with the CSV stem as ``{id}``, so the crops
+# convention is the default ``<csv stem>.cropped``.
+SIDECAR_YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
+    YamlPathKey("classes", False, ("classes.csv",)),
+    YamlPathKey("cropped_path", True, ("{id}.cropped",)),
+    YamlPathKey("classifier", False, ()),
 )
 
 # Top-level ``key: value`` at zero indentation. Nested mappings (e.g. the
@@ -576,6 +590,10 @@ def plan_yaml_repair(
     config: Dict[str, object],
     on_duplicate: Optional[DuplicateCallback] = None,
     on_missing: Optional[MissingCallback] = None,
+    keys: Tuple[YamlPathKey, ...] = YAML_PATH_KEYS,
+    fix_path_key: bool = True,
+    project_id: Optional[str] = None,
+    keep_relative: bool = False,
 ) -> YamlPlan:
     """Plan repairs for every path-bearing key in a project YAML.
 
@@ -598,6 +616,16 @@ def plan_yaml_repair(
             finds several matches. Returns ``("pick", path)``, ``("skip", None)``
             or ``("abort", None)``.
         on_missing: Called as ``(key, old_value)`` when nothing is found.
+        keys: The path-bearing keys to check (``SIDECAR_YAML_PATH_KEYS`` for
+            an annotation sidecar).
+        fix_path_key: Whether to set ``path:`` to the YAML's directory (the
+            project YAML only).
+        project_id: ``{id}`` for the naming conventions. Default: the YAML's
+            ``id`` key, else its directory name.
+        keep_relative: Write resolved paths relative to the YAML's directory
+            (also outside it, e.g. ``../classes.csv``) instead of as a bare
+            name or absolute path, and keep working relative values as they
+            are. Used for sidecars, whose paths are relative to the sidecar.
 
     Returns:
         YamlPlan: The planned repairs.
@@ -607,24 +635,35 @@ def plan_yaml_repair(
         RuntimeError: If a decision is needed but the callback is ``None``.
     """
     project_dir = os.path.dirname(os.path.abspath(yaml_path))
-    project_id = str(
-        config.get("id") or path_basename(project_dir) or ""
-    )
+    if project_id is None:
+        project_id = str(config.get("id") or path_basename(project_dir) or "")
     plan = YamlPlan(yaml_path=yaml_path, project_dir=project_dir,
                     project_id=project_id)
 
+    def written(resolved: str) -> str:
+        """The value to write for a resolved absolute path."""
+        if not keep_relative:
+            return relativise(resolved, project_dir)
+        try:
+            return os.path.relpath(resolved, project_dir)
+        except ValueError:  # e.g. another drive on Windows
+            return resolved
+
     # 1. path: always names the directory the YAML actually lives in.
-    old_path = config.get("path")
-    old_path_str = str(old_path) if old_path is not None else None
-    if old_path_str is None or os.path.abspath(old_path_str) != project_dir:
-        plan.entries.append(
-            YamlEntry("path", old_path_str, project_dir, "project-dir")
-        )
-    else:
-        plan.entries.append(YamlEntry("path", old_path_str, None, "unchanged"))
+    if fix_path_key:
+        old_path = config.get("path")
+        old_path_str = str(old_path) if old_path is not None else None
+        if old_path_str is None or os.path.abspath(old_path_str) != project_dir:
+            plan.entries.append(
+                YamlEntry("path", old_path_str, project_dir, "project-dir")
+            )
+        else:
+            plan.entries.append(
+                YamlEntry("path", old_path_str, None, "unchanged")
+            )
     plan.resolved["path"] = project_dir
 
-    for spec in YAML_PATH_KEYS:
+    for spec in keys:
         if spec.key not in config or config[spec.key] is None:
             continue
         old = str(config[spec.key])
@@ -634,7 +673,9 @@ def plan_yaml_repair(
         current = old if os.path.isabs(old) else os.path.join(project_dir, old)
         if exists(current):
             plan.resolved[spec.key] = os.path.abspath(current)
-            new = relativise(os.path.abspath(current), project_dir)
+            new = written(os.path.abspath(current))
+            if keep_relative and not os.path.isabs(old):
+                new = old  # a working relative value is already portable
             if new != old:
                 # Resolves fine, but shortening it to a bare name makes the
                 # YAML survive the next move.
@@ -686,12 +727,67 @@ def plan_yaml_repair(
 
         chosen = os.path.abspath(chosen)
         plan.resolved[spec.key] = chosen
-        new = relativise(chosen, project_dir)
+        new = written(chosen)
         plan.entries.append(
             YamlEntry(spec.key, old, new if new != old else None, how)
         )
 
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Annotation CSVs (point CSVs and their sidecars)
+# ---------------------------------------------------------------------------
+
+
+def read_csv_header(path: str) -> List[str]:
+    """Return the lower-cased, stripped column names of a CSV (or [])."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            return [c.strip().lower() for c in next(csv.reader(fh), [])]
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return []
+
+
+def is_point_csv(path: str) -> bool:
+    """Whether a CSV holds substrata points (annotations, intercepts, markers).
+
+    The rule matches substrata-explore: an ``id`` column plus ``x``/``orig_x``,
+    ``y``/``orig_y`` and ``z``/``orig_z``.
+    """
+    head = set(read_csv_header(path))
+    return "id" in head and all({a, "orig_" + a} & head for a in "xyz")
+
+
+def find_annotation_csvs(project_dir: str) -> List[str]:
+    """Return the point CSVs directly inside a project folder, sorted."""
+    try:
+        names = sorted(os.listdir(project_dir))
+    except OSError:
+        return []
+    paths = [
+        os.path.join(project_dir, n) for n in names if n.lower().endswith(".csv")
+    ]
+    return [p for p in paths if os.path.isfile(p) and is_point_csv(p)]
+
+
+def read_csv_column(path: str, column: str) -> List[str]:
+    """Return the non-empty values of one column of a CSV, in file order.
+
+    Args:
+        path: CSV file path.
+        column: Column name (matched case-insensitively).
+
+    Returns:
+        list[str]: The values; empty when the column is absent.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        head = [c.strip().lower() for c in next(reader, [])]
+        if column.lower() not in head:
+            return []
+        i = head.index(column.lower())
+        return [r[i] for r in reader if len(r) > i and r[i].strip()]
 
 
 def atomic_write_text(text: str, out_path: str) -> str:

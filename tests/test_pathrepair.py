@@ -533,5 +533,106 @@ class TestPlanYamlRepair(unittest.TestCase):
             self.assertEqual(plan.changes["photos_path"], "cur_sna.photos")
 
 
+class TestSidecarYamlRepair(unittest.TestCase):
+    """Phase A2: path keys of an annotation sidecar (<csv>.yaml)."""
+
+    def _plan(self, pr, proj, config, **kw):
+        sidecar = os.path.join(proj, "cur_sna_ann.csv.yaml")
+        return pr.plan_yaml_repair(
+            sidecar, config, keys=pr.SIDECAR_YAML_PATH_KEYS,
+            fix_path_key=False, project_id="cur_sna_ann", keep_relative=True,
+            **kw,
+        )
+
+    def test_relative_paths_outside_folder_are_kept(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            _touch(os.path.join(tmp, "classes.csv"))
+            os.makedirs(os.path.join(proj, "crops"))
+            plan = self._plan(
+                pr, proj, {"classes": "../classes.csv", "cropped_path": "crops"}
+            )
+            self.assertEqual(plan.changes, {})
+            self.assertNotIn("path", {e.key for e in plan.entries})
+
+    def test_stale_absolute_paths_become_relative(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            _touch(os.path.join(proj, "models", "reef.pkl"))
+            os.makedirs(os.path.join(proj, "cur_sna_ann.cropped"))
+            plan = self._plan(
+                pr, proj,
+                {
+                    "classifier": "/mnt/gone/models/reef.pkl",  # found by name
+                    "cropped_path": "/mnt/gone/crops",  # <stem>.cropped
+                    "type": "annotations",
+                },
+            )
+            self.assertEqual(
+                plan.changes,
+                {
+                    "classifier": os.path.join("models", "reef.pkl"),
+                    "cropped_path": "cur_sna_ann.cropped",
+                },
+            )
+
+    def test_working_absolute_path_is_made_relative(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            classes = _touch(os.path.join(tmp, "shared", "classes.csv"))
+            plan = self._plan(pr, proj, {"classes": classes})
+            self.assertEqual(
+                plan.changes,
+                {"classes": os.path.join("..", "shared", "classes.csv")},
+            )
+
+
+class TestAnnotationCsvs(unittest.TestCase):
+    """Phase C helpers: point-CSV discovery, column reading, memo seeding."""
+
+    def test_find_point_csvs_and_read_column(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a_ann.csv"), "w") as f:
+                f.write("id,orig_x,orig_y,orig_z,label,cam_filepath\n"
+                        "p1,1,2,3,X,/old/IMG_1.JPG\np2,1,2,3,X,\n")
+            with open(os.path.join(tmp, "m_markers.csv"), "w") as f:
+                f.write("id,x,y,z\nm1,1,2,3\n")
+            with open(os.path.join(tmp, "cams.csv"), "w") as f:
+                f.write("label,lat,lon\n")
+            names = [os.path.basename(p) for p in pr.find_annotation_csvs(tmp)]
+            self.assertEqual(names, ["a_ann.csv", "m_markers.csv"])
+            self.assertEqual(
+                pr.read_csv_column(os.path.join(tmp, "a_ann.csv"), "CAM_FILEPATH"),
+                ["/old/IMG_1.JPG"],
+            )
+            self.assertEqual(
+                pr.read_csv_column(os.path.join(tmp, "m_markers.csv"),
+                                   "cam_filepath"),
+                [],
+            )
+
+    def test_seeded_dir_map_resolves_without_prompting(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            new = os.path.join(tmp, "new", "dive1")
+            _touch(os.path.join(new, "IMG_0001.JPG"))
+            # A decoy forces a prompt unless the folder mapping is reused
+            _touch(os.path.join(tmp, "x", "IMG_0001.JPG"))
+            stored = {"/old/d1/IMG_0001.JPG": "/old/d1/IMG_0001.JPG"}
+            plan = pr.resolve_image_paths(
+                stored, pr.build_image_index(tmp, quiet=True),
+                on_duplicate=None, on_missing=None,
+                dir_map={"/old/d1": new},
+            )
+            self.assertEqual(
+                plan.changes,
+                {"/old/d1/IMG_0001.JPG": os.path.join(new, "IMG_0001.JPG")},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
