@@ -133,5 +133,60 @@ class TestYamlDerivedPlyPaths(unittest.TestCase):
             self.assertIsNone(init.ply_full_path)
 
 
+class TestAnnosConvention(unittest.TestCase):
+    """Annotation sets live in <id>.annos/; there is no default set."""
+
+    def test_annos_root_and_no_default_set(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            annos = os.path.join(proj, "cur_sna.annos")
+            os.makedirs(annos)
+            point = "id,orig_x,orig_y,orig_z,label\np1,1,2,3,X\n"
+            # The old folder-convention default is no longer picked up
+            for path in (
+                os.path.join(proj, "cur_sna_annotations.csv"),
+                os.path.join(annos, "b_ann.csv"),
+                os.path.join(annos, "a_intercepts.csv"),
+            ):
+                with open(path, "w") as f:
+                    f.write(point)
+            with open(os.path.join(annos, "a_intercepts.csv.yaml"), "w") as f:
+                f.write("type: intercepts\n")
+            init = PI(path=proj)
+            self.assertIsNone(init.annotations_filepath)
+            self.assertEqual(init.annos_root, annos)
+            self.assertEqual(
+                [os.path.basename(p) for p in init.annotation_csvs()],
+                ["a_intercepts.csv", "b_ann.csv"],
+            )
+
+    def test_yaml_annotations_key_names_the_default_set(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            os.makedirs(os.path.join(proj, "cur_sna.annos"))
+            y = os.path.join(proj, "cur_sna.yaml")
+            with open(y, "w") as f:
+                yaml_lib.dump(
+                    {"id": "cur_sna", "path": proj,
+                     "annotations": "cur_sna.annos/cur_sna_ann.csv"}, f
+                )
+            init = PI(yaml=y)
+            self.assertEqual(
+                init.annotations_filepath,
+                os.path.join(proj, "cur_sna.annos", "cur_sna_ann.csv"),
+            )
+            self.assertEqual(init.annotation_csvs(), [])  # folder empty
+
+    def test_no_path_means_no_annos_root(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            init = PI(path=tmp)
+        init.path = None
+        self.assertIsNone(init.annos_root)
+        self.assertEqual(init.annotation_csvs(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,8 +38,23 @@ cur_sna_20m_20200303/
 ├── cur_sna_20m_20200303.cams.xml      # Metashape camera poses
 ├── cur_sna_20m_20200303.meta.json     # camera metadata (paths/centers/transforms)
 ├── cur_sna_20m_20200303_markers.csv   # scalebar target coordinates
-└── cur_sna_20m_20200303_anns.csv      # annotation coordinates
+├── classes.csv                        # label codes (optional)
+└── cur_sna_20m_20200303.annos/        # annotation sets
+    ├── cur_sna_20m_20200303_ann.csv               # an annotation set (point CSV)
+    ├── cur_sna_20m_20200303_ann.csv.yaml          # its sidecar (optional)
+    ├── cur_sna_20m_20200303_ann.cropped/          # its crops
+    └── cur_sna_20m_20200303_slope_intercepts.csv  # e.g. from `substrata intercepts`
 ```
+
+**Annotation sets** live in `<id>.annos/`. This includes manual annotations, point
+intercepts and matched points. Each is a point CSV (an `id` column plus `x`/`orig_x`,
+`y`/`orig_y`, `z`/`orig_z`). Next to it sit its optional sidecar (`<csv>.yaml`, with
+the set's `classes`, `cropped_path`, `last_highest_id` and so on; see
+`substrata.sidecars`), its crops (`<csv stem>.cropped/`) and the backups of in-place
+edits (`backup/`). Tools that list a project's annotation sets look only in this
+folder (`ProjectInitializer.annotation_csvs()`). There is no default set: a project's
+default annotations file is whatever the YAML's `annotations:` key names, e.g.
+`annotations: cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv`.
 
 When you open a project by directory, `ProjectInitializer` first looks for a
 `<dirname>.yaml` file inside it. If that file exists, it is used. If not, the
@@ -198,7 +213,7 @@ the corresponding object unloaded (or fall back to the default shown).
 | `cams_xml` | str | Metashape camera poses (`chunk.exportCameras(...)`). Loaded only together with `cams_meta_json`. |
 | `cams_meta_json` | str | Camera metadata (paths / centers / transforms) from the Metashape API. |
 | `markers` | str | Scalebar target coordinates CSV. |
-| `annotations` | str | Point-label annotations CSV. |
+| `annotations` | str | The default annotation set (a point CSV, normally in `<id>.annos/`). Not set by a folder convention. |
 | `annotations_last_highest_id` | int | Highest annotation id issued so far (for assigning new ids). |
 | `classes` | str | Class-definition CSV. |
 | `classifier` | str | Trained crop-classifier file. |
@@ -222,7 +237,6 @@ from the directory `id`; only files that exist are registered):
 | `cams_xml` | `<id>.cams.xml` |
 | `cams_meta_json` | `<id>.meta.json` |
 | `markers` | `<id>_markers.csv` |
-| `annotations` | `<id>_annotations.csv` |
 | `photos_path` | `<id>.photos/` |
 | `cropped_path` | `<id>.cropped/` |
 | `thumbnails_path` | `<id>.thumbnails/` |
@@ -237,7 +251,7 @@ ply: "cur_sna_20m_20200303_dec50M.ply"
 cams_xml: "cur_sna_20m_20200303.cams.xml"
 cams_meta_json: "cur_sna_20m_20200303.meta.json"
 markers: "cur_sna_20m_20200303_markers.csv"
-annotations: "cur_sna_20m_20200303_annotations.csv"
+annotations: "cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv"
 annotations_last_highest_id: 620
 classes: "classes.csv"
 scale_factor: 1.0

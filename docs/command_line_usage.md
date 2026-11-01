@@ -8,7 +8,9 @@ Note: All commands look for a YAML project file or default filenames in the curr
 
 Decimate a PLY file to reduce the number of points. With no arguments, uses initializer on CWD, output to `<id>_dec50M.ply`, target = 50,000,000 points.
 
-Usage: `substrata decimate [--input PLY] [--output PLY] [--points N]`
+With `-c` (`--color_calibrate`), the YAML's `color_correction` (from `substrata colors`) is applied to the RGB while writing. The output's header is then marked, so loading it does not apply the correction again (see [Color calibration](#color-calibration)).
+
+Usage: `substrata decimate [--input PLY] [--output PLY] [--points N] [-c]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -19,6 +21,9 @@ substrata decimate --input cur_sna_20m_20200303.ply --output cur_sna_20m_2020030
 
 # Using short flags
 substrata decimate --ply input.ply -n 10000000
+
+# Bake the YAML color_correction into the decimated PLY
+substrata decimate -c
 ```
 
 ## Interactive viewer (explore)
@@ -201,16 +206,18 @@ substrata segment --full-ply
 
 ## Color calibration
 
-Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and optionally store the affine color correction (matrix + offset) in the project YAML. The PLY is always loaded in full when `--input` is given (never stream-decimated).
+Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and store the affine color correction (matrix + offset) in the project YAML as `color_correction`. The YAML is updated in place: only that key changes, and comments and relative paths are kept. Use `--no-save-yaml` to only write the PDF. The PLY is always loaded in full when `--input` is given (never stream-decimated).
 
-Usage: `substrata colors [--input PLY] [--markers CSV] [--output_pdf PDF] [-n N] [--save_yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
+No PLY is written. Loading the project (`ProjectInitializer.initialize()`) applies `color_correction` to the point cloud in memory, so the original colours stay on disk. To write a colour-corrected PLY as an explicit extra step, use `substrata decimate -c`. Its output header is marked (`comment substrata color_correction applied`), and loading a marked PLY skips the YAML correction, so it is never applied twice. Decimating a marked PLY with `-c` again is refused.
+
+Usage: `substrata colors [--input PLY] [--markers CSV] [--output_pdf PDF] [-n N] [--no-save-yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
 
 ```bash
-# Using default behavior (auto-detects from CWD)
+# QC PDF + color_correction into the project YAML (auto-detects from CWD)
 substrata colors
 
-# Save the affine colour_correction into the project YAML
-substrata colors --save_yaml
+# QC PDF only; leave the YAML unchanged
+substrata colors --no-save-yaml
 
 # Stream-sample the default YAML PLY to N vertices for a faster QC pass
 substrata colors -n 10000000
@@ -218,6 +225,9 @@ substrata colors -n 10000000
 # Omit specific ColorChecker cards from the fit (by 0-based index or by name)
 substrata colors --exclude-index 0 --exclude-index 3
 substrata colors --exclude-name top-left
+
+# Optional extra: write a colour-corrected decimated PLY
+substrata decimate -c
 ```
 
 ## FireFish alignment
@@ -312,7 +322,7 @@ substrata intercepts --slope
 substrata intercepts --search-radius 0.01
 ```
 
-Writes `<id>_{topdown,slope}_bbox.png`, the intercepts CSV `<id>_{topdown,slope}_intercepts.csv` and, next to it, its sidecar YAML `<id>_{topdown,slope}_intercepts.csv.yaml`. The sidecar records how the intercepts were generated, so `intercepts-plot` (and other tools) can replay the exact grid:
+Writes `<id>_{topdown,slope}_bbox.png` in the project folder. The intercepts CSV is an annotation set, so it goes to `<id>.annos/<id>_{topdown,slope}_intercepts.csv`, with its sidecar YAML `<id>_{topdown,slope}_intercepts.csv.yaml` next to it. The sidecar records how the intercepts were generated, so `intercepts-plot` (and other tools) can replay the exact grid:
 
 ```yaml
 type: intercepts
@@ -363,23 +373,23 @@ Usage: `substrata intercepts-plot [--intercepts CSV] [--yaml YAML] [--grid-size 
 
 ```bash
 # Plot slope intercepts (orientation + grid from the CSV's sidecar YAML)
-substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv --grid-size 0.2
+substrata intercepts-plot --intercepts cur_sna_20m_20230414.annos/cur_sna_20m_20230414_slope_intercepts.csv --grid-size 0.2
 
 # Older slope intercepts: pass the generation YAML explicitly
-substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+substrata intercepts-plot --intercepts cur_sna_20m_20230414.annos/cur_sna_20m_20230414_slope_intercepts.csv \
                           --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 0.2
 
 # Coarser grid (majority vote per larger cell)
-substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+substrata intercepts-plot --intercepts cur_sna_20m_20230414.annos/cur_sna_20m_20230414_slope_intercepts.csv \
                           --yaml cur_sna_20m_20230414_slope_intercepts.yaml --grid-size 1.0
 
 # Recover the grid for an older file lacking grid_bbox (fit from intercepts)
-substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+substrata intercepts-plot --intercepts cur_sna_20m_20230414.annos/cur_sna_20m_20230414_slope_intercepts.csv \
                           --yaml cur_sna_20m_20230414_slope_intercepts.yaml \
                           --grid-size 0.2 --fit-grid
 
 # Alternative: reconstruct the exact grid via the point-cloud box search
-substrata intercepts-plot --intercepts cur_sna_20m_20230414_slope_intercepts.csv \
+substrata intercepts-plot --intercepts cur_sna_20m_20230414.annos/cur_sna_20m_20230414_slope_intercepts.csv \
                           --yaml cur_sna_20m_20230414_slope_intercepts.yaml \
                           --grid-size 0.2 --box-length 25 --box-width 4
 
@@ -406,7 +416,7 @@ substrata intercepts-plot --fit-grid --animation-order categories
 
 Register a source to a target and print the alignment transform. `--source` and `--target` each take a PLY file, a project YAML (detected by the `.yaml`/`.yml` extension) or a project directory (resolved like other subcommands: its `<dirname>.yaml` if present, otherwise filename conventions).
 
-Usage: `substrata align --source PLY|YAML|DIR --target PLY|YAML|DIR [--cameras [--max-residual M] [--refine]] [--pdf PDF] [--no-scaling] [--voxel-size V] [--points N] [--output-yaml YAML]`
+Usage: `substrata align --source PLY|YAML|DIR --target PLY|YAML|DIR [--cameras [--max-residual M] [--refine]] [--pdf PDF] [--no-scaling] [--voxel-size V] [--points N] [--output-yaml YAML] [--as-parent]`
 
 The transform is always fitted between the **raw** (untransformed) models. Two matrices are printed:
 
@@ -433,6 +443,13 @@ The plots come from `visualizations.plot_pcd_context`, `plot_pcd_correspondence`
 
 `--output-yaml` writes a copy of the source project YAML whose `world_transform` is the raw source → oriented target transform. This replaces the source's previous `world_transform`, so loading that YAML puts the source in the target's oriented frame.
 
+`--as-parent` links the source to the target as its **parent** plot instead, and leaves the source `world_transform` (its local scale and orientation) untouched. It writes two keys to the source project YAML, or to a copy at `--output-yaml`. The rest of the file, including comments and relative paths, is kept as is.
+
+- `parent_id`: the target's id.
+- `parent_transform`: the fitted raw source → raw target transform, scale included. It maps the source's orig coords to the parent's orig coords, the frame the parent's cameras use. So points move between the two models exactly, e.g. annotations to reproject in the parent's images (see `substrata transform --to-parent`).
+
+The command also prints the scale ratio implied between the two world frames, `parent.world_transform @ parent_transform @ inv(world_transform)`. A value of 1 means both plots' scale factors agree. In Python, `ProjectInitializer.to_parent_world_transform(parent)` gives that transform, `parent_scale_ratio(parent)` gives the ratio, and `find_parent_project()` locates the parent's folder by `parent_id`. It searches sibling and ancestor folders, plus any extra folders you pass.
+
 ```bash
 # Align two point clouds
 substrata align --source source.ply --target target.ply
@@ -451,6 +468,10 @@ substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --max-
 # Same, refined with point-cloud ICP, with a QC report
 substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --refine \
     --pdf focal/focal_align_qc.pdf
+
+# Keep the focal plot's own world_transform; store the AUV model as its parent
+substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --refine \
+    --as-parent
 ```
 
 ## Image matches
@@ -547,7 +568,7 @@ substrata predict --points annotations.csv --image-dir frames --classifier crop_
 
 ## Match annotations
 
-Match random point annotations (e.g. a point-intercept CSV) to manual annotations of the same object (e.g. colony annotations in `<id>_ann.csv`). Only random points whose label starts with `--label-prefix` (default `CS`, hard corals; comma-separated list allowed, `''` for all) are considered, and only cameras are loaded (not the point cloud).
+Match random point annotations (e.g. a point-intercept CSV) to manual annotations of the same object (e.g. colony annotations in `<id>.annos/<id>_ann.csv`). Without `--manual`, the manual set is the `--random` sidecar's `matched_to`, else the project YAML's `annotations:`. Only random points whose label starts with `--label-prefix` (default `CS`, hard corals; comma-separated list allowed, `''` for all) are considered, and only cameras are loaded (not the point cloud).
 
 For each random point, the nearest manual annotations within `--max-dist` (default 1 m, up to `--max-candidates`, default 5) are candidates. SAM2 runs two tests per candidate:
 
@@ -556,11 +577,10 @@ For each random point, the nearest manual annotations within `--max-dist` (defau
 
 If a point is outside that photo, the most relevant camera that sees both points is used. SAM2's top-scoring mask is used, plus its 2nd mask as a fallback (e.g. the whole colony when the top mask covers one plate). A 2nd mask only counts together with a top-mask agreement in the other direction. SAM2 and a checkpoint are required (default `~/Github/sam2/checkpoints/sam2.1_hiera_large.pt`, see `settings.SAM2_CHECKPOINT`).
 
-Writes a copy of the random CSV (`<random>_matched.csv`) with four added columns:
+Writes a copy of the random CSV (`<random>_matched.csv`) with two added columns:
 
-- `manual_id` and `manual_label`: the matched manual annotation.
-- `manual_label_conf`: the manual annotation's `label_conf`.
-- `match_conf`, one of:
+- `manual_id`: the id of the matched manual annotation.
+- `manual_id_conf`, one of:
   - `high`: one candidate agrees both ways with top masks.
   - `medium`: one candidate agrees both ways using a 2nd mask, or agrees one way only.
   - `low`: several candidates agree (the nearest is chosen), or none agrees but the nearest is within `--fallback-dist` (5 cm).
@@ -568,24 +588,39 @@ Writes a copy of the random CSV (`<random>_matched.csv`) with four added columns
 
 A candidate inside the random point's mask whose own mask excludes the random point is ignored, because it is typically hidden behind the colony.
 
+Only the link is stored, not copies of the manual annotation, so a label corrected later in the manual CSV is never out of date in the matched CSV. Which manual CSV the `manual_id`s refer to is recorded in the matched CSV's sidecar (`<random>_matched.csv.yaml`) as `matched_to`, stored relative to the sidecar and repaired by `substrata path-repair`. The sidecar also carries over the random CSV's own sidecar (e.g. the intercepts settings).
+
+To get the manual labels next to each random point, run `--export-labels OUT.csv` on the matched CSV. This needs no cameras or SAM2. It writes the matched CSV plus the manual set's current `manual_label`, `manual_label_conf` and a `manual_status` column:
+
+- `ok`
+- `no match`
+- `missing`: the `manual_id` no longer exists in the manual set. Ids are never reused, so a deleted manual annotation can't silently point at another colony.
+
+This export is a derived snapshot: regenerate it after editing either set. In Python, `join_manual_annotations(matched_csv)` returns the same rows.
+
+Matched CSVs from before this change are migrated when passed back as `--random`: the copied `manual_label`/`manual_label_conf` columns are dropped and `match_conf` is renamed to `manual_id_conf`.
+
 A review PDF (`<random>_matches.pdf`) has one page per flagged point: every point that is not `high`, including unmatched points that had candidates. `--review-all` adds the `high` matches. Pages are ordered low, medium, unmatched, high. Each page shows:
 
 - The random point's image, with its mask in red.
 - The assigned (or nearest) candidate's image, with its mask.
 - A conflicting candidate, or else an overview that sees the most candidates.
 
-Candidates are labelled by their id suffix, with one colour per candidate. Each page also gives the approximate surface area of each colony. To correct a match, edit `manual_id` (and `manual_label`) directly in the matched CSV.
+Candidates are labelled by their id suffix, with one colour per candidate. Each page also gives the approximate surface area of each colony. To correct a match, edit `manual_id` (and `manual_id_conf`) directly in the matched CSV.
 
-The matched CSV can be passed back as `--random`. Rows that already have a `manual_id` or a `match_conf` are kept as they are, and only the remaining rows are matched. This covers matches from a previous run and matches you added by hand (e.g. with `match_conf` set to `manual`). Use `--redo-all` to re-match every row instead. Rows outside `--label-prefix` are never changed.
+The matched CSV can be passed back as `--random`. Its `matched_to` then becomes the default `--manual`. Rows that already have a `manual_id` or a `manual_id_conf` are kept as they are, and only the remaining rows are matched. This covers matches from a previous run and matches you added by hand (e.g. with `manual_id_conf` set to `manual`). Use `--redo-all` to re-match every row instead. Rows outside `--label-prefix` are never changed.
 
-Usage: `substrata match-annotations --random CSV [--manual CSV] [--label-prefix CS] [--max-dist M] [--max-candidates N] [--fallback-dist M] [--sam2-checkpoint PT] [--output CSV] [--pdf-output PDF] [--review-all] [--redo-all] [--no-pdf] [--photo-path-replace OLD NEW] [--local]`
+Usage: `substrata match-annotations --random CSV [--manual CSV] [--label-prefix CS] [--max-dist M] [--max-candidates N] [--fallback-dist M] [--sam2-checkpoint PT] [--output CSV] [--pdf-output PDF] [--review-all] [--redo-all] [--no-pdf] [--photo-path-replace OLD NEW] [--local]`, or `substrata match-annotations --random MATCHED_CSV --export-labels OUT_CSV [--manual CSV]`
 
 ```bash
 # Match random points to the project's manual annotations (auto-detects from CWD)
-substrata match-annotations --random ton_ko1_40m_20240930_slope_intercepts.csv
+substrata match-annotations --random ton_ko1_40m_20240930.annos/ton_ko1_40m_20240930_slope_intercepts.csv
 
 # Explicit manual annotations, and include every match in the review PDF
 substrata match-annotations --random points.csv --manual colonies_ann.csv --review-all
+
+# Matched points with the manual set's current labels, for analysis
+substrata match-annotations --random points_matched.csv --export-labels points_labels.csv
 
 # Match hard and soft corals
 substrata match-annotations --random points.csv --label-prefix CS,SC
@@ -624,9 +659,9 @@ substrata camsync -s 0 -u 1 --time-offset 12.5 --pdf-pairs 20
 
 ## Path repair (path-repair)
 
-A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. Annotation sets add two more: the path keys of their sidecar YAMLs (`<csv>.yaml`: `classes`, `cropped_path`, `classifier`) and the `cam_filepath` column of the CSVs (the image each point was placed on). `path-repair` checks and repairs all of them.
+A project records absolute paths in two places, and moving it breaks both at once. `<id>.yaml` records the project's own files (`ply`, `cams_xml`, `cams_meta_json`, `markers`, `annotations`, `photos_path`, …), and `<id>.meta.json` records each camera's image path as captured from Metashape at export time. Annotation sets (the point CSVs in `<id>.annos/`) add two more: the path keys of their sidecar YAMLs (`<csv>.yaml`: `classes`, `cropped_path`, `classifier`, `matched_to`) and the `cam_filepath` column of the CSVs (the image each point was placed on). `path-repair` checks and repairs all of them.
 
-Phase A repairs the project file paths in the YAML, and the path keys of each annotation sidecar (written relative to the sidecar, e.g. `classes.csv` or `../classes.csv`). Phase B repairs the per-camera image paths in the meta JSON. Phase C repairs the `cam_filepath` cells of the point CSVs directly in the project folder (any CSV with `id` and `x`/`orig_x`, `y`/`orig_y`, `z`/`orig_z` columns); it reuses phase B's folder mappings, so a folder answered once fixes both, and writes a backup of each changed CSV to `backup/`. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` (phase A) or `--cams-only` (phases B and C) to run part of it, and `--no-annotations` to leave the annotation sets alone.
+Phase A repairs the project file paths in the YAML, and the path keys of each annotation sidecar (written relative to the sidecar, e.g. `classes.csv` or `../classes.csv`). Phase B repairs the per-camera image paths in the meta JSON. Phase C repairs the `cam_filepath` cells of the point CSVs in `<id>.annos/` (any CSV with `id` and `x`/`orig_x`, `y`/`orig_y`, `z`/`orig_z` columns); it reuses phase B's folder mappings, so a folder answered once fixes both, and writes a backup of each changed CSV to `backup/`. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` (phase A) or `--cams-only` (phases B and C) to run part of it, and `--no-annotations` to leave the annotation sets alone.
 
 Each broken path is resolved by trying, in order: the conventional filename in the project folder, then a recursive search by basename, then asking you. The YAML's `path:` key is repaired first, because every relative value beneath it resolves against that key — one stale `path:` is usually the whole problem. Repaired YAML entries that sit inside the project folder are written as **bare filenames**, so the YAML stays portable and survives the next move.
 
@@ -672,7 +707,9 @@ substrata path-repair --find "D:\photos" --replace /data/reefs/photos
 
 Load annotations from a CSV, apply one or more transforms (entered interactively) to each annotation's `orig_coords`, and save the result. With `--inverse` the cumulative transform is inverted before being applied.
 
-Usage: `substrata transform INPUT [--output CSV] [--no_header] [--ignore_header] [--inverse]`
+Instead of prompting, `--to-parent PROJECT` applies that project's `parent_transform` (see `align --as-parent`). This moves the project's annotations into its parent's orig frame. `--from-parent PROJECT` applies the inverse, moving annotations from the parent into the project.
+
+Usage: `substrata transform INPUT [--output CSV] [--no_header] [--ignore_header] [--inverse] [--to-parent PROJECT | --from-parent PROJECT]`
 
 ```bash
 # Transform annotations; prompts for the transform matrix/matrices
@@ -683,6 +720,9 @@ substrata transform annotations.csv --output annotations_world.csv
 
 # Apply the inverse of the entered transform(s)
 substrata transform annotations.csv --inverse
+
+# Move a focal plot's annotations into its parent (AUV) model
+substrata transform focal/focal_ann.csv --to-parent focal/ --output auv/focal_ann_in_auv.csv
 ```
 
 ## Classifier training

@@ -43,7 +43,7 @@ import yaml
 from substrata import settings
 
 # Sidecar keys that hold file/folder paths (stored relative to the sidecar)
-SIDECAR_PATH_KEYS = ("classes", "cropped_path", "classifier")
+SIDECAR_PATH_KEYS = ("classes", "cropped_path", "classifier", "matched_to")
 
 
 def annotation_sidecar_path(csv_path: str) -> str:

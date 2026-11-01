@@ -556,6 +556,16 @@ class TestSidecarYamlRepair(unittest.TestCase):
             self.assertEqual(plan.changes, {})
             self.assertNotIn("path", {e.key for e in plan.entries})
 
+    def test_stale_matched_to_is_found_by_name(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            _touch(os.path.join(proj, "cur_sna_ann.csv"))
+            plan = self._plan(
+                pr, proj, {"matched_to": "/mnt/gone/cur_sna/cur_sna_ann.csv"}
+            )
+            self.assertEqual(plan.changes, {"matched_to": "cur_sna_ann.csv"})
+
     def test_stale_absolute_paths_become_relative(self) -> None:
         pr = _load_pathrepair()
         with tempfile.TemporaryDirectory() as tmp:
@@ -596,23 +606,63 @@ class TestAnnotationCsvs(unittest.TestCase):
     def test_find_point_csvs_and_read_column(self) -> None:
         pr = _load_pathrepair()
         with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "a_ann.csv"), "w") as f:
+            proj = os.path.join(tmp, "cur_sna")
+            annos = os.path.join(proj, "cur_sna.annos")
+            os.makedirs(annos)
+            with open(os.path.join(annos, "a_ann.csv"), "w") as f:
                 f.write("id,orig_x,orig_y,orig_z,label,cam_filepath\n"
                         "p1,1,2,3,X,/old/IMG_1.JPG\np2,1,2,3,X,\n")
-            with open(os.path.join(tmp, "m_markers.csv"), "w") as f:
+            with open(os.path.join(annos, "b_points.csv"), "w") as f:
                 f.write("id,x,y,z\nm1,1,2,3\n")
-            with open(os.path.join(tmp, "cams.csv"), "w") as f:
+            with open(os.path.join(annos, "cams.csv"), "w") as f:
                 f.write("label,lat,lon\n")
-            names = [os.path.basename(p) for p in pr.find_annotation_csvs(tmp)]
-            self.assertEqual(names, ["a_ann.csv", "m_markers.csv"])
+            with open(os.path.join(annos, "a_ann.csv.yaml"), "w") as f:
+                f.write("type: annotations\n")
+            # Point CSVs outside <id>.annos/ are not annotation sets
+            with open(os.path.join(proj, "loose_ann.csv"), "w") as f:
+                f.write("id,orig_x,orig_y,orig_z\np1,1,2,3\n")
+            names = [os.path.basename(p) for p in pr.find_annotation_csvs(proj)]
+            self.assertEqual(names, ["a_ann.csv", "b_points.csv"])
+            # The id can differ from the folder name (taken from the YAML)
+            self.assertEqual(pr.find_annotation_csvs(proj, "other"), [])
+            self.assertEqual(pr.find_annotation_csvs(tmp), [])
+            a_ann = os.path.join(annos, "a_ann.csv")
             self.assertEqual(
-                pr.read_csv_column(os.path.join(tmp, "a_ann.csv"), "CAM_FILEPATH"),
-                ["/old/IMG_1.JPG"],
+                pr.read_csv_column(a_ann, "CAM_FILEPATH"), ["/old/IMG_1.JPG"]
             )
             self.assertEqual(
-                pr.read_csv_column(os.path.join(tmp, "m_markers.csv"),
+                pr.read_csv_column(os.path.join(annos, "b_points.csv"),
                                    "cam_filepath"),
                 [],
+            )
+
+    def test_sidecar_in_annos_finds_project_classes(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            annos = os.path.join(proj, "cur_sna.annos")
+            _touch(os.path.join(proj, "classes.csv"))
+            os.makedirs(annos)
+            plan = pr.plan_yaml_repair(
+                os.path.join(annos, "cur_sna_ann.csv.yaml"),
+                {"classes": "/mnt/gone/classes.csv"},
+                keys=pr.SIDECAR_YAML_PATH_KEYS, fix_path_key=False,
+                project_id="cur_sna_ann", keep_relative=True,
+            )
+            self.assertEqual(plan.changes, {"classes": "../classes.csv"})
+
+    def test_stale_yaml_annotations_found_in_annos(self) -> None:
+        pr = _load_pathrepair()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            _touch(os.path.join(proj, "cur_sna.annos", "cur_sna_ann.csv"))
+            plan = pr.plan_yaml_repair(
+                os.path.join(proj, "cur_sna.yaml"),
+                {"path": proj, "annotations": "/mnt/gone/cur_sna_ann.csv"},
+            )
+            self.assertEqual(
+                plan.resolved["annotations"],
+                os.path.join(proj, "cur_sna.annos", "cur_sna_ann.csv"),
             )
 
     def test_seeded_dir_map_resolves_without_prompting(self) -> None:

@@ -47,6 +47,10 @@ class ProjectInitializer:
         # Sidecar YAML of the annotations CSV (see apply_annotation_sidecar)
         self.annotation_sidecar = {}
         self.world_transform = np.eye(4)
+        # Optional link to a larger parent plot (orig -> parent orig, see
+        # init_with_yaml); world_transform stays the local, canonical frame
+        self.parent_id = None
+        self.parent_transform = None
         self.scale_factor = None
         self.up_vector = None
         self.depth_offset = None
@@ -118,7 +122,7 @@ class ProjectInitializer:
         ply: "ton_tof_60m_20241008_dec50M.ply"
         cams_xml: "ton_tof_60m_20241008.cams.xml"
         cams_meta_json: "ton_tof_60m_20241008.meta.json"
-        annotations: "ton_tof_60m_20241008_DA_PH_ann.csv"
+        annotations: "ton_tof_60m_20241008.annos/ton_tof_60m_20241008_DA_PH_ann.csv"
         annotations_last_highest_id: 620
         photos_path: "ton_tof_60m_20241008.photos/"
         cropped_path: "cropped/"
@@ -132,6 +136,16 @@ class ProjectInitializer:
         - [0.00000000e+00, 0.00000000e+00, 0.00000000e+00, 1.00000000e+00]
         firefish_depth_sensor_offset: [0.0, 0.0, -0.152]  # optional, record only
         firefish_water_level: -0.32  # optional, record only
+        parent_id: "ton_tof_auv"  # optional, larger plot this one sits in
+        parent_transform:  # optional, 4x4: this plot's ORIG -> parent's ORIG
+        - [...]
+
+        ``parent_transform`` links the raw (orig) frames of the two models,
+        including any scale difference, so points move between them exactly
+        (e.g. to reproject annotations into the parent's cameras). It does not
+        depend on either ``world_transform``; this plot's own
+        ``world_transform`` (local scale and orientation) stays the frame used
+        for measurements. See :meth:`to_parent_world_transform`.
 
         ``annotations`` names the project's default annotation set. Settings of
         an annotation set (``classes``, ``cropped_path``, ``crop_size``,
@@ -196,6 +210,11 @@ class ProjectInitializer:
         if world_transform is not None:
             self.world_transform = np.array(world_transform, dtype=float)
 
+        self.parent_id = yaml_config.get("parent_id")
+        parent_transform = yaml_config.get("parent_transform")
+        if parent_transform is not None:
+            self.parent_transform = np.array(parent_transform, dtype=float)
+
         self.firefish_water_level = _parse_optional_float(
             yaml_config.get("firefish_water_level")
         )
@@ -245,9 +264,95 @@ class ProjectInitializer:
         return os.path.join(self.path, f"{self.id}{settings.THUMBNAILS_DIR_SUFFIX}")
 
     @property
+    def annos_root(self) -> str | None:
+        """Annotation sets directory: ``<path>/<id>.annos`` (may not exist yet).
+
+        Holds the project's point CSVs with their sidecars (``<csv>.yaml``),
+        crops (``<csv stem>.cropped/``) and edit backups (``backup/``).
+        """
+        if self.path is None or self.id is None:
+            return None
+        return os.path.join(self.path, f"{self.id}{settings.ANNOS_DIR_SUFFIX}")
+
+    def annotation_csvs(self) -> list[str]:
+        """The point CSVs (annotation sets) in :attr:`annos_root`, sorted."""
+        from substrata.pathrepair import find_annotation_csvs
+
+        if self.path is None:
+            return []
+        return find_annotation_csvs(self.path, self.id)
+
+    @property
     def world_transform_is_identity(self) -> bool:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
+
+    def to_parent_world_transform(self, parent: "ProjectInitializer") -> np.ndarray:
+        """Transform from this plot's world frame to the parent's world frame.
+
+        ``parent.world_transform @ parent_transform @ inv(world_transform)``,
+        e.g. to overlay this plot in the parent's (oriented) view. Its uniform
+        scale (see :meth:`parent_scale_ratio`) is 1 when both plots agree on
+        scale.
+
+        Args:
+            parent: The parent project (see :meth:`find_parent_project`).
+
+        Returns:
+            The 4x4 transform.
+        """
+        if self.parent_transform is None:
+            raise ValueError(f"{self.id}: no parent_transform set")
+        return (
+            np.asarray(parent.world_transform, dtype=float)
+            @ np.asarray(self.parent_transform, dtype=float)
+            @ np.linalg.inv(np.asarray(self.world_transform, dtype=float))
+        )
+
+    def parent_scale_ratio(self, parent: "ProjectInitializer") -> float:
+        """Scale of parent metres per local metre (QC of both scale factors)."""
+        m = self.to_parent_world_transform(parent)[:3, :3]
+        return float(np.cbrt(np.linalg.det(m)))
+
+    def find_parent_project(self, search_dirs=None) -> str | None:
+        """Locate the directory of the project named ``parent_id``.
+
+        Looks for a ``<parent_id>`` folder in each of ``search_dirs`` and then
+        in each ancestor of this project's path, both directly and one level
+        down (e.g. ``<site>/<parent_id>``).
+
+        Args:
+            search_dirs: Optional extra directories to search first.
+
+        Returns:
+            The parent project directory, or None if not found.
+        """
+        if not self.parent_id:
+            return None
+        dirs = [os.path.abspath(d) for d in (search_dirs or [])]
+        if self.path:
+            d = os.path.abspath(self.path)
+            while True:
+                parent_dir = os.path.dirname(d)
+                if parent_dir == d:
+                    break
+                d = parent_dir
+                dirs.append(d)
+        for d in dirs:
+            if os.path.basename(d) == self.parent_id:
+                return d
+            hit = os.path.join(d, self.parent_id)
+            if os.path.isdir(hit):
+                return hit
+            try:
+                subdirs = sorted(os.scandir(d), key=lambda e: e.name)
+            except OSError:
+                continue
+            for entry in subdirs:
+                hit = os.path.join(entry.path, self.parent_id)
+                if entry.is_dir() and os.path.isdir(hit):
+                    return hit
+        return None
 
     def save_config_to_yaml(self, filepath: str | None = None) -> None:
         """
@@ -294,6 +399,10 @@ class ProjectInitializer:
         if self.world_transform is not None:
             # Save as bracketed nested arrays ([[..., ...], [..., ...], ...]) in YAML
             config["world_transform"] = _as_flow_sequence(self.world_transform)
+        if self.parent_id is not None:
+            config["parent_id"] = self.parent_id
+        if self.parent_transform is not None:
+            config["parent_transform"] = _as_flow_sequence(self.parent_transform)
         # Optional orientation-related fields
         if self.up_vector is not None:
             up_val = getattr(self.up_vector, "xyz", self.up_vector)
@@ -375,11 +484,14 @@ class ProjectInitializer:
         - cams_xml: <id>.cams.xml
         - cams_meta_json: <id>.meta.json
         - markers: <id>_markers.csv
-        - annotations: <id>_annotations.csv
         - photos_path: <id>.photos/
         - cropped_path: <id>.cropped/
         - thumbnails_path: <id>.thumbnails/
         - classes: classes.csv
+
+        Annotation sets live in ``<id>.annos/`` (see :attr:`annos_root` and
+        :meth:`annotation_csvs`). There is no default set: ``annotations_filepath``
+        is only set by a YAML ``annotations:`` key (or explicitly).
         """
         self.path = filepath
         self.id = os.path.basename(os.path.normpath(filepath))
@@ -414,12 +526,6 @@ class ProjectInitializer:
         # Markers: <id>_markers.csv
         markers_path = os.path.join(filepath, f"{self.id}_markers.csv")
         self.markers_filepath = markers_path if os.path.exists(markers_path) else None
-
-        # Annotations: <id>_annotations.csv
-        annotations_path = os.path.join(filepath, f"{self.id}_annotations.csv")
-        self.annotations_filepath = (
-            annotations_path if os.path.exists(annotations_path) else None
-        )
 
         # Photos path: <id>.photos/
         photos_dir = os.path.join(filepath, f"{self.id}.photos")
@@ -522,8 +628,17 @@ class ProjectInitializer:
             and self.color_correction is not None
             and self.pcd is not None
         ):
-            print("Applying colour correction from YAML config")
-            self.pcd.apply_color_correction(self.color_correction)
+            if self.ply_filepath and pointclouds.ply_is_color_corrected(
+                self.ply_filepath
+            ):
+                # e.g. written by `substrata decimate -c`: already corrected
+                print(
+                    "Colour correction already applied to "
+                    f"{os.path.basename(self.ply_filepath)}; not applying it again"
+                )
+            else:
+                print("Applying colour correction from YAML config")
+                self.pcd.apply_color_correction(self.color_correction)
 
     def propagate_depth_model(self):
         """Pass the depth regression on to the loaded objects.
@@ -842,9 +957,50 @@ def _represent_flow_list(dumper, data):
 
 def _ensure_yaml_flow_registered() -> None:
     """Register the YAML representer for flow-style lists once."""
-    if not getattr(yaml, "_substrata_flow_registered", False):
+    if _YamlFlowList not in yaml.Dumper.yaml_representers:
         yaml.add_representer(_YamlFlowList, _represent_flow_list)  # type: ignore[arg-type]
-        yaml._substrata_flow_registered = True  # type: ignore[attr-defined]
+
+
+def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
+    """Set top-level keys in a project YAML, leaving the rest of the file as is.
+
+    Each key's existing block (its line plus indented continuation lines) is
+    removed and the new values are appended; a value of None only removes the
+    key. Unlike :meth:`ProjectInitializer.save_config_to_yaml` this keeps
+    comments, relative paths and keys the initializer does not model.
+
+    Args:
+        yaml_path: The project YAML to update (written atomically).
+        values: Mapping of top-level key to value (arrays become flow lists).
+    """
+    with open(yaml_path) as f:
+        lines = f.read().splitlines(keepends=True)
+    out, skipping = [], False
+    for line in lines:
+        is_top = bool(line.strip()) and not line[0].isspace() and line[0] != "#"
+        if is_top:
+            skipping = line.split(":", 1)[0].strip() in values
+        elif skipping and line.strip() and line[0].isspace():
+            continue
+        if not skipping:
+            out.append(line)
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    def _yamlable(v):
+        if isinstance(v, dict):
+            return {k: _yamlable(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return _as_flow_sequence(v)
+        return v
+
+    new = {k: _yamlable(v) for k, v in values.items() if v is not None}
+    text = "".join(out)
+    if new:
+        text += yaml.dump(new, default_flow_style=False, sort_keys=False)
+    tmp = f"{yaml_path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, yaml_path)
 
 
 def _as_flow_sequence(value):

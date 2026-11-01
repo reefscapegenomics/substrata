@@ -1899,7 +1899,7 @@ def save_annotation_matches_to_pdf(
             for rec in records
             if rec["candidates"] and (rec["flagged"] or review_all)
         ),
-        key=lambda rec: order.get(rec["match_conf"], 2),
+        key=lambda rec: order.get(rec["manual_id_conf"], 2),
     )
     pdf = FPDF(orientation="L", format="A4")
     pdf.set_auto_page_break(False)
@@ -1909,7 +1909,7 @@ def save_annotation_matches_to_pdf(
     counts = {}
     for rec in records:
         if rec["considered"]:
-            key = rec["match_conf"] or "unmatched"
+            key = rec["manual_id_conf"] or "unmatched"
             counts[key] = counts.get(key, 0) + 1
     pdf.add_page()
     pdf.set_font("Arial", "B", 14)
@@ -1931,7 +1931,7 @@ def save_annotation_matches_to_pdf(
         "ways using a 2nd mask, or one way only. low: several agree (nearest "
         "chosen) or nearest within the fallback distance.",
         "SA = mask area projected on the image plane (approximate).",
-        "To correct a match, edit manual_id (and manual_label) in the matched CSV.",
+        "To correct a match, edit manual_id (and manual_id_conf) in the matched CSV.",
     ]
     for i, line in enumerate(lines):
         pdf.set_xy(margin, margin + 12 + 6 * i)
@@ -1954,7 +1954,7 @@ def save_annotation_matches_to_pdf(
                 "manual_label_conf"] else ""
             assigned = (
                 f"{labels[chosen - 1]} ({rec['manual_label']}{conf})  -  "
-                f"match: {rec['match_conf']}"
+                f"match: {rec['manual_id_conf']}"
             )
         else:
             assigned = "UNMATCHED"

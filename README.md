@@ -113,7 +113,7 @@ cur_sna_20m_20200303/
 ├── cur_sna_20m_20200303_dec50M.ply    # decimated point cloud
 ├── cur_sna_20m_20200303.cams.xml      # camera poses and sensors (Metashape)
 ├── cur_sna_20m_20200303_markers.csv   # scalebar target markers
-└── cur_sna_20m_20200303_ann.csv       # annotations
+└── cur_sna_20m_20200303.annos/        # annotation sets (point CSVs + sidecars)
 ```
 
 See [Projects](https://substrata.readthedocs.io/en/latest/projects.html) for

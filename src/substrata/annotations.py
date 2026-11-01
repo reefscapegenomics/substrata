@@ -536,7 +536,7 @@ class Annotations:
            2nd-ranked mask (e.g. a whole colony when the top mask is one plate,
            or vice versa). The 3rd mask is not used (it often covers the reef).
 
-        ``match_conf`` (per random point):
+        ``manual_id_conf`` (per random point):
 
         - ``"high"``: exactly one candidate agrees both ways with top masks.
         - ``"medium"``: exactly one candidate agrees both ways when one
@@ -574,8 +574,8 @@ class Annotations:
         Returns:
             One match record (dict) per annotation in ``self``, in order. Keys:
             ``id``, ``label``, ``considered``, ``skipped``, ``manual_id``,
-            ``manual_label``,
-            ``manual_label_conf``, ``match_conf``, ``flagged``, ``orig_coords``,
+            ``manual_label``, ``manual_label_conf``, ``manual_id_conf``,
+            ``flagged``, ``orig_coords``,
             ``candidates`` (list of dicts with ``id``, ``label``,
             ``label_conf``, ``dist``, ``orig_coords``, ``fwd``/``rev``: tuple
             of in-mask results per mask rank or None if not tested), ``view``
@@ -584,8 +584,11 @@ class Annotations:
             the most candidates). A view is a dict with ``cam``, ``x``, ``y``,
             ``contours`` (per mask rank, list of ``(N, 2)`` full-res pixel
             arrays), ``area_cm2`` (per mask rank) and ``mask_scores``. The
-            ``manual_*`` and ``match_conf`` values are also stored in each
-            annotation's ``meta_data``.
+            ``manual_*`` and ``manual_id_conf`` values are also stored in each
+            annotation's ``meta_data``. Only ``manual_id`` and
+            ``manual_id_conf`` are saved (see :func:`save_annotation_matches_csv`);
+            the manual label is looked up when needed
+            (:func:`join_manual_annotations`).
         """
         from substrata import segmentation
 
@@ -723,7 +726,7 @@ class Annotations:
                 "manual_id": "",
                 "manual_label": "",
                 "manual_label_conf": "",
-                "match_conf": "",
+                "manual_id_conf": "",
                 "flagged": False,
                 "candidates": [],
                 "view": rand_views.get(i),
@@ -757,7 +760,7 @@ class Annotations:
                         manual_id=m.id,
                         manual_label=m.label,
                         manual_label_conf=m.label_conf or "",
-                        match_conf=conf,
+                        manual_id_conf=conf,
                     )
                 record["flagged"] = conf != "high"
                 pts = [ann.orig_coords] + [man_anns[j].orig_coords for j in idx]
@@ -772,7 +775,7 @@ class Annotations:
         counts: Dict[str, int] = {}
         for rec in records:
             if rec["considered"]:
-                key = rec["match_conf"] or "unmatched"
+                key = rec["manual_id_conf"] or "unmatched"
                 counts[key] = counts.get(key, 0) + 1
         n_flagged = sum(rec["flagged"] for rec in records)
         logger.info(f"Match confidence: {counts}; flagged for review: {n_flagged}")
@@ -3307,13 +3310,18 @@ def save_annotation_matches_csv(
 ) -> None:
     """Copy an annotation CSV, appending the match columns.
 
-    Appended columns: ``manual_id``, ``manual_label``, ``manual_label_conf``
-    (the manual annotation's ``label_conf``) and ``match_conf``. All original
+    Appended columns: ``manual_id`` (id in the manual set, which is named by
+    the output's sidecar ``matched_to``) and ``manual_id_conf``. All original
     columns and rows are kept verbatim; rows are matched to records by their
-    ``id`` column. When re-running on a matched file, the existing match
-    columns are overwritten only for ``considered`` records; other rows
-    (skipped, outside the label prefix, or without a record) keep their values,
-    so the output can again be used as input.
+    ``id`` column. When re-running on a matched file, the match columns are
+    overwritten only for ``considered`` records; other rows (skipped, outside
+    the label prefix, or without a record) keep their values, so the output can
+    again be used as input.
+
+    Columns of older matched CSVs are migrated: the copies ``manual_label`` and
+    ``manual_label_conf`` are dropped (look them up with
+    :func:`join_manual_annotations`) and ``match_conf`` becomes
+    ``manual_id_conf``.
 
     Args:
         src_filepath: The (random point) annotation CSV that was matched.
@@ -3332,8 +3340,18 @@ def save_annotation_matches_csv(
     if "id" not in header:
         raise ValueError(f"No 'id' column in {src_filepath}")
     id_col = header.index("id")
-    cols = [header.index(c) if c in header else None for c in new_cols]
-    out_header = list(rows[0]) + [c for c, i in zip(new_cols, cols) if i is None]
+    # Legacy match_conf is read as manual_id_conf; legacy copies are dropped
+    names = [
+        "manual_id_conf" if c == "match_conf" and "manual_id_conf" not in header
+        else c
+        for c in header
+    ]
+    keep = [i for i, c in enumerate(names) if c not in settings.MATCH_LEGACY_COLUMNS]
+    out_header = [rows[0][i] if names[i] == header[i] else names[i] for i in keep]
+    out_names = [names[i] for i in keep]
+    out_header += [c for c in new_cols if c not in out_names]
+    out_names += [c for c in new_cols if c not in out_names]
+    cols = [out_names.index(c) for c in new_cols]
     with open(src_filepath, newline="") as f:
         newline = "\r\n" if f.readline().endswith("\r\n") else "\n"
     with open(output_filepath, "w", newline="") as f:
@@ -3344,10 +3362,9 @@ def save_annotation_matches_csv(
                 continue
             rec = by_id.get(row[id_col].strip())
             row = list(row) + [""] * (len(rows[0]) - len(row))
-            for col, i in zip(new_cols, cols):
-                if i is None:
-                    row.append(rec.get(col, "") if rec else "")
-                elif rec is not None:
+            row = [row[i] for i in keep] + [""] * (len(out_names) - len(keep))
+            if rec is not None:
+                for col, i in zip(new_cols, cols):
                     row[i] = rec.get(col, "")
             writer.writerow(row)
 
@@ -3355,9 +3372,10 @@ def save_annotation_matches_csv(
 def get_matched_annotation_ids(filepath: str) -> Set[str]:
     """Ids of rows in a matched annotation CSV that already have a match.
 
-    A row counts as matched when its ``manual_id`` or ``match_conf`` is
-    non-empty, whatever the value (e.g. ``"manual"`` for a match added by
-    hand, or a marker for a point reviewed as having no match).
+    A row counts as matched when its ``manual_id`` or ``manual_id_conf`` (or
+    the legacy ``match_conf``) is non-empty, whatever the value (e.g.
+    ``"manual"`` for a match added by hand, or a marker for a point reviewed
+    as having no match).
 
     Args:
         filepath: Annotation CSV, typically written by
@@ -3374,13 +3392,132 @@ def get_matched_annotation_ids(filepath: str) -> Set[str]:
     if "id" not in header:
         return set()
     id_col = header.index("id")
-    cols = [header.index(c) for c in ("manual_id", "match_conf") if c in header]
+    cols = [
+        header.index(c)
+        for c in ("manual_id", "manual_id_conf", "match_conf")
+        if c in header
+    ]
     return {
         row[id_col].strip()
         for row in rows[1:]
         if len(row) > id_col
         and any(i < len(row) and row[i].strip() for i in cols)
     }
+
+
+def join_manual_annotations(
+    matched_filepath: str, manual_filepath: Optional[str] = None
+) -> List[Dict[str, str]]:
+    """Look up the current manual annotation of each matched random point.
+
+    The matched CSV stores only the link (``manual_id``, ``manual_id_conf``);
+    labels are read from the manual set at call time, so corrections there
+    are always reflected.
+
+    Args:
+        matched_filepath: Matched (random point) annotation CSV.
+        manual_filepath: The manual annotation CSV; default: the matched CSV's
+            sidecar ``matched_to``.
+
+    Returns:
+        One dict per row, in file order: ``id``, ``manual_id``,
+        ``manual_id_conf``, ``manual_label``, ``manual_label_conf`` and
+        ``status``: ``"ok"``, ``"no match"`` (empty ``manual_id``) or
+        ``"missing"`` (the id is not in the manual set, e.g. deleted; ids are
+        never reused, so it cannot point at another annotation instead).
+    """
+    if manual_filepath is None:
+        manual_filepath = sidecars.read_annotation_sidecar(matched_filepath).get(
+            "matched_to"
+        )
+    if not manual_filepath:
+        raise ValueError(
+            f"{matched_filepath}: no manual annotations file given and no "
+            "'matched_to' in its sidecar"
+        )
+    manual: Dict[str, Tuple[str, str]] = {}
+    m_rows, _, m_head = _read_csv_rows(manual_filepath)
+    if "id" not in m_head:
+        raise ValueError(f"No 'id' column in {manual_filepath}")
+    mi = m_head.index("id")
+    li = m_head.index("label") if "label" in m_head else None
+    ci = m_head.index("label_conf") if "label_conf" in m_head else None
+
+    def _cell(row, i):
+        return row[i].strip() if i is not None and i < len(row) else ""
+
+    for row in m_rows[1:]:
+        if len(row) > mi:
+            manual[row[mi].strip()] = (_cell(row, li), _cell(row, ci))
+
+    rows, _, head = _read_csv_rows(matched_filepath)
+    if "id" not in head:
+        raise ValueError(f"No 'id' column in {matched_filepath}")
+    idx = {c: head.index(c) if c in head else None for c in head}
+    conf_i = idx.get("manual_id_conf", idx.get("match_conf"))
+    out = []
+    for row in rows[1:]:
+        if not row:
+            continue
+        mid = _cell(row, idx.get("manual_id"))
+        label, conf = manual.get(mid, ("", ""))
+        status = "no match" if not mid else ("ok" if mid in manual else "missing")
+        out.append(
+            dict(
+                id=_cell(row, idx["id"]),
+                manual_id=mid,
+                manual_id_conf=_cell(row, conf_i),
+                manual_label=label,
+                manual_label_conf=conf,
+                status=status,
+            )
+        )
+    return out
+
+
+def save_joined_manual_annotations(
+    matched_filepath: str,
+    output_filepath: str,
+    manual_filepath: Optional[str] = None,
+) -> Dict[str, int]:
+    """Write the matched CSV with the current manual labels joined in.
+
+    A self-contained snapshot for analysis or sharing: the matched CSV's
+    columns plus ``manual_label``, ``manual_label_conf`` and ``manual_status``
+    from :func:`join_manual_annotations`. Regenerate it after editing either
+    set; it is not read back by ``match-annotations``.
+
+    Args:
+        matched_filepath: Matched (random point) annotation CSV.
+        output_filepath: Where to write the joined CSV.
+        manual_filepath: See :func:`join_manual_annotations`.
+
+    Returns:
+        Row counts per ``status``.
+    """
+    joined = {
+        j["id"]: j for j in join_manual_annotations(matched_filepath, manual_filepath)
+    }
+    rows, newline, head = _read_csv_rows(matched_filepath)
+    id_col = head.index("id")
+    extra = ["manual_label", "manual_label_conf", "manual_status"]
+    keep = [i for i, c in enumerate(head) if c not in extra]
+    counts: Dict[str, int] = {}
+    with open(output_filepath, "w", newline="") as f:
+        writer = csv.writer(f, lineterminator=newline)
+        writer.writerow([rows[0][i] for i in keep] + extra)
+        for row in rows[1:]:
+            if not row:
+                continue
+            row = list(row) + [""] * (len(head) - len(row))
+            j = joined.get(row[id_col].strip(), {})
+            status = j.get("status", "")
+            counts[status] = counts.get(status, 0) + 1
+            writer.writerow(
+                [row[i] for i in keep]
+                + [j.get("manual_label", ""), j.get("manual_label_conf", ""), status]
+            )
+    return counts
 
 
 # ---------------------------------------------------------------------------

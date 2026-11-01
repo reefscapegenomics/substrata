@@ -190,52 +190,123 @@ class TestSaveAnnotationMatchesCsv(unittest.TestCase):
         with open(self.src, "w", newline="") as f:
             f.write("id,orig_x,orig_y,orig_z,label,extra\r\n")
             f.write("0,1,2,3,CSF,a\r\n1,4,5,6,MAF_T,\r\n")
+        # Records also carry the manual label (for the PDF); it is not saved
         self.records = [
             {"id": "0", "manual_id": "m_001", "manual_label": "POR",
-             "manual_label_conf": "0.9", "match_conf": "high"},
+             "manual_label_conf": "0.9", "manual_id_conf": "high"},
             {"id": "1", "manual_id": "", "manual_label": "", "manual_label_conf": "",
-             "match_conf": ""},
+             "manual_id_conf": ""},
         ]
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_appends_columns_and_keeps_original(self):
+    def test_appends_only_the_link_columns(self):
         a.save_annotation_matches_csv(self.src, self.records, self.out)
         with open(self.out, newline="") as f:
             text = f.read()
         self.assertEqual(
             text,
-            "id,orig_x,orig_y,orig_z,label,extra,manual_id,manual_label,"
-            "manual_label_conf,match_conf\r\n0,1,2,3,CSF,a,m_001,POR,0.9,high\r\n"
-            "1,4,5,6,MAF_T,,,,,\r\n",
+            "id,orig_x,orig_y,orig_z,label,extra,manual_id,manual_id_conf\r\n"
+            "0,1,2,3,CSF,a,m_001,high\r\n"
+            "1,4,5,6,MAF_T,,,\r\n",
         )
 
     def test_rerun_overwrites_existing_match_columns(self):
         a.save_annotation_matches_csv(self.src, self.records, self.out)
-        self.records[0].update(manual_id="m_002", match_conf="low")
+        self.records[0].update(manual_id="m_002", manual_id_conf="low")
         rerun = os.path.join(self.tmp.name, "rerun.csv")
         a.save_annotation_matches_csv(self.out, self.records, rerun)
         with open(rerun, newline="") as f:
             lines = f.read().splitlines()
-        self.assertEqual(lines[0].count("manual_id"), 1)
-        self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_002,POR,0.9,low")
+        self.assertEqual(lines[0].count("manual_id"), 2)
+        self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_002,low")
 
     def test_rerun_keeps_rows_that_were_not_considered(self):
         a.save_annotation_matches_csv(self.src, self.records, self.out)
         # Row 0 skipped (already matched); row 1 matched in the re-run
         records = [
             {"id": "0", "considered": False, "skipped": True, "manual_id": "",
-             "manual_label": "", "manual_label_conf": "", "match_conf": ""},
+             "manual_id_conf": ""},
             {"id": "1", "considered": True, "manual_id": "m_003",
-             "manual_label": "AGA", "manual_label_conf": "", "match_conf": "medium"},
+             "manual_id_conf": "medium"},
         ]
         rerun = os.path.join(self.tmp.name, "rerun.csv")
         a.save_annotation_matches_csv(self.out, records, rerun)
         with open(rerun, newline="") as f:
             lines = f.read().splitlines()
-        self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_001,POR,0.9,high")
-        self.assertEqual(lines[2], "1,4,5,6,MAF_T,,m_003,AGA,,medium")
+        self.assertEqual(lines[1], "0,1,2,3,CSF,a,m_001,high")
+        self.assertEqual(lines[2], "1,4,5,6,MAF_T,,m_003,medium")
+
+    def test_legacy_columns_are_migrated(self):
+        legacy = os.path.join(self.tmp.name, "legacy.csv")
+        with open(legacy, "w", newline="") as f:
+            f.write(
+                "id,label,manual_id,manual_label,manual_label_conf,match_conf,extra\n"
+                "0,CSF,m_001,POR,0.9,manual,x\n"
+                "1,CSF,,,,,y\n"
+            )
+        records = [{"id": "1", "considered": True, "manual_id": "m_005",
+                    "manual_id_conf": "high"}]
+        a.save_annotation_matches_csv(legacy, records, self.out)
+        with open(self.out, newline="") as f:
+            self.assertEqual(
+                f.read(),
+                "id,label,manual_id,manual_id_conf,extra\n"
+                "0,CSF,m_001,manual,x\n"
+                "1,CSF,m_005,high,y\n",
+            )
+
+
+@unittest.skipUnless(a is not None, "requires the open3d/substrata environment")
+class TestJoinManualAnnotations(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.manual = os.path.join(d, "manual.csv")
+        self.matched = os.path.join(d, "rand_matched.csv")
+        with open(self.manual, "w", newline="") as f:
+            f.write("id,orig_x,orig_y,orig_z,label,label_conf\n"
+                    "m_1,0,0,0,POR,4\nm_2,1,1,1,AGA,\n")
+        with open(self.matched, "w", newline="") as f:
+            f.write("id,label,manual_id,manual_id_conf\n"
+                    "0,CSF,m_1,high\n1,CSF,,\n2,CSF,m_9,low\n")
+        sidecars = importlib.import_module("substrata.sidecars")
+        sidecars.write_annotation_sidecar(self.matched, {"matched_to": self.manual})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_join_reads_current_labels_via_sidecar(self):
+        rows = a.join_manual_annotations(self.matched)
+        self.assertEqual([r["status"] for r in rows], ["ok", "no match", "missing"])
+        self.assertEqual(rows[0]["manual_label"], "POR")
+        self.assertEqual(rows[0]["manual_label_conf"], "4")
+        self.assertEqual(rows[0]["manual_id_conf"], "high")
+        # A relabelled manual annotation is picked up without re-matching
+        with open(self.manual, "w", newline="") as f:
+            f.write("id,orig_x,orig_y,orig_z,label,label_conf\nm_1,0,0,0,ACR,5\n")
+        self.assertEqual(a.join_manual_annotations(self.matched)[0]["manual_label"],
+                         "ACR")
+
+    def test_sidecar_stores_matched_to_relative(self):
+        with open(self.matched + ".yaml") as f:
+            self.assertIn("matched_to: manual.csv", f.read())
+
+    def test_export(self):
+        out = os.path.join(self.tmp.name, "joined.csv")
+        counts = a.save_joined_manual_annotations(self.matched, out)
+        self.assertEqual(counts, {"ok": 1, "no match": 1, "missing": 1})
+        with open(out, newline="") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[0], "id,label,manual_id,manual_id_conf,"
+                                   "manual_label,manual_label_conf,manual_status")
+        self.assertEqual(lines[1], "0,CSF,m_1,high,POR,4,ok")
+
+    def test_no_manual_file_raises(self):
+        os.remove(self.matched + ".yaml")
+        with self.assertRaises(ValueError):
+            a.join_manual_annotations(self.matched)
 
 
 @unittest.skipUnless(a is not None, "requires the open3d/substrata environment")
@@ -251,7 +322,16 @@ class TestGetMatchedAnnotationIds(unittest.TestCase):
         with open(self.path, "w", newline="") as f:
             f.write(text)
 
-    def test_any_manual_id_or_match_conf_counts(self):
+    def test_any_manual_id_or_conf_counts(self):
+        self.write(
+            "id,x,y,z,label,manual_id,manual_id_conf\n"
+            "0,1,2,3,CSF,m_001,high\n"
+            "1,1,2,3,CSF,,\n"
+            "2,1,2,3,CSF,,none\n"
+        )
+        self.assertEqual(a.get_matched_annotation_ids(self.path), {"0", "2"})
+
+    def test_legacy_match_conf_counts(self):
         self.write(
             "id,x,y,z,label,manual_id,manual_label,manual_label_conf,match_conf\n"
             "0,1,2,3,CSF,m_001,POR,0.9,high\n"

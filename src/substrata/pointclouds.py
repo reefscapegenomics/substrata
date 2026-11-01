@@ -1702,16 +1702,59 @@ def _parse_ply_header(fin):
     return fmt, endian, vertex_count, vertex_props, record_size, header_lines
 
 
-def _make_output_header(fmt: str, vertex_props, vertex_count_out: int) -> bytes:
+def _make_output_header(
+    fmt: str, vertex_props, vertex_count_out: int, comments=()
+) -> bytes:
     lines = []
     lines.append(b"ply\n")
     lines.append(f"format {fmt} 1.0\n".encode("ascii"))
     lines.append(b"comment decimated with reservoir sampling\n")
+    for c in comments:
+        lines.append(f"comment {c}\n".encode("ascii"))
     lines.append(f"element vertex {vertex_count_out}\n".encode("ascii"))
     for t, name in vertex_props:
         lines.append(f"property {t} {name}\n".encode("ascii"))
     lines.append(b"end_header\n")
     return b"".join(lines)
+
+
+def _header_is_color_corrected(header_lines) -> bool:
+    """Whether raw PLY header lines carry the colour-corrected marker."""
+    marker = f"comment {settings.PLY_COLOR_CORRECTED_COMMENT}"
+    return any(
+        line.decode("ascii", errors="replace").strip() == marker
+        for line in header_lines
+    )
+
+
+def ply_is_color_corrected(path: str) -> bool:
+    """Whether a PLY's RGB already has the YAML ``color_correction`` applied.
+
+    ``decimate_ply_file(..., color_correction=...)`` (``substrata decimate -c``)
+    marks its output with ``settings.PLY_COLOR_CORRECTED_COMMENT``, and the
+    marker is kept when such a file is decimated or repaired again. Only the
+    header is read.
+
+    Args:
+        path: PLY file path.
+
+    Returns:
+        bool: True if the header carries the marker; False otherwise (also for
+        unreadable files).
+    """
+    lines = []
+    try:
+        with open(path, "rb") as fin:
+            for _ in range(10000):
+                line = fin.readline()
+                if not line:
+                    break
+                lines.append(line)
+                if line.strip() == b"end_header":
+                    break
+    except OSError:
+        return False
+    return _header_is_color_corrected(lines)
 
 
 def _ply_red_green_blue_layout(
@@ -2377,7 +2420,22 @@ def decimate_ply_file(
         offset_cc = np.asarray(color_correction["offset"], dtype=np.float64)
 
     with open(input_path, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
+        fmt, endian, n_vertices, vprops, rec_size, header_lines = _parse_ply_header(
+            fin
+        )
+        if color_correction is not None and _header_is_color_corrected(header_lines):
+            raise ValueError(
+                f"{input_path} already has the colour correction applied; "
+                "refusing to apply it twice."
+            )
+        # Mark baked-in colour correction (and keep an existing mark), so
+        # loading the output does not apply the YAML correction again
+        comments = (
+            (settings.PLY_COLOR_CORRECTED_COMMENT,)
+            if color_correction is not None
+            or _header_is_color_corrected(header_lines)
+            else ()
+        )
 
         # Reads must be multiples of rec_size (e.g. 64 MiB is not divisible by 28).
         aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
@@ -2394,14 +2452,14 @@ def decimate_ply_file(
         k = max(0, min(int(target_points), n_vertices))
         if k == 0:
             # Write empty PLY file
-            out_header = _make_output_header(fmt, vprops, 0)
+            out_header = _make_output_header(fmt, vprops, 0, comments)
             with open(output_path, "wb") as fout:
                 fout.write(out_header)
             return
 
         if k >= n_vertices:
             # fast stream copy - no decimation needed
-            out_header = _make_output_header(fmt, vprops, n_vertices)
+            out_header = _make_output_header(fmt, vprops, n_vertices, comments)
             with open(output_path, "wb") as fout:
                 fout.write(out_header)
                 bytes_left = n_vertices * rec_size
@@ -2483,7 +2541,7 @@ def decimate_ply_file(
 
         # Now write the file with the correct vertex count
         actual_count = taken
-        out_header = _make_output_header(fmt, vprops, actual_count)
+        out_header = _make_output_header(fmt, vprops, actual_count, comments)
         with open(output_path, "wb") as fout:
             fout.write(out_header)
             for vertex_data in selected_vertices:
@@ -2537,11 +2595,19 @@ def repair_ply_for_open3d(
         output_path = f"{base}_o3d.ply"
 
     with open(input_path, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
+        fmt, endian, n_vertices, vprops, rec_size, header_lines = _parse_ply_header(
+            fin
+        )
 
         # Reuse the same clean-header generator as decimate_ply_file; that
-        # output has been verified to load in Open3D.
-        out_header = _make_output_header(fmt, vprops, n_vertices)
+        # output has been verified to load in Open3D. Keep a colour-corrected
+        # marker.
+        comments = (
+            (settings.PLY_COLOR_CORRECTED_COMMENT,)
+            if _header_is_color_corrected(header_lines)
+            else ()
+        )
+        out_header = _make_output_header(fmt, vprops, n_vertices, comments)
         # Reads must be multiples of rec_size to keep whole vertex records.
         aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
 

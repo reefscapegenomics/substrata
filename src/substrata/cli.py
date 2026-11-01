@@ -5,6 +5,7 @@ from collections import Counter
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -844,7 +845,13 @@ def handle_scalebars(args):
 
 
 def handle_colors(args):
-    """Colour calibration QC PDF and optional affine correction in YAML."""
+    """Colour calibration QC PDF, and the affine correction in the project YAML.
+
+    The fitted ``color_correction`` (matrix + offset) is written to the project
+    YAML by default (``--no-save-yaml`` to skip); loading the project then
+    applies it to the point cloud. No PLY is written: a colour-corrected copy
+    is an explicit extra step (``substrata decimate -c``).
+    """
     from substrata.color_calibration import ColorCalibrations
     from substrata.initializer import ProjectInitializer
 
@@ -913,10 +920,20 @@ def handle_colors(args):
                 file=sys.stderr,
             )
         else:
+            from substrata.initializer import set_project_yaml_keys
+
             init.color_correction = cc.color_correction
             yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
-            init.save_config_to_yaml(yaml_path)
+            if os.path.isfile(yaml_path):
+                # Only this key changes: comments and relative paths are kept
+                set_project_yaml_keys(
+                    yaml_path, {"color_correction": init.color_correction}
+                )
+            else:
+                init.save_config_to_yaml(yaml_path)
             print(f"Saved colour correction to YAML: {yaml_path}")
+    else:
+        print("Not saving the colour correction (--no-save-yaml)")
 
 
 def handle_views(args):
@@ -1359,7 +1376,10 @@ def handle_intercepts(args):
     slope = getattr(args, "slope", False)
     mode = "slope" if slope else "topdown"
     fig.savefig(_get_output_filepath(init, f"{mode}_bbox.png"))
-    csv_path = _get_output_filepath(init, f"{mode}_intercepts.csv")
+    # Annotation sets live in <id>.annos/ (with their sidecars and crops)
+    annos_dir = init.annos_root or os.path.join(os.getcwd(), f"{init.id}.annos")
+    os.makedirs(annos_dir, exist_ok=True)
+    csv_path = os.path.join(annos_dir, f"{init.id}_{mode}_intercepts.csv")
     intercepts.save(csv_path)
 
     # Grid frame = grid_transform @ world_transform @ orig, where grid_transform
@@ -1425,7 +1445,10 @@ def handle_intercepts_plot(args):
 
     ann_path = args.annotations or init.annotations_filepath
     if not ann_path:
-        raise SystemExit("intercepts-plot requires an annotations/intercepts file")
+        raise SystemExit(
+            "intercepts-plot requires an intercepts file: pass --annotations "
+            "<id>.annos/<id>_<mode>_intercepts.csv"
+        )
 
     # Read the generation settings (orientation + optional exact grid) from --yaml,
     # else from the CSV's sidecar (<csv>.yaml written by `intercepts`), else fall
@@ -1736,6 +1759,11 @@ def handle_align(args):
         raise SystemExit(
             "align --output-yaml requires a project YAML or directory as --source"
         )
+    if args.as_parent and (src["init"] is None or tgt["init"] is None):
+        raise SystemExit(
+            "align --as-parent requires project YAMLs or directories as --source "
+            "and --target"
+        )
 
     def _load_pcds():
         for label, info in (("source", src), ("target", tgt)):
@@ -1788,7 +1816,9 @@ def handle_align(args):
                 T_final,
             )
 
-    if args.output_yaml:
+    if args.as_parent:
+        _write_align_parent(args, src, tgt, T_raw)
+    elif args.output_yaml:
         init = src["init"]
         old = np.asarray(init.world_transform, dtype=float)
         if not np.allclose(old, np.eye(4)):
@@ -1801,6 +1831,43 @@ def handle_align(args):
         _save_align_qc_pdf(
             args, src, tgt, T_raw, T_final, cam_fit, metrics, src_pcd, tgt_pcd
         )
+
+
+def _write_align_parent(args, src: dict, tgt: dict, T_raw: np.ndarray) -> None:
+    """Store the target as the source project's parent (align --as-parent).
+
+    Writes ``parent_id`` and ``parent_transform`` (raw source → raw target, the
+    fitted transform including any scale) to the source project YAML, in place
+    or to a copy at ``--output-yaml``. The source ``world_transform`` is left
+    untouched; the implied scale ratio between the two world frames is
+    reported as a check on both plots' scale factors.
+    """
+    from substrata.initializer import set_project_yaml_keys
+
+    init, parent = src["init"], tgt["init"]
+    init.parent_id = parent.id
+    init.parent_transform = np.asarray(T_raw, dtype=float)
+    if init.world_transform_is_identity or parent.world_transform_is_identity:
+        print("Scale ratio: n/a (source or target has no world_transform)")
+    else:
+        ratio = init.parent_scale_ratio(parent)
+        print(
+            f"Scale ratio (parent m per local m): {ratio:.5f} "
+            f"({(ratio - 1) * 100:+.2f} %)"
+        )
+    out = args.output_yaml or init.yaml_path
+    if not out:
+        raise SystemExit(
+            "align --as-parent: the source has no project YAML; pass --output-yaml"
+        )
+    if args.output_yaml and init.yaml_path and os.path.isfile(init.yaml_path):
+        shutil.copyfile(init.yaml_path, out)
+    elif not os.path.isfile(out):
+        init.save_config_to_yaml(out)
+    set_project_yaml_keys(
+        out, {"parent_id": parent.id, "parent_transform": init.parent_transform}
+    )
+    print(f"Wrote parent_id={parent.id} and parent_transform to {out}")
 
 
 def _save_align_qc_pdf(
@@ -2521,7 +2588,7 @@ def handle_path_repair(args):
     Phase A repairs the project's own file paths in ``<id>.yaml`` (and the
     path keys of the annotation sidecars, ``<csv>.yaml``); phase B repairs the
     per-camera image paths in ``<id>.meta.json``; phase C repairs the
-    ``cam_filepath`` cells of the point CSVs in the project folder. All phases
+    ``cam_filepath`` cells of the point CSVs in ``<id>.annos/``. All phases
     are planned in full before any writes, so aborting at any point leaves the
     project untouched.
 
@@ -2563,7 +2630,15 @@ def handle_path_repair(args):
     has_yaml = os.path.isfile(yaml_path)
 
     print(f"Project:   {base}   ({project_dir})")
-    ann_csvs = pr.find_annotation_csvs(project_dir) if do_anns else []
+    # Annotation sets: the point CSVs in <id>.annos/ (id from the YAML)
+    project_id = base
+    if has_yaml:
+        try:
+            with open(yaml_path) as f:
+                project_id = (yaml.safe_load(f) or {}).get("id") or base
+        except (OSError, yaml.YAMLError, AttributeError):
+            pass
+    ann_csvs = pr.find_annotation_csvs(project_dir, project_id) if do_anns else []
 
     # One image index (a single walk under --root) for phases B and C
     _index = {}
@@ -2992,8 +3067,9 @@ def _load_annotation_project(args, need_annotations=True, use_ply=True):
         init.ply_filepath = None
     if need_annotations and not init.annotations_filepath:
         raise SystemExit(
-            "No annotations file found. Provide --annotations or run from a "
-            "project folder with an annotations CSV."
+"No annotations file given. Provide --annotations or set "
+            "`annotations:` in the project YAML (annotation sets live in "
+            "<id>.annos/)."
         )
     init.initialize()
     if init.cams is None:
@@ -3337,8 +3413,9 @@ def handle_images(args):
     # Resolve annotations
     if not init.annotations_filepath:
         raise SystemExit(
-            "No annotations file found. Provide --annotations or ensure "
-            "initializer finds an annotations CSV in CWD."
+"No annotations file given. Provide --annotations or set "
+            "`annotations:` in the project YAML (annotation sets live in "
+            "<id>.annos/)."
         )
 
     # Initialize (loads PCD and cameras if available)
@@ -3405,13 +3482,16 @@ def handle_match_annotations(args):
 
     Matches random point annotations to manual (colony) annotations of the
     same object using 3-D proximity + SAM2 masks, writes a copy of the random
-    annotation CSV with ``manual_id``, ``manual_label``, ``manual_label_conf``
-    and ``match_conf`` columns, and a PDF to review flagged matches.
+    annotation CSV with ``manual_id`` and ``manual_id_conf`` columns (its
+    sidecar's ``matched_to`` names the manual CSV), and a PDF to review
+    flagged matches.
 
     The matched CSV can be passed back as ``--random``: rows that already have
-    a ``manual_id`` or ``match_conf`` (from a previous run, or added by hand)
-    are then kept as they are, and only the remaining rows are matched, unless
-    ``--redo-all`` is given.
+    a ``manual_id`` or ``manual_id_conf`` (from a previous run, or added by
+    hand) are then kept as they are, and only the remaining rows are matched,
+    unless ``--redo-all`` is given. With ``--export-labels`` nothing is
+    matched: the matched CSV is written with the manual set's current labels
+    joined in.
 
     Args:
         args: Arguments from argparse.
@@ -3421,15 +3501,32 @@ def handle_match_annotations(args):
     from substrata.annotations import (
         get_matched_annotation_ids,
         save_annotation_matches_csv,
+        save_joined_manual_annotations,
     )
+
+    random_sidecar = sidecars.read_annotation_sidecar(args.random)
+    if args.export_labels:
+        counts = save_joined_manual_annotations(
+            args.random, args.export_labels, manual_filepath=args.manual
+        )
+        print(f"Joined manual labels saved to {args.export_labels}")
+        print("Rows: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+        if counts.get("missing"):
+            print(
+                f"Warning: {counts['missing']} manual_id(s) no longer exist in the "
+                "manual set"
+            )
+        return
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
-    manual_path = args.manual or init.annotations_filepath
+    manual_path = (
+        args.manual or random_sidecar.get("matched_to") or init.annotations_filepath
+    )
     if not manual_path:
         raise SystemExit(
-            "No manual annotations file found. Provide --manual or ensure the "
-            "initializer finds an annotations CSV in CWD."
+            "No manual annotations file given. Provide --manual or set "
+            "`annotations:` in the project YAML."
         )
     for path in (args.random, manual_path):
         if not os.path.isfile(path):
@@ -3473,12 +3570,17 @@ def handle_match_annotations(args):
     stem = os.path.splitext(args.random)[0]
     output = args.output or f"{stem}_matched.csv"
     save_annotation_matches_csv(args.random, records, output)
-    print(f"Matched annotations saved to {output}")
+    # The matched copy keeps the random set's sidecar and names the manual set
+    sidecar = {k: v for k, v in random_sidecar.items() if k != "matched_to"}
+    sidecars.write_annotation_sidecar(
+        output, {**sidecar, "matched_to": os.path.abspath(manual_path)}
+    )
+    print(f"Matched annotations saved to {output} (manual set: {manual_path})")
 
     counts = {}
     for rec in records:
         if rec["considered"]:
-            key = rec["match_conf"] or "unmatched"
+            key = rec["manual_id_conf"] or "unmatched"
             counts[key] = counts.get(key, 0) + 1
     print("Match confidence: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
     print(f"Flagged for review: {sum(rec['flagged'] for rec in records)}")
@@ -3515,8 +3617,27 @@ def handle_transform(args):
 
     print(f"Loaded {len(anns)} annotations from {args.input}")
 
-    # Prompt for transform(s)
-    transform = _get_transform_from_user()
+    # Transform from a project's parent link, or prompt for transform(s)
+    link = args.to_parent or args.from_parent
+    if args.to_parent and args.from_parent:
+        raise SystemExit("transform: use either --to-parent or --from-parent")
+    if link:
+        init = (
+            ProjectInitializer(path=link)
+            if os.path.isdir(link)
+            else ProjectInitializer(yaml=link)
+        )
+        if init.parent_transform is None:
+            raise SystemExit(f"transform: {init.id} has no parent_transform")
+        transform = np.asarray(init.parent_transform, dtype=float)
+        if args.from_parent:
+            transform = np.linalg.inv(transform)
+        print(
+            f"Using parent_transform of {init.id} "
+            f"({'to' if args.to_parent else 'from'} parent {init.parent_id})"
+        )
+    else:
+        transform = _get_transform_from_user()
 
     # Apply inverse if requested
     if getattr(args, "inverse", False):
@@ -4108,7 +4229,8 @@ def main():
         action="store_true",
         help=(
             "Apply color_correction from the project YAML while writing the output "
-            "PLY (requires `substrata colors -s` or equivalent). No second load."
+            "PLY (from `substrata colors`). The output's header is marked, so "
+            "loading it does not apply the correction a second time."
         ),
     )
 
@@ -4532,8 +4654,8 @@ def main():
     p_colors = subparsers.add_parser(
         "colors",
         help=(
-            "Run ColorCalibrations from project markers, save QC PDF and optionally "
-            "store affine colour correction in YAML."
+            "Run ColorCalibrations from project markers, save a QC PDF and store "
+            "the affine colour correction in the project YAML (no PLY is written)."
         ),
     )
     p_colors.add_argument(
@@ -4576,7 +4698,18 @@ def main():
         "--save_yaml",
         dest="save_yaml",
         action="store_true",
-        help="Write affine colour_correction (matrix + offset) into the project YAML.",
+        default=True,
+        help=(
+            "Write the affine color_correction (matrix + offset) into the project "
+            "YAML (the default; kept for compatibility)."
+        ),
+    )
+    p_colors.add_argument(
+        "--no-save-yaml",
+        "--no_save_yaml",
+        dest="save_yaml",
+        action="store_false",
+        help="Only write the QC PDF; leave the project YAML unchanged.",
     )
     p_colors.add_argument(
         "--exclude-index",
@@ -4918,7 +5051,18 @@ def main():
         default=None,
         help=(
             "Write a copy of the source project YAML with world_transform set "
-            "to the raw source → oriented target transform"
+            "to the raw source → oriented target transform (with --as-parent: "
+            "a copy with the parent link added instead)"
+        ),
+    )
+    p_align.add_argument(
+        "--as-parent",
+        dest="as_parent",
+        action="store_true",
+        help=(
+            "Keep the source world_transform and store the target as its parent "
+            "instead: parent_id and parent_transform (raw source → raw target) "
+            "are written to the source YAML (or to --output-yaml)"
         ),
     )
     p_intercepts.add_argument(
@@ -5346,7 +5490,7 @@ def main():
         help=(
             "Random point annotations CSV (the file that gets matched). A "
             "previously matched CSV can be given to only match the rows without "
-            "a manual_id/match_conf."
+            "a manual_id/manual_id_conf."
         ),
     )
     p_match.add_argument(
@@ -5354,7 +5498,21 @@ def main():
         dest="manual",
         type=str,
         default=None,
-        help="Manual annotations CSV. Default: the project's annotations file.",
+        help=(
+            "Manual annotations CSV. Default: the --random CSV's sidecar "
+            "matched_to, else the project's annotations file."
+        ),
+    )
+    p_match.add_argument(
+        "--export-labels",
+        dest="export_labels",
+        type=str,
+        default=None,
+        metavar="CSV",
+        help=(
+            "Don't match: write the --random (matched) CSV with the manual set's "
+            "current manual_label, manual_label_conf and manual_status joined in."
+        ),
     )
     p_match.add_argument(
         "--label-prefix",
@@ -5430,7 +5588,7 @@ def main():
         action="store_true",
         help=(
             "Re-match all random points, overwriting existing manual_id/"
-            "match_conf values (default: skip rows that already have one)."
+            "manual_id_conf values (default: skip rows that already have one)."
         ),
     )
     p_match.add_argument(
@@ -5662,6 +5820,26 @@ def main():
         action="store_true",
         help="Apply the inverse of the cumulative transforms (default: False).",
     )
+    p_transform.add_argument(
+        "--to-parent",
+        dest="to_parent",
+        metavar="PROJECT",
+        default=None,
+        help=(
+            "Instead of prompting, use the parent_transform of this project "
+            "(dir or YAML): moves its annotations into the parent's orig frame"
+        ),
+    )
+    p_transform.add_argument(
+        "--from-parent",
+        dest="from_parent",
+        metavar="PROJECT",
+        default=None,
+        help=(
+            "Like --to-parent but inverted: moves annotations of the parent "
+            "into this project's orig frame"
+        ),
+    )
 
     # path-repair
     p_pathrepair = subparsers.add_parser(
@@ -5674,10 +5852,10 @@ def main():
         ),
         epilog=(
             "Phase A repairs the project's own file paths in <id>.yaml, and\n"
-            "the path keys (classes, cropped_path, classifier) of each\n"
-            "annotation sidecar <csv>.yaml; phase B repairs the per-camera\n"
+            "the path keys (classes, cropped_path, classifier, matched_to) of\n"
+            "each annotation sidecar <csv>.yaml; phase B repairs the per-camera\n"
             "image paths in <id>.meta.json; phase C repairs the cam_filepath\n"
-            "column of the point CSVs in the project folder (a backup of each\n"
+            "column of the point CSVs in <id>.annos/ (a backup of each\n"
             "changed CSV goes to backup/). The .cams.xml is never modified (it\n"
             "stores image labels, not paths).\n"
             "\n"

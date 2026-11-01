@@ -400,7 +400,8 @@ YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
     YamlPathKey("cams_xml", False, ("{id}.cams.xml",)),
     YamlPathKey("cams_meta_json", False, ("{id}.meta.json",)),
     YamlPathKey("markers", False, ("{id}_markers.csv",)),
-    YamlPathKey("annotations", False, ("{id}_annotations.csv",)),
+    # No default annotation set: a stale value is found by name (also in <id>.annos)
+    YamlPathKey("annotations", False, ()),
     YamlPathKey("classes", False, ("classes.csv",)),
     YamlPathKey("classifier", False, ()),
     YamlPathKey("photos_path", True, ("{id}.photos",)),
@@ -412,9 +413,11 @@ YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
 # substrata.sidecars). Planned with the CSV stem as ``{id}``, so the crops
 # convention is the default ``<csv stem>.cropped``.
 SIDECAR_YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
-    YamlPathKey("classes", False, ("classes.csv",)),
+    # Sidecars sit in <id>.annos/, one level below the project's classes.csv
+    YamlPathKey("classes", False, ("../classes.csv", "classes.csv")),
     YamlPathKey("cropped_path", True, ("{id}.cropped",)),
     YamlPathKey("classifier", False, ()),
+    YamlPathKey("matched_to", False, ()),
 )
 
 # Top-level ``key: value`` at zero indentation. Nested mappings (e.g. the
@@ -759,14 +762,31 @@ def is_point_csv(path: str) -> bool:
     return "id" in head and all({a, "orig_" + a} & head for a in "xyz")
 
 
-def find_annotation_csvs(project_dir: str) -> List[str]:
-    """Return the point CSVs directly inside a project folder, sorted."""
+def find_annotation_csvs(
+    project_dir: str, project_id: Optional[str] = None
+) -> List[str]:
+    """Return the point CSVs of a project's annotation sets, sorted.
+
+    Annotation sets live in ``<project_dir>/<id>.annos/`` (see
+    ``settings.ANNOS_DIR_SUFFIX``); CSVs elsewhere in the project folder are
+    not annotation sets.
+
+    Args:
+        project_dir: The project folder.
+        project_id: The project id; default: the folder name.
+
+    Returns:
+        list[str]: Paths of the point CSVs directly inside ``<id>.annos/``
+        (empty when the folder does not exist).
+    """
+    project_id = project_id or path_basename(os.path.normpath(project_dir))
+    annos_dir = os.path.join(project_dir, project_id + settings.ANNOS_DIR_SUFFIX)
     try:
-        names = sorted(os.listdir(project_dir))
+        names = sorted(os.listdir(annos_dir))
     except OSError:
         return []
     paths = [
-        os.path.join(project_dir, n) for n in names if n.lower().endswith(".csv")
+        os.path.join(annos_dir, n) for n in names if n.lower().endswith(".csv")
     ]
     return [p for p in paths if os.path.isfile(p) and is_point_csv(p)]
 

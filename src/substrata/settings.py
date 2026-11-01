@@ -147,6 +147,9 @@ CROP_SIZE_DEFAULT = (800, 800)  # pixels (w, h); centred on the image match
 # otherwise cut from the source photo. Matches the training crop size.
 PREDICTION_CROP_SIZE_DEFAULT = (TRAIN_CROP_SIZE, TRAIN_CROP_SIZE)
 CROP_JPEG_QUALITY = TRAIN_CROP_JPEG_QUALITY  # avoid extra loss vs training crops
+# Annotation sets of a project: <id>.annos/ holds the point CSVs with their
+# sidecars (<csv>.yaml), crops (<csv stem>.cropped/) and edit backups (backup/)
+ANNOS_DIR_SUFFIX = ".annos"
 CROPS_DIR_SUFFIX = ".cropped"  # default crops dir: <annotations csv stem>.cropped
 # Per-annotation-set metadata: <annotations csv filename>.yaml (e.g. x_ann.csv.yaml),
 # keeping the .csv so it never clashes with the project's <id>.yaml
@@ -181,6 +184,10 @@ RGL_SCALEBARS = [
     ["target 43", "target 44", 0.07],
     ["target 45", "target 46", 0.07],
 ]
+
+# PLY header comment marking a cloud whose RGB already has the project's YAML
+# color_correction baked in (decimate -c), so loading must not apply it again
+PLY_COLOR_CORRECTED_COMMENT = "substrata color_correction applied"
 
 # --- ColorChecker Classic (24 patches) ----------------------------------------
 # Reference sRGB (D65, 8-bit) from published ColorChecker tables; see e.g.
@@ -311,7 +318,11 @@ MATCH_FALLBACK_DISTANCE = 0.05  # metres; nearest-only match when no mask agrees
 MATCH_MASK_TOLERANCE_PX = 10  # full-res px; point counts as inside a mask within this
 MATCH_MAX_MASK_FRACTION = 0.5  # masks covering more of the image are ignored
 # Columns appended to the matched CSV; a row with a non-empty manual_id or
-# match_conf counts as matched (skipped on a re-run unless --redo-all)
-MATCH_CSV_COLUMNS = ("manual_id", "manual_label", "manual_label_conf", "match_conf")
+# manual_id_conf counts as matched (skipped on a re-run unless --redo-all). Only
+# the link is stored; the manual set it points to is the sidecar's `matched_to`.
+MATCH_CSV_COLUMNS = ("manual_id", "manual_id_conf")
+# Columns of older matched CSVs: copies of the manual annotation (dropped on save)
+# and the former name of manual_id_conf (migrated on save)
+MATCH_LEGACY_COLUMNS = ("manual_label", "manual_label_conf", "match_conf")
 MATCH_REVIEW_CROP_PX = 600  # px; size of each image panel in the review PDF
 MATCH_REVIEW_MIN_CROP_PX = 1000  # full-res px; minimum crop side (context)
