@@ -783,6 +783,22 @@ def handle_head(args):
     if is_stratified(input_path):
         print()
         print(StratifiedPly(input_path).summary())
+    if init.baseline_id:
+        print()
+        print(f"baseline: {init.baseline_id} ({_baseline_status(init)})")
+
+
+def _baseline_status(init) -> str:
+    """``fresh``, ``stale`` or why not, for a project with a baseline_id."""
+    if init.baseline_transform is None:
+        return "no baseline_transform"
+    path = init.find_baseline_project()
+    if not path:
+        return "not found"
+    baseline = ProjectInitializer(path=path)
+    if init.world_transform_is_stale(baseline):
+        return "stale; run `substrata baseline --update`"
+    return "fresh"
 
 
 def handle_scalebars(args):
@@ -1112,6 +1128,13 @@ def handle_orient(args):
         # Propagate updated world_transform to cameras/markers/annotations
         init.apply_world_transform(skip_pcd=True)
 
+    if init.baseline_id:
+        print(
+            f"Warning: {init.id} inherits its frame from baseline "
+            f"{init.baseline_id}; this orientation replaces it and "
+            "`substrata baseline --update` would restore the baseline's. Remove "
+            "baseline_id/baseline_transform from the YAML to keep this one."
+        )
     # Always save values to YAML
     yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
     init.save_config_to_yaml(yaml_path)
@@ -1759,9 +1782,14 @@ def handle_align(args):
         raise SystemExit(
             "align --output-yaml requires a project YAML or directory as --source"
         )
-    if args.as_parent and (src["init"] is None or tgt["init"] is None):
+    if args.as_parent and args.as_baseline:
+        raise SystemExit("align: use either --as-parent or --as-baseline")
+    link = "--as-parent" if args.as_parent else "--as-baseline"
+    if (args.as_parent or args.as_baseline) and (
+        src["init"] is None or tgt["init"] is None
+    ):
         raise SystemExit(
-            "align --as-parent requires project YAMLs or directories as --source "
+            f"align {link} requires project YAMLs or directories as --source "
             "and --target"
         )
 
@@ -1818,6 +1846,8 @@ def handle_align(args):
 
     if args.as_parent:
         _write_align_parent(args, src, tgt, T_raw)
+    elif args.as_baseline:
+        _write_align_baseline(args, src, tgt, T_raw)
     elif args.output_yaml:
         init = src["init"]
         old = np.asarray(init.world_transform, dtype=float)
@@ -1831,6 +1861,23 @@ def handle_align(args):
         _save_align_qc_pdf(
             args, src, tgt, T_raw, T_final, cam_fit, metrics, src_pcd, tgt_pcd
         )
+
+
+def _align_link_yaml(args, init, flag: str) -> str:
+    """The YAML that align --as-parent/--as-baseline writes its keys to.
+
+    The source project YAML itself, or a copy of it at ``--output-yaml``.
+    """
+    out = args.output_yaml or init.yaml_path
+    if not out:
+        raise SystemExit(
+            f"align {flag}: the source has no project YAML; pass --output-yaml"
+        )
+    if args.output_yaml and init.yaml_path and os.path.isfile(init.yaml_path):
+        shutil.copyfile(init.yaml_path, out)
+    elif not os.path.isfile(out):
+        init.save_config_to_yaml(out)
+    return out
 
 
 def _write_align_parent(args, src: dict, tgt: dict, T_raw: np.ndarray) -> None:
@@ -1855,19 +1902,39 @@ def _write_align_parent(args, src: dict, tgt: dict, T_raw: np.ndarray) -> None:
             f"Scale ratio (parent m per local m): {ratio:.5f} "
             f"({(ratio - 1) * 100:+.2f} %)"
         )
-    out = args.output_yaml or init.yaml_path
-    if not out:
-        raise SystemExit(
-            "align --as-parent: the source has no project YAML; pass --output-yaml"
-        )
-    if args.output_yaml and init.yaml_path and os.path.isfile(init.yaml_path):
-        shutil.copyfile(init.yaml_path, out)
-    elif not os.path.isfile(out):
-        init.save_config_to_yaml(out)
+    out = _align_link_yaml(args, init, "--as-parent")
     set_project_yaml_keys(
         out, {"parent_id": parent.id, "parent_transform": init.parent_transform}
     )
     print(f"Wrote parent_id={parent.id} and parent_transform to {out}")
+
+
+def _write_align_baseline(args, src: dict, tgt: dict, T_raw: np.ndarray) -> None:
+    """Store the target as the source project's baseline (align --as-baseline).
+
+    Writes ``baseline_id`` and ``baseline_transform`` (raw source → raw target)
+    and the frame inherited from the baseline: ``world_transform`` (=
+    baseline ``world_transform @ baseline_transform``) with the scale factor
+    and depth model carried over. In place, or to a copy at ``--output-yaml``.
+    """
+    from substrata.initializer import set_project_yaml_keys
+
+    init, baseline = src["init"], tgt["init"]
+    if baseline.world_transform_is_identity:
+        print(f"Warning: baseline {baseline.id} has no world_transform yet")
+    init.baseline_id = baseline.id
+    init.baseline_transform = np.asarray(T_raw, dtype=float)
+    keys = init.baseline_world_keys(baseline)
+    out = _align_link_yaml(args, init, "--as-baseline")
+    set_project_yaml_keys(
+        out,
+        {"baseline_id": baseline.id, "baseline_transform": init.baseline_transform,
+         **keys},
+    )
+    print(
+        f"Wrote baseline_id={baseline.id}, baseline_transform and the inherited "
+        f"{', '.join(keys)} to {out}"
+    )
 
 
 def _save_align_qc_pdf(
@@ -2512,6 +2579,48 @@ def _pr_prompt_missing(label, name, old_path):
     return _pr_prompt_manual()
 
 
+def _pr_prompt_missing_dir(label, old_dir, n):
+    """Ask what to do with a folder none of whose images can be found.
+
+    Typically a photo folder deliberately left out of a local copy, so it is
+    asked once per folder instead of once per image.
+
+    Args:
+        label (str): What the images belong to, e.g. "Camera".
+        old_dir (str): The stored folder.
+        n (int): Number of images stored in it.
+
+    Returns:
+        tuple: ``(action, path)`` where action is "skip", "skip_all", "pick"
+        (path is the new folder), "each" or "abort".
+    """
+    print(
+        f"\n{label} folder {old_dir}: none of its {n} image(s) found under the "
+        "search root"
+    )
+    while True:
+        ans = input(
+            "[s]kip folder, skip [all] missing folders, [p]ath to the folder, "
+            "[i]ndividually, [a]bort: "
+        ).strip()
+        low = ans.lower()
+        if low in ("a", "abort"):
+            return ("abort", None)
+        if low in ("s", "skip") or not ans:
+            return ("skip", None)
+        if low == "all":
+            return ("skip_all", None)
+        if low in ("i", "individually"):
+            return ("each", None)
+        if low in ("p", "path"):
+            path = os.path.expanduser(input("Folder path: ").strip())
+            if os.path.isdir(path):
+                return ("pick", os.path.abspath(path))
+            print(f"  Not an existing directory: {path}")
+            continue
+        print("  Not a valid choice.")
+
+
 def _pr_prompt_manual():
     """Read a path from the user, re-prompting until it exists.
 
@@ -2580,6 +2689,24 @@ def _print_cams_report(plan, max_rows, title="Camera images", unit="cameras"):
             print(f"      {name(cam_id)}  {new_path}")
         if len(individual) > max_rows:
             print(f"      ... {len(individual) - max_rows} more")
+
+
+def _print_skipped_dirs(plan, max_rows):
+    """List the folders skipped as a whole, with their image counts."""
+    from substrata.pathrepair import path_dirname
+
+    if not plan.skipped_dirs:
+        return
+    counts = {}
+    for path in plan.skipped.values():
+        d = path_dirname(path)
+        if d in plan.skipped_dirs:
+            counts[d] = counts.get(d, 0) + 1
+    print(f"  in {len(plan.skipped_dirs)} skipped folder(s):")
+    for d in sorted(counts)[:max_rows]:
+        print(f"    {d}  ({counts[d]})")
+    if len(counts) > max_rows:
+        print(f"    ... {len(counts) - max_rows} more")
 
 
 def handle_path_repair(args):
@@ -2774,6 +2901,13 @@ def handle_path_repair(args):
                     ),
                     # Folders already mapped for the cameras need no new answer
                     dir_map=cplan.dir_map if cplan is not None else None,
+                    on_missing_dir=(
+                        (lambda d, n: _pr_prompt_missing_dir(
+                            "Annotation image", d, n))
+                        if interactive else None
+                    ),
+                    # ... and folders skipped for the cameras are skipped again
+                    skip_dirs=cplan.skipped_dirs if cplan is not None else None,
                 )
             except pr.PathAborted:
                 raise SystemExit("Aborted; nothing written.")
@@ -2818,13 +2952,19 @@ def handle_path_repair(args):
     ann_changes = aplan.changes if aplan is not None else {}
     n_sidecar_keys = sum(len(c) for c in sidecar_changes.values())
     if not (yaml_changes or cam_changes or sidecar_changes or ann_changes):
-        if aplan is not None and aplan.skipped:
-            print(
-                f"\nNothing to repair; {len(aplan.skipped)} annotation image "
-                "path(s) could not be found under the search root."
-            )
-        else:
+        left = [
+            (plan, what)
+            for plan, what in ((cplan, "camera image"), (aplan, "annotation image"))
+            if plan is not None and plan.skipped
+        ]
+        if not left:
             print("\nNothing to repair; all paths already resolve.")
+        for plan, what in left:
+            print(
+                f"\nNothing to repair; {len(plan.skipped)} {what} path(s) "
+                "skipped or not found under the search root."
+            )
+            _print_skipped_dirs(plan, max_rows)
         return
 
     # ---- Report -----------------------------------------------------------
@@ -2835,6 +2975,7 @@ def handle_path_repair(args):
         print(f"\nCamera images already valid: {len(cplan.unchanged)}")
         if cplan.skipped:
             print(f"Camera images skipped:       {len(cplan.skipped)}")
+        _print_skipped_dirs(cplan, max_rows)
         empty = pr.zero_byte_paths(list(cam_changes.values()))
         if empty:
             print(f"Warning: {len(empty)} matched image(s) are zero bytes.")
@@ -2848,6 +2989,7 @@ def handle_path_repair(args):
         print(f"  in {n_csvs} annotation CSV(s)")
         if aplan.skipped:
             print(f"Annotation images not found:  {len(aplan.skipped)}")
+        _print_skipped_dirs(aplan, max_rows)
 
     if getattr(args, "dry_run", False):
         print("\nDry run: nothing written.")
@@ -3024,6 +3166,11 @@ def _plan_camera_paths(
             ),
             on_missing=(
                 (lambda cid, old: _pr_prompt_missing("Camera", cid, old))
+                if interactive
+                else None
+            ),
+            on_missing_dir=(
+                (lambda d, n: _pr_prompt_missing_dir("Camera", d, n))
                 if interactive
                 else None
             ),
@@ -3666,6 +3813,174 @@ def handle_transform(args):
 
     anns.save(output_path, orig_coords_only=True)
     print(f"Saved transformed annotations to {output_path}")
+
+
+def _project_yamls(target: str) -> list[str]:
+    """Project YAMLs at ``target``: a YAML, a project dir, or a folder of them.
+
+    A folder is searched up to two levels down (e.g. a site folder holding
+    ``<plot>/<timepoint>/<timepoint>.yaml``).
+    """
+    if os.path.isfile(target):
+        return [os.path.abspath(target)]
+    dirs, level = [os.path.abspath(target)], [os.path.abspath(target)]
+    for _ in range(2):
+        level = [
+            e.path for d in level for e in sorted(os.scandir(d), key=lambda e: e.name)
+            if e.is_dir() and not e.name.startswith(".")
+        ]
+        dirs += level
+    yamls = [os.path.join(d, f"{os.path.basename(d)}.yaml") for d in dirs]
+    return [y for y in yamls if os.path.isfile(y)]
+
+
+def _frame_change(W_old: np.ndarray, W_new: np.ndarray) -> str:
+    """Describe the world-frame change ``W_new @ inv(W_old)`` in a few words."""
+    D = W_new @ np.linalg.inv(W_old)
+    s = float(np.cbrt(np.linalg.det(D[:3, :3])))
+    cos = (np.trace(D[:3, :3] / s) - 1) / 2
+    angle = float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+    return (
+        f"rotation {angle:.3f} deg, origin shift {np.linalg.norm(D[:3, 3]):.4f}, "
+        f"scale x{s:.5f}"
+    )
+
+
+def handle_baseline(args):
+    """Check (and refresh) world_transforms inherited from a baseline timepoint.
+
+    A project with ``baseline_id``/``baseline_transform`` caches the baseline's
+    frame in its ``world_transform``. This reports per project whether that
+    cache still matches the baseline's current ``world_transform``; with
+    ``--update`` stale caches (and the scale factor and depth model carried
+    over with them) are rewritten in place, baselines before their dependants.
+    ``--link`` instead adds the link to YAMLs whose ``world_transform`` was
+    built from the baseline before links existed.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    from substrata.initializer import set_project_yaml_keys
+
+    targets = args.projects or [os.getcwd()]
+    yamls = list(dict.fromkeys(y for t in targets for y in _project_yamls(t)))
+    if not yamls:
+        raise SystemExit(f"baseline: no project YAMLs found in {', '.join(targets)}")
+    projects = {}
+    for y in yamls:
+        init = ProjectInitializer(yaml=y)
+        projects.setdefault(init.id, init)
+    search = [os.path.dirname(os.path.dirname(y)) for y in yamls]
+
+    def _load(ref, near):
+        if ref in projects:
+            return projects[ref]
+        path = ref if os.path.exists(ref) else near.find_project(ref, search)
+        if not path:
+            return None
+        init = (
+            ProjectInitializer(path=path)
+            if os.path.isdir(path)
+            else ProjectInitializer(yaml=path)
+        )
+        return projects.setdefault(init.id, init)
+
+    def _write(init, values):
+        if args.update or args.link:
+            set_project_yaml_keys(init.yaml_path, values)
+            print(f"  updated {init.yaml_path}")
+
+    if args.link:
+        # Only the projects named, never every plot found in a folder
+        link_yamls = [
+            t if os.path.isfile(t)
+            else os.path.join(t, f"{os.path.basename(os.path.abspath(t))}.yaml")
+            for t in targets
+        ]
+        for y in link_yamls:
+            if not os.path.isfile(y):
+                raise SystemExit(f"baseline --link: {y} is not a project YAML")
+        print()
+        for y in link_yamls:
+            init = ProjectInitializer(yaml=y)
+            baseline = _load(args.link, init)
+            if baseline is None:
+                raise SystemExit(f"baseline --link: {args.link} not found")
+            if baseline.id == init.id:
+                continue
+            init.baseline_id = baseline.id
+            init.baseline_transform = np.linalg.inv(
+                np.asarray(baseline.world_transform, dtype=float)
+            ) @ np.asarray(init.world_transform, dtype=float)
+            print(f"{init.id}: linked to baseline {baseline.id}")
+            _write(
+                init,
+                {"baseline_id": baseline.id,
+                 "baseline_transform": init.baseline_transform,
+                 **init.baseline_world_keys(baseline)},
+            )
+        return
+
+    done, visiting, counts = set(), set(), {}
+
+    def _resolve(init):
+        """Bring init's cached frame up to date (in memory), baselines first."""
+        if init.id in done or not init.baseline_id:
+            return
+        if init.id in visiting:
+            raise SystemExit(f"baseline: cycle in baseline links at {init.id}")
+        visiting.add(init.id)
+        status = None
+        if init.baseline_transform is None:
+            status = "no baseline_transform"
+        else:
+            baseline = _load(init.baseline_id, init)
+            if baseline is None:
+                status = f"baseline {init.baseline_id} not found"
+        if status:
+            print(f"{init.id}: {status}")
+            status = "unresolved"
+        else:
+            _resolve(baseline)
+            if init.world_transform_is_stale(baseline):
+                change = _frame_change(
+                    init.world_transform, init.world_transform_from_baseline(baseline)
+                )
+                status = "stale"
+                print(f"{init.id}: stale vs baseline {baseline.id} ({change})")
+                keys = init.baseline_world_keys(baseline)
+                init.world_transform = keys["world_transform"]
+                for k in ("scale_factor", "up_vector", "depth_offset",
+                          "depth_per_unit"):
+                    if k in keys:
+                        setattr(init, k, keys[k])
+                if init.yaml_path in yamls:
+                    _write(init, keys)
+                    status = "updated" if args.update else status
+                else:
+                    print(f"  not written: {init.yaml_path} is outside {targets}")
+            else:
+                status = "fresh"
+                print(f"{init.id}: fresh (baseline {baseline.id})")
+        counts[status] = counts.get(status, 0) + 1
+        visiting.discard(init.id)
+        done.add(init.id)
+
+    print()
+    for init in list(projects.values()):
+        _resolve(init)
+    if not counts:
+        print("No projects with a baseline_id")
+        return
+    print("\n" + ", ".join(f"{n} {k}" for k, n in counts.items()))
+    if counts.get("stale"):
+        print("Run with --update to refresh the stale world_transforms.")
+    if counts.get("updated"):
+        print(
+            "The world_* columns of these plots' annotation CSVs (and their "
+            "sidecar world_transform) still follow the old frame; orig_* are "
+            "unaffected."
+        )
 
 
 def _find_metashape_executable(explicit: str | None) -> str:
@@ -4423,7 +4738,8 @@ def main():
     p_head = subparsers.add_parser(
         "head",
         help="Show first N vertex rows from a PLY file (and, for a stratified PLY, "
-        "its index summary).",
+        "its index summary; for a plot with a baseline_id, whether its "
+        "world_transform still follows the baseline).",
     )
     p_head.add_argument(
         "--input",
@@ -5051,8 +5367,8 @@ def main():
         default=None,
         help=(
             "Write a copy of the source project YAML with world_transform set "
-            "to the raw source → oriented target transform (with --as-parent: "
-            "a copy with the parent link added instead)"
+            "to the raw source → oriented target transform (with --as-parent "
+            "or --as-baseline: a copy with the link added instead)"
         ),
     )
     p_align.add_argument(
@@ -5063,6 +5379,18 @@ def main():
             "Keep the source world_transform and store the target as its parent "
             "instead: parent_id and parent_transform (raw source → raw target) "
             "are written to the source YAML (or to --output-yaml)"
+        ),
+    )
+    p_align.add_argument(
+        "--as-baseline",
+        dest="as_baseline",
+        action="store_true",
+        help=(
+            "The target is an earlier timepoint whose frame the source inherits: "
+            "writes baseline_id, baseline_transform (raw source → raw target) "
+            "and world_transform = target world_transform @ baseline_transform "
+            "(plus scale factor and depth model) to the source YAML (or to "
+            "--output-yaml). See `substrata baseline` to refresh it later"
         ),
     )
     p_intercepts.add_argument(
@@ -5841,6 +6169,45 @@ def main():
         ),
     )
 
+    # baseline
+    p_baseline = subparsers.add_parser(
+        "baseline",
+        help=(
+            "Check that world_transforms inherited from a baseline timepoint "
+            "(baseline_id/baseline_transform) still match the baseline, and "
+            "refresh them with --update"
+        ),
+    )
+    p_baseline.add_argument(
+        "projects",
+        nargs="*",
+        metavar="PROJECT",
+        help=(
+            "Project YAMLs or dirs, or folders of them (searched two levels "
+            "down, e.g. a site folder); default: the current directory"
+        ),
+    )
+    p_baseline.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Rewrite stale world_transforms (with scale factor and depth model) "
+            "in place; baselines are refreshed before their dependants"
+        ),
+    )
+    p_baseline.add_argument(
+        "--link",
+        metavar="BASELINE",
+        default=None,
+        help=(
+            "Add baseline_id/baseline_transform to the given projects, whose "
+            "world_transform was already built from this baseline (dir, YAML or "
+            "id); baseline_transform = inv(baseline world_transform) @ "
+            "world_transform, so only valid if the baseline was not re-oriented "
+            "since"
+        ),
+    )
+
     # path-repair
     p_pathrepair = subparsers.add_parser(
         "path-repair",
@@ -6250,6 +6617,7 @@ def main():
         "camsync": handle_camsync,
         "path-repair": handle_path_repair,
         "transform": handle_transform,
+        "baseline": handle_baseline,
         "train": handle_train,
     }
     handlers[args.command](args)

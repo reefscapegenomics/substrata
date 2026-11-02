@@ -197,6 +197,80 @@ class TestResolveImagePaths(unittest.TestCase):
             # The resolver must not mutate what it was handed.
             self.assertEqual(stored, snapshot)
 
+    def _folders_case(self, tmp):
+        """dive1 was moved, dive2/dive3 are left out; dive4 is partly missing."""
+        cp = _load_pathrepair()
+        for i in (1, 2):
+            _touch(os.path.join(tmp, "new", "dive1", f"A_{i}.JPG"))
+        _touch(os.path.join(tmp, "new", "dive4", "D_1.JPG"))
+        stored = {}
+        for dive, prefix in (("dive1", "A"), ("dive2", "B"), ("dive3", "C"),
+                             ("dive4", "D")):
+            for i in (1, 2):
+                stored[f"{prefix}{i}"] = f"/old/{dive}/{prefix}_{i}.JPG"
+        return cp, stored, cp.build_image_index(tmp, quiet=True)
+
+    def test_missing_folder_is_asked_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cp, stored, index = self._folders_case(tmp)
+            dir_calls, file_calls = [], []
+
+            def on_missing_dir(old_dir, n):
+                dir_calls.append((old_dir, n))
+                return ("skip", None)
+
+            def on_missing(cam_id, old):
+                file_calls.append(cam_id)
+                return ("skip", None)
+
+            plan = cp.resolve_image_paths(
+                stored, index, on_missing=on_missing, on_missing_dir=on_missing_dir
+            )
+            # One question per entirely missing folder; the partly missing
+            # dive4 still asks per image
+            self.assertEqual(dir_calls, [("/old/dive2", 2), ("/old/dive3", 2)])
+            self.assertEqual(file_calls, ["D2"])
+            self.assertEqual(plan.skipped_dirs, {"/old/dive2", "/old/dive3"})
+            self.assertEqual(set(plan.skipped), {"B1", "B2", "C1", "C2", "D2"})
+            self.assertEqual(set(plan.changes), {"A1", "A2", "D1"})
+
+    def test_skip_all_and_seeded_skip_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cp, stored, index = self._folders_case(tmp)
+            calls = []
+            plan = cp.resolve_image_paths(
+                stored, index, on_missing=lambda *a: ("skip", None),
+                on_missing_dir=lambda d, n: calls.append(d) or ("skip_all", None),
+            )
+            self.assertEqual(calls, ["/old/dive2"])
+            self.assertEqual(plan.skipped_dirs, {"/old/dive2", "/old/dive3"})
+
+            # A later plan (annotation images) skips those folders unasked
+            again = cp.resolve_image_paths(
+                {"x": "/old/dive3/C_1.JPG"}, index,
+                on_missing_dir=lambda d, n: self.fail("asked again"),
+                skip_dirs=plan.skipped_dirs,
+            )
+            self.assertEqual(again.skipped, {"x": "/old/dive3/C_1.JPG"})
+
+    def test_missing_folder_mapped_to_a_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside:
+            cp, stored, index = self._folders_case(tmp)
+            # dive2 exists outside the search root
+            for i in (1, 2):
+                _touch(os.path.join(outside, f"B_{i}.JPG"))
+            plan = cp.resolve_image_paths(
+                stored, index, on_missing=lambda *a: ("skip", None),
+                on_missing_dir=lambda d, n: (
+                    ("pick", outside) if d.endswith("dive2") else ("each", None)
+                ),
+            )
+            self.assertEqual(plan.changes["B1"], os.path.join(outside, "B_1.JPG"))
+            self.assertEqual(plan.skipped_dirs, set())
+            # "each" falls back to the per-image question
+            self.assertIn("C1", plan.skipped)
+
     def test_missing_callback_required_when_non_interactive(self) -> None:
         cp = _load_pathrepair()
         with tempfile.TemporaryDirectory() as tmp:

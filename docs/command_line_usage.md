@@ -115,6 +115,8 @@ substrata ply-repair --input pointcloud.ply --output pointcloud_fixed.ply
 
 Show the first N vertex rows from a PLY file. For a stratified PLY (see `substrata stratify`) it also prints the index summary: point count and properties, bounding box, clusters, rounds and the prefix ends (how many leading points form each uniform subsample).
 
+For a project with a `baseline_id` it also says whether its `world_transform` still follows the baseline (see `substrata baseline`).
+
 Usage: `substrata head [--input PLY] [-n N]`
 
 ```bash
@@ -416,7 +418,7 @@ substrata intercepts-plot --fit-grid --animation-order categories
 
 Register a source to a target and print the alignment transform. `--source` and `--target` each take a PLY file, a project YAML (detected by the `.yaml`/`.yml` extension) or a project directory (resolved like other subcommands: its `<dirname>.yaml` if present, otherwise filename conventions).
 
-Usage: `substrata align --source PLY|YAML|DIR --target PLY|YAML|DIR [--cameras [--max-residual M] [--refine]] [--pdf PDF] [--no-scaling] [--voxel-size V] [--points N] [--output-yaml YAML] [--as-parent]`
+Usage: `substrata align --source PLY|YAML|DIR --target PLY|YAML|DIR [--cameras [--max-residual M] [--refine]] [--pdf PDF] [--no-scaling] [--voxel-size V] [--points N] [--output-yaml YAML] [--as-parent | --as-baseline]`
 
 The transform is always fitted between the **raw** (untransformed) models. Two matrices are printed:
 
@@ -448,6 +450,14 @@ The plots come from `visualizations.plot_pcd_context`, `plot_pcd_correspondence`
 - `parent_id`: the target's id.
 - `parent_transform`: the fitted raw source → raw target transform, scale included. It maps the source's orig coords to the parent's orig coords, the frame the parent's cameras use. So points move between the two models exactly, e.g. annotations to reproject in the parent's images (see `substrata transform --to-parent`).
 
+`--as-baseline` is for later **timepoints** of the same plot. The target is the baseline timepoint whose orientation and scale the source inherits, because part of that orientation is arbitrary and can't simply be redone. It writes the link and the inherited frame to the source project YAML (or a copy at `--output-yaml`), keeping the rest of the file as is:
+
+- `baseline_id`: the target's id.
+- `baseline_transform`: the fitted raw source → raw target transform, scale included. It never changes after fitting.
+- `world_transform` = baseline `world_transform @ baseline_transform`, and the `scale_factor` and depth model (`up_vector`, `depth_offset`, `depth_per_unit`) carried over from the baseline. These are a **cache**, so the YAML still loads on its own. When the baseline is re-oriented, `substrata baseline` reports the cache as stale and `--update` refreshes it (see [Baseline timepoints](#baseline-timepoints-baseline)).
+
+Unlike plain `--output-yaml`, which writes the same `world_transform` but no link, this keeps track of where the frame came from.
+
 The command also prints the scale ratio implied between the two world frames, `parent.world_transform @ parent_transform @ inv(world_transform)`. A value of 1 means both plots' scale factors agree. In Python, `ProjectInitializer.to_parent_world_transform(parent)` gives that transform, `parent_scale_ratio(parent)` gives the ratio, and `find_parent_project()` locates the parent's folder by `parent_id`. It searches sibling and ancestor folders, plus any extra folders you pass.
 
 ```bash
@@ -472,6 +482,45 @@ substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --refi
 # Keep the focal plot's own world_transform; store the AUV model as its parent
 substrata align --source focal/focal.yaml --target auv/auv.yaml --cameras --refine \
     --as-parent
+
+# A later timepoint inherits the frame of the baseline timepoint
+substrata align --source cur_sna_20m_20240305/ --target cur_sna_20m_20200303/ \
+    --cameras --refine --as-baseline
+```
+
+### Which transform key means what
+
+| keys | relation | `world_transform` of this plot |
+| --- | --- | --- |
+| `world_transform` only | own frame (scalebars + orientation) | its own |
+| `parent_id` + `parent_transform` | placed inside a larger plot (e.g. AUV); orig → parent orig | its own (local scale kept) |
+| `baseline_id` + `baseline_transform` | later timepoint of the same plot; orig → baseline orig | inherited: baseline `world_transform @ baseline_transform` (cached) |
+
+A later timepoint needs no `parent_*` keys of its own: its placement in the parent is the baseline's `parent_transform @ baseline_transform`.
+
+## Baseline timepoints (baseline)
+
+Check that the `world_transform` of later timepoints still follows their baseline timepoint (`baseline_id`/`baseline_transform`, written by `align --as-baseline`), and refresh it when the baseline was re-oriented.
+
+Usage: `substrata baseline [PROJECT ...] [--update] [--link BASELINE]`
+
+`PROJECT` is a project YAML or directory, or a folder of them, searched two levels down (e.g. a site folder `<site>/<plot>/<timepoint>/`). The default is the current directory. Baselines are looked up among those projects first, then like `find_project` (sibling and ancestor folders).
+
+- **Default (dry run)**: for each project with a `baseline_id`, prints `fresh`, `stale` (with how much the frame moved: rotation, origin shift, scale), or why it can't be checked. A stale cache is detected without any extra key: the baseline frame it was built from is `world_transform @ inv(baseline_transform)`. Chains (tp3 → tp2 → tp1) are followed, so tp3 is reported stale when tp1 changed.
+- **`--update`**: rewrites the stale `world_transform`, `scale_factor` and depth model in place, baselines before their dependants. Only the YAMLs found under `PROJECT` are written. The `world_*` columns of those plots' annotation CSVs (and their sidecar `world_transform`) still follow the old frame. `orig_*` are unaffected.
+- **`--link BASELINE`**: adds the link to YAMLs whose `world_transform` was built from the baseline before links existed (e.g. by `align --output-yaml`): `baseline_transform = inv(baseline world_transform) @ world_transform`. This is only right if the baseline hasn't been re-oriented since. `BASELINE` is a project directory, YAML or id. Only the projects named are linked, never a whole folder.
+
+Re-orienting a later timepoint with `substrata orient` gives it its own frame; it prints a warning, since `baseline --update` would restore the baseline's. `substrata head` shows `baseline: <id> (fresh|stale|not found)` for a project with a `baseline_id`.
+
+```bash
+# Check all timepoints of a site after re-orienting a baseline
+substrata baseline /data/cur_sna
+
+# Refresh the stale ones
+substrata baseline /data/cur_sna --update
+
+# Link an existing timepoint that was aligned with --output-yaml
+substrata baseline cur_sna_20m_20240305/ --link cur_sna_20m_20200303
 ```
 
 ## Image matches
@@ -664,6 +713,8 @@ A project records absolute paths in two places, and moving it breaks both at onc
 Phase A repairs the project file paths in the YAML, and the path keys of each annotation sidecar (written relative to the sidecar, e.g. `classes.csv` or `../classes.csv`). Phase B repairs the per-camera image paths in the meta JSON. Phase C repairs the `cam_filepath` cells of the point CSVs in `<id>.annos/` (any CSV with `id` and `x`/`orig_x`, `y`/`orig_y`, `z`/`orig_z` columns); it reuses phase B's folder mappings, so a folder answered once fixes both, and writes a backup of each changed CSV to `backup/`. The `.cams.xml` is never modified, since it stores image *labels*, not paths. Use `--yaml-only` (phase A) or `--cams-only` (phases B and C) to run part of it, and `--no-annotations` to leave the annotation sets alone.
 
 Each broken path is resolved by trying, in order: the conventional filename in the project folder, then a recursive search by basename, then asking you. The YAML's `path:` key is repaired first, because every relative value beneath it resolves against that key — one stale `path:` is usually the whole problem. Repaired YAML entries that sit inside the project folder are written as **bare filenames**, so the YAML stays portable and survives the next move.
+
+**Missing photo folders** (e.g. a local copy that deliberately leaves out the AUV or video-frame images) are asked about once per folder, not once per image. When none of a folder's images can be found, you choose: `s` skips the folder, `all` skips it and every further missing folder, `p` gives the folder's new location, `i` asks per image as before, and `a` aborts. Skipped folders are listed with their image counts in the report, and phase C skips the same folders without asking again. Their paths are left as they are, so a later run on a machine that has the images can still repair them. A folder of which only some images are missing is still asked per image.
 
 The YAML is patched line by line, preserving comments, key order and any keys substrata does not itself use. (The initializer's own `save_config_to_yaml` rebuilds the file from scratch and drops anything it does not model, so it is not used here.)
 

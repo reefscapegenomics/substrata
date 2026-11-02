@@ -30,6 +30,9 @@ from substrata.logging import logger
 Decision = Tuple[str, Optional[str]]
 DuplicateCallback = Callable[[str, str, List[str]], Decision]
 MissingCallback = Callable[[str, str], Decision]
+# Called as (old_dir, n_images) for a folder none of whose images can be found;
+# also returns ("skip_all", None) or ("each", None), see resolve_image_paths.
+MissingDirCallback = Callable[[str, int], Decision]
 
 _SEP_RE = re.compile(r"[\\/]+")
 
@@ -49,6 +52,8 @@ class PathPlan:
         skipped: Camera id to stored filepath, for cameras the user skipped.
         missing: Camera id to filepath that does not exist on disk.
         dir_map: Remembered old-directory to new-directory mappings.
+        skipped_dirs: Stored directories skipped as a whole (none of their
+            images found).
         n_duplicate_prompts: Number of duplicate decisions put to the user.
         n_missing_prompts: Number of missing-file decisions put to the user.
     """
@@ -59,6 +64,7 @@ class PathPlan:
     skipped: Dict[str, str] = field(default_factory=dict)
     missing: Dict[str, str] = field(default_factory=dict)
     dir_map: Dict[str, str] = field(default_factory=dict)
+    skipped_dirs: set = field(default_factory=set)
     n_duplicate_prompts: int = 0
     n_missing_prompts: int = 0
 
@@ -205,6 +211,8 @@ def resolve_image_paths(
     on_duplicate: Optional[DuplicateCallback] = None,
     on_missing: Optional[MissingCallback] = None,
     dir_map: Optional[Dict[str, str]] = None,
+    on_missing_dir: Optional[MissingDirCallback] = None,
+    skip_dirs: Optional[set] = None,
 ) -> PathPlan:
     """Resolve each camera's stored path to a file found under the search root.
 
@@ -228,6 +236,14 @@ def resolve_image_paths(
     is always verified with :func:`os.path.isfile` before use, so a wrong
     mapping cannot fabricate a path; it simply falls through to a prompt.
 
+    Before that, stored folders none of whose images can be found (not on
+    disk, not in the index, not via ``dir_map``) are put to ``on_missing_dir``
+    once per folder, e.g. photo folders deliberately left out of a local
+    copy. It returns ``("skip", None)`` to skip the folder's images,
+    ``("skip_all", None)`` to skip this and every further missing folder,
+    ``("pick", new_dir)`` to map the folder, ``("each", None)`` to resolve its
+    images one by one as usual, or ``("abort", None)``.
+
     Args:
         paths: Camera id to currently stored filepath.
         index: Basename index from :func:`build_image_index`.
@@ -238,6 +254,11 @@ def resolve_image_paths(
             Same return contract.
         dir_map: Old-to-new directory mappings to start from (e.g. those of
             an earlier plan), so a folder already answered is not asked again.
+        on_missing_dir: Called as ``(old_dir, n_images)`` for a folder none
+            of whose images is found. Without it, such images are resolved
+            one by one.
+        skip_dirs: Stored folders to skip without asking when none of their
+            images is found (e.g. ``skipped_dirs`` of an earlier plan).
 
     Returns:
         PathPlan: The planned changes.
@@ -249,9 +270,32 @@ def resolve_image_paths(
     """
     plan = PathPlan(stored=dict(paths))
     plan.dir_map.update(dir_map or {})
+    skip_known = set(skip_dirs or ())
+    skip_all = False
+    pre_skipped = set()
+    for old_dir, ids in sorted(_missing_dirs(paths, index, plan.dir_map).items()):
+        if old_dir in skip_known or skip_all:
+            action, chosen = "skip", None
+        elif on_missing_dir is None:
+            continue
+        else:
+            plan.n_missing_prompts += 1
+            action, chosen = on_missing_dir(old_dir, len(ids))
+        if action == "abort":
+            raise PathAborted(f"Aborted while resolving folder {old_dir}.")
+        if action == "skip_all":
+            skip_all, action = True, "skip"
+        if action == "skip":
+            plan.skipped_dirs.add(old_dir)
+            pre_skipped.update(ids)
+            for cam_id in ids:
+                plan.skipped[cam_id] = paths[cam_id]
+        elif action == "pick" and chosen:
+            plan.dir_map[old_dir] = chosen
+
     for cam_id in sorted(paths):
         stored = paths[cam_id]
-        if not stored:
+        if not stored or cam_id in pre_skipped:
             continue
 
         # 1. Already valid. Never rewrite a working path, even if the index
@@ -316,6 +360,37 @@ def resolve_image_paths(
         _record(plan, cam_id, stored, chosen, old_dir)
 
     return plan
+
+
+def _missing_dirs(
+    paths: Dict[str, str], index: Dict[str, List[str]], dir_map: Dict[str, str]
+) -> Dict[str, List[str]]:
+    """Stored folders none of whose images can be found anywhere.
+
+    A folder qualifies when every stored path in it is absent on disk, has no
+    basename match in the index and no file via a ``dir_map`` mapping.
+
+    Returns:
+        dict[str, list[str]]: Stored directory to the ids of its images.
+    """
+    by_dir: Dict[str, List[str]] = {}
+    found = set()
+    for cam_id, stored in paths.items():
+        if not stored:
+            continue
+        old_dir = path_dirname(stored)
+        by_dir.setdefault(old_dir, []).append(cam_id)
+        if old_dir in found:
+            continue
+        basename = path_basename(stored)
+        mapped = dir_map.get(old_dir)
+        if (
+            basename.lower() in index
+            or (mapped and os.path.isfile(os.path.join(mapped, basename)))
+            or os.path.isfile(stored)
+        ):
+            found.add(old_dir)
+    return {d: sorted(ids) for d, ids in by_dir.items() if d not in found}
 
 
 def _record(

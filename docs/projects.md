@@ -226,6 +226,8 @@ the corresponding object unloaded (or fall back to the default shown).
 | `depth_offset` | float | Offset aligning the z-axis with depth (read-only metadata). |
 | `depth_per_unit` | float | Vertical scale (depth units per model unit; read-only metadata). |
 | `world_transform` | 4×4 list | Cumulative transform applied on `initialize()`. Defaults to the identity matrix. |
+| `parent_id`, `parent_transform` | str, 4×4 list | Optional larger plot this one sits in, and this plot's orig → parent orig transform. `world_transform` stays its own. |
+| `baseline_id`, `baseline_transform` | str, 4×4 list | Optional baseline timepoint whose frame this plot inherits, and this plot's orig → baseline orig transform. `world_transform` (and the scale/depth keys) are then a cached baseline `world_transform @ baseline_transform`; see `substrata baseline`. |
 | `color_correction` | mapping | `matrix` (3×3 or 3×4) and `offset` (length-3) arrays applied to point-cloud colours on load. |
 
 Defaults when opening by `path` with **no** YAML present (filenames are derived

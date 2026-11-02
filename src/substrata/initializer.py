@@ -51,6 +51,11 @@ class ProjectInitializer:
         # init_with_yaml); world_transform stays the local, canonical frame
         self.parent_id = None
         self.parent_transform = None
+        # Optional link to a baseline timepoint (orig -> baseline orig) whose
+        # frame this plot inherits; world_transform is then a cached
+        # baseline.world_transform @ baseline_transform (see init_with_yaml)
+        self.baseline_id = None
+        self.baseline_transform = None
         self.scale_factor = None
         self.up_vector = None
         self.depth_offset = None
@@ -139,6 +144,9 @@ class ProjectInitializer:
         parent_id: "ton_tof_auv"  # optional, larger plot this one sits in
         parent_transform:  # optional, 4x4: this plot's ORIG -> parent's ORIG
         - [...]
+        baseline_id: "ton_tof_60m_20221012"  # optional, timepoint whose frame is used
+        baseline_transform:  # optional, 4x4: this plot's ORIG -> baseline's ORIG
+        - [...]
 
         ``parent_transform`` links the raw (orig) frames of the two models,
         including any scale difference, so points move between them exactly
@@ -146,6 +154,14 @@ class ProjectInitializer:
         depend on either ``world_transform``; this plot's own
         ``world_transform`` (local scale and orientation) stays the frame used
         for measurements. See :meth:`to_parent_world_transform`.
+
+        ``baseline_transform`` links this plot to an earlier timepoint of the
+        same plot whose (partly arbitrary) orientation and scale it inherits.
+        The link is authoritative: ``world_transform`` is then a cache of
+        ``baseline.world_transform @ baseline_transform``, kept so the YAML
+        stands alone. When the baseline is re-oriented the cache goes stale
+        (see :meth:`world_transform_is_stale`; ``substrata baseline --update``
+        refreshes it).
 
         ``annotations`` names the project's default annotation set. Settings of
         an annotation set (``classes``, ``cropped_path``, ``crop_size``,
@@ -214,6 +230,11 @@ class ProjectInitializer:
         parent_transform = yaml_config.get("parent_transform")
         if parent_transform is not None:
             self.parent_transform = np.array(parent_transform, dtype=float)
+
+        self.baseline_id = yaml_config.get("baseline_id")
+        baseline_transform = yaml_config.get("baseline_transform")
+        if baseline_transform is not None:
+            self.baseline_transform = np.array(baseline_transform, dtype=float)
 
         self.firefish_water_level = _parse_optional_float(
             yaml_config.get("firefish_water_level")
@@ -314,20 +335,91 @@ class ProjectInitializer:
         m = self.to_parent_world_transform(parent)[:3, :3]
         return float(np.cbrt(np.linalg.det(m)))
 
-    def find_parent_project(self, search_dirs=None) -> str | None:
-        """Locate the directory of the project named ``parent_id``.
+    def world_transform_from_baseline(
+        self, baseline: "ProjectInitializer"
+    ) -> np.ndarray:
+        """This plot's world_transform in the baseline timepoint's frame.
 
-        Looks for a ``<parent_id>`` folder in each of ``search_dirs`` and then
-        in each ancestor of this project's path, both directly and one level
-        down (e.g. ``<site>/<parent_id>``).
+        ``baseline.world_transform @ baseline_transform``: what
+        ``world_transform`` should be after the baseline was (re)oriented.
 
         Args:
+            baseline: The baseline project (see :meth:`find_baseline_project`).
+
+        Returns:
+            The 4x4 transform.
+        """
+        if self.baseline_transform is None:
+            raise ValueError(f"{self.id}: no baseline_transform set")
+        return np.asarray(baseline.world_transform, dtype=float) @ np.asarray(
+            self.baseline_transform, dtype=float
+        )
+
+    def baseline_world_transform_used(self) -> np.ndarray:
+        """The baseline world_transform that the cached world_transform used.
+
+        ``world_transform @ inv(baseline_transform)``; equal to the baseline's
+        current ``world_transform`` unless the baseline was re-oriented since.
+        """
+        if self.baseline_transform is None:
+            raise ValueError(f"{self.id}: no baseline_transform set")
+        return np.asarray(self.world_transform, dtype=float) @ np.linalg.inv(
+            np.asarray(self.baseline_transform, dtype=float)
+        )
+
+    def world_transform_is_stale(
+        self, baseline: "ProjectInitializer", atol: float = 1e-9
+    ) -> bool:
+        """Whether world_transform no longer follows the baseline's frame."""
+        return not np.allclose(
+            self.world_transform, self.world_transform_from_baseline(baseline),
+            atol=atol,
+        )
+
+    def baseline_world_keys(self, baseline: "ProjectInitializer") -> dict:
+        """The YAML keys derived from the baseline's frame, for this plot.
+
+        ``world_transform`` (see :meth:`world_transform_from_baseline`) plus
+        the baseline's ``scale_factor`` and depth model (``up_vector``,
+        ``depth_offset``, ``depth_per_unit``, all in orig units) carried over
+        through ``baseline_transform``. Keys the baseline lacks are omitted.
+
+        Args:
+            baseline: The baseline project.
+
+        Returns:
+            Mapping of YAML key to value, e.g. for :func:`set_project_yaml_keys`.
+        """
+        T = np.asarray(self.baseline_transform, dtype=float)
+        s = float(np.cbrt(np.linalg.det(T[:3, :3])))
+        keys = {"world_transform": self.world_transform_from_baseline(baseline)}
+        if baseline.scale_factor is not None:
+            keys["scale_factor"] = float(baseline.scale_factor) * s
+        if baseline.up_vector is not None:
+            # depth = up . orig_b + offset, with orig_b = T @ orig
+            up_b = np.asarray(getattr(baseline.up_vector, "xyz", baseline.up_vector))
+            keys["up_vector"] = [float(v) for v in up_b @ T[:3, :3]]
+            if baseline.depth_offset is not None:
+                keys["depth_offset"] = float(up_b @ T[:3, 3] + baseline.depth_offset)
+        if baseline.depth_per_unit is not None:
+            keys["depth_per_unit"] = float(baseline.depth_per_unit) * s
+        return keys
+
+    def find_project(self, project_id: str, search_dirs=None) -> str | None:
+        """Locate the directory of another project (e.g. a parent or baseline).
+
+        Looks for a ``<project_id>`` folder in each of ``search_dirs`` and then
+        in each ancestor of this project's path, both directly and one level
+        down (e.g. ``<site>/<project_id>``).
+
+        Args:
+            project_id: Id (folder name) of the project to find.
             search_dirs: Optional extra directories to search first.
 
         Returns:
-            The parent project directory, or None if not found.
+            The project directory, or None if not found.
         """
-        if not self.parent_id:
+        if not project_id:
             return None
         dirs = [os.path.abspath(d) for d in (search_dirs or [])]
         if self.path:
@@ -339,9 +431,9 @@ class ProjectInitializer:
                 d = parent_dir
                 dirs.append(d)
         for d in dirs:
-            if os.path.basename(d) == self.parent_id:
+            if os.path.basename(d) == project_id:
                 return d
-            hit = os.path.join(d, self.parent_id)
+            hit = os.path.join(d, project_id)
             if os.path.isdir(hit):
                 return hit
             try:
@@ -349,10 +441,24 @@ class ProjectInitializer:
             except OSError:
                 continue
             for entry in subdirs:
-                hit = os.path.join(entry.path, self.parent_id)
+                hit = os.path.join(entry.path, project_id)
                 if entry.is_dir() and os.path.isdir(hit):
                     return hit
         return None
+
+    def find_parent_project(self, search_dirs=None) -> str | None:
+        """Locate the directory of the project named ``parent_id``.
+
+        See :meth:`find_project`.
+        """
+        return self.find_project(self.parent_id, search_dirs)
+
+    def find_baseline_project(self, search_dirs=None) -> str | None:
+        """Locate the directory of the project named ``baseline_id``.
+
+        See :meth:`find_project`.
+        """
+        return self.find_project(self.baseline_id, search_dirs)
 
     def save_config_to_yaml(self, filepath: str | None = None) -> None:
         """
@@ -403,6 +509,10 @@ class ProjectInitializer:
             config["parent_id"] = self.parent_id
         if self.parent_transform is not None:
             config["parent_transform"] = _as_flow_sequence(self.parent_transform)
+        if self.baseline_id is not None:
+            config["baseline_id"] = self.baseline_id
+        if self.baseline_transform is not None:
+            config["baseline_transform"] = _as_flow_sequence(self.baseline_transform)
         # Optional orientation-related fields
         if self.up_vector is not None:
             up_val = getattr(self.up_vector, "xyz", self.up_vector)
@@ -977,10 +1087,12 @@ def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
         lines = f.read().splitlines(keepends=True)
     out, skipping = [], False
     for line in lines:
-        is_top = bool(line.strip()) and not line[0].isspace() and line[0] != "#"
+        # Block-sequence items ("- ...") may start at column 0 and still belong
+        # to the key above
+        is_top = bool(line.strip()) and line[0] not in " \t#-"
         if is_top:
             skipping = line.split(":", 1)[0].strip() in values
-        elif skipping and line.strip() and line[0].isspace():
+        elif skipping and line.strip() and line[0] in " \t-":
             continue
         if not skipping:
             out.append(line)
