@@ -477,7 +477,7 @@ YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
     YamlPathKey("markers", False, ("{id}_markers.csv",)),
     # No default annotation set: a stale value is found by name (also in <id>.annos)
     YamlPathKey("annotations", False, ()),
-    YamlPathKey("classes", False, ("classes.csv",)),
+    YamlPathKey("classes", False, ("{id}.annos/classes.csv", "classes.csv")),
     YamlPathKey("classifier", False, ()),
     YamlPathKey("photos_path", True, ("{id}.photos",)),
     YamlPathKey("cropped_path", True, ("{id}.cropped",)),
@@ -488,8 +488,9 @@ YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
 # substrata.sidecars). Planned with the CSV stem as ``{id}``, so the crops
 # convention is the default ``<csv stem>.cropped``.
 SIDECAR_YAML_PATH_KEYS: Tuple[YamlPathKey, ...] = (
-    # Sidecars sit in <id>.annos/, one level below the project's classes.csv
-    YamlPathKey("classes", False, ("../classes.csv", "classes.csv")),
+    # Sidecars sit in <id>.annos/, next to the default classes.csv (or one
+    # level below the legacy project-folder one)
+    YamlPathKey("classes", False, ("classes.csv", "../classes.csv")),
     YamlPathKey("cropped_path", True, ("{id}.cropped",)),
     YamlPathKey("classifier", False, ()),
     YamlPathKey("matched_to", False, ()),

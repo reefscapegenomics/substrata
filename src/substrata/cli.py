@@ -1275,7 +1275,7 @@ def handle_cams2video(args):
         init.pcd_filepath = args.input
     # Allow explicit override of annotations path
     if args.annotations_file:
-        init.annotations_filepath = args.annotations_file
+        init.use_annotations_file(args.annotations_file)
 
     # Initialize (loads PCD and cameras if available)
     init.initialize()
@@ -3207,7 +3207,7 @@ def _load_annotation_project(args, need_annotations=True, use_ply=True):
     _base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
     if getattr(args, "annotations", None):
-        init.annotations_filepath = args.annotations
+        init.use_annotations_file(args.annotations)
     if not need_annotations:
         init.annotations_filepath = None
     if not use_ply:
@@ -3555,7 +3555,7 @@ def handle_images(args):
         init.pcd_filepath = args.input
     # Allow explicit override of annotations path
     if args.annotations:
-        init.annotations_filepath = args.annotations
+        init.use_annotations_file(args.annotations)
 
     # Resolve annotations
     if not init.annotations_filepath:

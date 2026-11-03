@@ -156,6 +156,9 @@ CROPS_DIR_SUFFIX = ".cropped"  # default crops dir: <annotations csv stem>.cropp
 ANNOTATION_SIDECAR_SUFFIX = ".yaml"
 THUMBNAIL_MAX_SIZE = (1024, 768)  # pixels; bounding box, aspect ratio is kept
 THUMBNAILS_DIR_SUFFIX = ".thumbnails"  # default thumbnails dir: <id>.thumbnails
+# Default label set: next to the annotations CSV, in <id>.annos/, else the
+# project folder (legacy); see ProjectInitializer.default_classes_path
+CLASSES_FILE = "classes.csv"
 MAX_PHOTOS_TO_CROP_DEFAULT = 10  # image matches cropped per annotation
 # How per-crop predictions combine into one prediction per annotation:
 # "weighted" (relevance-weighted mean of class probabilities) or "first".

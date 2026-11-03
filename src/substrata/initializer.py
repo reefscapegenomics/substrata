@@ -43,6 +43,9 @@ class ProjectInitializer:
         self.crop_size = None
         self.thumbnail_path = None
         self.classes_filepath = None
+        # Whether classes_filepath came from a classes.csv convention rather
+        # than a YAML/sidecar key (see default_classes_path); not saved
+        self.classes_from_convention = False
         self.classifier_filepath = None
         # Sidecar YAML of the annotations CSV (see apply_annotation_sidecar)
         self.annotation_sidecar = {}
@@ -534,7 +537,11 @@ class ProjectInitializer:
             config["crop_size"] = int(self.crop_size)
         if self.thumbnail_path is not None:
             config["thumbnails_path"] = self.thumbnail_path
-        if self.classes_filepath is not None and "classes" not in sidecar_keys:
+        if (
+            self.classes_filepath is not None
+            and "classes" not in sidecar_keys
+            and not self.classes_from_convention
+        ):
             config["classes"] = self.classes_filepath
         if self.scale_factor is not None:
             config["scale_factor"] = float(self.scale_factor)
@@ -586,9 +593,58 @@ class ProjectInitializer:
         sets ``classes``, ``cropped_path``, ``crop_size`` and ``classifier`` per
         annotation set, overriding the (legacy) project YAML keys and the folder
         conventions. ``last_highest_id`` only ever raises
-        ``annotations_last_highest_id``, so deleted ids are never reused. Called
-        on construction; call again after changing ``annotations_filepath``.
+        ``annotations_last_highest_id``, so deleted ids are never reused. When
+        neither names a classes file, :meth:`default_classes_path` is used.
+        Called on construction; call again after changing
+        ``annotations_filepath``.
         """
+        self.__read_annotation_sidecar()
+        if self.classes_filepath is None or self.classes_from_convention:
+            self.classes_filepath = self.default_classes_path()
+            self.classes_from_convention = self.classes_filepath is not None
+
+    def use_annotations_file(self, filepath: str) -> None:
+        """Switch to another annotation set and apply its sidecar.
+
+        Every set is handled alike (manual annotations, intercepts, matched
+        points). Its crops folder and id high-water mark belong to the CSV, so
+        those of the previous set are dropped (the crops default to
+        ``<csv stem>.cropped``); ``classes``, ``crop_size`` and ``classifier``
+        carry over unless the new sidecar sets them. Call before
+        :meth:`initialize`.
+
+        Args:
+            filepath: The annotations CSV.
+        """
+        self.annotations_filepath = filepath
+        self.cropped_path = None
+        self.annotations_last_highest_id = None
+        self.annotation_sidecar = {}
+        self.apply_annotation_sidecar()
+
+    def default_classes_path(self) -> str | None:
+        """The conventional classes file, if one exists.
+
+        The first ``classes.csv`` found next to the annotations CSV, in
+        ``<id>.annos/``, or in the project folder (legacy). The label set
+        belongs to the annotation sets, so it sits with them by default; a
+        shared label set elsewhere is named by the sidecar ``classes`` key.
+        """
+        dirs = []
+        if self.annotations_filepath:
+            dirs.append(os.path.dirname(os.path.abspath(self.annotations_filepath)))
+        if self.annos_root:
+            dirs.append(self.annos_root)
+        if self.path:
+            dirs.append(self.path)
+        for d in dirs:
+            candidate = os.path.join(d, settings.CLASSES_FILE)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def __read_annotation_sidecar(self) -> None:
+        """Apply the sidecar keys (see :meth:`apply_annotation_sidecar`)."""
         if not self.annotations_filepath:
             return
         sidecar = sidecars.read_annotation_sidecar(self.annotations_filepath)
@@ -601,6 +657,7 @@ class ProjectInitializer:
         )
         if sidecar.get("classes"):
             self.classes_filepath = sidecar["classes"]
+            self.classes_from_convention = False
         if sidecar.get("cropped_path"):
             self.cropped_path = sidecar["cropped_path"]
         if sidecar.get("crop_size") is not None:
@@ -632,7 +689,9 @@ class ProjectInitializer:
         - markers: <id>_markers.csv
         - photos_path: <id>.photos/
         - thumbnails_path: <id>.thumbnails/
-        - classes: classes.csv
+
+        ``classes`` follows :meth:`default_classes_path` (``<id>.annos/``, then
+        this folder), as for a YAML without a ``classes`` key.
 
         Annotation sets live in ``<id>.annos/`` (see :attr:`annos_root` and
         :meth:`annotation_csvs`). There is no default set: ``annotations_filepath``
@@ -689,10 +748,6 @@ class ProjectInitializer:
             if os.path.exists(thumbnails_dir) and os.path.isdir(thumbnails_dir)
             else None
         )
-
-        # Classes: classes.csv
-        classes_path = os.path.join(filepath, "classes.csv")
-        self.classes_filepath = classes_path if os.path.exists(classes_path) else None
 
     def initialize(self, apply_transform=True, apply_color_correction=True):
         """
@@ -1036,18 +1091,23 @@ class ProjectInitializer:
     def reset_paths_to_local(self, path: str | None = None) -> None:
         """Reset all path/filepath variables to a new base path.
 
-        Extracts the filename or directory name from each existing path and
-        updates it to be relative to the new base path. If a path is None,
-        it remains None.
+        Paths inside the old base (``self.path``) keep their place relative to
+        it, so ``<id>.annos/x.csv`` stays in ``<id>.annos/``. A path outside it
+        (e.g. a shared ``../classes.csv``) keeps its relative place too when
+        that exists under the new base, and otherwise moves into the new base
+        by its name (as without an old base). If a path is None, it remains
+        None.
 
         Args:
-            path (str, optional): New base path. If None, uses self.path.
+            path (str, optional): New base path. If None, uses the current
+                working directory.
         """
         if path is None:
             path = os.getcwd()
 
         # Normalize the new base path
         new_base_path = os.path.normpath(path)
+        old_base_path = os.path.normpath(self.path) if self.path else None
 
         # List of path attributes to reset
         path_attributes = [
@@ -1069,10 +1129,7 @@ class ProjectInitializer:
         for attr_name in path_attributes:
             current_path = getattr(self, attr_name, None)
             if current_path is not None:
-                # Extract the filename or directory name
-                name = os.path.basename(current_path)
-                # Join with new base path
-                new_path = os.path.join(new_base_path, name)
+                new_path = _rebase_path(current_path, old_base_path, new_base_path)
                 setattr(self, attr_name, new_path)
 
         # Update the base path itself
@@ -1083,6 +1140,22 @@ class ProjectInitializer:
         if self.yaml_path is not None:
             yaml_filename = os.path.basename(self.yaml_path)
             self.yaml_path = os.path.join(new_base_path, yaml_filename)
+
+
+def _rebase_path(path: str, old_base: str | None, new_base: str) -> str:
+    """Move ``path`` from ``old_base`` to ``new_base`` (see reset_paths_to_local).
+
+    Works on the strings alone, so the old base may be on another machine.
+    """
+    name = os.path.basename(os.path.normpath(path))
+    if old_base:
+        rel = os.path.relpath(os.path.normpath(path), old_base)
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+            return os.path.join(new_base, rel)
+        moved = os.path.normpath(os.path.join(new_base, rel))
+        if os.path.exists(moved):
+            return moved
+    return os.path.join(new_base, name)
 
 
 class _YamlFlowList(list):

@@ -39,16 +39,26 @@ cur_sna_20m_20200303/
 ├── cur_sna_20m_20200303.cams.xml      # Metashape camera poses
 ├── cur_sna_20m_20200303.meta.json     # camera metadata (paths/centers/transforms)
 ├── cur_sna_20m_20200303_markers.csv   # scalebar target coordinates
-├── classes.csv                        # label codes (optional)
-├── cur_sna_20m_20200303.photos/       # source photos (plus e.g. <id>.auv/, <id>.closeup/)
+├── cur_sna_20m_20200303.photos/       # survey photos
+├── cur_sna_20m_20200303.auv/          # more photo folders (one per group)
+├── cur_sna_20m_20200303.closeup/
 ├── cur_sna_20m_20200303.thumbnails/   # downscaled photos, from `substrata thumbnails`
+│   ├── cur_sna_20m_20200303.photos/IMG_0001.jpg
+│   └── cur_sna_20m_20200303.auv/G0012345.jpg
 ├── cur_sna_20m_20200303_views.pdf     # QC reports etc. (<id>_<name>), from the CLI
 └── cur_sna_20m_20200303.annos/        # annotation sets
-    ├── cur_sna_20m_20200303_ann.csv               # an annotation set (point CSV)
-    ├── cur_sna_20m_20200303_ann.csv.yaml          # its sidecar (optional)
-    ├── cur_sna_20m_20200303_ann.cropped/          # its crops
-    ├── cur_sna_20m_20200303_slope_intercepts.csv  # e.g. from `substrata intercepts`
-    └── backup/                                    # backups of in-place edits
+    ├── classes.csv                                     # label codes (optional)
+    ├── cur_sna_20m_20200303_ann.csv                    # manual annotations
+    ├── cur_sna_20m_20200303_ann.csv.yaml               # their sidecar (optional)
+    ├── cur_sna_20m_20200303_ann.cropped/               # their crops
+    ├── cur_sna_20m_20200303_slope_intercepts.csv       # from `substrata intercepts`
+    ├── cur_sna_20m_20200303_slope_intercepts.csv.yaml  # their sidecar (grid settings)
+    ├── cur_sna_20m_20200303_slope_intercepts.cropped/  # their crops
+    │   └── cur_sna_20m_20200303_17/                    # one folder per point id
+    │       ├── cur_sna_20m_20200303.photos/IMG_0001.jpg
+    │       ├── cur_sna_20m_20200303.photos/IMG_0002.jpg
+    │       └── cur_sna_20m_20200303.closeup/DSC_0420.jpg
+    └── backup/                                         # backups of in-place edits
 ```
 
 The **point cloud** is `<id>.ply`. `substrata decimate` writes the `_dec50M.ply`
@@ -64,15 +74,38 @@ stale after a move, use `substrata path-repair`. Thumbnails mirror the same
 folders: `<id>.thumbnails/<photo folder>/<filename>`.
 
 **Annotation sets** live in `<id>.annos/`. This includes manual annotations, point
-intercepts and matched points. Each is a point CSV (an `id` column plus `x`/`orig_x`,
-`y`/`orig_y`, `z`/`orig_z`). Next to it sit its optional sidecar (`<csv>.yaml`, with
-the set's `classes`, `cropped_path`, `last_highest_id` and so on; see
-`substrata.sidecars`), its crops (`<csv stem>.cropped/`, laid out as
-`<ann_id>/<photo folder>/<filename>`) and the backups of in-place edits (`backup/`).
+intercepts and matched points, and all of them are handled alike. Each is a point CSV
+(an `id` column plus `x`/`orig_x`, `y`/`orig_y`, `z`/`orig_z`). Next to it sit its
+optional sidecar (`<csv>.yaml`, with the set's `classes`, `cropped_path`,
+`last_highest_id` and so on; see `substrata.sidecars`), its crops
+(`<csv stem>.cropped/`) and the backups of in-place edits (`backup/`). `substrata
+intercepts` always writes the sidecar of its CSV, recording the grid it was drawn
+from. Point the CSV-based commands (`crops`, `predict`, …) at a set other than the
+default with `--annotations`; they then use that set's own sidecar and crops folder.
 Tools that list a project's annotation sets look only in this folder
 (`ProjectInitializer.annotation_csvs()`). There is no default set: a project's
 default annotations file is whatever the YAML's `annotations:` key names, e.g.
 `annotations: cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv`.
+
+**Crops** (`substrata crops`) are stored per point and per photo:
+`<crops>/<point id>/<photo folder>/<photo filename>`. A point seen in several photos
+gets several crops, best matches first, up to `--max-photos`. Each one keeps the name
+of the photo it was cut from, and sits under the name of that photo's folder
+(`<id>.photos`, `<id>.auv`, `<id>.closeup`, …). This way, two photo groups whose
+cameras both produce an `IMG_0001.jpg` never overwrite each other's crops. Thumbnails
+mirror the photo folders the same way. A crop's EXIF records, for example, whether the point
+may be hidden in that photo, plus any prediction (see `read_crop_metadata`). Crops from the older layout,
+`<crops>/<point id>/<photo filename>`, are still found and are not cropped again. The
+crops folder defaults to `<csv stem>.cropped/` next to the CSV; to keep crops
+elsewhere (for example a folder shared with reefview), set `cropped_path` in the
+set's sidecar.
+
+The **label set** (`classes.csv`) belongs to the annotation sets too, so by default
+it sits with them. When neither the sidecar nor the YAML names one, the first
+`classes.csv` found next to the annotations CSV, in `<id>.annos/`, or in the project
+folder (legacy) is used. A label set shared across plots stays wherever it is, named
+by the sidecar's `classes` key. A trained classifier has no default location: name
+it in the sidecar (`classifier`), so it is always clear which model labelled a set.
 
 Files the CLI writes for a project go in the project folder as `<id>_<name>`, e.g.
 `<id>_scalebars.pdf`, `<id>_views.pdf`, `<id>_depth_residuals.pdf`,
@@ -241,7 +274,7 @@ the corresponding object unloaded (or fall back to the default shown).
 | `markers` | str | Scalebar target coordinates CSV. |
 | `annotations` | str | The default annotation set (a point CSV, normally in `<id>.annos/`). Not set by a folder convention. |
 | `annotations_last_highest_id` | int | Highest annotation id issued so far (for assigning new ids). |
-| `classes` | str | Class-definition CSV. |
+| `classes` | str | Class-definition CSV. Default: `classes.csv` next to the annotations CSV, in `<id>.annos/`, or in the project folder. |
 | `classifier` | str | Trained crop-classifier file. |
 | `photos_path` | str | Directory of source photos. |
 | `cropped_path` | str | Directory of cropped image chips. |
@@ -273,7 +306,7 @@ from the directory `id`; only files that exist are registered):
 | `markers` | `<id>_markers.csv` |
 | `photos_path` | `<id>.photos/` |
 | `thumbnails_path` | `<id>.thumbnails/` |
-| `classes` | `classes.csv` |
+| `classes` | `<id>.annos/classes.csv`, else `classes.csv` |
 
 ### A complete example
 
@@ -286,7 +319,6 @@ cams_meta_json: "cur_sna_20m_20200303.meta.json"
 markers: "cur_sna_20m_20200303_markers.csv"
 annotations: "cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv"
 annotations_last_highest_id: 620
-classes: "classes.csv"
 scale_factor: 1.0
 up_vector: [0.0, 0.0, 1.0]
 depth_offset: 0.0
@@ -303,7 +335,10 @@ world_transform:
 Project files store paths, which won't match after copying a project to a
 different machine or directory. To rebase every registered path onto a new base
 directory, pass `local=True` (rebases onto the current working directory) or call
-`proj.reset_paths_to_local("/new/base/dir")` and re-save:
+`proj.reset_paths_to_local("/new/base/dir")` and re-save. Files inside the old
+`path` keep their place relative to it (e.g. `<id>.annos/x.csv`). A file outside it,
+such as a shared `../classes.csv`, keeps its relative place when it exists there
+under the new base; otherwise it is looked for in the new base by name:
 
 ```python
 proj = ProjectInitializer(yaml="cur_sna_20m_20200303.yaml", local=True)

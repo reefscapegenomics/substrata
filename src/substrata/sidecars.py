@@ -8,7 +8,7 @@ cannot be derived from the CSV:
 
     type: intercepts               # annotations | intercepts
     plot_id: cur_sna_20m_20200303
-    classes: ../classes.csv        # paths are relative to the sidecar's folder
+    classes: classes.csv           # paths are relative to the sidecar's folder
     world_transform: [[...]]       # plot transform used to generate/annotate
     last_highest_id: 620           # id high-water mark; deleted ids are not reused
     cropped_path: crops/           # optional, default <csv stem>.cropped

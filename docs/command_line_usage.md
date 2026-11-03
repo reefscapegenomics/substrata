@@ -559,7 +559,7 @@ substrata thumbnails --size 1280 960 --overwrite
 
 ## Crops
 
-Save a crop centred on each image match of every annotation (up to `--max-photos` per annotation, best matches first). Crops belong to an annotations file, not to the model: they go in `cropped_path` from the YAML, or next to the annotations CSV in `<annotations csv stem>.cropped/` by default. The layout is `<crops>/<ann_id>/<photo folder>/<filename>`, so photos from `.photos`, `.auv` and `.closeup` folders never collide. Old crops stored as `<crops>/<ann_id>/<filename>` are still found and skipped.
+Save a crop centred on each image match of every annotation (up to `--max-photos` per annotation, best matches first). Crops belong to an annotations file, not to the model: they go in the set's `cropped_path` (from its sidecar), or next to the annotations CSV in `<annotations csv stem>.cropped/` by default. With `--annotations`, the given CSV's own sidecar applies, so e.g. `--annotations <id>.annos/<id>_slope_intercepts.csv` crops into `<id>_slope_intercepts.cropped/`. The layout is `<crops>/<ann_id>/<photo folder>/<filename>`, e.g. `<id>_ann.cropped/<id>_17/<id>.auv/G0012345.jpg`, so photos from `.photos`, `.auv` and `.closeup` folders never collide (see the layout in {doc}`projects`). Old crops stored as `<crops>/<ann_id>/<filename>` are still found and skipped.
 
 Matches whose crop would extend past the image edge are rejected, so every crop is centred on its annotation. With a point cloud, occluded matches are dropped and possibly obstructed ones are flagged in the crop's EXIF; `--no-ply` skips this for speed. Crops keep the photo's EXIF and are saved at JPEG quality 95.
 

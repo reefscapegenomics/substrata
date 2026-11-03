@@ -192,6 +192,139 @@ class TestAnnosConvention(unittest.TestCase):
                 init.thumbnail_path, os.path.join(proj, "cur_sna.thumbnails")
             )
 
+    def _touch(self, *parts):
+        path = os.path.join(*parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+        return path
+
+    def test_classes_default_prefers_annos(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            legacy = self._touch(proj, "classes.csv")
+            self.assertEqual(PI(path=proj).classes_filepath, legacy)
+            annos = self._touch(proj, "cur_sna.annos", "classes.csv")
+            init = PI(path=proj)
+            self.assertEqual(init.classes_filepath, annos)
+            self.assertTrue(init.classes_from_convention)
+
+    def test_classes_next_to_csv_and_explicit_key_wins(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            self._touch(proj, "cur_sna.annos", "classes.csv")
+            beside = self._touch(proj, "other", "classes.csv")
+            self._touch(proj, "other", "x_ann.csv")
+            y = os.path.join(proj, "cur_sna.yaml")
+            config = {"id": "cur_sna", "path": proj,
+                      "annotations": "other/x_ann.csv"}
+            with open(y, "w") as f:
+                yaml_lib.dump(config, f)
+            init = PI(yaml=y)
+            self.assertEqual(init.classes_filepath, beside)
+            # A conventional default is not written back to the project YAML
+            out = os.path.join(tmp, "saved.yaml")
+            init.save_config_to_yaml(out)
+            with open(out) as f:
+                self.assertNotIn("classes", yaml_lib.safe_load(f))
+
+            shared = self._touch(tmp, "shared.csv")
+            config["classes"] = shared
+            with open(y, "w") as f:
+                yaml_lib.dump(config, f)
+            init = PI(yaml=y)
+            self.assertEqual(init.classes_filepath, shared)
+            self.assertFalse(init.classes_from_convention)
+
+    def test_use_annotations_file_applies_its_own_sidecar(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            annos = os.path.join(proj, "cur_sna.annos")
+            self._touch(annos, "classes.csv")
+            self._touch(annos, "a_ann.csv")
+            self._touch(annos, "cur_sna_slope_intercepts.csv")
+            with open(os.path.join(annos, "a_ann.csv.yaml"), "w") as f:
+                yaml_lib.dump({"cropped_path": "/elsewhere/crops",
+                               "last_highest_id": 620, "crop_size": 400}, f)
+            with open(os.path.join(
+                    annos, "cur_sna_slope_intercepts.csv.yaml"), "w") as f:
+                yaml_lib.dump({"type": "intercepts", "classes": "classes.csv"}, f)
+            y = os.path.join(proj, "cur_sna.yaml")
+            with open(y, "w") as f:
+                yaml_lib.dump({"id": "cur_sna", "path": proj,
+                               "annotations": "cur_sna.annos/a_ann.csv"}, f)
+            init = PI(yaml=y)
+            self.assertEqual(init.cropped_path, "/elsewhere/crops")
+            init.use_annotations_file(
+                os.path.join(annos, "cur_sna_slope_intercepts.csv"))
+            # The previous set's crops folder and ids do not carry over
+            self.assertIsNone(init.cropped_path)
+            self.assertIsNone(init.annotations_last_highest_id)
+            self.assertEqual(init.crop_size, 400)
+            self.assertEqual(init.annotation_sidecar["type"], "intercepts")
+            self.assertEqual(
+                init.classes_filepath, os.path.join(annos, "classes.csv"))
+
+    def test_reset_paths_keeps_relative_layout(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            site = os.path.join(tmp, "site")
+            proj = os.path.join(site, "cur_sna")
+            shared = self._touch(site, "shared_classes.csv")
+            self._touch(proj, "cur_sna.annos", "a_ann.csv")
+            y = os.path.join(proj, "cur_sna.yaml")
+            old = "/Volumes/other_machine/site/cur_sna"
+            with open(y, "w") as f:
+                yaml_lib.dump({
+                    "id": "cur_sna", "path": old,
+                    "ply": "cur_sna.ply",
+                    "annotations": "cur_sna.annos/a_ann.csv",
+                    "photos_path": "cur_sna.photos/",
+                    "classes": "../shared_classes.csv",
+                    "classifier": "/Volumes/models/caribbean.pkl",
+                }, f)
+            init = PI(yaml=y)
+            init.reset_paths_to_local(proj)
+            self.assertEqual(init.path, proj)
+            self.assertEqual(
+                init.annotations_filepath,
+                os.path.join(proj, "cur_sna.annos", "a_ann.csv"),
+            )
+            self.assertEqual(init.ply_filepath, os.path.join(proj, "cur_sna.ply"))
+            self.assertEqual(init.photos_path, os.path.join(proj, "cur_sna.photos"))
+            # Outside the base: relative place kept when it exists there...
+            self.assertEqual(init.classes_filepath, shared)
+            # ...otherwise looked for in the new base by name
+            self.assertEqual(
+                init.classifier_filepath, os.path.join(proj, "caribbean.pkl")
+            )
+
+    def test_local_flag_applies_the_moved_sidecar(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            annos = os.path.join(proj, "cur_sna.annos")
+            self._touch(annos, "a_ann.csv")
+            with open(os.path.join(annos, "a_ann.csv.yaml"), "w") as f:
+                yaml_lib.dump({"last_highest_id": 7}, f)
+            y = os.path.join(proj, "cur_sna.yaml")
+            with open(y, "w") as f:
+                yaml_lib.dump({"id": "cur_sna", "path": "/gone/cur_sna",
+                               "annotations": "cur_sna.annos/a_ann.csv"}, f)
+            cwd = os.getcwd()
+            os.chdir(proj)
+            try:
+                init = PI(yaml=y, local=True)
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(
+                os.path.realpath(init.annotations_filepath),
+                os.path.realpath(os.path.join(annos, "a_ann.csv")),
+            )
+            self.assertEqual(init.annotations_last_highest_id, 7)
+
     def test_no_path_means_no_annos_root(self) -> None:
         PI = _load_initializer()
         with tempfile.TemporaryDirectory() as tmp:
