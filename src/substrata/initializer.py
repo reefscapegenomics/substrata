@@ -226,15 +226,15 @@ class ProjectInitializer:
         if world_transform is not None:
             self.world_transform = np.array(world_transform, dtype=float)
 
+        # Links to other plots (orig -> their orig, see the docstring)
         self.parent_id = yaml_config.get("parent_id")
-        parent_transform = yaml_config.get("parent_transform")
-        if parent_transform is not None:
-            self.parent_transform = np.array(parent_transform, dtype=float)
-
+        self.parent_transform = _parse_link_transform(
+            yaml_config.get("parent_transform"), "parent_transform"
+        )
         self.baseline_id = yaml_config.get("baseline_id")
-        baseline_transform = yaml_config.get("baseline_transform")
-        if baseline_transform is not None:
-            self.baseline_transform = np.array(baseline_transform, dtype=float)
+        self.baseline_transform = _parse_link_transform(
+            yaml_config.get("baseline_transform"), "baseline_transform"
+        )
 
         self.firefish_water_level = _parse_optional_float(
             yaml_config.get("firefish_water_level")
@@ -460,6 +460,42 @@ class ProjectInitializer:
         """
         return self.find_project(self.baseline_id, search_dirs)
 
+    def effective_parent_link(
+        self, search_dirs=None
+    ) -> tuple[str | None, np.ndarray | None]:
+        """The larger plot this one sits in, and this plot's orig -> its orig.
+
+        The plot's own ``parent_id``/``parent_transform`` when set. A later
+        timepoint without them sits where its baseline sits:
+        ``baseline parent_transform @ baseline_transform``, following baseline
+        chains (tp3 -> tp2 -> tp1) up to the first timepoint with a parent.
+
+        Args:
+            search_dirs: Extra directories to look for baselines in (see
+                :meth:`find_project`).
+
+        Returns:
+            ``(parent_id, transform)``. The transform is None when that
+            parent_id has no parent_transform; both are None when there is no
+            parent link (a baseline not found, or a cycle of baseline links).
+        """
+        init, T, seen = self, np.eye(4), set()
+        while not init.parent_id:
+            if not init.baseline_id or init.baseline_transform is None:
+                return None, None
+            if init.id in seen:
+                return None, None
+            seen.add(init.id)
+            path = init.find_baseline_project(search_dirs)
+            if not path:
+                return None, None
+            # this plot's orig -> the baseline's orig
+            T = np.asarray(init.baseline_transform, dtype=float) @ T
+            init = ProjectInitializer(path=path)
+        if init.parent_transform is None:
+            return init.parent_id, None
+        return init.parent_id, np.asarray(init.parent_transform, dtype=float) @ T
+
     def save_config_to_yaml(self, filepath: str | None = None) -> None:
         """
         Save the current configuration to a YAML file.
@@ -595,13 +631,14 @@ class ProjectInitializer:
         - cams_meta_json: <id>.meta.json
         - markers: <id>_markers.csv
         - photos_path: <id>.photos/
-        - cropped_path: <id>.cropped/
         - thumbnails_path: <id>.thumbnails/
         - classes: classes.csv
 
         Annotation sets live in ``<id>.annos/`` (see :attr:`annos_root` and
         :meth:`annotation_csvs`). There is no default set: ``annotations_filepath``
-        is only set by a YAML ``annotations:`` key (or explicitly).
+        is only set by a YAML ``annotations:`` key (or explicitly). Crops belong
+        to a set (``<csv stem>.cropped/``), so a legacy ``<id>.cropped/`` folder
+        is not picked up; name it in ``cropped_path`` to use it.
         """
         self.path = filepath
         self.id = os.path.basename(os.path.normpath(filepath))
@@ -642,14 +679,6 @@ class ProjectInitializer:
         self.photos_path = (
             photos_dir
             if os.path.exists(photos_dir) and os.path.isdir(photos_dir)
-            else None
-        )
-
-        # Cropped path: <id>.cropped/
-        cropped_dir = os.path.join(filepath, f"{self.id}.cropped")
-        self.cropped_path = (
-            cropped_dir
-            if os.path.exists(cropped_dir) and os.path.isdir(cropped_dir)
             else None
         )
 
@@ -1113,6 +1142,27 @@ def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, yaml_path)
+
+
+def _parse_link_transform(value, key: str) -> np.ndarray | None:
+    """Parse a ``parent_transform``/``baseline_transform`` YAML value.
+
+    Accepts a 4x4 or 3x4 matrix (the bottom row ``[0, 0, 0, 1]`` is added).
+
+    Raises:
+        ValueError: If the value is not a 3x4 or 4x4 matrix.
+    """
+    if value is None:
+        return None
+    try:
+        m = np.array(value, dtype=float)
+    except (TypeError, ValueError):
+        m = None
+    if m is None or m.shape not in ((3, 4), (4, 4)):
+        raise ValueError(f"{key} must be a 3x4 or 4x4 matrix, got {value!r}")
+    if m.shape == (3, 4):
+        m = np.vstack([m, [0.0, 0.0, 0.0, 1.0]])
+    return m
 
 
 def _as_flow_sequence(value):

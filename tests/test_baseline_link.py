@@ -86,9 +86,30 @@ class TestBaselineLink(_Base):
             np.dot([0.01, 0.02, 0.19], x_b) - 40.0,
         )
 
+    def test_save_config_round_trip(self):
+        y = self._project("tp2", {"baseline_id": "tp1", "baseline_transform": T_12})
         out = os.path.join(self.root, "saved.yaml")
-        tp.save_config_to_yaml(out)
-        self.assertEqual(self._cfg(out)["baseline_id"], "tp1")
+        ProjectInitializer(yaml=y).save_config_to_yaml(out)
+        with open(out) as f:
+            self.assertIn("baseline_transform: [[", f.read())  # flow style
+        again = ProjectInitializer(yaml=out)
+        self.assertEqual(again.baseline_id, "tp1")
+        np.testing.assert_array_equal(again.baseline_transform, T_12)
+
+        # Without the keys nothing is written
+        plain = os.path.join(self.root, "plain.yaml")
+        ProjectInitializer(yaml=self._project("tp1")).save_config_to_yaml(plain)
+        self.assertNotIn("baseline_id", self._cfg(plain))
+        self.assertNotIn("baseline_transform", self._cfg(plain))
+
+    def test_link_transform_shapes(self):
+        y = self._project("tp2", {"baseline_transform": T_12[:3]})
+        np.testing.assert_array_equal(
+            ProjectInitializer(yaml=y).baseline_transform, T_12
+        )
+        init_mod.set_project_yaml_keys(y, {"baseline_transform": [[1, 2], [3, 4]]})
+        with self.assertRaises(ValueError):
+            ProjectInitializer(yaml=y)
 
     def test_staleness_and_used_frame(self):
         b = ProjectInitializer(yaml=self._project("tp1", self._baseline_keys()))
@@ -127,6 +148,32 @@ class TestBaselineLink(_Base):
         tp = ProjectInitializer(yaml=self._project("tp2", {"baseline_id": "tp1"}))
         self.assertEqual(
             tp.find_baseline_project(), os.path.join(self.root, "site", "plot", "tp1")
+        )
+
+    def test_effective_parent_link(self):
+        P = _similarity(0.5, 10, [100, 0, 0])  # tp1 orig -> auv orig
+        self._project("tp1", {"parent_id": "auv", "parent_transform": P})
+        self._project("tp2", {"baseline_id": "tp1", "baseline_transform": T_12})
+        y3 = self._project("tp3", {"baseline_id": "tp2", "baseline_transform": T_23})
+        pid, T = ProjectInitializer(yaml=y3).effective_parent_link()
+        self.assertEqual(pid, "auv")
+        np.testing.assert_allclose(T, P @ T_12 @ T_23, atol=1e-12)
+
+        # Its own parent link wins
+        Q = _similarity(1, 0, [1, 1, 1])
+        init_mod.set_project_yaml_keys(y3, {"parent_id": "other", "parent_transform": Q})
+        pid, T = ProjectInitializer(yaml=y3).effective_parent_link()
+        self.assertEqual(pid, "other")
+        np.testing.assert_allclose(T, Q)
+
+        # No parent anywhere, a missing baseline, a cycle
+        y4 = self._project("tp4", {"baseline_id": "tp5", "baseline_transform": T_12})
+        self.assertEqual(ProjectInitializer(yaml=y4).effective_parent_link(), (None, None))
+        self._project("tp5", {"baseline_id": "tp4", "baseline_transform": T_23})
+        self.assertEqual(ProjectInitializer(yaml=y4).effective_parent_link(), (None, None))
+        self.assertEqual(
+            ProjectInitializer(yaml=self._project("tp6")).effective_parent_link(),
+            (None, None),
         )
 
 

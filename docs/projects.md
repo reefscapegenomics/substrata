@@ -34,27 +34,53 @@ project **id**. A typical layout:
 cur_sna_20m_20200303/
 ├── cur_sna_20m_20200303.yaml          # project file (optional but recommended)
 ├── cur_sna_20m_20200303.ply           # dense point cloud
+├── cur_sna_20m_20200303.strat.npz     # stratify index of the .ply (optional)
 ├── cur_sna_20m_20200303_dec50M.ply    # decimated copy (50M points)
 ├── cur_sna_20m_20200303.cams.xml      # Metashape camera poses
 ├── cur_sna_20m_20200303.meta.json     # camera metadata (paths/centers/transforms)
 ├── cur_sna_20m_20200303_markers.csv   # scalebar target coordinates
 ├── classes.csv                        # label codes (optional)
+├── cur_sna_20m_20200303.photos/       # source photos (plus e.g. <id>.auv/, <id>.closeup/)
+├── cur_sna_20m_20200303.thumbnails/   # downscaled photos, from `substrata thumbnails`
+├── cur_sna_20m_20200303_views.pdf     # QC reports etc. (<id>_<name>), from the CLI
 └── cur_sna_20m_20200303.annos/        # annotation sets
     ├── cur_sna_20m_20200303_ann.csv               # an annotation set (point CSV)
     ├── cur_sna_20m_20200303_ann.csv.yaml          # its sidecar (optional)
     ├── cur_sna_20m_20200303_ann.cropped/          # its crops
-    └── cur_sna_20m_20200303_slope_intercepts.csv  # e.g. from `substrata intercepts`
+    ├── cur_sna_20m_20200303_slope_intercepts.csv  # e.g. from `substrata intercepts`
+    └── backup/                                    # backups of in-place edits
 ```
+
+The **point cloud** is `<id>.ply`. `substrata decimate` writes the `_dec50M.ply`
+copy, which is what a project opened without a YAML loads when it exists. A PLY
+reordered by `substrata stratify` stays `<id>.ply` and gains the small
+`<id>.strat.npz` index; its first N points are already a uniform subsample, so it
+needs no separate decimated copy.
+
+**Photos** sit in one or more folders named `<id>.<group>` (`.photos`, `.auv`,
+`.closeup`, `.videoframes`, …). The cameras find them through the paths in
+`<id>.meta.json`, so the folder names are only a convention. If those paths go
+stale after a move, use `substrata path-repair`. Thumbnails mirror the same
+folders: `<id>.thumbnails/<photo folder>/<filename>`.
 
 **Annotation sets** live in `<id>.annos/`. This includes manual annotations, point
 intercepts and matched points. Each is a point CSV (an `id` column plus `x`/`orig_x`,
 `y`/`orig_y`, `z`/`orig_z`). Next to it sit its optional sidecar (`<csv>.yaml`, with
 the set's `classes`, `cropped_path`, `last_highest_id` and so on; see
-`substrata.sidecars`), its crops (`<csv stem>.cropped/`) and the backups of in-place
-edits (`backup/`). Tools that list a project's annotation sets look only in this
-folder (`ProjectInitializer.annotation_csvs()`). There is no default set: a project's
+`substrata.sidecars`), its crops (`<csv stem>.cropped/`, laid out as
+`<ann_id>/<photo folder>/<filename>`) and the backups of in-place edits (`backup/`).
+Tools that list a project's annotation sets look only in this folder
+(`ProjectInitializer.annotation_csvs()`). There is no default set: a project's
 default annotations file is whatever the YAML's `annotations:` key names, e.g.
 `annotations: cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv`.
+
+Files the CLI writes for a project go in the project folder as `<id>_<name>`, e.g.
+`<id>_scalebars.pdf`, `<id>_views.pdf`, `<id>_depth_residuals.pdf`,
+`<id>_colorcal.pdf`, `<id>_camsync.pdf`, `<id>_cams.mp4` and `<id>_seg.npz`. Most of
+these commands accept an output option to write somewhere else. The project YAML
+also records links to other plots, but these are ids (`parent_id`, `baseline_id`),
+not files. substrata looks for a folder with that id among the project's ancestor
+folders and one level below each of them, so siblings are found too.
 
 When you open a project by directory, `ProjectInitializer` first looks for a
 `<dirname>.yaml` file inside it. If that file exists, it is used. If not, the
@@ -229,6 +255,12 @@ the corresponding object unloaded (or fall back to the default shown).
 | `parent_id`, `parent_transform` | str, 4×4 list | Optional larger plot this one sits in, and this plot's orig → parent orig transform. `world_transform` stays its own. |
 | `baseline_id`, `baseline_transform` | str, 4×4 list | Optional baseline timepoint whose frame this plot inherits, and this plot's orig → baseline orig transform. `world_transform` (and the scale/depth keys) are then a cached baseline `world_transform @ baseline_transform`; see `substrata baseline`. |
 | `color_correction` | mapping | `matrix` (3×3 or 3×4) and `offset` (length-3) arrays applied to point-cloud colours on load. |
+| `firefish_water_level`, `firefish_depth_sensor_offset` | float, `[x, y, z]` | Firefish depth-sensor settings (kept as a record only). |
+
+The per-set keys `annotations_last_highest_id`, `classes`, `classifier`,
+`cropped_path` and `crop_size` are legacy keys here. They now belong in the sidecar
+of the annotation set (`<csv>.yaml`, where the id key is `last_highest_id`), which
+overrides them.
 
 Defaults when opening by `path` with **no** YAML present (filenames are derived
 from the directory `id`; only files that exist are registered):
@@ -240,7 +272,6 @@ from the directory `id`; only files that exist are registered):
 | `cams_meta_json` | `<id>.meta.json` |
 | `markers` | `<id>_markers.csv` |
 | `photos_path` | `<id>.photos/` |
-| `cropped_path` | `<id>.cropped/` |
 | `thumbnails_path` | `<id>.thumbnails/` |
 | `classes` | `classes.csv` |
 

@@ -179,6 +179,19 @@ class TestAnnosConvention(unittest.TestCase):
             )
             self.assertEqual(init.annotation_csvs(), [])  # folder empty
 
+    def test_legacy_cropped_folder_not_picked_up(self) -> None:
+        PI = _load_initializer()
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "cur_sna")
+            os.makedirs(os.path.join(proj, "cur_sna.cropped"))
+            os.makedirs(os.path.join(proj, "cur_sna.thumbnails"))
+            init = PI(path=proj)
+            # Crops belong to a set (<csv stem>.cropped), not the project
+            self.assertIsNone(init.cropped_path)
+            self.assertEqual(
+                init.thumbnail_path, os.path.join(proj, "cur_sna.thumbnails")
+            )
+
     def test_no_path_means_no_annos_root(self) -> None:
         PI = _load_initializer()
         with tempfile.TemporaryDirectory() as tmp:
