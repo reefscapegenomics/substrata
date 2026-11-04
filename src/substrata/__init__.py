@@ -24,6 +24,7 @@ warnings.filterwarnings(
     category=TqdmWarning,
 )
 
+import __future__ as _future
 import importlib as _importlib
 from typing import List
 
@@ -54,7 +55,12 @@ def _load_all():
             if names is None:
                 names = [n for n in vars(mod) if not n.startswith("_")]
             for n in names:
-                g[n] = getattr(mod, n)
+                v = getattr(mod, n)
+                # `from __future__ import annotations` binds the name `annotations`, which
+                # would otherwise replace the substrata.annotations submodule
+                if isinstance(v, _future._Feature):
+                    continue
+                g[n] = v
         g["__all__"] = ["logger"] + [n for n in list(g) if not n.startswith("_")]
         _state["loaded"] = True
     finally:
