@@ -1691,6 +1691,97 @@ def save_cropped_image_matches_to_pdf(
     print(f"PDF created: {output_filepath}")
 
 
+def save_training_crops_pdf(
+    groups,
+    output_filepath,
+    n_cols=settings.TRAIN_PDF_COLS,
+    n_rows=settings.TRAIN_PDF_ROWS,
+    thumb_px=settings.TRAIN_PDF_THUMB_PX,
+    crop_dirs=settings.TRAIN_CROP_DIRS,
+):
+    """Save a contact sheet of training crops, one or more pages per class.
+
+    Each crop is captioned with its annotation id (searchable PDF text), plus
+    its raw label when that was collapsed into the class and a ``val``/``test``
+    tag for validation/test crops. Crops are downscaled to ``thumb_px`` and
+    stored as JPEG to keep the PDF small.
+
+    Args:
+        groups: ``class -> (n_crops, [(path, id, raw_label, split_dir), ...])``
+            (see :func:`substrata.classification.training_crops_by_class`).
+        output_filepath: Destination PDF path.
+        n_cols: Crops per row.
+        n_rows: Rows per page.
+        thumb_px: Longest side of the embedded crops in pixels.
+        crop_dirs: Train/validation/test folder names (for the split tags).
+
+    Returns:
+        Number of pages written.
+    """
+    split_tags = {crop_dirs[1]: "val", crop_dirs[2]: "test"}
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(False)
+    margin, header_h, caption_h = 8.0, 7.0, 2.8
+    cell_w = (pdf.w - 2 * margin) / n_cols
+    cell_h = (pdf.h - 2 * margin - header_h) / n_rows
+    side = min(cell_w - 1.0, cell_h - caption_h - 0.4)
+    per_page = n_cols * n_rows
+
+    def _caption(text, x, y, max_size=3.5):
+        size = max_size
+        pdf.set_font("Helvetica", size=size)
+        while size > 1.5 and pdf.get_string_width(text) > cell_w - 0.6:
+            size -= 0.25
+            pdf.set_font("Helvetica", size=size)
+        pdf.text(x, y, text)
+
+    n_total = sum(len(items) for _, items in groups.values())
+    with tqdm(total=n_total, desc="Training crops PDF", unit="crop") as bar:
+        for cls, (n_crops, items) in groups.items():
+            raw_counts = {}
+            for _, _, raw, _ in items:
+                raw_counts[raw] = raw_counts.get(raw, 0) + 1
+            raw_text = ", ".join(f"{r} {n}" for r, n in sorted(raw_counts.items()))
+            n_pages = max(1, -(-len(items) // per_page))
+            for page in range(n_pages):
+                pdf.add_page()
+                pdf.set_font("Helvetica", style="B", size=10)
+                title = f"{cls} - showing {len(items)} of {n_crops} crops"
+                if n_pages > 1:
+                    title += f" (page {page + 1}/{n_pages})"
+                pdf.text(margin, margin + 3.5, title)
+                pdf.set_font("Helvetica", size=6)
+                pdf.text(margin, margin + 6.2, f"raw labels shown: {raw_text}")
+                page_items = items[page * per_page:(page + 1) * per_page]
+                for i, (path, ann_id, raw, split_dir) in enumerate(page_items):
+                    x = margin + (i % n_cols) * cell_w
+                    y = margin + header_h + (i // n_cols) * cell_h
+                    img_x = x + (cell_w - side) / 2.0
+                    try:
+                        with Image.open(path) as im:
+                            im = im.convert("RGB")
+                            im.thumbnail((thumb_px, thumb_px))
+                            buf = BytesIO()
+                            im.save(buf, format="JPEG", quality=85)
+                        buf.seek(0)
+                        pdf.image(buf, x=img_x, y=y, w=side, h=side)
+                    except Exception as e:  # noqa: BLE001 - unreadable crop
+                        logger.warning("Unreadable crop %s: %s", path, e)
+                        pdf.set_font("Helvetica", size=4)
+                        _draw_placeholder(pdf, img_x, y, side, side, "unreadable")
+                    _caption(ann_id, img_x, y + side + 1.2)
+                    extra = [t for t in (
+                        raw if raw != cls else "", split_tags.get(split_dir, "")
+                    ) if t]
+                    if extra:
+                        _caption(" ".join(extra), img_x, y + side + 2.6, 3.0)
+                    bar.update(1)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_filepath)), exist_ok=True)
+    pdf.output(output_filepath)
+    return pdf.pages_count
+
+
 def _pil_to_pdf(pdf, pil_img, x, y, max_w, max_h):
     """Place *pil_img* centred inside the cell (x, y, max_w, max_h), preserving aspect ratio."""
     try:

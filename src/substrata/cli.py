@@ -4209,6 +4209,23 @@ def handle_train(args):
     def _stats_pdf(split_folder):
         return os.path.join(output_dir, f"{split_folder}_stats.pdf")
 
+    def _crops_pdf(label_map):
+        """--pdf: the crops per training class, captioned with their ids."""
+        from substrata import visualizations
+
+        ann_csv = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
+        if not os.path.isfile(ann_csv):
+            raise SystemExit(f"--pdf: training annotations not found: {ann_csv}")
+        groups = classification.training_crops_by_class(
+            ann_csv, output_dir, label_map, max_per_class=args.pdf_max
+        )
+        pdf_path = os.path.join(output_dir, settings.TRAIN_CROPS_PDF_FILE)
+        n_pages = visualizations.save_training_crops_pdf(groups, pdf_path)
+        print(
+            f"Wrote training crops PDF: {pdf_path} ({len(groups)} class(es), "
+            f"{n_pages} page(s))"
+        )
+
     # --test / --validate: skip training and only re-run evaluation/reporting
     # on the test or validation crops respectively.
     eval_only = getattr(args, "test", False) or getattr(args, "validate", False)
@@ -4226,6 +4243,8 @@ def handle_train(args):
                 "`substrata train` (or --prepare-only) first to create it."
             )
         label_map = classification.load_label_map(map_path)
+        if getattr(args, "pdf", False):
+            _crops_pdf(label_map)
         classification.report_classifier_stats(
             model_file, output_dir, split, label_map, pdf_path=_stats_pdf(split)
         )
@@ -4414,6 +4433,9 @@ def handle_train(args):
         f"  {len(label_map)} label(s) -> {len(training_classes)} training "
         f"class(es): {', '.join(training_classes)}"
     )
+
+    if getattr(args, "pdf", False):
+        _crops_pdf(label_map)
 
     # --prepare-only: stop here so the map can be hand-tuned before training.
     if getattr(args, "prepare_only", False):
@@ -6518,6 +6540,28 @@ def main():
             "Generate crops and write/merge the label map, then stop before "
             "training so the map can be hand-tuned; re-run `substrata train` "
             "to train on the edited map."
+        ),
+    )
+    p_train.add_argument(
+        "--pdf",
+        dest="pdf",
+        action="store_true",
+        help=(
+            f"Write {settings.TRAIN_CROPS_PDF_FILE} with the crops per training "
+            "class, each captioned with its annotation id, to inspect the labels "
+            "(after the crops and label map; also with --prepare-only, --validate "
+            "or --test)."
+        ),
+    )
+    p_train.add_argument(
+        "--pdf-max",
+        dest="pdf_max",
+        type=int,
+        default=settings.TRAIN_PDF_MAX_PER_CLASS,
+        metavar="N",
+        help=(
+            "Crops per class in the --pdf (a fixed sample when there are more; "
+            f"0 = all). Default: {settings.TRAIN_PDF_MAX_PER_CLASS} (one page)."
         ),
     )
     p_train.add_argument(

@@ -1,6 +1,7 @@
 # Standard Library
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import csv
+import re
 import hashlib
 import os
 from collections import Counter
@@ -493,6 +494,14 @@ def aggregate_predictions(
 # parameters) live in ``settings``.
 
 
+def _class_column(name: str) -> str:
+    """Normalise a classes CSV header, e.g. ``"level 2 "`` -> ``CATAMI_LEVEL_2``."""
+    col = re.sub(r"\s+", "_", (name or "").strip()).upper()
+    if re.fullmatch(r"LEVEL_?\d", col):
+        col = "CATAMI_LEVEL_" + col[-1]
+    return col
+
+
 def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
     """Load the CATAMI class hierarchy from a classes CSV.
 
@@ -509,10 +518,23 @@ def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
     nodes: Dict[str, Dict[str, str]] = {}
     children: Dict[str, List[str]] = {}
     rows = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
+    # utf-8-sig: spreadsheet exports often start with a byte-order mark
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        columns = [_class_column(c) for c in reader.fieldnames or []]
+        missing = [
+            c for c in ("SPECIES_CODE", "CATAMI_PARENT_ID", "CPC_CODES")
+            if c not in columns
+        ]
+        if missing:
+            raise ValueError(
+                f"{path}: missing column(s) {', '.join(missing)} "
+                f"(found: {', '.join(c for c in columns if c)})"
+            )
+        reader.fieldnames = columns
+        for row in reader:
             # Skip blank/padding rows that have no species code.
-            if not row["SPECIES_CODE"].strip():
+            if not (row["SPECIES_CODE"] or "").strip():
                 continue
             rows.append(row)
 
@@ -523,12 +545,12 @@ def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
         # Display name = deepest non-empty CATAMI level for this row.
         name = code
         for col in settings.TRAIN_LEVEL_COLUMNS:
-            if row.get(col, "").strip():
+            if (row.get(col) or "").strip():
                 name = row[col].strip()
         nodes[code] = {
-            "cpc": row["CPC_CODES"].strip(),
+            "cpc": (row["CPC_CODES"] or "").strip(),
             "name": name,
-            "parent": row["CATAMI_PARENT_ID"].strip(),
+            "parent": (row["CATAMI_PARENT_ID"] or "").strip(),
         }
         children.setdefault(code, [])
 
@@ -1685,6 +1707,64 @@ def _remove_empty_category_dirs(
                 except OSError as e:
                     logger.warning("Could not remove empty dir %s: %s", cat_dir, e)
     return removed
+
+
+def training_crops_by_class(
+    annotations_path: str, output_dir: str, label_map: Dict[str, str],
+    max_per_class: int = settings.TRAIN_PDF_MAX_PER_CLASS,
+    crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
+) -> Dict[str, Tuple[int, List[Tuple[str, str, str, str]]]]:
+    """The existing crops per training class, e.g. for inspecting the labels.
+
+    Uses :func:`plan_crops` for the annotation id of each crop (it cannot be
+    parsed from the filename) and collapses raw labels to training classes via
+    ``label_map``; raw labels absent from the map are skipped, as in
+    :func:`count_crops_by_class`. A class with more crops than
+    ``max_per_class`` is sampled by a hash of the id, so reruns show the same
+    crops.
+
+    Args:
+        annotations_path: Consolidated training annotations CSV.
+        output_dir: Base directory holding the crop folders.
+        label_map: ``raw_label -> training_class`` mapping.
+        max_per_class: Crops kept per class (0 = all).
+        crop_dirs: Folder names for the three splits.
+
+    Returns:
+        Mapping ``class -> (n_crops, [(path, id, raw_label, split_dir), ...])``,
+        classes sorted by name and each list by raw label and id.
+    """
+    split_of = {
+        os.path.normpath(os.path.join(output_dir, d)): d for d in crop_dirs
+    }
+    per_class: Dict[str, List[Tuple[str, str, str, str]]] = {}
+    for path, info in plan_crops(
+        annotations_path, output_dir, crop_dirs=crop_dirs
+    ).items():
+        cls = label_map.get(info["label"])
+        if cls is None:
+            continue
+        try:
+            if os.path.getsize(path) == 0:
+                continue
+        except OSError:
+            continue
+        split_dir = split_of.get(os.path.dirname(os.path.dirname(path)), "")
+        per_class.setdefault(cls, []).append(
+            (path, info["id"], info["label"], split_dir)
+        )
+
+    def _hash(item):
+        return hashlib.md5(item[1].encode()).hexdigest()
+
+    result = {}
+    for cls in sorted(per_class):
+        items = per_class[cls]
+        shown = items
+        if max_per_class and len(items) > max_per_class:
+            shown = sorted(items, key=_hash)[:max_per_class]
+        result[cls] = (len(items), sorted(shown, key=lambda i: (i[2], i[1])))
+    return result
 
 
 # ---------------------------------------------------------------------------

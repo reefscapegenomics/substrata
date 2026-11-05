@@ -232,6 +232,81 @@ class TestLabelTree(unittest.TestCase):
         self.assertNotIn("A", cmap2)
 
 
+class TestLoadClassesHeaders(unittest.TestCase):
+    """Spreadsheet exports: a BOM, ``Level n`` headers and padding columns."""
+
+    def test_bom_and_level_headers(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "classes.csv")
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["SPECIES_CODE", "CATAMI_PARENT_ID", "CPC_CODES",
+                            "Level 1", "level 2 ", "", ""])
+                w.writerow(["1000", "", "C", "Corals", "", "", ""])
+                w.writerow(["1100", "1000", "CB", "Corals", "Branching"])
+                w.writerow(["", "", "", "", "", "", ""])
+            nodes, children, roots = cl.load_classes(path)
+        self.assertEqual(roots, ["1000"])
+        self.assertEqual(nodes["1100"]["name"], "Branching")
+        self.assertEqual(children["1000"], ["1100"])
+
+    def test_missing_column_is_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "classes.csv")
+            with open(path, "w") as f:
+                f.write("code,parent\n1,\n")
+            with self.assertRaisesRegex(ValueError, "SPECIES_CODE"):
+                cl.load_classes(path)
+
+
+class TestTrainingCropsByClass(unittest.TestCase):
+    """Crops grouped per training class for the `train --pdf` contact sheet."""
+
+    def _setup(self, d, n_cb=6):
+        ann = os.path.join(d, "training_annotations.csv")
+        rows = [_ann_row(f"cb{i}", "CB", f"/imgs/IMG_{i}.jpg", "10", "20")
+                for i in range(n_cb)]
+        rows += [
+            _ann_row("cma0", "CMA", "/imgs/IMG_A.jpg", "1", "2"),
+            _ann_row("alg0", "A", "/imgs/IMG_B.jpg", "1", "2"),  # not in the map
+            _ann_row("gone", "CB", "/imgs/IMG_C.jpg", "1", "2"),  # crop missing
+        ]
+        _write_ann(ann, rows)
+        for path, info in cl.plan_crops(ann, d).items():
+            if info["id"] == "gone":
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"jpg")
+        label_map = {"CB": "CB", "CMA": "CM"}  # CMA collapsed into CM
+        return ann, label_map
+
+    def test_groups_by_training_class(self):
+        with tempfile.TemporaryDirectory() as d:
+            ann, label_map = self._setup(d)
+            groups = cl.training_crops_by_class(ann, d, label_map)
+        self.assertEqual(list(groups), ["CB", "CM"])
+        n_cb, cb = groups["CB"]
+        self.assertEqual(n_cb, 6)  # "gone" has no crop file
+        self.assertEqual([i[1] for i in cb], [f"cb{i}" for i in range(6)])
+        n_cm, cm = groups["CM"]
+        self.assertEqual((n_cm, cm[0][1], cm[0][2]), (1, "cma0", "CMA"))
+        self.assertIn(cm[0][3], cl.settings.TRAIN_CROP_DIRS)
+
+    def test_cap_is_a_fixed_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            ann, label_map = self._setup(d, n_cb=40)
+            a = cl.training_crops_by_class(ann, d, label_map, max_per_class=5)
+            b = cl.training_crops_by_class(ann, d, label_map, max_per_class=5)
+            everything = cl.training_crops_by_class(
+                ann, d, label_map, max_per_class=0
+            )
+        self.assertEqual(a["CB"][0], 40)
+        self.assertEqual(len(a["CB"][1]), 5)
+        self.assertEqual(a, b)
+        self.assertEqual(len(everything["CB"][1]), 40)
+
+
 class TestLabelMap(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

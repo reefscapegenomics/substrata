@@ -870,7 +870,19 @@ another class, or blank one to exclude it), then re-run `substrata train
 --keep-map` to train on the edited map (a plain `substrata train` would re-seed
 it and discard your edits).
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--crop-size PX] [--jobs N] [--arch ARCH] [--pretrained-weights CKPT] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
+**Inspecting the crops (`--pdf`).** `--pdf` writes `training_crops.pdf` once the
+crops and label map are ready: one A4 page per training class, as an 11 × 15 grid
+of crops. Each crop is captioned with its annotation id, so a mislabelled crop can
+be traced back to its point. Captions also show the raw label when it was collapsed
+into the class, and `val`/`test` for validation and test crops. The ids are PDF
+text, so you can search for them. A class with more crops than `--pdf-max`
+(default 165, one page) shows a fixed sample, the same on every run; `--pdf-max 0`
+shows them all, over as many pages as needed. Combine it with `--prepare-only` to
+inspect before training. After training, `--validate --pdf` or `--test --pdf`
+rebuilds the PDF from the existing crops and map without collating again, and then
+runs the evaluation.
+
+Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--pretrained-weights CKPT] [--epochs N] [--model PKL] [--validate] [--test] [--yes]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, crop, seed the map, and train
@@ -880,6 +892,9 @@ substrata train
 substrata train --include-classes MAF_T MAENRC_C CSE --prepare-only
 $EDITOR training_label_map.csv   # re-point / collapse / exclude labels
 substrata train --keep-map       # trains on the edited map (edits preserved)
+
+# Prepare, then inspect the crops per class before training
+substrata train --classes classes.csv --min-count 20 --collapse --prepare-only --pdf
 
 # Train parent classes, folding their sub-categories in (MAFG/MAF_T -> MAF)
 substrata train --include-classes MAF MAEN --collapse

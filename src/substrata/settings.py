@@ -108,6 +108,12 @@ TRAIN_SUMMARY_CLASSES_PER_PAGE = 40  # category bars per training-summary PDF pa
 TRAIN_CM_ANNOTATE_MAX = 25  # max classes for per-cell count labels on the matrix
 TRAIN_EXAMPLES_PER_CLASS = 10  # example crops shown per category in the PDF
 TRAIN_EXAMPLE_ROWS_PER_PAGE = 8  # category rows per example-images PDF page
+# `train --pdf`: contact sheet of the training crops per training class
+TRAIN_CROPS_PDF_FILE = "training_crops.pdf"
+TRAIN_PDF_COLS = 11  # crops per row (A4 portrait)
+TRAIN_PDF_ROWS = 15  # rows per page
+TRAIN_PDF_MAX_PER_CLASS = TRAIN_PDF_COLS * TRAIN_PDF_ROWS  # one page per class
+TRAIN_PDF_THUMB_PX = 128  # crops are downscaled to this size in the PDF
 
 # Label-tree (CATAMI hierarchy) rendering and consolidated-CSV layout.
 TRAIN_LABEL_COLUMN = "label"
