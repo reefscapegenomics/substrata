@@ -96,7 +96,8 @@ TRAIN_DELETE_PREVIEW = 5  # example paths shown before deleting redundant crops
 TRAIN_MIN_VISIBLE_COUNT = 1
 TRAIN_SPLIT = (80, 10, 10)  # train / validation / test percentages
 TRAIN_CROP_DIRS = ("training_crops", "validation_crops", "test_crops")
-# `train --arch`: a DINOv2 backbone (point-feature classifier, the default) or a
+# `train --arch`: a DINOv2 / DINOv3 backbone (point-feature classifier, the
+# default; a short-hand of POINT_ARCH_ALIASES or a torch.hub name) or a
 # torchvision architecture (fastai crop classifier, e.g. resnet34).
 TRAIN_DEFAULT_ARCH = "dinov2_vitb14_reg"
 TRAIN_DEFAULT_CROP_ARCH = "resnet34"  # default of the fastai crop classifier
@@ -105,9 +106,30 @@ TRAIN_DEFAULT_MODEL_FILE = "crop_classifier.pkl"  # fastai crop classifier
 
 # --- Point-feature classifier (DINOv2 features read at the annotated pixel) ---
 POINT_DEFAULT_MODEL_FILE = "point_classifier.pt"
-POINT_ARCH_PREFIX = "dinov2"  # --arch values starting with this use point features
+POINT_ARCH_PREFIX = "dinov"  # --arch values starting with this use point features
+# `train --arch` short-hands -> backbone (torch.hub entry point)
+POINT_ARCH_ALIASES = {
+    "dinov2": "dinov2_vitb14_reg", "dinov2-s": "dinov2_vits14_reg",
+    "dinov2-b": "dinov2_vitb14_reg", "dinov2-l": "dinov2_vitl14_reg",
+    "dinov2-g": "dinov2_vitg14_reg",
+    "dinov3": "dinov3_vitb16", "dinov3-s": "dinov3_vits16",
+    "dinov3-b": "dinov3_vitb16", "dinov3-l": "dinov3_vitl16",
+    "dinov3-h": "dinov3_vith16plus",
+}
 POINT_HUB_REPO = "facebookresearch/dinov2"  # torch.hub repo (or a local clone)
-POINT_WINDOW_PX = 448  # model-input context window per point (multiple of 14)
+# DINOv3: the backbone code comes from this GitHub repo (or a local clone; only
+# its backbone module is imported, which needs nothing beyond torch). Its
+# weights are gated: after accepting the licence (POINT_DINOV3_ACCESS_URL) put
+# the downloaded dinov3_<arch>_pretrain_lvd1689m-*.pth in torch.hub's
+# checkpoints folder, or point the environment variable below at the file, its
+# folder or the download link.
+POINT_HUB_REPO_DINOV3 = "facebookresearch/dinov3"
+POINT_DINOV3_WEIGHTS_ENV = "SUBSTRATA_DINOV3_WEIGHTS"
+POINT_DINOV3_ACCESS_URL = (
+    "https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/")
+# model-input context window per point (a multiple of the patch size: 14 for
+# DINOv2, 16 for DINOv3; 448 is both)
+POINT_WINDOW_PX = 448
 # Without a ground resolution, the window covers this fraction of the median
 # training image width (448 px windows: ~0.25 on 9568 px diver photos, ~1 on
 # 2816 px AUV frames - the best scales in the samoa tests).
@@ -120,11 +142,68 @@ POINT_CALIB_IMAGES = 500  # photos sampled for feature (calibration) statistics
 POINT_CALIB_PER_IMAGE = 4  # random patches per sampled photo
 POINT_CALIB_MARGIN = 0.1  # random patches avoid this fraction of each image edge
 POINT_FEATURES_DIR = "point_features"  # feature caches, under train --output
+# Photos without a ground resolution whose width differs from the training
+# photos' median width by more than this share (another camera) are resampled so
+# the window covers the same share of their width; within it (the training
+# camera) the classifier's fixed scale is used, as in training.
+POINT_WIDTH_TOLERANCE = 0.25
 # A projected annotation must land within this many px of its cam_x/cam_y for
 # the camera distance (ground resolution) to be trusted.
 POINT_GSD_PIXEL_TOL = 5.0
 # mm/px mode needs a ground resolution for at least this fraction of points
 POINT_GSD_MIN_FRACTION = 0.9
+# Optionally place each training point at a fixed pseudo-random offset from its
+# window centre (at least POINT_TRAIN_OFFSET_MARGIN_PX from the edge), as cells
+# of the dense maps sit anywhere in their tiles. Off: in 5-fold CV over 2362
+# samoa diver points (14 classes) it gave dense maps +1.5 accuracy but equal
+# macro-F1, and cost per-point classification 3 macro-F1 (centred+offset
+# augmentation was worse still).
+POINT_TRAIN_OFFSETS = False
+POINT_TRAIN_OFFSET_MARGIN_PX = 28
+# Dense per-photo maps: tiles of POINT_WINDOW_PX overlap by this much (model px,
+# rounded down to whole feature cells) and are blended with centre-peaked weights
+POINT_DENSE_OVERLAP_PX = 112
+POINT_DENSE_TILE_BATCH = 16  # tiles per backbone pass
+# `segment` with a point classifier: views (best cameras) fused per query point
+SEG_POINT_VIEWS = 3
+MASKS_DEFAULT_DIR = "masks"  # `substrata masks` output folder (under the CWD)
+MASKS_INDEX_FILE = "masks.json"  # classes, colours and cell size per photo
+MASKS_COVER_FILE = "masks_cover.csv"  # per-photo class fractions
+# --- Curation (`substrata curate`, run in the classifier folder) ---
+# Decisions (accept / relabel / exclude) on training points, one JSON object per
+# line, latest per point wins; keyed by photo file name + rounded pixel, so they
+# survive regenerated training sets, renumbered ids and moved photo folders.
+CURATION_FILE = "curation.jsonl"
+CURATION_DIR = "curate"  # scores, tiles and pools (under the classifier folder)
+CURATION_POINTS_FILE = "points.csv"  # per-point scores of the training points
+CURATION_META_FILE = "meta.json"
+# Thumbnails of the model input windows, in one SQLite file (one file per
+# thumbnail wastes space on large-cluster file systems, e.g. exFAT: 256 KB each)
+CURATION_TILES_FILE = "tiles.sqlite"
+CURATION_POOLS_DIR = "pools"  # unlabelled points sampled from photos (--mine)
+CURATION_TILE_PX = 224  # thumbnail size (the window is downscaled to it)
+CURATION_TILE_QUALITY = 85  # JPEG quality of the thumbnails
+CURATION_ACTIONS = ("accept", "relabel", "exclude", "clear")
+# Reasons offered for excluding a point (any text is accepted)
+CURATION_EXCLUDE_REASONS = ("mixed", "misplaced", "unclear", "photo", "other")
+CURATION_CV_FOLDS = 5  # cross-validated probabilities (grouped by photo)
+# Neighbourhood ring: positions this far from the point (model px; 2 feature
+# cells at the default 448 px window) in CURATION_RING_N directions
+CURATION_RING_RADIUS_PX = 28
+CURATION_RING_N = 8
+CURATION_KNN = 10  # neighbours for label consistency and novelty
+# A point "looks clean" (summary only, never auto-accepted) when both hold
+CURATION_CLEAN_P = 0.8  # cross-validated probability of its own class
+CURATION_CLEAN_RING = 0.8  # mean probability of its class around it
+# Summary counts only (the queues are sorted, not cut): suspect labels and
+# mixed neighbourhoods (about the lowest quartiles in the samoa tests)
+CURATION_SUSPECT_P = 0.2
+CURATION_MIXED_RING = 0.25
+# --mine: unlabelled points sampled from photos and clustered
+CURATION_MINE_IMAGES = 2000  # photos sampled
+CURATION_MINE_PER_IMAGE = 12  # points per photo (jittered grid)
+CURATION_MINE_CLUSTERS = 60
+CURATION_MINE_PCA = 64  # dimensions before k-means
 TRAIN_ANNOTATIONS_FILE = "training_annotations.csv"
 # Editable label->training-class map (selection + hierarchical collapse). Seeded
 # from the label tree, hand-tunable, and read by both training and evaluation.
@@ -164,6 +243,8 @@ TRAIN_ANN_COLUMNS = [
     "cam_y",
     "depth",
     "split_key",  # optional: rows sharing a key share a split (see plan_crops)
+    "cam_gsd_mm",  # optional: ground resolution of the photo at the point (mm/px)
+    "domain",  # optional: camera system of points mined from other photos (curate)
 ]
 
 # CoralNet point exports (`substrata train --coralnet`)

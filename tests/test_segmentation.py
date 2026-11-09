@@ -315,6 +315,136 @@ class TestClassifyPointFeatures(unittest.TestCase):
         self.assertTrue(np.isnan(conf[1]) and np.isnan(conf[3]))
 
 
+class _ProjCam:
+    """Camera double for matching: fixed relevance per query, all in view."""
+
+    def __init__(self, rel, filepath="p.png"):
+        self.rel = np.asarray(rel, float)
+        self.sensor = types.SimpleNamespace(fx=1000.0)
+        self.filepath = filepath
+
+    def project_points(self, orig, use_orig_coords=True):
+        n = len(orig)
+        x = np.full(n, 10.0) + self.rel
+        return x, x, np.ones(n), self.rel, np.ones(n, bool)
+
+
+class TestMatchMultiView(unittest.TestCase):
+    def test_top_k_sorted_and_single_view_wrapper(self):
+        cams = [_ProjCam([3.0, 1.0]), _ProjCam([1.0, 5.0]), _ProjCam([2.0, 2.0])]
+        qc = np.zeros((2, 3))
+        cam, x, _y, _d, rel, _cl = seg._match_points_to_cameras_multi(
+            qc, cams, views=2, verbose=False)
+        self.assertEqual(cam.tolist(), [[1, 2], [0, 2]])
+        self.assertEqual(rel.tolist(), [[1.0, 2.0], [1.0, 2.0]])
+        self.assertEqual(x[0].tolist(), [11.0, 12.0])
+        best, *_ = seg._match_points_to_cameras(qc, cams, verbose=False)
+        self.assertEqual(best.tolist(), [1, 0])
+        # More views than cameras: the rest stay empty.
+        cam5, *_r = seg._match_points_to_cameras_multi(
+            qc, cams, views=5, verbose=False)
+        self.assertEqual((cam5 >= 0).sum(1).tolist(), [3, 3])
+        self.assertTrue((cam5[:, 3:] == -1).all())
+
+
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
+
+
+@unittest.skipUnless(torch, "torch not installed")
+class TestClassifyDenseViews(unittest.TestCase):
+    """Fusion of dense per-photo maps over several views per query."""
+
+    def setUp(self):
+        from PIL import Image
+
+        from substrata import pointfeatures as pf
+
+        class Backbone(torch.nn.Module):
+            patch_size, embed_dim = 14, 3
+
+            def __init__(self):
+                super().__init__()
+                self.p = torch.nn.Parameter(torch.zeros(1))
+
+            def forward_features(self, x):
+                t = torch.nn.functional.avg_pool2d(x, 14)
+                b, c = t.shape[:2]
+                return {"x_norm_patchtokens": t.flatten(2).transpose(1, 2)}
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.paths = []
+        for name, ch in (("red", 0), ("blue", 2)):
+            arr = np.zeros((112, 112, 3), np.uint8)
+            arr[..., ch] = 255
+            p = os.path.join(self.tmp.name, f"{name}.png")
+            Image.fromarray(arr).save(p)
+            self.paths.append(p)
+        self.clf = pf.PointFeatureClassifier(
+            backbone="fake", classes=["red", "green", "blue"],
+            weights=np.eye(3, dtype=np.float32), bias=np.zeros(3, np.float32),
+            source_mean=np.zeros(3, np.float32), source_std=np.ones(3, np.float32),
+            window=56, target_mm_px=1.0, scale_factor=1.0,
+        )
+        model = Backbone()
+        self.clf.backbone_model = lambda: model
+        self.cams = [_FakeSensorCam(p, fx=1000.0) for p in self.paths]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_weighted_fusion_agreement_and_masks(self):
+        # Query 0: red photo (rel 1) + blue photo (rel 2); query 1: blue only;
+        # query 2: no view.
+        vc = np.array([[0, 1], [1, -1], [-1, -1]])
+        vx = np.full((3, 2), 50.0)
+        vd = np.full((3, 2), 1.0)  # 1 m at fx 1000 -> 1 mm/px = target
+        vr = np.array([[1.0, 2.0], [3.0, np.inf], [np.inf, np.inf]])
+        mask_dir = os.path.join(self.tmp.name, "masks")
+        res = seg._classify_dense_views(
+            vc, vx, vx, vd, vr, self.cams, self.clf, depth_scale=1.0,
+            mask_dir=mask_dir, mask_colors={"red": (255, 0, 0)}, verbose=False,
+        )
+        self.assertEqual(res["labels"].tolist(), ["red", "blue", ""])
+        self.assertEqual(res["n_views"].tolist(), [2, 1, 0])
+        # Weights 1 and 0.5: the red view carries 2/3 of the weight.
+        self.assertAlmostEqual(res["agreement"][0], 2 / 3, places=5)
+        self.assertAlmostEqual(res["agreement"][1], 1.0)
+        self.assertTrue(np.isnan(res["agreement"][2]))
+        self.assertEqual(res["cam"].tolist(), [0, 1, -1])
+        self.assertTrue(os.path.isfile(os.path.join(mask_dir, "red_labels.png")))
+        with open(os.path.join(mask_dir, "masks.json")) as f:
+            import json
+            idx = json.load(f)
+        self.assertEqual(idx["classes"], ["red", "green", "blue"])
+        self.assertEqual(len(idx["photos"]), 2)
+
+    def test_segmentation_keeps_views_and_agreement(self):
+        s = seg.Segmentation.from_query_labels(
+            np.zeros((3, 3)), np.array(["a", "", "b"], dtype=object),
+            np.array([0.9, np.nan, 0.6]), n_views=np.array([3, 0, 1]),
+            agreement=np.array([1.0, np.nan, 0.5]),
+        )
+        self.assertEqual(s.query_n_views.tolist(), [3, 1])
+        with tempfile.TemporaryDirectory() as d:
+            path = s.save(os.path.join(d, "s.npz"))
+            back = seg.Segmentation.load(path)
+            self.assertEqual(back.query_agreement.tolist(), [1.0, 0.5])
+            self.assertEqual(back.query_n_views.tolist(), [3, 1])
+        # Other test modules stub substrata.annotations; the CSV part needs the
+        # real module.
+        try:
+            from substrata.annotations import Annotation  # noqa: F401
+        except ImportError:
+            self.skipTest("substrata.annotations is stubbed in this run")
+        anns = s.to_annotations()
+        a0 = list(anns.data.values())[0]
+        self.assertEqual(a0.pred_n, 3)
+        self.assertEqual(a0.meta_data["pred_agreement"], 1.0)
+
+
 _SEG_HEAD = ("id,orig_x,orig_y,orig_z,label,label_conf,world_x,world_y,world_z,"
              "cam_filepath,cam_x,cam_y,depth,pred_label,pred_conf,pred_n\n")
 

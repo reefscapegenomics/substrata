@@ -137,6 +137,23 @@ class TestWindows(unittest.TestCase):
                 r = wins[0][int(xy[0][1]), int(xy[0][0]), 0]
                 self.assertAlmostEqual(float(r), float(ramp[150, 200]), delta=6)
 
+    def test_image_windows_offset(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.png")
+            self._gradient(path)
+            wins, xy = pf.image_windows(path, np.array([[200.0, 150.0]]),
+                                        np.array([0.5]), 64,
+                                        offsets=np.array([[10.0, -6.0]]))
+            np.testing.assert_allclose(xy[0], [42, 26], atol=0.6)
+
+    def test_training_offsets_deterministic_and_bounded(self):
+        keys = [f"id{i}|p.jpg|1.0|2.0" for i in range(200)]
+        a = pf.training_offsets(keys, window=448, margin=28)
+        np.testing.assert_array_equal(a, pf.training_offsets(keys, 448, 28))
+        self.assertLessEqual(np.abs(a).max(), 196)
+        self.assertGreater(np.abs(a).max(), 150)  # spread over the range
+        self.assertFalse((pf.training_offsets(keys, 56, 28) != 0).any())
+
     def test_image_windows_unreadable(self):
         self.assertIsNone(pf.image_windows("/no/such.png", np.zeros((1, 2)),
                                            np.ones(1), 28))
@@ -236,6 +253,26 @@ class TestClassifier(unittest.TestCase):
             torch.save({"x": 1}, os.path.join(d, "other.pt"))
             with self.assertRaises(ValueError):
                 pf.PointFeatureClassifier.load(os.path.join(d, "other.pt"))
+
+    @unittest.skipUnless(torch, "torch not installed")
+    def test_backbone_from_hub_cache_without_network(self):
+        old = torch.hub.get_dir()
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "someone_somerepo_main")
+            os.makedirs(repo)
+            with open(os.path.join(repo, "hubconf.py"), "w") as f:
+                f.write("import torch\n"
+                        "def tiny():\n"
+                        "    m = torch.nn.Linear(1, 1)\n"
+                        "    m.embed_dim = 7\n"
+                        "    return m\n")
+            torch.hub.set_dir(d)
+            try:
+                m = pf.load_backbone("tiny", device="cpu", hub_repo="someone/somerepo")
+            finally:
+                torch.hub.set_dir(old)
+                pf._BACKBONES.clear()
+        self.assertEqual(m.embed_dim, 7)
 
     def test_arch_and_path_detection(self):
         self.assertTrue(pf.is_point_arch("dinov2_vitb14_reg"))
@@ -342,6 +379,98 @@ class TestExtraction(unittest.TestCase):
         self.assertIs(m.classification, res[0])
         self.assertIsNone(res[1])
         self.assertEqual(cl.classify_image_match(m, clf)["label"], "blue")
+
+
+class TestDenseMap(unittest.TestCase):
+    def _map(self):
+        probs = np.zeros((2, 3, 2), np.float32)
+        probs[..., 0] = np.arange(3)[None, :]  # class 0 "prob" = column index
+        probs[..., 1] = np.arange(2)[:, None]  # class 1 = row index
+        return pf.DenseMap(probs, scale=0.5, patch=14, width=84, height=56,
+                           classes=["a", "b"])
+
+    def test_sample_at_cell_centres_and_between(self):
+        dm = self._map()
+        self.assertEqual(dm.cell_px, 28)
+        # Cell (row 1, col 2) is centred on native (2.5 * 28, 1.5 * 28).
+        np.testing.assert_allclose(dm.sample([70], [42]), [[2, 1]])
+        np.testing.assert_allclose(dm.sample([28], [28]), [[0.5, 0.5]])
+        np.testing.assert_allclose(dm.sample([-50, 999], [0, 999]), [[0, 0], [2, 1]])
+
+    def test_labels_conf_cover(self):
+        dm = self._map()
+        # Ties go to the first class.
+        self.assertEqual(dm.labels().tolist(), [[0, 0, 0], [1, 0, 0]])
+        self.assertAlmostEqual(sum(dm.cover().values()), 1.0)
+        self.assertAlmostEqual(dm.cover()["a"], 5 / 6)
+
+    def test_photo_scale_and_unique_stems(self):
+        clf = _make_classifier(target_mm_px=2.0, scale_factor=0.3)
+        self.assertEqual(pf.photo_scale(clf, 1.0), 0.5)
+        self.assertEqual(pf.photo_scale(clf, None), 0.3)
+        self.assertEqual(pf.photo_scale(_make_classifier(scale_factor=0.3), 1.0), 0.3)
+        self.assertEqual(pf.unique_stems(["/a/x.png", "/b/x.jpg", "/b/y.png"]),
+                         ["a_x", "b_x", "y"])
+
+    def test_save_masks(self):
+        dm = self._map()
+        with tempfile.TemporaryDirectory() as d:
+            files = pf.save_dense_masks(dm, d, "p", {"a": (255, 0, 0)},
+                                        save_probs=True)
+            lab = Image.open(os.path.join(d, files["labels"]))
+            self.assertEqual(lab.mode, "P")
+            self.assertEqual(np.asarray(lab).tolist(), dm.labels().tolist())
+            self.assertEqual(lab.getpalette()[:3], [255, 0, 0])
+            self.assertEqual(lab.getpalette()[3:6], [128, 128, 128])  # no colour
+            conf = np.asarray(Image.open(os.path.join(d, files["conf"])))
+            self.assertEqual(conf.dtype, np.uint8)
+            z = np.load(os.path.join(d, files["probs"]))
+            self.assertEqual(z["probs"].shape, (2, 3, 2))
+
+
+@unittest.skipUnless(torch, "torch not installed")
+class TestDenseProbabilities(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        arr = np.zeros((280, 560, 3), np.uint8)
+        arr[:, :280, 0] = 255
+        arr[:, 280:, 2] = 255
+        self.arr = arr
+        self.photo = os.path.join(self.tmp.name, "p.png")
+        Image.fromarray(arr).save(self.photo)
+        self.clf = _make_classifier(classes=["red", "green", "blue"], window=56)
+        self.model = FakeBackbone()
+        self.clf.backbone_model = lambda: self.model
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_tiled_blend_matches_halves_without_seams(self):
+        probs = pf.dense_probabilities(self.clf, self.arr, self.model,
+                                       overlap_px=28, tile_batch=3)
+        self.assertEqual(probs.shape, (20, 40, 3))
+        np.testing.assert_allclose(probs.sum(-1), 1, rtol=1e-5)
+        labels = probs.argmax(-1)
+        self.assertTrue((labels[:, :20] == 0).all())
+        self.assertTrue((labels[:, 20:] == 2).all())
+        # Uniform regions get identical probabilities wherever tiles meet.
+        self.assertLess(probs[:, :18].std(axis=(0, 1)).max(), 1e-5)
+
+    def test_single_tile_when_photo_fits(self):
+        small = self.arr[:30, :40]
+        probs = pf.dense_probabilities(self.clf, small, self.model)
+        self.assertEqual(probs.shape, (3, 3, 3))  # ceil(30/14) x ceil(40/14)
+
+    def test_iter_dense_maps(self):
+        out = list(pf.iter_dense_maps(self.clf, [self.photo, "/missing.png"],
+                                      [0.5, 0.5], n_jobs=2, progress=False))
+        self.assertEqual([i for i, _ in out], [0, 1])
+        dm = out[0][1]
+        self.assertIsNone(out[1][1])
+        self.assertEqual((dm.width, dm.height, dm.cell_px), (560, 280, 28))
+        self.assertEqual(dm.probs.shape, (10, 20, 3))
+        np.testing.assert_allclose(dm.sample([100, 460], [140, 140]).argmax(1),
+                                   [0, 2])
 
 
 class TestTrainingPlan(unittest.TestCase):

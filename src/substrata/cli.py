@@ -1067,6 +1067,7 @@ def _seg_output_names(init, cwd, tag=None):
         "points": os.path.join(annos_dir, f"{init.id}_{stem}_points.csv"),
         "ply_dec": _get_output_filepath(init, f"{stem}_dec.ply"),
         "ply": _get_output_filepath(init, f"{stem}.ply"),
+        "masks": _get_output_filepath(init, f"{stem}_masks"),
     }
 
 
@@ -1106,6 +1107,17 @@ def _segment_classify(args, init, names):
         lbl, hexv = spec.split("=", 1)
         label_colors[lbl] = _parse_hex_color(hexv)
 
+    from substrata import pointfeatures
+
+    point_clf = pointfeatures.is_point_classifier(learn)
+    dense = point_clf and not getattr(args, "per_point", False)
+    views = (getattr(args, "views", None) or settings.SEG_POINT_VIEWS) if dense else 1
+    mask_dir = None
+    if getattr(args, "save_masks", None) is not None:
+        if not dense:
+            raise SystemExit("--save-masks needs a point classifier (dense maps).")
+        mask_dir = args.save_masks or names["masks"]
+        os.makedirs(mask_dir, exist_ok=True)
     seg = segmentation.segment_point_cloud(
         init.pcd, init.cams, learn,
         world_transform=init.pcd.world_transform,
@@ -1114,7 +1126,12 @@ def _segment_classify(args, init, names):
         occlusion=not args.no_occlusion,
         label_colors=label_colors or None,
         crop_size=crop_size,
+        views=views,
+        dense=dense,
+        mask_dir=mask_dir,
     )
+    if mask_dir:
+        print(f"Saved per-photo masks: {mask_dir}")
 
     if args.output_npz:
         seg.save(args.output_npz)
@@ -1137,6 +1154,9 @@ def _segment_classify(args, init, names):
             "crop_size": int(crop_size),
             "occlusion": not args.no_occlusion,
             "colors": seg.hex_colors(),
+            **({"method": "dense" if dense else "per-point", "views": int(views)}
+               if point_clf else {}),
+            **({"masks": mask_dir} if mask_dir else {}),
         },
     }, update=False)
     print(f"Saved classified query points: {points_csv} ({seg.n_queries:,})")
@@ -3491,7 +3511,7 @@ def _predict_images(args):
     predictions are written to the points CSV, with a per-image cover table
     next to it.
     """
-    from substrata import classification
+    from substrata import classification, pointfeatures
     from substrata.annotations import Annotations
     from substrata.cameras import Cameras
 
@@ -3566,9 +3586,15 @@ def _predict_images(args):
                 print(f"Resampling; old points backed up to {backup}")
             anns = _sample(all_cams)
 
-    results = anns.classify_image_matches(
-        learn, crop_size=crop_size, batch_size=args.batch_size, n_jobs=args.jobs,
-    )
+    if not pointfeatures.is_point_classifier(learn) and (args.gsd_mm or args.domain):
+        raise SystemExit("--gsd-mm and --domain apply to point classifiers (.pt).")
+    try:
+        results = anns.classify_image_matches(
+            learn, crop_size=crop_size, batch_size=args.batch_size, n_jobs=args.jobs,
+            gsd_mm=args.gsd_mm, domain=args.domain,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e))
     for ann_id, res in results.items():
         if res is not None:
             anns[ann_id].pred_label = res["label"]
@@ -3584,7 +3610,8 @@ def _predict_images(args):
     cover_path = os.path.splitext(points_path)[0] + "_cover.csv"
     if _write_cover_table(anns, cover_path) is not None:
         print(f"Saved per-image cover (% of points) to {cover_path}")
-    _print_label_agreement(anns, {str(v) for v in learn.dls.vocab})
+    vocab = learn.vocab if pointfeatures.is_point_classifier(learn) else learn.dls.vocab
+    _print_label_agreement(anns, {str(v) for v in vocab})
 
 
 def handle_predict(args):
@@ -4321,7 +4348,9 @@ def handle_train(args):
         else settings.TRAIN_DEFAULT_PATTERN
     )
     crop_size = args.crop_size or settings.TRAIN_CROP_SIZE
-    # --arch dinov2_* (default): point-feature classifier; else fastai crops.
+    # --arch dinov2 / dinov3 (short-hands or torch.hub names; default DINOv2):
+    # point-feature classifier; else fastai crops.
+    args.arch = pointfeatures.resolve_arch(args.arch)
     point_mode = pointfeatures.is_point_arch(args.arch)
     model_file = args.model or os.path.join(
         output_dir,
@@ -4468,6 +4497,30 @@ def handle_train(args):
             converted.append(out_path)
         csv_files, pattern = converted, "*_points.csv"
 
+    # --- Curation decisions (`substrata curate`) and pool points ---
+    curation_store = None
+    if not getattr(args, "no_curation", False):
+        from substrata import curation as cur
+
+        try:
+            curation_store = cur.store_for_folder(
+                output_dir, getattr(args, "curation", None) or [])
+        except FileNotFoundError as e:
+            raise SystemExit(str(e))
+        if len(curation_store):
+            done = curation_store.counts()
+            what = ", ".join(f"{n} {a}" for a, n in sorted(done.items()))
+            extra = "".join(f" + {p}" for p in curation_store.extra)
+            print(f"Curation: {len(curation_store)} decision(s) ({what}) from "
+                  f"{curation_store.path}{extra}")
+            pools = cur.pool_csvs(output_dir)
+            if pools and done.get("relabel"):
+                csv_files = csv_files + pools
+                print(f"  + {len(pools)} pool(s): their points labelled in "
+                      "curation join the training")
+        else:
+            curation_store = None
+
     # --- Step 1: label tree (or flat label counts) + seed collapse map ---
     include_classes = getattr(args, "include_classes", None)
     include_set = set(include_classes) if include_classes else None
@@ -4478,13 +4531,14 @@ def handle_train(args):
                 classes_path, csv_files, args.min_count, args.tips_only,
                 include_labels=include_set,
                 collapse=bool(getattr(args, "collapse", False)),
+                curation=curation_store,
             )
         )
     else:
         lines, training_labels, counts, _unknown, collapse_map = (
             classification.build_flat_labels(
                 csv_files, args.min_count, include_labels=include_set,
-                exclude_labels=exclude_set,
+                exclude_labels=exclude_set, curation=curation_store,
             )
         )
     print("\n".join(lines))
@@ -4539,13 +4593,22 @@ def handle_train(args):
     else:
         conf_is_strict = False
     ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
+    curation_applied = Counter()
     n_written, n_dropped, n_dropped_conf = (
         classification.collate_training_annotations(
             csv_files, pattern, visible_labels, ann_path, model_path,
             prompt=(interactive and not assume_yes),
             min_conf=min_conf, conf_strict=conf_is_strict,
+            curation=curation_store, curation_stats=curation_applied,
         )
     )
+    if curation_store is not None:
+        print(
+            "Curation applied: "
+            f"{curation_applied['exclude']} excluded, "
+            f"{curation_applied['relabel']} relabelled, "
+            f"{curation_applied['accept']} accepted."
+        )
     conf_note = (
         f", {n_dropped_conf} dropped below confidence {min_conf}"
         if min_conf is not None else ""
@@ -4627,6 +4690,11 @@ def handle_train(args):
         ("Classes file", classes_path if use_tree else "(none; flat labels)"),
         ("Input format", "CoralNet" if coralnet else "substrata"),
         ("Map mode", "keep-map" if getattr(args, "keep_map", False) else "reseed"),
+        (
+            "Curation",
+            "(none)" if curation_store is None else _counts_text(
+                curation_applied, "no decision applied"),
+        ),
         ("Annotation pattern", pattern),
         ("CSV files scanned", len(csv_files)),
         ("Training classes", len(training_classes)),
@@ -4642,7 +4710,7 @@ def handle_train(args):
                 feature_mm_px=args.feature_mm_px, feature_scale=args.feature_scale,
                 batch_size=args.batch_size, n_jobs=args.jobs,
             )
-        except ValueError as e:
+        except (ValueError, FileNotFoundError) as e:
             raise SystemExit(str(e))
         print(f"Saved point classifier: {model_file}")
         if run["n_failed"]:
@@ -4746,18 +4814,367 @@ def handle_calibrate(args):
     )
 
 
+def _counts_text(counts, empty=""):
+    """``"3 accept, 2 exclude"`` from a Counter (``empty`` without counts)."""
+    return ", ".join(f"{n} {a}" for a, n in sorted(counts.items())) or empty
+
+
+def handle_curate_gui(argv):
+    """Run the curation grid (substrata-explore's ``curate`` mode).
+
+    Args:
+        argv: Its command-line arguments (after ``curate``, without ``--gui``).
+    """
+    try:
+        from substrata_explore.curate import main as curate_main
+    except ImportError:
+        raise SystemExit(
+            "substrata curate --gui needs the substrata-explore package: "
+            "pip install -e <path to substrata-explore>. Without it, "
+            "`substrata curate --sheets` writes contact sheets and "
+            "`--import CSV` reads decisions."
+        )
+    curate_main(argv)
+
+
+def _curate_sheets(folder, max_per_sheet):
+    """Contact sheets of the review queues (PDF), from curate/points.csv."""
+    import tempfile
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    from substrata import curation as cur
+    from substrata import visualizations
+
+    out_dir = cur.curation_dir(folder)
+    table = os.path.join(out_dir, settings.CURATION_POINTS_FILE)
+    if not os.path.isfile(table):
+        raise SystemExit(f"{table} not found: run `substrata curate` first.")
+    rows = [r for r in cur.read_table(table) if r.get("tile")]
+    store = cur.store_for_folder(folder)
+
+    def f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return np.nan
+
+    open_rows = [r for r in rows if store.get(r["key"]) is None and r["cls"]]
+    queues = {
+        "suspect labels (lowest cross-validated probability of the label)":
+            sorted([r for r in open_rows if np.isfinite(f(r["p_label"]))],
+                   key=lambda r: f(r["p_label"])),
+        "mixed neighbourhoods (lowest share of the class around the point)":
+            sorted([r for r in open_rows if np.isfinite(f(r["ring_agree"]))],
+                   key=lambda r: f(r["ring_agree"])),
+        "unusual points (most novel)":
+            sorted([r for r in open_rows if np.isfinite(f(r["novelty"]))],
+                   key=lambda r: -f(r["novelty"])),
+    }
+    tiles = cur.tile_store(folder)
+    pdf_path = os.path.join(out_dir, "review_sheets.pdf")
+    with tempfile.TemporaryDirectory() as tmp:
+        groups = {}
+        for title, items in queues.items():
+            out = []
+            for r in items[:max_per_sheet]:
+                dst = os.path.join(tmp, r["tile"])
+                tile = tiles.get(r["tile"])
+                if tile is None:
+                    continue
+                if not os.path.isfile(dst):
+                    try:
+                        with Image.open(BytesIO(tile[0])) as im:
+                            im = im.convert("RGB")
+                            d = ImageDraw.Draw(im)
+                            x, y = f(r["tile_x"]), f(r["tile_y"])
+                            if np.isfinite(x) and np.isfinite(y):
+                                for c, w in (((0, 0, 0), 3), ((255, 60, 60), 1)):
+                                    d.line([(x - 9, y), (x - 3, y)], fill=c, width=w)
+                                    d.line([(x + 3, y), (x + 9, y)], fill=c, width=w)
+                                    d.line([(x, y - 9), (x, y - 3)], fill=c, width=w)
+                                    d.line([(x, y + 3), (x, y + 9)], fill=c, width=w)
+                            im.save(dst, quality=90)
+                    except OSError:
+                        continue
+                caption = f"{r['label']}>{r['cv_pred'] or '?'} {f(r['p_label']):.2f}"
+                out.append((dst, r["id"], caption, ""))
+            groups[title] = (len(items), out)
+        n_pages = visualizations.save_training_crops_pdf(groups, pdf_path)
+    print(f"Wrote {pdf_path} ({n_pages} page(s)). Captions: id, label>predicted "
+          "class and the cross-validated probability of the label. Record "
+          "decisions in a CSV (id, action, label, reason) and read it with "
+          "`substrata curate --import CSV`.")
+
+
+def handle_curate(args):
+    """Handle 'curate': score training points, mine pools, manage decisions.
+
+    Runs in a classifier folder (``substrata train`` output). Without options
+    the training points are scored for review (``curate/points.csv`` + tiles);
+    ``--mine`` samples and clusters unlabelled photos into a pool;
+    ``--status``, ``--export``, ``--import`` and ``--sheets`` work on the
+    decisions; ``--gui`` opens the review grid (substrata-explore).
+    """
+    from substrata import curation as cur
+    from substrata import pointfeatures
+
+    folder = os.path.abspath(args.folder or os.getcwd())
+    try:
+        store = cur.store_for_folder(folder, args.curation or [])
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+
+    def lookup():
+        out = {}
+        table = os.path.join(cur.curation_dir(folder), settings.CURATION_POINTS_FILE)
+        for path in ([table] if os.path.isfile(table) else []) + cur.pool_csvs(folder):
+            for r in cur.read_table(path):
+                if r.get("id") and r.get("key"):
+                    out[r["id"]] = r
+        return out
+
+    if args.status or args.export or args.import_csv:
+        if args.import_csv:
+            n, problems = cur.import_decisions(store, args.import_csv, lookup())
+            for p in problems[:20]:
+                print(f"  skipped {p}")
+            if len(problems) > 20:
+                print(f"  ... and {len(problems) - 20} more")
+            print(f"Imported {n} decision(s) into {store.path}")
+        if args.export:
+            n = store.export_csv(args.export)
+            print(f"Exported {n} decision(s) to {args.export}")
+        done = store.counts()
+        what = ", ".join(f"{n} {a}" for a, n in sorted(done.items()))
+        print(f"{store.path}: {len(store)} decision(s)" + (f": {what}" if done else ""))
+        reasons = Counter(e.get("reason") or "(none)" for e in store.entries()
+                          if e["action"] == "exclude")
+        if reasons:
+            print("  excluded by reason: " + ", ".join(
+                f"{r} {n}" for r, n in reasons.most_common()))
+        return
+    if args.sheets:
+        return _curate_sheets(folder, args.sheets_max)
+
+    clf_path = args.model or os.path.join(folder, settings.POINT_DEFAULT_MODEL_FILE)
+    if not pointfeatures.is_point_classifier_path(clf_path):
+        raise SystemExit(f"curate needs a point classifier (.pt): {clf_path}")
+    try:
+        clf = pointfeatures.PointFeatureClassifier.load(clf_path)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(f"{e} (run `substrata train` in this folder first).")
+
+    if args.mine or args.image_dir or args.points:
+        if not args.name:
+            raise SystemExit("A pool needs a --name (e.g. auv_deep).")
+        points = info = None
+        if args.points:
+            if args.mine:
+                raise SystemExit("Pass --points or --mine, not both.")
+            if not os.path.isfile(args.points):
+                raise SystemExit(f"No such points CSV: {args.points}")
+            points, info = cur.read_pool_points(args.points, args.image_dir)
+            if info.get("coralnet"):
+                print(f"CoralNet points: {info['n_points']} on "
+                      f"{info['n_images_found']}/{info['n_images']} images found in "
+                      f"{info['image_dir']}")
+            print(f"Pool points: {info['n_used']} of {info['n_rows']} from "
+                  f"{args.points}" + (f" ({info['n_skipped']} without a readable "
+                                       "photo or position)" if info["n_skipped"] else ""))
+            if not points:
+                raise SystemExit("No usable points (are the photos readable? "
+                                 "--image-dir for a CoralNet export's photos).")
+            images = sorted({q["path"] for q in points})
+        else:
+            images = pointfeatures.list_images(
+                list(args.mine or []) + ([args.image_dir] if args.image_dir else []))
+            if not images:
+                raise SystemExit("No photos found for the pool.")
+        try:
+            meta = cur.mine_pool(
+                folder, clf, images, args.name, gsd_mm=args.gsd_mm,
+                domain=args.domain, n_images=args.mine_images,
+                per_image=args.per_image, n_clusters=args.clusters,
+                seed=args.seed, resample=args.resample,
+                batch_size=args.batch_size, n_jobs=args.jobs,
+                points=points, points_info=info,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            raise SystemExit(str(e))
+        print(f"Pool {meta['name']} (domain {meta['domain']}): {meta['n_points']} "
+              f"point(s) in {meta['n_clusters']} cluster(s) -> {meta['csv']}")
+
+        def nov(c):
+            return "" if c["novelty"] is None else f" nov {c['novelty']:.2f}"
+
+        print("  largest clusters: " + "; ".join(
+            f"#{c['cluster']} n={c['n']} {c['pred']} {c['pred_share']:.0%}{nov(c)}"
+            for c in meta["clusters"][:8]))
+        nov = [c for c in meta["clusters"] if c["novelty"] is not None]
+        if nov:
+            top = sorted(nov, key=lambda c: -c["novelty"])[:5]
+            print("  most novel clusters: " + "; ".join(
+                f"#{c['cluster']} n={c['n']} nov {c['novelty']:.2f} (pred "
+                f"{c['pred']})" for c in top))
+        if meta.get("n_given_labels"):
+            print(f"  {meta['n_given_labels']} point(s) carry a given label: accept "
+                  "(or change) it in the review grid to use it.")
+        print("Label clusters with `substrata curate --gui`; labelled pool points "
+              "join the next `substrata train` in this folder.")
+        return
+
+    try:
+        summary = cur.score_training_points(
+            folder, clf, args.annotations, batch_size=args.batch_size,
+            n_jobs=args.jobs,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        raise SystemExit(str(e))
+    cv = summary["cv"]
+    print(f"Scored {summary['n_points']} training point(s) -> {summary['table']}")
+    if cv:
+        print(f"  cross-validated ({cv['folds']} folds by photo): accuracy "
+              f"{cv['accuracy']:.3f}, macro-F1 {cv['macro_f1']:.3f}")
+    print(f"  look clean: {summary['n_clean']} (label probability >= "
+          f"{settings.CURATION_CLEAN_P} and neighbourhood >= "
+          f"{settings.CURATION_CLEAN_RING})")
+    print(f"  suspect labels (probability < {settings.CURATION_SUSPECT_P}): "
+          f"{summary['n_suspect']}; mixed neighbourhoods (< "
+          f"{settings.CURATION_MIXED_RING}): {summary['n_mixed']}")
+    done = store.counts()
+    what = ", ".join(f"{n} {a}" for a, n in sorted(done.items()))
+    print(f"  decisions so far: {len(store)}" + (f" ({what})" if done else ""))
+    print("Review with `substrata curate --gui` (or `--sheets` for PDFs); then "
+          "re-run `substrata train` here to apply the decisions.")
+
+
+def handle_masks(args):
+    """Handle 'masks': dense per-photo class masks for plain photos.
+
+    Every photo gets a label mask (palette PNG) and a confidence mask at
+    feature-cell resolution from a point classifier; ``masks.json`` indexes
+    them (classes, colours, cell size and cover per photo) and
+    ``masks_cover.csv`` lists the class fractions per photo. Photos that
+    already have masks are skipped (resumable), unless ``--overwrite``.
+    """
+    import csv
+
+    from substrata import pointfeatures, segmentation
+
+    clf_path = args.classifier or os.path.join(
+        os.getcwd(), settings.POINT_DEFAULT_MODEL_FILE
+    )
+    if not pointfeatures.is_point_classifier_path(clf_path):
+        raise SystemExit(f"masks needs a point classifier (.pt): {clf_path}")
+    try:
+        clf = pointfeatures.PointFeatureClassifier.load(clf_path)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e))
+    images = pointfeatures.list_images(args.images)
+    if not images:
+        raise SystemExit("No photos found.")
+    if clf.target_mm_px and not args.gsd_mm:
+        print(
+            f"Note: the classifier works at {clf.target_mm_px:.3f} mm/px but no "
+            f"--gsd-mm was given: photos of its training camera use its fixed "
+            f"scale {clf.scale_factor:.3f}, others are scaled by their width."
+        )
+    # ground resolution first; else the training camera's fixed scale, or the
+    # width rule for another camera (as predict and curate pools)
+    widths = ({} if clf.target_mm_px and args.gsd_mm
+              else pointfeatures._image_widths(images))
+    photo_scales = [pointfeatures.photo_scale(clf, args.gsd_mm, widths.get(p))
+                    for p in images]
+    scale = float(np.median(photo_scales))
+    out_dir = args.output or os.path.join(os.getcwd(), settings.MASKS_DEFAULT_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    overrides = {}
+    for spec in getattr(args, "color", None) or []:
+        if "=" not in spec:
+            raise SystemExit(f"Invalid --color {spec!r}; expected LABEL=RRGGBB.")
+        lbl, hexv = spec.split("=", 1)
+        overrides[lbl] = _parse_hex_color(hexv)
+    colors = segmentation._build_label_colors(list(clf.classes), overrides or None)
+
+    index_path = os.path.join(out_dir, settings.MASKS_INDEX_FILE)
+    index = {"classes": list(clf.classes), "photos": {}}
+    if os.path.isfile(index_path) and not args.overwrite:
+        with open(index_path) as f:
+            old = json.load(f)
+        if old.get("classes") == list(clf.classes):
+            index["photos"] = old.get("photos", {})
+    index.update({
+        "classifier": os.path.abspath(clf_path),
+        "colors": {c: list(v) for c, v in colors.items()},
+        "gsd_mm": args.gsd_mm, "scale": scale,
+    })
+    stems = pointfeatures.unique_stems(images)
+
+    def _done(i):
+        label_png = os.path.join(out_dir, f"{stems[i]}_labels.png")
+        return images[i] in index["photos"] and os.path.isfile(label_png)
+
+    todo = [i for i in range(len(images)) if args.overwrite or not _done(i)]
+    lo, hi = min(photo_scales), max(photo_scales)
+    span = f"{lo:.3f}" if hi - lo < 1e-4 else f"{lo:.3f}-{hi:.3f}"
+    print(f"Masks for {len(todo)} photo(s) ({len(images) - len(todo)} already "
+          f"done) at scale {span} -> {out_dir}")
+
+    def write_index():
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=1)
+
+    n_done = 0
+    for k, dm in pointfeatures.iter_dense_maps(
+        clf, [images[i] for i in todo], [photo_scales[i] for i in todo], n_jobs=args.jobs,
+    ):
+        i = todo[k]
+        if dm is None:
+            continue
+        files = pointfeatures.save_dense_masks(
+            dm, out_dir, stems[i], colors, save_probs=args.probs,
+        )
+        index["photos"][images[i]] = dict(
+            files, cell_px=round(dm.cell_px, 4), scale=round(dm.scale, 5),
+            width=dm.width, height=dm.height,
+            mean_conf=round(float(dm.confidence().mean()), 4),
+            cover={c: round(v, 5) for c, v in dm.cover().items()},
+        )
+        n_done += 1
+        if n_done % 200 == 0:
+            write_index()
+    write_index()
+
+    cover_path = os.path.join(out_dir, settings.MASKS_COVER_FILE)
+    with open(cover_path, "w", newline="") as f:
+        w = csv.writer(f)
+        head = ["photo", "width", "height", "cell_px", "mean_conf"]
+        w.writerow(head + list(clf.classes))
+        for photo, info in sorted(index["photos"].items()):
+            cov = info.get("cover", {})
+            meta = [photo] + [info.get(k) for k in head[1:]]
+            w.writerow(meta + [cov.get(c, 0.0) for c in clf.classes])
+    print(f"Wrote {n_done} new mask pair(s); index {index_path}; cover {cover_path}")
+
+
 def main():
     """Build the argparse CLI and dispatch to the selected subcommand handler.
 
     Defines all subcommands (decimate, ply-repair, head, scalebars, views, orient,
     colors, firefish, cams2video, intercepts, intercepts-plot, align, images,
     match-annotations, camsync, path-repair, transform, train, calibrate,
-    metashape-export),
+    masks, curate, metashape-export),
     parses the arguments, and calls the matching handle_* function.
     """
     # explore: the interactive viewer (the substrata-explore package), its own arguments
     if len(sys.argv) > 1 and sys.argv[1] == "explore":
         return handle_explore(sys.argv[2:])
+    # curate --gui: the review grid (substrata-explore), its own arguments
+    if len(sys.argv) > 2 and sys.argv[1] == "curate" and "--gui" in sys.argv[2:]:
+        return handle_curate_gui([a for a in sys.argv[2:] if a != "--gui"])
 
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5206,6 +5623,25 @@ def main():
     p_seg.add_argument(
         "--no-occlusion", dest="no_occlusion", action="store_true",
         help="Skip reprojection occlusion filtering (faster, less accurate).",
+    )
+    p_seg.add_argument(
+        "--views", dest="views", type=int, default=None, metavar="N",
+        help="Point classifiers: photos fused per query point (its N best "
+             "views by relevance, each classified from that photo's dense map; "
+             f"weighted by relevance). Default: {settings.SEG_POINT_VIEWS}.",
+    )
+    p_seg.add_argument(
+        "--save-masks", dest="save_masks", nargs="?", const="", default=None,
+        metavar="DIR",
+        help="Point classifiers: also save each photo's label/confidence masks "
+             "(feature-cell resolution) with a masks.json index. Default folder: "
+             "<id>_seg[_<tag>]_masks in the plot folder.",
+    )
+    p_seg.add_argument(
+        "--per-point", dest="per_point", action="store_true",
+        help="Point classifiers: classify each query from a window around it "
+             "in its best photo instead of dense per-photo maps (no fusion; "
+             "slower for dense query grids).",
     )
     p_seg.add_argument(
         "--max-radius", dest="max_radius", type=float, default=None,
@@ -6079,6 +6515,20 @@ def main():
         help="Random seed for reproducible points.",
     )
     img_group.add_argument(
+        "--gsd-mm", dest="gsd_mm", type=float, default=None, metavar="MM",
+        help="Point classifiers: ground resolution of the photos (mm/px), used "
+        "first by classifiers with a physical resolution. Without it, photos "
+        "of another camera (width more than 25%% off the training photos') are "
+        "resampled so the window covers the same share of their width, as "
+        "`substrata curate` pools are.",
+    )
+    img_group.add_argument(
+        "--domain", dest="domain", default=None, metavar="NAME",
+        help="Point classifiers: standardise the features with this camera "
+        "domain's statistics (a `substrata curate` pool whose labelled points "
+        "were trained on; default: the training photos').",
+    )
+    img_group.add_argument(
         "--resample", dest="resample", action="store_true",
         help="Draw new points even if the points file exists (old one is "
              "backed up).",
@@ -6845,11 +7295,13 @@ def main():
         type=str,
         default=settings.TRAIN_DEFAULT_ARCH,
         help=(
-            "A DINOv2 backbone (torch.hub name, e.g. dinov2_vitb14_reg or "
-            "dinov2_vitl14_reg): point-feature classifier, a linear probe on "
-            "frozen features read at each point (no crops). Or a torchvision "
-            "architecture (e.g. resnet34, resnet50): fastai crop classifier. "
-            f"Default: {settings.TRAIN_DEFAULT_ARCH}."
+            "Point-feature classifier (a linear probe on frozen features read at "
+            "each point, no crops) on a DINOv2 or DINOv3 backbone: dinov2 "
+            "(= dinov2_vitb14_reg), dinov2-s/-l/-g, dinov3 (= dinov3_vitb16), "
+            "dinov3-s/-l/-h, or a torch.hub name. DINOv3 weights are gated: "
+            "download them once (see the error message, or the docs). Or a "
+            "torchvision architecture (e.g. resnet34, resnet50): fastai crop "
+            f"classifier. Default: {settings.TRAIN_DEFAULT_ARCH}."
         ),
     )
     p_feat = p_train.add_mutually_exclusive_group()
@@ -6945,6 +7397,18 @@ def main():
         action="store_true",
         help="Skip interactive confirmations (labels, deletions, paths).",
     )
+    p_train.add_argument(
+        "--curation", action="append", default=None, metavar="JSONL",
+        help=(
+            f"Another curation store to apply (read-only; repeatable), e.g. the "
+            f"{settings.CURATION_FILE} of another classifier folder. The "
+            "output folder's own store is always applied (it wins)."
+        ),
+    )
+    p_train.add_argument(
+        "--no-curation", dest="no_curation", action="store_true",
+        help="Ignore curation decisions (and pool points labelled in them).",
+    )
 
     # calibrate (point classifier -> another camera system)
     p_cal = subparsers.add_parser(
@@ -7015,6 +7479,163 @@ def main():
         help="Photo decoding threads (-1 = all cores). Default: -1.",
     )
 
+    # masks (dense per-photo class masks from a point classifier)
+    p_masks = subparsers.add_parser(
+        "masks",
+        help=(
+            "Dense per-photo class masks (label + confidence PNGs) and per-photo "
+            "cover from a point classifier, for plain photos (no 3-D model)."
+        ),
+    )
+    p_masks.add_argument(
+        "images", nargs="+",
+        help="Photos (files, folders searched recursively, or glob patterns).",
+    )
+    p_masks.add_argument(
+        "--classifier", type=str, default=None,
+        help=f"Point classifier (default: {settings.POINT_DEFAULT_MODEL_FILE} in "
+        "the CWD; use a calibrated one for another camera system).",
+    )
+    p_masks.add_argument(
+        "--gsd-mm", dest="gsd_mm", type=float, default=None, metavar="MM",
+        help="Ground resolution of the photos (mm/px); needed for classifiers "
+        "with a physical resolution (otherwise their fixed scale is used).",
+    )
+    p_masks.add_argument(
+        "--output", type=str, default=None,
+        help=f"Output folder (default: ./{settings.MASKS_DEFAULT_DIR}).",
+    )
+    p_masks.add_argument(
+        "--probs", action="store_true",
+        help="Also save all class probabilities per photo (<stem>_probs.npz).",
+    )
+    p_masks.add_argument(
+        "--color", dest="color", action="append", default=None,
+        metavar="LABEL=RRGGBB", help="Mask colour of a class (repeatable).",
+    )
+    p_masks.add_argument(
+        "--overwrite", action="store_true",
+        help="Redo photos that already have masks.",
+    )
+    p_masks.add_argument(
+        "--jobs", type=int, default=-1,
+        help="Photo decoding threads (-1 = all cores). Default: -1.",
+    )
+
+    # curate (training-data curation, run in the classifier folder)
+    p_cur = subparsers.add_parser(
+        "curate",
+        help=(
+            "Curate point-classifier training data in a classifier folder: "
+            "score points for review, mine unlabelled photos into clustered "
+            "pools, manage decisions; --gui opens the review grid."
+        ),
+    )
+    p_cur.add_argument(
+        "--gui", action="store_true",
+        help="Open the review grid in the browser (substrata-explore; "
+        "`substrata curate --gui -h` for its options).",
+    )
+    p_cur.add_argument(
+        "--folder", default=None,
+        help="Classifier folder (default: the CWD).",
+    )
+    p_cur.add_argument(
+        "--model", default=None,
+        help=f"Point classifier (default: {settings.POINT_DEFAULT_MODEL_FILE} "
+        "in the folder).",
+    )
+    p_cur.add_argument(
+        "--annotations", default=None,
+        help=f"Training annotations (default: {settings.TRAIN_ANNOTATIONS_FILE} "
+        "in the folder).",
+    )
+    p_cur.add_argument(
+        "--mine", nargs="+", default=None, metavar="IMAGES",
+        help="Sample unlabelled points from these photos (files, folders, glob "
+        "patterns, or a text file listing photos) into a clustered pool.",
+    )
+    p_cur.add_argument(
+        "--image-dir", dest="image_dir", default=None, metavar="DIR",
+        help="Image-only pool, as `substrata predict --image-dir`: sample points "
+        "on the photos under DIR (recursive; same as --mine DIR). With --points: "
+        "where a CoralNet export's photos are (default: the CSV's folder).",
+    )
+    p_cur.add_argument(
+        "--points", default=None, metavar="CSV",
+        help="Pool of these points instead of sampled ones, as `substrata predict "
+        "--points`: a points CSV (cam_filepath, cam_x, cam_y; e.g. predict's "
+        "output) or a CoralNet export. Their labels are shown as given labels: "
+        "accepting one in the review grid labels the point with it.",
+    )
+    p_cur.add_argument("--name", default=None, help="Pool name (--mine, --image-dir, --points).")
+    p_cur.add_argument(
+        "--gsd-mm", dest="gsd_mm", type=float, default=None, metavar="MM",
+        help="Ground resolution of the pool's photos (mm/px). Without it the "
+        "window covers the share of each photo's width it covers on the "
+        "training photos.",
+    )
+    p_cur.add_argument(
+        "--domain", default=None,
+        help="Camera domain of the pool (default: its name); pools of one "
+        "camera system can share it.",
+    )
+    p_cur.add_argument(
+        "--mine-images", dest="mine_images", type=int,
+        default=settings.CURATION_MINE_IMAGES,
+        help=f"Photos sampled (default: {settings.CURATION_MINE_IMAGES}).",
+    )
+    p_cur.add_argument(
+        "--per-image", "--n-points", dest="per_image", type=int,
+        default=settings.CURATION_MINE_PER_IMAGE,
+        help=f"Points per photo (default: {settings.CURATION_MINE_PER_IMAGE}).",
+    )
+    p_cur.add_argument(
+        "--clusters", type=int, default=settings.CURATION_MINE_CLUSTERS,
+        help=f"Clusters (default: {settings.CURATION_MINE_CLUSTERS}).",
+    )
+    p_cur.add_argument(
+        "--resample", action="store_true",
+        help="Sample the pool again (default: re-cluster the same points).",
+    )
+    p_cur.add_argument(
+        "--seed", type=int, default=0,
+        help="Random seed of the pool's sampling (default: 0).",
+    )
+    p_cur.add_argument(
+        "--status", action="store_true", help="Summarise the decisions.",
+    )
+    p_cur.add_argument(
+        "--export", default=None, metavar="CSV",
+        help="Write the current decisions as CSV.",
+    )
+    p_cur.add_argument(
+        "--import", dest="import_csv", default=None, metavar="CSV",
+        help="Append decisions from a CSV (action, label, reason and key, "
+        "photo + x + y, or id).",
+    )
+    p_cur.add_argument(
+        "--sheets", action="store_true",
+        help="Contact sheets (PDF) of the review queues, without the GUI.",
+    )
+    p_cur.add_argument(
+        "--sheets-max", dest="sheets_max", type=int, default=330,
+        help="Points per queue in --sheets (default: 330, two pages).",
+    )
+    p_cur.add_argument(
+        "--curation", action="append", default=None, metavar="JSONL",
+        help="Another curation store to read (read-only; repeatable).",
+    )
+    p_cur.add_argument(
+        "--batch-size", dest="batch_size", type=int,
+        default=settings.POINT_BATCH_SIZE,
+        help=f"Windows per forward pass (default: {settings.POINT_BATCH_SIZE}).",
+    )
+    p_cur.add_argument(
+        "--jobs", type=int, default=-1,
+        help="Photo decoding threads (-1 = all cores). Default: -1.",
+    )
+
     args = parser.parse_args()
 
     handlers = {
@@ -7044,6 +7665,8 @@ def main():
         "baseline": handle_baseline,
         "train": handle_train,
         "calibrate": handle_calibrate,
+        "masks": handle_masks,
+        "curate": handle_curate,
     }
     handlers[args.command](args)
 

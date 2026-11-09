@@ -187,11 +187,11 @@ With `--use_chunk_transform`, scale and orientation are taken from the `chunk_tr
 
 ## Segmentation
 
-Segment the point cloud by reusing a trained classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the patch around it, then propagate the labels to every point via nearest neighbour. The patch is as large as the classifier's training crops (recorded in the classifier by `substrata train`; `--crop-size` overrides it, and older classifiers without a recorded size use 224 px). A point-feature classifier (`point_classifier.pt`) classifies each query at its pixel instead of a crop, resampling each photo by the query's ground resolution (camera depth / focal length) when the classifier works at a physical resolution. Saves the classified query points as an annotation set `<id>.annos/<id>_seg_points.csv`, the segmentation's source of truth: predictions in `pred_label`/`pred_conf`, `label` left empty to check by hand, and the photo and pixel each point was classified from in `cam_filepath`/`cam_x`/`cam_y`. Its sidecar records `type: segmentation`, the classifier, cell size, sampling, crop size and the label colours. It also writes a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance) in the project folder; the sidecar names the recoloured clouds made from the set (`seg_ply_dec`, `seg_ply`). `--tag NAME` keeps versions side by side: `<id>.annos/<id>_seg_NAME_points.csv` and `<id>_seg_NAME[_dec].ply`. `--from-points CSV` skips sampling and classification and only recolours from an existing points CSV, where a hand-checked `label` wins over `pred_label` (the clouds keep that set's tag). `--output-npz` also saves the compact `.npz` of `Segmentation.save` (not written by default; `Segmentation.from_annotations` reads the CSV).
+Segment the point cloud by reusing a trained classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the patch around it, then propagate the labels to every point via nearest neighbour. The patch is as large as the classifier's training crops (recorded in the classifier by `substrata train`; `--crop-size` overrides it, and older classifiers without a recorded size use 224 px). With a point-feature classifier (`point_classifier.pt`, the `substrata train` default) no crops are cut. Each query keeps its `--views` best photos (default 3, by the same relevance as the best photo: close and central; with occlusion filtering every view is checked), every photo that is a view of some query gets one dense probability map (the photo is resampled at its median ground resolution over its views, cut into overlapping 448 px tiles whose per-cell probabilities are blended with centre-weighted weights, so there are no tile seams), and a query's prediction is the mean of its views' probabilities read at its pixel, weighted by relevance as in `predict --method weighted`. Each point then also records how many photos were fused (`pred_n`) and their agreement (`pred_agreement`: the weight share of the views whose own label is the fused one; 1 = all agree) - low agreement flags occlusions, boundaries and ambiguous surfaces worth checking by hand. `--save-masks [DIR]` also keeps every photo's dense map as masks (default folder `<id>_seg[_<tag>]_masks/` in the plot folder; see *Masks* below for the format), e.g. for 2-D area measurements. `--per-point` instead classifies each query from a window around it in its best photo only (the classifier's training view; no fusion; its cost grows with the number of queries, the dense path's with the number of photos). For scale: on a 40 m diver plot (2,510 photos, 200 k queries at 5 cm, RTX 4080) the dense path took ~18 min with 3 views and ~11 min with 1; more views were a little more accurate on held-out annotations (`--views 5` for the best results, at more time). Saves the classified query points as an annotation set `<id>.annos/<id>_seg_points.csv`, the segmentation's source of truth: predictions in `pred_label`/`pred_conf`, `label` left empty to check by hand, and the photo and pixel each point was classified from in `cam_filepath`/`cam_x`/`cam_y`. Its sidecar records `type: segmentation`, the classifier, cell size, sampling, crop size and the label colours. It also writes a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance) in the project folder; the sidecar names the recoloured clouds made from the set (`seg_ply_dec`, `seg_ply`). `--tag NAME` keeps versions side by side: `<id>.annos/<id>_seg_NAME_points.csv` and `<id>_seg_NAME[_dec].ply`. `--from-points CSV` skips sampling and classification and only recolours from an existing points CSV, where a hand-checked `label` wins over `pred_label` (the clouds keep that set's tag). `--output-npz` also saves the compact `.npz` of `Segmentation.save` (not written by default; `Segmentation.from_annotations` reads the CSV).
 
 Because the points CSV is an ordinary annotation set, its labels can be summarised like any other (e.g. cover per label over depth). With `voxel` sampling each point stands for about the same patch of surface (one per `--cell-size` cell), so a label's share of the points is its 3D (surface) cover; with `xy_grid` it is planar (top-down) cover. Query points that no photo saw, or that failed to classify, are left out, so the cover is of the observed surface. Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
 
-Usage: `substrata segment [--input PLY] [--classifier PKL] [--cell-size M] [--crop-size PX] [--sampling voxel|xy_grid] [--no-occlusion] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--tag NAME] [--from-points CSV] [--output-npz NPZ] [--output-ply PLY]`
+Usage: `substrata segment [--input PLY] [--classifier PKL|PT] [--cell-size M] [--crop-size PX] [--sampling voxel|xy_grid] [--no-occlusion] [--views N] [--save-masks [DIR]] [--per-point] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--tag NAME] [--from-points CSV] [--output-npz NPZ] [--output-ply PLY]`
 
 ```bash
 # Using default behavior (auto-detects project + classifier from CWD)
@@ -199,6 +199,9 @@ substrata segment
 
 # Use a specific classifier and 10 cm query spacing
 substrata segment --classifier crop_classifier.pkl --cell-size 0.10
+
+# Point classifier: fuse 5 views per point and keep each photo's masks
+substrata segment --classifier point_classifier.pt --views 5 --save-masks
 
 # Manual category colours (repeatable): coral=red, macroalgae=green, substrate=yellow
 substrata segment --color CS=ff0000 --color MA=00ff00 --color SU=ffff00
@@ -615,9 +618,11 @@ With `--image-dir` or `--points`, `predict` works on plain photos instead of a 3
 - `--image-dir DIR`: random points are sampled on every image in `DIR` (searched recursively): `--n-points` per image (default 25), simple random or `--stratified` (one point per grid cell), kept at least half a crop from the image edges, reproducible with `--seed`. They are saved to `<output>/<DIR name>_points.csv` (`--output`, default CWD) and **reused** on later runs, so different classifiers are compared on the same points. Images added to the folder later get their own new points. `--resample` draws new points (the old file is backed up).
 - `--points CSV`: predict at given points instead: a points CSV from an earlier run (updated in place), or a CoralNet export (`Name`, `Row`, `Column`, `Label code`). For a CoralNet export the images are searched in `--image-dir` (default: the CSV's folder), the result is written to `<output>/<CSV name>_points.csv`, and the predictions are compared with the CoralNet labels (agreement and a per-class report). Labels the classifier does not predict are reported and left out of the comparison.
 
+With a point classifier (`.pt`) each point is read in a window resampled, in order of precedence: (1) to the classifier's resolution from the photos' ground resolution, `--gsd-mm MM` (classifiers trained in mm/px); (2) for photos of another camera (width more than 25% off the training photos' median), so that the window covers the same share of the photo width as on the training photos; (3) at the classifier's fixed scale. `substrata curate` pools, `substrata train` (for pool points) and `substrata masks` use the same rule, so predictions on a new camera match how its pool points were reviewed and trained. `--domain NAME` standardises the features with a camera domain's statistics (a `curate` pool whose labelled points went into training) instead of the training photos'.
+
 The points CSV has the image (`cam_filepath`) and pixel position (`cam_x`, `cam_y`) of each point plus `pred_label`/`pred_conf` (the 3-D coordinate columns are `nan`); an existing file is backed up to `backup/` first. A `<points>_cover.csv` next to it gives, per image, the number of points and the percent cover of each predicted label, plus an `ALL` row over all points.
 
-Usage: `substrata predict (--image-dir DIR | --points CSV) --classifier PKL [--n-points N] [--stratified] [--seed N] [--resample] [--output DIR] [--size W H] [--batch-size N] [--jobs N]`
+Usage: `substrata predict (--image-dir DIR | --points CSV) --classifier PKL|PT [--n-points N] [--stratified] [--seed N] [--resample] [--output DIR] [--gsd-mm MM] [--domain NAME] [--size W H] [--batch-size N] [--jobs N]`
 
 ```bash
 # 25 stratified random points per photo; reused on later runs
@@ -625,6 +630,10 @@ substrata predict --image-dir photos --classifier crop_classifier.pkl --stratifi
 
 # Check a model against CoralNet's own annotations (images in frames/)
 substrata predict --points annotations.csv --image-dir frames --classifier crop_classifier.pkl
+
+# AUV frames with a diver-trained point classifier: their ground resolution, and the
+# statistics of the AUV pool whose labelled points were trained on
+substrata predict --image-dir auv_frames --classifier point_classifier.pt --gsd-mm 1.21 --domain auv
 ```
 
 ## Match annotations
@@ -793,9 +802,10 @@ substrata transform focal/focal_ann.csv --to-parent focal/ --output auv/focal_an
 Train a classifier from labelled annotations. There are two kinds, chosen with
 `--arch`:
 
-- **Point-feature classifier** (default, `--arch dinov2_vitb14_reg` or another
-  DINOv2 backbone such as `dinov2_vitl14_reg`): a frozen self-supervised
-  backbone (DINOv2) looks at a context window around each annotated point, its
+- **Point-feature classifier** (default, `--arch dinov2` = `dinov2_vitb14_reg`;
+  or `dinov3` = `dinov3_vitb16`; sizes `dinov2-s/-l/-g`, `dinov3-s/-l/-h`, or
+  any torch.hub name): a frozen self-supervised
+  backbone (DINOv2 / DINOv3) looks at a context window around each annotated point, its
   local feature is read at the exact point pixel, and a linear probe on those
   features is the classifier (`point_classifier.pt`). The label then describes a
   feature cell of about 1-3 cm rather than a whole crop, which suits point
@@ -925,20 +935,48 @@ tree, label map, `training_annotations.csv`) are as above; then:
   to be trusted, so points reprojected from another model fall back gracefully.
   The ground resolutions found are cached in
   `point_features/gsd_cache.json`; delete it after adding or re-aligning
-  projects.
+  projects. Retraining in a folder that already holds a point classifier keeps
+  its resolution (curation changes the points, and a new automatic target would
+  re-extract every feature); `--feature-mm-px` / `--feature-scale` (or removing
+  the classifier) changes it. Points of another camera domain (see below) never
+  set the automatic target.
 - *Features are cached* in `<output>/point_features/` per backbone, keyed by
   point (id, photo, pixel) and resolution. Features are extracted for every
   visible label, like crops, so editing the label map, the class selection or
   `--collapse` never re-extracts; `--validate` / `--test` reuse the cache too.
 - *Calibration statistics.* Features are standardised with the statistics of
   random patches of the training photos (also cached), which `substrata
-  calibrate` can later swap for another camera system's.
+  calibrate` can later swap for another camera system's. Points of another
+  camera system among the training points (a `domain` column, e.g. AUV points
+  labelled from a `curate --mine` pool) are standardised with their own
+  statistics (the pool's), so diver and AUV points train one classifier; the
+  classifier keeps these per-domain statistics. The patches are drawn per photo
+  (by a hash of its name), so adding or removing a few photos only changes their
+  own patches.
+- *Curation.* Decisions recorded with `substrata curate` (`curation.jsonl` in
+  the output folder) are applied while collating: excluded points are left out,
+  relabelled points take their new label (also in the label tree counts), and
+  accepted points are kept whatever their `label_conf`. Points of the folder's
+  pools (`curate/pools/*.csv`) that were given a label join the training.
+  `--curation JSONL` adds another folder's store (read-only; the folder's own
+  decisions win), `--no-curation` ignores them all.
+- *DINOv3* (`--arch dinov3`, `dinov3-s/-l/-h`): Meta's weights are gated.
+  Accept the licence at
+  https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/, download
+  `dinov3_vitb16_pretrain_lvd1689m-*.pth` (or the size you use) from the link you
+  are sent, and put it in torch.hub's checkpoints folder
+  (`~/.cache/torch/hub/checkpoints`), or set `SUBSTRATA_DINOV3_WEIGHTS` to the
+  file, its folder or the download link. The backbone code comes from GitHub
+  (`facebookresearch/dinov3`, once; `SUBSTRATA_DINOV3_HUB_REPO` for a local
+  clone) and needs no packages beyond torch. A classifier keeps its backbone, so
+  `predict`, `segment`, `curate` and substrata-explore need the same weights on
+  that machine.
 - *The probe* is a class-balanced logistic regression, its regularisation chosen
   by 5-fold cross-validation on macro-F1 over the training split.
 - *Outputs:* `point_classifier.pt` (`--model`; a small file - the backbone
   weights come from torch.hub, downloaded once to the torch cache; set
   `SUBSTRATA_POINT_HUB_REPO` to a local clone of `facebookresearch/dinov2` to
-  work offline), `training_summary.pdf` (settings, resolution, per-class point
+  work offline; DINOv3: see below), `training_summary.pdf` (settings, resolution, per-class point
   counts per split, validation and test accuracy / balanced accuracy /
   macro-F1) and `validation_points_stats.pdf` (per-class report and confusion
   matrix; `--test` writes `test_points_stats.pdf`).
@@ -959,7 +997,7 @@ inspect before training. After training, `--validate --pdf` or `--test --pdf`
 rebuilds the PDF from the existing crops and map without collating again, and then
 runs the evaluation.
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes]`
+Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes] [--curation JSONL ...] [--no-curation]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, seed the map, and train a
@@ -1021,6 +1059,152 @@ substrata train --test
 
 # Non-interactive (auto-confirm, deletions, path fallbacks)
 substrata train --yes
+```
+
+## Curation (curate)
+
+Curate the training points of a point-feature classifier. `substrata curate` runs
+in a classifier folder (where `substrata train` ran, with its CSVs from any
+number of projects) and works on what training sees: photos and pixels, no
+point clouds.
+
+**Decisions** go to `curation.jsonl` in the folder, one JSON line per decision:
+`accept`, `relabel` (with the new label), `exclude` (with a reason: `mixed`,
+`misplaced`, `unclear`, `photo`, `other`) or `clear`. The file is append-only and
+the latest line of a point wins. Points are keyed by the photo's file name and
+the rounded pixel (`IMG_1234.jpg|4021|2210`), not by row or id, so decisions
+survive regenerated training sets, other mixes of CSVs, renumbered ids and moved
+photo folders. The next `substrata train` in the folder applies them (see
+*Curation* under the point-feature classifier); copy the file, or pass
+`--curation PATH`, to use them in another classifier folder.
+
+**Scores.** `substrata curate` (no options) scores every training point for
+review and writes `curate/points.csv` plus a thumbnail of each model input window
+(`curate/tiles/`):
+
+- `p_label`: the cross-validated probability of the point's own class (5 folds,
+  grouped by photo so neighbouring points of a photo never vouch for each
+  other) - low for label noise; `cv_pred` / `cv_conf` is the predicted class;
+- `ring_agree`: the mean probability of the point's class at 8 positions 2
+  feature cells (~2 cm at 0.7 mm/px) around it, read in the same window - low
+  for points on boundaries and small objects, whose label will not hold for a
+  patch; `ring_sim` is the feature similarity to that ring;
+- `knn_label`: the share of the 10 most similar points (in other photos) with
+  the same class;
+- `novelty`: 1 - the mean similarity to those neighbours.
+
+Features come from the training cache, so this costs one pass over the photos
+for the neighbourhoods and thumbnails (cached too; ~30 s for 2,500 points).
+In the samoa test (2,362 diver points, 14 classes), accuracy rose from 0.38 to
+0.98 across the quartiles of `ring_agree` and from 0.28 to 0.98 across those of
+`knn_label`.
+
+**Pools.** `substrata curate --mine IMAGES --name NAME` samples unlabelled
+points from photos (e.g. AUV frames of habitats without annotations; folders,
+globs or a `.txt` list): `--mine-images` photos (2000), `--per-image` points on
+a jittered grid (12), resampled to the classifier's resolution (`--gsd-mm` for
+classifiers in mm/px). Their features are standardised with their own
+statistics (`--domain`, default the pool name: one camera system), clustered
+(PCA + k-means, `--clusters`, 60; largest first), predicted and compared with the
+training points (novelty). The pool is `curate/pools/<name>.csv` (an annotation
+CSV with an empty `label`, plus `cluster`, `pred_label`, `novelty`, ...), `.npz`
+(features, domain statistics) and `.json` (per-cluster summary). Re-running
+with other `--clusters` re-clusters the same points (`--resample` draws new
+ones). Pool points given a label (relabel) join the next `substrata train` in
+the folder, standardised with their pool's statistics.
+
+*Image-only pools* take `substrata predict`'s inputs: `--image-dir DIR` samples
+the photos under DIR (like `--mine DIR`; `--n-points` = `--per-image`, `--seed`),
+and `--points CSV` uses the points of a points CSV (`cam_filepath`, `cam_x`,
+`cam_y`, e.g. `predict`'s output) or a CoralNet export (photos under
+`--image-dir`, default the CSV's folder) instead of sampled ones. Their labels
+become the pool's `given_label`: shown in the review grid, where accepting one
+labels the point with it (only reviewed points train). Scales follow the same
+precedence as `predict`: the ground resolution first (`--gsd-mm`, or a
+`cam_gsd_mm` column of a `--points` CSV; classifiers in mm/px); else photos of
+another camera (width more than 25% off the training photos') are resampled so
+the model window covers the same share of their width as on the training photos
+(scale = the classifier's fixed scale × the training photos' median width / the
+photo's width; e.g. 0.95 for 2816 px AUV frames with a diver classifier at 0.28
+on 9568 px photos); else the fixed scale. `substrata train` resamples the pool's
+labelled points the same way, and `predict --domain <pool domain>` classifies
+new photos of that camera as they were trained.
+
+**Reviewing.** `substrata curate --gui` (or `substrata-curate`, both from the
+substrata-explore package) opens the review grid in the browser: queues
+(suspect labels, mixed neighbourhoods, neighbour labels, unusual points, by
+class), pools by cluster, a wider view of the photo around the point, class
+hotkeys from `classes.csv`, and keys for accept / exclude / relabel / undo; see
+substrata-explore's documentation. Without it, `--sheets` writes contact sheets
+of the queues (`curate/review_sheets.pdf`; captions: id, label > predicted
+class, label probability), and `--import CSV` reads decisions from a CSV
+(`action`, `label`, `reason`, and the point as `key`, `cam_filepath` + `cam_x` +
+`cam_y`, or `id`). `--status` summarises the decisions, `--export CSV` writes
+them.
+
+Usage: `substrata curate [--folder DIR] [--model PT] [--annotations CSV] [{--mine IMAGES ... | --image-dir DIR | --points CSV [--image-dir DIR]} --name NAME [--gsd-mm MM] [--domain D] [--mine-images N] [--per-image/--n-points N] [--clusters K] [--seed N] [--resample]] [--status] [--export CSV] [--import CSV] [--sheets [--sheets-max N]] [--curation JSONL ...] [--batch-size N] [--jobs N] [--gui [GUI OPTIONS]]`
+
+```bash
+# In the classifier folder, after `substrata train`
+substrata curate                 # score the training points
+substrata curate --gui           # review them in the browser (port 8010)
+
+# Mine AUV frames of 60-145 m (no diver annotations) into a clustered pool
+substrata curate --mine /data/auv/deep_frames.txt --name auv_deep --domain auv \
+    --gsd-mm 1.21 --clusters 40
+
+# Image-only, as with `substrata predict`: a folder of photos (no ground
+# resolution: the window keeps its share of the photo width) ...
+substrata curate --image-dir /data/drop_cam/2024 --name dropcam --n-points 10
+# ... or given points: predict's output, or a CoralNet export (labels kept as
+# given labels, accepted or changed in the review grid)
+substrata curate --points /data/coralnet/annotations.csv --image-dir /data/coralnet/images \
+    --name coralnet_site4
+
+# Without the GUI: contact sheets, then decisions from a CSV
+substrata curate --sheets
+substrata curate --import decisions.csv --status
+
+# Apply the decisions
+substrata train --keep-map --yes
+```
+
+## Masks (dense per-photo classification)
+
+Classify every part of plain photos (no 3-D model needed, e.g. AUV frames) with a
+point-feature classifier and save the result as masks. Each photo is resampled
+(to the classifier's resolution: `--gsd-mm` gives the photos' ground
+resolution for classifiers working in mm/px, otherwise the classifier's fixed
+scale is used), cut into overlapping tiles and classified per feature cell
+(about 14 resampled pixels; the tiles are blended so there are no seams). Use a
+classifier calibrated to the camera system (`substrata calibrate`) for photos of
+another camera than the training photos.
+
+For each photo, in the output folder (`--output`, default `./masks`):
+
+- `<stem>_labels.png`: palette PNG, one pixel per feature cell; the pixel value
+  is the class index (order of `classes` in `masks.json`), shown in the class
+  colour (`--color LABEL=RRGGBB` to set one).
+- `<stem>_conf.png`: 8-bit confidence of that class (255 = 1.0).
+- `<stem>_probs.npz` (with `--probs`): all class probabilities, uint8 (0-255).
+
+`masks.json` indexes them: the classes and colours, and per photo the files,
+`cell_px` (photo pixels per mask pixel - upsample by it to overlay a mask on its
+photo), size, mean confidence and cover. `masks_cover.csv` has one row per photo
+with the fraction of its cells per class (most likely class), e.g. for percent
+cover per frame. Photos already in the index are skipped, so an interrupted run
+continues where it stopped (`--overwrite` redoes them); the index is saved every
+200 photos. Stems that repeat across folders are prefixed with their folder name.
+
+Usage: `substrata masks IMAGES ... [--classifier PT] [--gsd-mm MM] [--output DIR] [--probs] [--color LABEL=RRGGBB ...] [--overwrite] [--jobs N]`
+
+```bash
+# AUV frames of one dive, with the AUV-calibrated classifier at 1.21 mm/px
+substrata masks /data/auv/dive3 --classifier point_classifier_calibrated.pt \
+    --gsd-mm 1.21 --output /data/auv/dive3_masks
+
+# Photos like the training photos, keeping all probabilities
+substrata masks "photos/*.jpg" --probs
 ```
 
 ## Classifier calibration (calibrate)

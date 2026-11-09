@@ -245,14 +245,17 @@ def _result_from_probs(prob_list, vocab) -> Dict[str, Any]:
 def _classify_matches_point_features(
     image_matches: List[Any], clf: Any,
     batch_size: int = settings.POINT_BATCH_SIZE, n_jobs: int = -1,
-    progress: bool = True,
+    progress: bool = True, gsd_mm: Optional[float] = None,
+    domain: Optional[str] = None,
 ) -> List[Optional[Dict[str, Any]]]:
     """Classify ImageMatches with a point-feature classifier.
 
-    Each match is classified at its pixel ``(x, y)`` on its photo; its ground
-    resolution (camera depth, see
-    :func:`substrata.pointfeatures.image_match_gsd_mm`) sets the resampling of
-    classifiers with a physical target resolution. Results are attached as
+    Each match is classified at its pixel ``(x, y)`` on its photo, resampled
+    as :func:`substrata.pointfeatures.photo_scale`: by its ground resolution
+    (camera depth, see :func:`substrata.pointfeatures.image_match_gsd_mm`,
+    else ``gsd_mm``) for classifiers with a physical target resolution, else
+    by its photo's width when that is another camera's. ``domain``: standardise
+    with that camera domain's statistics. Results are attached as
     ``.classification`` like the crop path.
     """
     from substrata import pointfeatures
@@ -270,18 +273,16 @@ def _classify_matches_point_features(
     matches = [image_matches[i] for i in usable]
     gsd = None
     if clf.target_mm_px:
-        gsd = [pointfeatures.image_match_gsd_mm(m) for m in matches]
+        gsd = [pointfeatures.image_match_gsd_mm(m) or gsd_mm for m in matches]
         n_missing = sum(g is None for g in gsd)
-        if n_missing:
+        if n_missing and n_missing < len(gsd):
             logger.warning(
-                "%d of %d match(es) have no camera geometry; they are resampled "
-                "with the classifier's fixed scale %.3f.",
-                n_missing, len(matches), clf.scale_factor,
-            )
+                "%d of %d match(es) have no camera geometry (and no --gsd-mm); "
+                "they are resampled by their photo's width.", n_missing, len(matches))
     probs, ok = clf.classify_points(
         [m.filepath for m in matches], [float(m.x) for m in matches],
         [float(m.y) for m in matches], gsd_mm=gsd, batch_size=batch_size,
-        n_jobs=n_jobs, progress=progress,
+        n_jobs=n_jobs, progress=progress, domain=domain,
     )
     for i, res in zip(usable, clf.results(probs, ok)):
         results[i] = res
@@ -294,7 +295,8 @@ def classify_image_matches_batch(
     image_matches: List[Any], classifier: Union[str, Any],
     crop_size: Optional[Union[int, Tuple[int, int]]] = None,
     batch_size: int = 64, n_jobs: int = -1,
-    crops_root: Optional[str] = None,
+    crops_root: Optional[str] = None, gsd_mm: Optional[float] = None,
+    domain: Optional[str] = None,
 ) -> List[Optional[Dict[str, Any]]]:
     """Classify many ImageMatches in batched GPU passes (fast path).
 
@@ -319,6 +321,10 @@ def classify_image_matches_batch(
         crops_root: Optional crops directory; matches with a stored crop at
             least ``crop_size`` are classified from its centre instead of the
             source photo (same pixels, much faster to decode).
+        gsd_mm, domain: Point-feature classifiers only: the ground resolution
+            (mm/px) of photos without camera geometry, and the camera domain
+            whose statistics standardise the features
+            (:func:`_classify_matches_point_features`).
 
     Returns:
         List of result dicts (or ``None``) aligned with ``image_matches``.
@@ -336,7 +342,8 @@ def classify_image_matches_batch(
 
     if pointfeatures.is_point_classifier(learn):
         return _classify_matches_point_features(
-            image_matches, learn, batch_size=batch_size, n_jobs=n_jobs
+            image_matches, learn, batch_size=batch_size, n_jobs=n_jobs,
+            gsd_mm=gsd_mm, domain=domain,
         )
 
     # Report the inference device so it is clear whether classification is
@@ -653,7 +660,7 @@ def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
 
 
 def count_labels(
-    files: List[str], class_codes: Optional[Set[str]]
+    files: List[str], class_codes: Optional[Set[str]], curation: Any = None,
 ) -> Tuple[Counter, Counter]:
     """Tally ``label`` column values across the given annotation CSVs.
 
@@ -661,6 +668,8 @@ def count_labels(
         files: Annotation CSV paths to scan.
         class_codes: Set of valid CPC codes (labels not in this set are
             collected separately as ``unknown``), or None to count every label.
+        curation: Optional :class:`substrata.curation.CurationStore`; excluded
+            points are not counted and relabelled ones count as their new label.
 
     Returns:
         Tuple ``(counts, unknown)`` of Counters keyed by label/CPC code.
@@ -673,6 +682,10 @@ def count_labels(
             if settings.TRAIN_LABEL_COLUMN not in (reader.fieldnames or []):
                 continue
             for row in reader:
+                if curation is not None:
+                    row, _action = curation.apply(row)
+                    if row is None:
+                        continue
                 label = (row.get(settings.TRAIN_LABEL_COLUMN) or "").strip()
                 if not label:
                     continue
@@ -888,7 +901,7 @@ def get_label_collapse_map(
 def build_label_tree(
     classes_path: str, csv_files: List[str], min_count: int = 1,
     tips_only: bool = False, include_labels: Optional[Set[str]] = None,
-    collapse: bool = False,
+    collapse: bool = False, curation: Any = None,
 ) -> Tuple[List[str], Set[str], Counter, Counter, Dict[str, str]]:
     """Render the CATAMI label tree and derive the training-label set.
 
@@ -920,7 +933,7 @@ def build_label_tree(
     nodes, children, roots = load_classes(classes_path)
     cpc_to_code = {n["cpc"]: code for code, n in nodes.items() if n["cpc"]}
 
-    counts, unknown = count_labels(csv_files, set(cpc_to_code))
+    counts, unknown = count_labels(csv_files, set(cpc_to_code), curation)
 
     direct: Counter = Counter()
     for cpc, n in counts.items():
@@ -971,7 +984,7 @@ def build_label_tree(
 def build_flat_labels(
     csv_files: List[str], min_count: int = 1,
     include_labels: Optional[Set[str]] = None,
-    exclude_labels: Optional[Set[str]] = None,
+    exclude_labels: Optional[Set[str]] = None, curation: Any = None,
 ) -> Tuple[List[str], Set[str], Counter, Counter, Dict[str, str]]:
     """Flat (non-hierarchical) counterpart of :func:`build_label_tree`.
 
@@ -990,7 +1003,7 @@ def build_flat_labels(
         Same tuple as :func:`build_label_tree`, with an empty ``unknown`` and
         an identity ``collapse_map`` over the selected labels.
     """
-    counts, unknown = count_labels(csv_files, None)
+    counts, unknown = count_labels(csv_files, None, curation)
     for label in exclude_labels or ():
         counts.pop(label, None)
     if include_labels is not None:
@@ -1261,6 +1274,7 @@ def collate_training_annotations(
     csv_files: List[str], pattern: str, keep_labels: Set[str],
     output_path: str, model_path: str, prompt: bool = True,
     min_conf: Optional[float] = None, conf_strict: bool = False,
+    curation: Any = None, curation_stats: Optional[Counter] = None,
 ) -> Tuple[int, int, int]:
     """Write a consolidated training annotations CSV.
 
@@ -1284,6 +1298,11 @@ def collate_training_annotations(
         min_conf: If set, minimum ``label_conf`` to keep a row.
         conf_strict: Treat an empty ``label_conf`` as ``0`` (excluded when
             ``min_conf`` > 0) instead of keeping it.
+        curation: Optional :class:`substrata.curation.CurationStore` applied
+            first (excluded points dropped, relabelled ones take their new
+            label); a curated label is kept whatever its ``label_conf``.
+        curation_stats: Optional Counter filled with the decisions applied
+            (``exclude`` / ``relabel`` / ``accept``).
 
     Returns:
         Tuple ``(n_written, n_dropped_missing_cam, n_dropped_low_conf)``.
@@ -1299,10 +1318,17 @@ def collate_training_annotations(
         with open(path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                action = None
+                if curation is not None:
+                    row, action = curation.apply(row)
+                    if curation_stats is not None and action:
+                        curation_stats[action] += 1
+                    if row is None:
+                        continue
                 label = (row.get("label") or "").strip()
                 if label not in keep_labels:
                     continue
-                if min_conf is not None and not confidence_passes(
+                if min_conf is not None and action is None and not confidence_passes(
                     row.get("label_conf"), min_conf, conf_strict
                 ):
                     n_dropped_conf += 1
@@ -1352,6 +1378,8 @@ def collate_training_annotations(
                 cam_y,
                 row.get("depth", ""),
                 row.get("split_key", ""),
+                row.get("cam_gsd_mm", ""),
+                row.get("domain", ""),
             ])
             n_written += 1
     return n_written, n_dropped, n_dropped_conf

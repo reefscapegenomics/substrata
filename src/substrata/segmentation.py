@@ -1705,6 +1705,10 @@ class Segmentation:
             classified from (``""`` if unknown).
         query_px: optional ``(Nq, 2)`` float pixel (x, y) of each query in that
             photo (``nan`` if unknown).
+        query_n_views: optional ``(Nq,)`` int number of photos (views) fused
+            into each query's prediction (point-feature classifiers).
+        query_agreement: optional ``(Nq,)`` float weight share of those views
+            whose own label is the fused one (1 = all views agree).
     """
 
     query_coords: np.ndarray
@@ -1715,6 +1719,8 @@ class Segmentation:
     point_codes: Optional[np.ndarray] = None
     query_cams: Optional[np.ndarray] = None
     query_px: Optional[np.ndarray] = None
+    query_n_views: Optional[np.ndarray] = None
+    query_agreement: Optional[np.ndarray] = None
     _tree: Any = field(default=None, repr=False, compare=False)
     _codes: Any = field(default=None, repr=False, compare=False)
 
@@ -1731,11 +1737,15 @@ class Segmentation:
         label_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
         cams: Optional[np.ndarray] = None,
         px: Optional[np.ndarray] = None,
+        n_views: Optional[np.ndarray] = None,
+        agreement: Optional[np.ndarray] = None,
     ) -> "Segmentation":
         """Build a Segmentation, keeping only successfully-classified queries.
 
         ``cams`` / ``px``: optional photo filepath and pixel (x, y) per query
-        (see :attr:`query_cams` / :attr:`query_px`).
+        (see :attr:`query_cams` / :attr:`query_px`); ``n_views`` /
+        ``agreement``: optional multi-view fusion details
+        (:attr:`query_n_views` / :attr:`query_agreement`).
         """
         matched = np.array([bool(l) for l in labels])
         if not matched.any():
@@ -1751,7 +1761,10 @@ class Segmentation:
         colors = _build_label_colors(codebook, label_colors)
         qcam = None if cams is None else np.asarray(cams, dtype=object)[matched]
         qpx = None if px is None else np.asarray(px, dtype=float)[matched]
-        return cls(qc, ql, qcf, codebook, colors, query_cams=qcam, query_px=qpx)
+        qnv = None if n_views is None else np.asarray(n_views, dtype=int)[matched]
+        qag = None if agreement is None else np.asarray(agreement, float)[matched]
+        return cls(qc, ql, qcf, codebook, colors, query_cams=qcam, query_px=qpx,
+                   query_n_views=qnv, query_agreement=qag)
 
     @classmethod
     def from_annotations(
@@ -1790,7 +1803,7 @@ class Segmentation:
                 i = col.get(name)
                 return r[i].strip() if i is not None and i < len(r) else ""
 
-            xyz, labels, conf, cams, px = [], [], [], [], []
+            xyz, labels, conf, cams, px, nviews, agree = [], [], [], [], [], [], []
             for r in rows:
                 if not r:
                     continue
@@ -1806,6 +1819,9 @@ class Segmentation:
                 cams.append(get(r, "cam_filepath"))
                 x, y = get(r, "cam_x"), get(r, "cam_y")
                 px.append([float(x) if x else np.nan, float(y) if y else np.nan])
+                nv, ag = get(r, "pred_n"), get(r, "pred_agreement")
+                nviews.append(int(float(nv)) if nv else 0)
+                agree.append(float(ag) if ag else np.nan)
         if not labels:
             raise ValueError(f"{csv_path}: no labelled or predicted points")
         qc = np.asarray(xyz, dtype=float)
@@ -1824,6 +1840,10 @@ class Segmentation:
             qc.astype(np.float32), ql, np.asarray(conf, dtype=float), codebook,
             colors, query_cams=np.array(cams, dtype=object),
             query_px=np.asarray(px, dtype=float),
+            query_n_views=(np.array(nviews, dtype=int)
+                           if "pred_n" in col else None),
+            query_agreement=(np.array(agree, dtype=float)
+                             if "pred_agreement" in col else None),
         )
 
     def hex_colors(self) -> Dict[str, str]:
@@ -1915,7 +1935,9 @@ class Segmentation:
         """The classified query points as an annotation set.
 
         Each point becomes an annotation ``<id_prefix>_<i>`` whose prediction is
-        in ``pred_label`` / ``pred_conf`` (``pred_n`` = 1, one crop each); its
+        in ``pred_label`` / ``pred_conf`` (``pred_n`` = the number of photos
+        fused, 1 for one crop; with multi-view fusion also ``pred_agreement``,
+        the weight share of the views agreeing with the prediction); its
         ``label`` stays empty, as for :meth:`Annotations.predict`, so the set can
         be checked by hand. The photo and pixel it was classified from (if
         known) go in ``cam_filepath`` / ``cam_x`` / ``cam_y``. Read it back
@@ -1939,7 +1961,15 @@ class Segmentation:
                 continue
             ann = Annotation(np.asarray(xyz, float), id=f"{id_prefix}_{i}")
             ann.label, ann.label_conf = "", ""
-            ann.pred_label, ann.pred_conf, ann.pred_n = str(label), float(conf), 1
+            n_views = 1
+            if self.query_n_views is not None:
+                n_views = int(self.query_n_views[i])
+            ann.pred_label, ann.pred_conf, ann.pred_n = str(label), float(conf), n_views
+            if self.query_agreement is not None and np.isfinite(
+                self.query_agreement[i]
+            ):
+                ann.meta_data["pred_agreement"] = round(
+                    float(self.query_agreement[i]), 4)
             if self.query_cams is not None and self.query_cams[i]:
                 ann.cam_filepath = str(self.query_cams[i])
                 if self.query_px is not None and np.isfinite(self.query_px[i]).all():
@@ -1972,6 +2002,10 @@ class Segmentation:
         )
         if include_point_codes and self.point_codes is not None:
             payload["point_codes"] = self.point_codes
+        if self.query_n_views is not None:
+            payload["query_n_views"] = self.query_n_views
+        if self.query_agreement is not None:
+            payload["query_agreement"] = self.query_agreement
         np.savez_compressed(path, **payload)
         return path
 
@@ -1986,6 +2020,10 @@ class Segmentation:
         return cls(
             d["query_coords"], d["query_labels"], d["query_conf"], codebook, colors,
             point_codes=d["point_codes"] if "point_codes" in d.files else None,
+            query_n_views=(d["query_n_views"] if "query_n_views" in d.files
+                           else None),
+            query_agreement=(d["query_agreement"] if "query_agreement" in d.files
+                             else None),
         )
 
 
@@ -2034,34 +2072,35 @@ def sample_query_points(
     return sums / counts
 
 
-def _match_points_to_cameras(
+def _match_points_to_cameras_multi(
     query_coords: np.ndarray,
     cams,
     world_transform: Optional[np.ndarray] = None,
     pcd=None,
     occlusion: bool = True,
+    views: int = 1,
     intercept_radius: Optional[float] = None,
     discard_threshold: Optional[float] = None,
     verbose: bool = True,
 ):
-    """Find each query point's best camera (fast, vectorized, occlusion-aware).
+    """Find each query point's ``views`` best cameras (vectorized, occlusion-aware).
 
     For every camera, project *all* query points at once
-    (:meth:`~substrata.cameras.Camera.project_points`) and keep the running
-    best camera per query by the ``relevance`` metric — O(cameras) numpy passes,
-    no per-query Python loop. When ``occlusion`` is on, run the reprojection
-    ray-march (``pcd.get_intercept``) once per query against its *chosen*
-    camera and drop queries whose line of sight is blocked. This is the
-    production replacement for ``Annotations.get_first_image_matches``, which
-    looped every camera per query and ran the ray-march per candidate (~15 min
-    for 40 k queries).
+    (:meth:`~substrata.cameras.Camera.project_points`) and keep, per query, the
+    ``views`` cameras with the lowest ``relevance`` (closest, most central) —
+    O(cameras) numpy passes, no per-query Python loop. When ``occlusion`` is
+    on, the reprojection ray-march (``pcd.get_intercept``) runs once per kept
+    view, and views whose line of sight is blocked by a nearer surface are
+    dropped. This is the production replacement for
+    ``Annotations.get_first_image_matches``, which looped every camera per query
+    and ran the ray-march per candidate (~15 min for 40 k queries).
 
     Returns:
-        ``(best_cam, best_x, best_y, best_depth, cam_list)`` where ``best_cam``
-        is an ``(Nq,)`` int index into ``cam_list`` (``-1`` = unmatched),
-        ``best_x``/``best_y`` are ``(Nq,)`` pixel coordinates, and ``best_depth``
-        is the ``(Nq,)`` camera-to-point distance (world metres) of the chosen
-        camera — used to report the physical crop footprint.
+        ``(cam, x, y, depth, rel, cam_list)``: ``(Nq, views)`` arrays sorted by
+        relevance (column 0 = best view), with ``cam`` an int index into
+        ``cam_list`` (``-1`` = no view / blocked, ``rel`` then ``inf``),
+        ``x``/``y`` pixel coordinates and ``depth`` the point depth along the
+        camera axis in original-frame units.
     """
     from substrata import settings
 
@@ -2069,6 +2108,7 @@ def _match_points_to_cameras(
         intercept_radius = settings.DEFAULT_INTERCEPT_SEARCH_RADIUS
     if discard_threshold is None:
         discard_threshold = settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD
+    views = max(1, int(views))
 
     query_coords = np.asarray(query_coords, dtype=float)
     n = len(query_coords)
@@ -2084,11 +2124,12 @@ def _match_points_to_cameras(
         orig = query_coords
 
     cam_list = list(cams)
-    best_rel = np.full(n, np.inf)
-    best_cam = np.full(n, -1, dtype=int)
-    best_x = np.zeros(n)
-    best_y = np.zeros(n)
-    best_depth = np.zeros(n)
+    top_rel = np.full((n, views), np.inf)
+    top_cam = np.full((n, views), -1, dtype=int)
+    top_x = np.zeros((n, views))
+    top_y = np.zeros((n, views))
+    top_depth = np.zeros((n, views))
+    rows = np.arange(n)
 
     iterator = (
         tqdm(cam_list, desc="Projecting cameras", unit="cam") if verbose else cam_list
@@ -2097,41 +2138,72 @@ def _match_points_to_cameras(
         if getattr(cam, "enabled", True) is False or cam.sensor is None:
             continue
         x, y, depth, rel, in_view = cam.project_points(orig, use_orig_coords=True)
-        better = in_view & (depth > 0) & (rel < best_rel)
+        # Replace each query's worst kept view when this camera beats it.
+        worst = np.argmax(top_rel, axis=1)
+        better = in_view & (depth > 0) & (rel < top_rel[rows, worst])
         if not better.any():
             continue
-        best_rel = np.where(better, rel, best_rel)
-        best_cam = np.where(better, ci, best_cam)
-        best_x = np.where(better, x, best_x)
-        best_y = np.where(better, y, best_y)
-        best_depth = np.where(better, depth, best_depth)
+        q = rows[better]
+        j = worst[better]
+        top_rel[q, j] = rel[better]
+        top_cam[q, j] = ci
+        top_x[q, j] = x[better]
+        top_y[q, j] = y[better]
+        top_depth[q, j] = depth[better]
 
     if occlusion and pcd is not None:
         pcd.build_kd_tree()
-        matched_idx = np.nonzero(best_cam >= 0)[0]
+        kept = np.argwhere(top_cam >= 0)
         it = (
-            tqdm(matched_idx, desc="Occlusion check", unit="pt")
-            if verbose else matched_idx
+            tqdm(kept, desc="Occlusion check", unit="view") if verbose else kept
         )
-        for qi in it:
-            cam = cam_list[best_cam[qi]]
+        for qi, j in it:
+            cam = cam_list[top_cam[qi, j]]
             try:
-                vector = cam.pixel_to_ray(float(best_x[qi]), float(best_y[qi]))
+                vector = cam.pixel_to_ray(float(top_x[qi, j]), float(top_y[qi, j]))
                 intercept = pcd.get_intercept(
                     cam.coords, search_radius=intercept_radius,
                     vector=vector, always_return=True,
                 )
-            except Exception:  # noqa: BLE001 - drop the match on any ray failure
-                best_cam[qi] = -1
-                continue
-            if intercept is None:
-                best_cam[qi] = -1
-                continue
-            err = float(np.linalg.norm(query_coords[qi] - intercept.coords))
-            if err > discard_threshold:
-                best_cam[qi] = -1  # line of sight blocked by nearer surface
+            except Exception:  # noqa: BLE001 - drop the view on any ray failure
+                intercept = None
+            if intercept is None or float(
+                np.linalg.norm(query_coords[qi] - intercept.coords)
+            ) > discard_threshold:  # no hit, or line of sight blocked
+                top_cam[qi, j] = -1
+                top_rel[qi, j] = np.inf
 
-    return best_cam, best_x, best_y, best_depth, cam_list
+    order = np.argsort(top_rel, axis=1, kind="stable")
+    take = (lambda a: np.take_along_axis(a, order, axis=1))
+    return (take(top_cam), take(top_x), take(top_y), take(top_depth),
+            take(top_rel), cam_list)
+
+
+def _match_points_to_cameras(
+    query_coords: np.ndarray,
+    cams,
+    world_transform: Optional[np.ndarray] = None,
+    pcd=None,
+    occlusion: bool = True,
+    intercept_radius: Optional[float] = None,
+    discard_threshold: Optional[float] = None,
+    verbose: bool = True,
+):
+    """Find each query point's best camera (see :func:`_match_points_to_cameras_multi`).
+
+    Returns:
+        ``(best_cam, best_x, best_y, best_depth, cam_list)`` where ``best_cam``
+        is an ``(Nq,)`` int index into ``cam_list`` (``-1`` = unmatched or
+        blocked), ``best_x``/``best_y`` are ``(Nq,)`` pixel coordinates, and
+        ``best_depth`` is the ``(Nq,)`` point depth of the chosen camera (in
+        original-frame units) — used to report the physical crop footprint.
+    """
+    cam, x, y, depth, _rel, cam_list = _match_points_to_cameras_multi(
+        query_coords, cams, world_transform=world_transform, pcd=pcd,
+        occlusion=occlusion, views=1, intercept_radius=intercept_radius,
+        discard_threshold=discard_threshold, verbose=verbose,
+    )
+    return cam[:, 0], x[:, 0], y[:, 0], depth[:, 0], cam_list
 
 
 def _classify_crops(
@@ -2329,6 +2401,120 @@ def _classify_point_features(
     return labels, conf
 
 
+def _classify_dense_views(
+    view_cam: np.ndarray,
+    view_x: np.ndarray,
+    view_y: np.ndarray,
+    view_depth: np.ndarray,
+    view_rel: np.ndarray,
+    cam_list,
+    clf,
+    depth_scale: float,
+    mask_dir: Optional[str] = None,
+    mask_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    verbose: bool = True,
+):
+    """Classify queries from dense per-photo maps, fusing several views.
+
+    Every photo that is a view of some query gets one dense probability map
+    (:func:`substrata.pointfeatures.iter_dense_maps`; resampled at the photo's
+    median ground resolution over its views when the classifier works in
+    mm/px). Each view's probabilities are read at its pixel, and a query's are
+    the mean over its views weighted by ``relevance_min / relevance`` (as
+    ``predict --method weighted``).
+
+    Args:
+        view_cam, view_x, view_y, view_depth, view_rel: ``(Nq, V)`` views from
+            :func:`_match_points_to_cameras_multi`.
+        cam_list: Cameras indexed by ``view_cam``.
+        clf: Point-feature classifier.
+        depth_scale: World metres per original-frame unit.
+        mask_dir: If given, write each photo's masks there
+            (:func:`substrata.pointfeatures.save_dense_masks`) plus an index.
+        mask_colors: ``{label: (r, g, b)}`` mask colours.
+
+    Returns:
+        Dict of ``(Nq,)`` arrays: ``labels`` (``""`` unclassified), ``conf``
+        (fused probability), ``n_views`` (views used), ``agreement`` (weight
+        share of the views whose own label is the fused one), ``cam`` / ``x`` /
+        ``y`` (the highest-weight view used; ``-1`` / nan if none).
+    """
+    import json
+
+    from substrata import pointfeatures
+
+    n, _v = view_cam.shape
+    k = len(clf.classes)
+    valid = view_cam >= 0
+    rel_min = np.where(valid, view_rel, np.inf).min(axis=1)
+    weight = np.where(valid, rel_min[:, None] / np.where(valid, view_rel, 1.0), 0.0)
+
+    photos = np.unique(view_cam[valid])
+    entries = {ci: np.argwhere(view_cam == ci) for ci in photos}
+    scales = []
+    for ci in photos:
+        q, j = entries[ci].T
+        g = None
+        if clf.target_mm_px:
+            fx = getattr(getattr(cam_list[ci], "sensor", None), "fx", None)
+            gs = [pointfeatures.ground_resolution_mm(d, fx, depth_scale)
+                  for d in view_depth[q, j]]
+            gs = [x for x in gs if x is not None]
+            g = float(np.median(gs)) if gs else None
+        scales.append(pointfeatures.photo_scale(clf, g))
+    if verbose:
+        print(f"[dense] {len(photos):,} photos for {int(valid.any(1).sum()):,} "
+              f"queries ({valid.sum():,} views); median scale "
+              f"{np.median(scales) if scales else float('nan'):.3f}")
+
+    fused = np.zeros((n, k), np.float32)
+    wsum = np.zeros(n)
+    view_lab = np.full(view_cam.shape, -1, dtype=int)
+    paths = [cam_list[ci].filepath for ci in photos]
+    stems = pointfeatures.unique_stems(paths) if mask_dir else None
+    index = {}
+    for i, dm in pointfeatures.iter_dense_maps(clf, paths, scales, progress=verbose):
+        if dm is None:
+            continue
+        q, j = entries[photos[i]].T
+        p = dm.sample(view_x[q, j], view_y[q, j])
+        w = weight[q, j]
+        np.add.at(fused, q, p * w[:, None])
+        np.add.at(wsum, q, w)
+        view_lab[q, j] = p.argmax(1)
+        if mask_dir:
+            files = pointfeatures.save_dense_masks(dm, mask_dir, stems[i],
+                                                   mask_colors or {})
+            index[paths[i]] = dict(files, cell_px=dm.cell_px, scale=dm.scale,
+                                   width=dm.width, height=dm.height)
+    if mask_dir:
+        with open(os.path.join(mask_dir, "masks.json"), "w") as f:
+            json.dump({"classes": list(clf.classes),
+                       "colors": {c: list(v) for c, v in (mask_colors or {}).items()},
+                       "photos": index}, f, indent=1)
+
+    ok = wsum > 0
+    probs = np.divide(fused, wsum[:, None], out=np.zeros_like(fused),
+                      where=ok[:, None])
+    lab = probs.argmax(1)
+    classes = np.array(clf.classes, dtype=object)
+    labels = np.where(ok, classes[lab], "").astype(object)
+    conf = np.where(ok, probs[np.arange(n), lab], np.nan)
+    used = view_lab >= 0
+    agree = np.where(used & (view_lab == lab[:, None]), weight, 0.0).sum(1)
+    agreement = np.where(ok, agree / np.where(ok, wsum, 1.0), np.nan)
+    # The highest-weight view actually used (for cam_filepath / cam_x / cam_y).
+    best = np.argmax(np.where(used, weight, -1.0), axis=1)
+    rows = np.arange(n)
+    cam = np.where(ok, view_cam[rows, best], -1)
+    return {
+        "labels": labels, "conf": conf, "n_views": used.sum(1),
+        "agreement": agreement, "cam": cam,
+        "x": np.where(ok, view_x[rows, best], np.nan),
+        "y": np.where(ok, view_y[rows, best], np.nan),
+    }
+
+
 def segment_point_cloud(
     pcd,
     cams,
@@ -2342,13 +2528,20 @@ def segment_point_cloud(
     crop_size: Optional[int] = None,
     batch_size: int = 64,
     flush_batch: int = 16384,
+    views: Optional[int] = None,
+    dense: bool = True,
+    mask_dir: Optional[str] = None,
     verbose: bool = True,
 ) -> Segmentation:
     """Segment a point cloud by classifying camera patches at sampled query points.
 
-    Samples query points across ``pcd``, matches each to its best camera photo
-    (fast vectorized, occlusion-aware), classifies the 224 px patches with the
-    trained crop classifier, and returns a :class:`Segmentation`. Propagate its
+    Samples query points across ``pcd`` and matches them to camera photos (fast
+    vectorized, occlusion-aware). With a crop classifier, each query's best
+    photo is classified from a crop around it. With a point-feature classifier
+    (``.pt``), each photo that sees queries gets one dense probability map,
+    and every query fuses its ``views`` best photos (weighted by relevance;
+    see :func:`_classify_dense_views`), which also gives each point its number
+    of views and their agreement. Returns a :class:`Segmentation`. Propagate its
     labels to a cloud with :meth:`Segmentation.propagate`, recolour with
     :meth:`Segmentation.recolor`, or recolour a full-size PLY with
     :func:`recolor_ply_file`.
@@ -2371,6 +2564,11 @@ def segment_point_cloud(
         batch_size: inference batch size.
         flush_batch: max crops held in memory before a forward pass frees them
             (bounds peak RAM regardless of ``cell_size`` / cloud size).
+        views: point classifiers: photos fused per query (default
+            ``settings.SEG_POINT_VIEWS``).
+        dense: point classifiers: dense per-photo maps (default); False
+            classifies each query's best view from its own window instead.
+        mask_dir: point classifiers (dense): also save each photo's masks here.
 
     Returns:
         A :class:`Segmentation` (classified query points + codebook + colours).
@@ -2397,19 +2595,53 @@ def segment_point_cloud(
             f"({sampling}, {cell_size * 100:.0f} cm)"
         )
 
-    best_cam, best_x, best_y, best_depth, cam_list = _match_points_to_cameras(
-        qc, cams, world_transform=world_transform,
-        pcd=(pcd if occlusion else None), occlusion=occlusion, verbose=verbose,
-    )
-    # best_depth is in the original frame; convert to world metres via the
+    from substrata import pointfeatures
+
+    point_clf = pointfeatures.is_point_classifier(learn)
+    # Depths are in the original frame; convert to world metres via the
     # world_transform's linear scale (cbrt of its 3x3 determinant).
     depth_scale = 1.0
     if world_transform is not None:
         lin = np.asarray(world_transform, dtype=float)[:3, :3]
         depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
-    from substrata import pointfeatures
 
-    point_clf = pointfeatures.is_point_classifier(learn)
+    if point_clf and dense:
+        n_views = int(views or settings.SEG_POINT_VIEWS)
+        vc, vx, vy, vd, vr, cam_list = _match_points_to_cameras_multi(
+            qc, cams, world_transform=world_transform,
+            pcd=(pcd if occlusion else None), occlusion=occlusion,
+            views=n_views, verbose=verbose,
+        )
+        if verbose:
+            print(f"[match] {int((vc[:, 0] >= 0).sum()):,}/{len(qc):,} queries "
+                  f"matched, {(vc >= 0).sum(1).mean():.2f} of {n_views} views "
+                  "per query on average")
+        mask_colors = None
+        if mask_dir:
+            mask_colors = _build_label_colors(list(learn.classes), label_colors)
+        res = _classify_dense_views(
+            vc, vx, vy, vd, vr, cam_list, learn, depth_scale,
+            mask_dir=mask_dir, mask_colors=mask_colors, verbose=verbose,
+        )
+        labels = res["labels"]
+        if verbose:
+            done = labels != ""
+            print(f"[classify] {int(done.sum()):,} classified; views agree "
+                  f"fully for {np.mean(res['agreement'][done] >= 0.999):.0%}")
+        cams_of = np.array(
+            [cam_list[c].filepath if c >= 0 else "" for c in res["cam"]],
+            dtype=object,
+        )
+        return Segmentation.from_query_labels(
+            qc, labels, res["conf"], label_colors=label_colors, cams=cams_of,
+            px=np.column_stack([res["x"], res["y"]]), n_views=res["n_views"],
+            agreement=res["agreement"],
+        )
+
+    best_cam, best_x, best_y, best_depth, cam_list = _match_points_to_cameras(
+        qc, cams, world_transform=world_transform,
+        pcd=(pcd if occlusion else None), occlusion=occlusion, verbose=verbose,
+    )
     if verbose:
         print(f"[match] {int((best_cam >= 0).sum()):,}/{len(qc):,} queries matched")
         if not point_clf:

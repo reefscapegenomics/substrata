@@ -814,6 +814,8 @@ class Annotations:
         print_summary: bool = False,
         batch_size: int = 64,
         n_jobs: int = -1,
+        gsd_mm: Optional[float] = None,
+        domain: Optional[str] = None,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Classify all image matches for annotations that have them.
 
@@ -828,6 +830,10 @@ class Annotations:
             print_summary: Whether to print classification category counts.
             batch_size: Inference batch size.
             n_jobs: Threads for parallel crop loading (-1 = all cores).
+            gsd_mm: Point classifiers: ground resolution (mm/px) of photos
+                without camera geometry.
+            domain: Point classifiers: camera domain whose statistics
+                standardise the features (a ``substrata curate`` pool's).
 
         Returns:
             Mapping of annotation IDs to classification results.
@@ -841,7 +847,7 @@ class Annotations:
         ]
         batch = classification.classify_image_matches_batch(
             [im for _id, im in matched], classifier, crop_size,
-            batch_size=batch_size, n_jobs=n_jobs,
+            batch_size=batch_size, n_jobs=n_jobs, gsd_mm=gsd_mm, domain=domain,
         )
         results: Dict[str, Optional[Dict[str, Any]]] = {
             ann.id: None for ann in self.data.values()
