@@ -3287,10 +3287,23 @@ def _classifier_crop_size(values, learn, default):
     Classifiers from ``substrata train`` record the crop size they were trained
     on; older ones fall back to ``default`` (with a note).
     """
-    from substrata import classification
+    from substrata import classification, pointfeatures
 
     if values:
         return _size_arg(values, default)
+    if pointfeatures.is_point_classifier(learn):
+        # Point classifiers read the photo around each point themselves; the
+        # crop size only affects stored crops / thumbnails and edge margins.
+        res = (
+            f"{learn.target_mm_px:.3f} mm/px" if learn.target_mm_px
+            else f"scale {learn.scale_factor:.3f}"
+        )
+        cal = ", calibrated" if learn.calibrated else ""
+        print(
+            f"Point classifier ({learn.backbone}, {res}{cal}); crops of "
+            f"{default[0]}x{default[1]} px only for stored crops."
+        )
+        return default
     stored = classification.classifier_crop_size(learn)
     if stored:
         print(f"Crop size {stored} px (as the classifier was trained)")
@@ -4295,7 +4308,7 @@ def handle_train(args):
     """
     import glob
 
-    from substrata import classification
+    from substrata import classification, pointfeatures
 
     cwd = os.getcwd()
     csv_path = args.csv_path or cwd
@@ -4308,9 +4321,18 @@ def handle_train(args):
         else settings.TRAIN_DEFAULT_PATTERN
     )
     crop_size = args.crop_size or settings.TRAIN_CROP_SIZE
+    # --arch dinov2_* (default): point-feature classifier; else fastai crops.
+    point_mode = pointfeatures.is_point_arch(args.arch)
     model_file = args.model or os.path.join(
-        output_dir, settings.TRAIN_DEFAULT_MODEL_FILE
+        output_dir,
+        settings.POINT_DEFAULT_MODEL_FILE if point_mode
+        else settings.TRAIN_DEFAULT_MODEL_FILE,
     )
+    if point_mode and getattr(args, "pretrained_weights", None):
+        raise SystemExit(
+            "--pretrained-weights applies to the fastai crop classifier; use it "
+            "with a torchvision --arch (e.g. resnet50)."
+        )
     map_path = getattr(args, "label_map", None) or os.path.join(
         output_dir, settings.TRAIN_LABEL_MAP_FILE
     )
@@ -4351,6 +4373,26 @@ def handle_train(args):
             split = settings.TRAIN_CROP_DIRS[1]  # validation_crops
         if not os.path.isfile(model_file):
             raise SystemExit(f"Model file not found for {flag}: {model_file}")
+        if pointfeatures.is_point_classifier_path(model_file):
+            # Point classifiers carry their label map; points come from the
+            # training annotations CSV (same split as training).
+            split_name = "test" if getattr(args, "test", False) else "validation"
+            ann_csv = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
+            if not os.path.isfile(ann_csv):
+                raise SystemExit(f"Training annotations not found: {ann_csv}")
+            clf = pointfeatures.PointFeatureClassifier.load(model_file)
+            try:
+                result = pointfeatures.evaluate_point_classifier(
+                    clf, ann_csv, output_dir, split_name,
+                    batch_size=args.batch_size, n_jobs=args.jobs,
+                )
+            except ValueError as e:
+                raise SystemExit(str(e))
+            pointfeatures.report_point_evaluation(
+                result, split_name,
+                pdf_path=os.path.join(output_dir, f"{split_name}_points_stats.pdf"),
+            )
+            return
         if not os.path.isfile(map_path):
             raise SystemExit(
                 f"Label map not found for {flag}: {map_path}. Run "
@@ -4474,15 +4516,16 @@ def handle_train(args):
     }
     print(
         f"\nThe {len(training_labels)} bolded entries above seed the training "
-        f"classes; crops are generated for all {len(visible_labels)} visible "
-        "label(s)."
+        f"classes; {'points are kept' if point_mode else 'crops are generated'} "
+        f"for all {len(visible_labels)} visible label(s)."
     )
     if not assume_yes:
         if not interactive:
             raise SystemExit(
                 "Confirmation required; re-run with --yes in non-interactive use."
             )
-        ans = input("Proceed (generate crops and seed the label map)? [y/N]: ")
+        what = "collate the points" if point_mode else "generate crops"
+        ans = input(f"Proceed ({what} and seed the label map)? [y/N]: ")
         if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("Aborted.")
 
@@ -4515,18 +4558,21 @@ def handle_train(args):
         raise SystemExit("No usable training annotations; aborting.")
 
     # --- Step 4: sync crops (80/10/10) ---
-    stats = classification.sync_crops(
-        ann_path, output_dir, crop_size,
-        delete_stale=True, prompt=(interactive and not assume_yes),
-        n_jobs=args.jobs,
-    )
-    print(
-        f"Crops: {stats['generated']} generated, "
-        f"{stats['skipped_existing']} already present, "
-        f"{stats['deleted']} deleted, "
-        f"{stats['removed_dirs']} empty folder(s) removed, "
-        f"{stats['failed']} failed."
-    )
+    # The point-feature classifier reads the photos directly; crops are only
+    # made for it when --pdf asks for the contact sheet.
+    if not point_mode or getattr(args, "pdf", False):
+        stats = classification.sync_crops(
+            ann_path, output_dir, crop_size,
+            delete_stale=True, prompt=(interactive and not assume_yes),
+            n_jobs=args.jobs,
+        )
+        print(
+            f"Crops: {stats['generated']} generated, "
+            f"{stats['skipped_existing']} already present, "
+            f"{stats['deleted']} deleted, "
+            f"{stats['removed_dirs']} empty folder(s) removed, "
+            f"{stats['failed']} failed."
+        )
 
     # --- Step 4b: seed/merge the editable label map ---
     # Crops exist for every visible label, but the map only lists labels that
@@ -4554,27 +4600,14 @@ def handle_train(args):
     # --prepare-only: stop here so the map can be hand-tuned before training.
     if getattr(args, "prepare_only", False):
         print(
-            f"\nPrepared crops and label map. Edit {map_path} to tune the "
+            f"\nPrepared {'training points' if point_mode else 'crops'} and "
+            f"label map. Edit {map_path} to tune the "
             "selection/collapsing, then re-run `substrata train --keep-map` to "
             "train on the edited map (plain `substrata train` re-seeds it)."
         )
         return
 
-    # --- Step 5: train ---
-    learn = classification.train_classifier(
-        output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs,
-        pretrained_weights=args.pretrained_weights, crop_size=crop_size,
-    )
-
-    # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
-    counts_by_split = classification.count_crops_by_class(output_dir, label_map)
-    info = [
-        ("Model architecture", args.arch),
-        ("Pretrained weights", args.pretrained_weights or "ImageNet (torchvision)"),
-        ("Epochs", args.epochs),
-        ("Crop size (px)", crop_size),
-        ("Input size (px)", settings.TRAIN_IMAGE_SIZE),
-        ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
+    selection_info = [
         ("Selection: min_count", args.min_count),
         ("Selection: tips_only", bool(args.tips_only)),
         (
@@ -4600,6 +4633,63 @@ def handle_train(args):
         ("Label map", map_path),
         ("Model output", model_file),
     ]
+
+    # --- Step 5 (point features): features, probe, evaluation ---
+    if point_mode:
+        try:
+            clf, run = pointfeatures.train_point_classifier(
+                ann_path, label_map, output_dir, model_file, backbone=args.arch,
+                feature_mm_px=args.feature_mm_px, feature_scale=args.feature_scale,
+                batch_size=args.batch_size, n_jobs=args.jobs,
+            )
+        except ValueError as e:
+            raise SystemExit(str(e))
+        print(f"Saved point classifier: {model_file}")
+        if run["n_failed"]:
+            print(f"Skipped {run['n_failed']} point(s) on unreadable photos.")
+        metrics = {
+            f"{split} {k}": round(run["evaluation"][split][k], 4)
+            for split in run["evaluation"]
+            for k in ("accuracy", "balanced_accuracy", "macro_f1")
+        }
+        info = [
+            ("Classifier", "point features (linear probe on frozen backbone)"),
+            ("Backbone", args.arch),
+            ("Resolution", run["plan"].description),
+            ("Window (model px)", clf.window),
+            ("Probe C", clf.meta.get("probe_C")),
+            ("Calibration patches", clf.meta.get("n_calibration_patches")),
+            ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
+        ] + selection_info
+        summary_pdf = os.path.join(output_dir, settings.TRAIN_SUMMARY_FILE)
+        classification.write_training_summary_pdf(
+            summary_pdf, info, run["counts"], crop_dirs=pointfeatures.SPLIT_NAMES,
+            metrics=metrics,
+        )
+        print(f"Wrote training summary: {summary_pdf}")
+        if "validation" in run["evaluation"]:
+            pointfeatures.report_point_evaluation(
+                run["evaluation"]["validation"], "validation",
+                pdf_path=os.path.join(output_dir, "validation_points_stats.pdf"),
+            )
+        return
+
+    # --- Step 5: train ---
+    learn = classification.train_classifier(
+        output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs,
+        pretrained_weights=args.pretrained_weights, crop_size=crop_size,
+    )
+
+    # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
+    counts_by_split = classification.count_crops_by_class(output_dir, label_map)
+    info = [
+        ("Model architecture", args.arch),
+        ("Pretrained weights", args.pretrained_weights or "ImageNet (torchvision)"),
+        ("Epochs", args.epochs),
+        ("Crop size (px)", crop_size),
+        ("Input size (px)", settings.TRAIN_IMAGE_SIZE),
+        ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
+    ] + selection_info
     summary_pdf = os.path.join(output_dir, settings.TRAIN_SUMMARY_FILE)
     classification.write_training_summary_pdf(
         summary_pdf, info, counts_by_split,
@@ -4615,12 +4705,54 @@ def handle_train(args):
     )
 
 
+def handle_calibrate(args):
+    """Handle 'calibrate': add another camera system's feature statistics.
+
+    Samples random patches of the given photos (which must show the same area
+    as the classifier's training photos), computes their backbone feature
+    statistics and writes a copy of the classifier that standardises with them.
+    """
+    from substrata import pointfeatures
+
+    clf_path = args.classifier or os.path.join(
+        os.getcwd(), settings.POINT_DEFAULT_MODEL_FILE
+    )
+    if not pointfeatures.is_point_classifier_path(clf_path):
+        raise SystemExit(f"Not a point classifier (.pt): {clf_path}")
+    try:
+        clf = pointfeatures.PointFeatureClassifier.load(clf_path)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e))
+    images = pointfeatures.list_images(args.images)
+    if not images:
+        raise SystemExit("No photos found for calibration.")
+    print(f"Calibrating {os.path.basename(clf_path)} on {len(images)} photo(s)")
+    try:
+        cal = pointfeatures.calibrate_point_classifier(
+            clf, images, gsd_mm=args.gsd_mm, n_images=args.n_images,
+            per_image=args.per_image, batch_size=args.batch_size, n_jobs=args.jobs,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e))
+    out = args.output or os.path.splitext(clf_path)[0] + "_calibrated.pt"
+    cal.meta["calibration"]["images"] = (
+        args.images if len(args.images) <= 5 else args.images[:5] + ["..."]
+    )
+    cal.save(out)
+    shift = float(np.mean(np.abs(cal.target_mean - clf.source_mean) / clf.source_std))
+    print(
+        f"Wrote {out} ({cal.meta['calibration']['n_patches']} patches; mean "
+        f"feature shift {shift:.2f} SD from the training photos)."
+    )
+
+
 def main():
     """Build the argparse CLI and dispatch to the selected subcommand handler.
 
     Defines all subcommands (decimate, ply-repair, head, scalebars, views, orient,
     colors, firefish, cams2video, intercepts, intercepts-plot, align, images,
-    match-annotations, camsync, path-repair, transform, train, metashape-export),
+    match-annotations, camsync, path-repair, transform, train, calibrate,
+    metashape-export),
     parses the arguments, and calls the matching handle_* function.
     """
     # explore: the interactive viewer (the substrata-explore package), its own arguments
@@ -6712,7 +6844,48 @@ def main():
         "--arch",
         type=str,
         default=settings.TRAIN_DEFAULT_ARCH,
-        help=f"torchvision architecture. Default: {settings.TRAIN_DEFAULT_ARCH}.",
+        help=(
+            "A DINOv2 backbone (torch.hub name, e.g. dinov2_vitb14_reg or "
+            "dinov2_vitl14_reg): point-feature classifier, a linear probe on "
+            "frozen features read at each point (no crops). Or a torchvision "
+            "architecture (e.g. resnet34, resnet50): fastai crop classifier. "
+            f"Default: {settings.TRAIN_DEFAULT_ARCH}."
+        ),
+    )
+    p_feat = p_train.add_mutually_exclusive_group()
+    p_feat.add_argument(
+        "--feature-mm-px",
+        dest="feature_mm_px",
+        type=float,
+        default=None,
+        metavar="MM",
+        help=(
+            "Point features: resample every photo to this ground resolution "
+            "(mm per model pixel), from each point's camera distance (project "
+            "cameras or a cam_gsd_mm column). Default: automatic - physical "
+            "when ground resolutions are known, else a fixed scale."
+        ),
+    )
+    p_feat.add_argument(
+        "--feature-scale",
+        dest="feature_scale",
+        type=float,
+        default=None,
+        metavar="S",
+        help=(
+            "Point features: fixed resampling (model px per photo px), e.g. "
+            "0.25 for 9568 px photos. Default: automatic (see --feature-mm-px)."
+        ),
+    )
+    p_train.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=settings.POINT_BATCH_SIZE,
+        help=(
+            "Point features: windows per backbone pass. "
+            f"Default: {settings.POINT_BATCH_SIZE}."
+        ),
     )
     p_train.add_argument(
         "--pretrained-weights",
@@ -6737,8 +6910,9 @@ def main():
         type=str,
         default=None,
         help=(
-            "Exported learner .pkl path (also the load target with --test). "
-            f"Default: <output>/{settings.TRAIN_DEFAULT_MODEL_FILE}."
+            "Classifier path (also the load target with --validate/--test). "
+            f"Default: <output>/{settings.POINT_DEFAULT_MODEL_FILE} for point "
+            f"features, <output>/{settings.TRAIN_DEFAULT_MODEL_FILE} for fastai."
         ),
     )
     p_train.add_argument(
@@ -6746,8 +6920,8 @@ def main():
         type=int,
         default=settings.TRAIN_CROP_JOBS,
         help=(
-            "Parallel workers for crop generation (-1 = all cores). "
-            f"Default: {settings.TRAIN_CROP_JOBS}."
+            "Parallel workers for crop generation / photo decoding (-1 = all "
+            f"cores). Default: {settings.TRAIN_CROP_JOBS}."
         ),
     )
     p_train.add_argument(
@@ -6755,18 +6929,90 @@ def main():
         action="store_true",
         help=(
             "Skip training; load --model and re-run stats on the validation "
-            "crops."
+            "crops (points, for a point classifier)."
         ),
     )
     p_train.add_argument(
         "--test",
         action="store_true",
-        help="Skip training; load --model and report stats on the test crops.",
+        help=(
+            "Skip training; load --model and report stats on the test crops "
+            "(points, for a point classifier)."
+        ),
     )
     p_train.add_argument(
         "--yes",
         action="store_true",
         help="Skip interactive confirmations (labels, deletions, paths).",
+    )
+
+    # calibrate (point classifier -> another camera system)
+    p_cal = subparsers.add_parser(
+        "calibrate",
+        help=(
+            "Calibrate a point classifier to another camera system from "
+            "unlabelled photos of the same area as its training photos."
+        ),
+    )
+    p_cal.add_argument(
+        "images",
+        nargs="+",
+        help=(
+            "Photos of the target camera system covering the training area "
+            "(files, folders searched recursively, or glob patterns)."
+        ),
+    )
+    p_cal.add_argument(
+        "--classifier",
+        type=str,
+        default=None,
+        help=f"Point classifier (default: {settings.POINT_DEFAULT_MODEL_FILE} "
+        "in the CWD).",
+    )
+    p_cal.add_argument(
+        "--gsd-mm",
+        dest="gsd_mm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help=(
+            "Ground resolution of the photos in mm per pixel (camera distance "
+            "/ focal length); required for classifiers with a physical "
+            "resolution."
+        ),
+    )
+    p_cal.add_argument(
+        "--n-images",
+        dest="n_images",
+        type=int,
+        default=settings.POINT_CALIB_IMAGES,
+        help=f"Photos sampled. Default: {settings.POINT_CALIB_IMAGES}.",
+    )
+    p_cal.add_argument(
+        "--per-image",
+        dest="per_image",
+        type=int,
+        default=settings.POINT_CALIB_PER_IMAGE,
+        help=f"Random patches per photo. Default: {settings.POINT_CALIB_PER_IMAGE}.",
+    )
+    p_cal.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Calibrated classifier path (default: <classifier>_calibrated.pt).",
+    )
+    p_cal.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=settings.POINT_BATCH_SIZE,
+        help=f"Windows per backbone pass. Default: {settings.POINT_BATCH_SIZE}.",
+    )
+    p_cal.add_argument(
+        "--jobs",
+        type=int,
+        default=-1,
+        help="Photo decoding threads (-1 = all cores). Default: -1.",
     )
 
     args = parser.parse_args()
@@ -6797,6 +7043,7 @@ def main():
         "transform": handle_transform,
         "baseline": handle_baseline,
         "train": handle_train,
+        "calibrate": handle_calibrate,
     }
     handlers[args.command](args)
 

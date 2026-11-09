@@ -54,7 +54,7 @@ Analysis and Processing
 -----------------------
 
 Terrain and ecology metrics, color calibration from ColorChecker targets, and
-the crop-classification and segmentation tooling.
+the classification (crop and point-feature classifiers) and segmentation tooling.
 
 .. automodule:: substrata.measurements
     :members:
@@ -67,6 +67,11 @@ the crop-classification and segmentation tooling.
     :show-inheritance:
 
 .. automodule:: substrata.classification
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+.. automodule:: substrata.pointfeatures
     :members:
     :undoc-members:
     :show-inheritance:

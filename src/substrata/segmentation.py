@@ -2276,6 +2276,59 @@ def _report_crop_footprint(
         )
 
 
+def _classify_point_features(
+    best_cam: np.ndarray,
+    best_x: np.ndarray,
+    best_y: np.ndarray,
+    best_depth: np.ndarray,
+    cam_list,
+    clf,
+    depth_scale: float,
+    batch_size: int = 64,
+    verbose: bool = True,
+):
+    """Classify matched queries with a point-feature classifier.
+
+    Each query is classified at its pixel in its best photo; its ground
+    resolution (``depth x depth_scale / fx``) sets the resampling of
+    classifiers with a physical target resolution. Photos are decoded once and
+    windows are streamed through the backbone (bounded memory).
+
+    Returns:
+        ``(labels, conf)`` aligned with the queries (unmatched/failed ->
+        ``""`` / ``nan``).
+    """
+    from substrata import pointfeatures
+
+    n = len(best_cam)
+    labels = np.full(n, "", dtype=object)
+    conf = np.full(n, np.nan)
+    qi = np.nonzero(best_cam >= 0)[0]
+    if not len(qi):
+        return labels, conf
+    paths = [cam_list[best_cam[i]].filepath for i in qi]
+    gsd = None
+    if clf.target_mm_px:
+        gsd = []
+        for i in qi:
+            sensor = getattr(cam_list[best_cam[i]], "sensor", None)
+            gsd.append(pointfeatures.ground_resolution_mm(
+                best_depth[i], getattr(sensor, "fx", None), depth_scale))
+        if verbose:
+            g = np.array([np.nan if v is None else v for v in gsd])
+            print(f"[classify] ground resolution median {np.nanmedian(g):.3f} "
+                  f"mm/px -> target {clf.target_mm_px:.3f} mm/px")
+    probs, ok = clf.classify_points(
+        paths, best_x[qi], best_y[qi], gsd_mm=gsd, batch_size=batch_size,
+        progress=verbose,
+    )
+    k = np.nanargmax(np.where(ok[:, None], probs, -1), axis=1)
+    classes = np.array(clf.classes, dtype=object)
+    labels[qi[ok]] = classes[k[ok]]
+    conf[qi[ok]] = probs[ok, k[ok]]
+    return labels, conf
+
+
 def segment_point_cloud(
     pcd,
     cams,
@@ -2348,23 +2401,33 @@ def segment_point_cloud(
         qc, cams, world_transform=world_transform,
         pcd=(pcd if occlusion else None), occlusion=occlusion, verbose=verbose,
     )
+    # best_depth is in the original frame; convert to world metres via the
+    # world_transform's linear scale (cbrt of its 3x3 determinant).
+    depth_scale = 1.0
+    if world_transform is not None:
+        lin = np.asarray(world_transform, dtype=float)[:3, :3]
+        depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
+    from substrata import pointfeatures
+
+    point_clf = pointfeatures.is_point_classifier(learn)
     if verbose:
         print(f"[match] {int((best_cam >= 0).sum()):,}/{len(qc):,} queries matched")
-        # best_depth is in the original frame; convert to world metres via the
-        # world_transform's linear scale (cbrt of its 3x3 determinant).
-        depth_scale = 1.0
-        if world_transform is not None:
-            lin = np.asarray(world_transform, dtype=float)[:3, :3]
-            depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
-        _report_crop_footprint(
-            best_cam, best_depth, cam_list, crop_size, cell_size, depth_scale
-        )
+        if not point_clf:
+            _report_crop_footprint(
+                best_cam, best_depth, cam_list, crop_size, cell_size, depth_scale
+            )
 
-    labels, conf = _classify_crops(
-        qc, best_cam, best_x, best_y, cam_list, learn,
-        crop_size=crop_size, batch_size=batch_size, flush_batch=flush_batch,
-        verbose=verbose,
-    )
+    if point_clf:
+        labels, conf = _classify_point_features(
+            best_cam, best_x, best_y, best_depth, cam_list, learn, depth_scale,
+            batch_size=batch_size, verbose=verbose,
+        )
+    else:
+        labels, conf = _classify_crops(
+            qc, best_cam, best_x, best_y, cam_list, learn,
+            crop_size=crop_size, batch_size=batch_size, flush_batch=flush_batch,
+            verbose=verbose,
+        )
     if verbose:
         print(f"[classify] {int((labels != '').sum()):,} classified")
 

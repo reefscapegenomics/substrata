@@ -96,9 +96,35 @@ TRAIN_DELETE_PREVIEW = 5  # example paths shown before deleting redundant crops
 TRAIN_MIN_VISIBLE_COUNT = 1
 TRAIN_SPLIT = (80, 10, 10)  # train / validation / test percentages
 TRAIN_CROP_DIRS = ("training_crops", "validation_crops", "test_crops")
-TRAIN_DEFAULT_ARCH = "resnet34"
+# `train --arch`: a DINOv2 backbone (point-feature classifier, the default) or a
+# torchvision architecture (fastai crop classifier, e.g. resnet34).
+TRAIN_DEFAULT_ARCH = "dinov2_vitb14_reg"
+TRAIN_DEFAULT_CROP_ARCH = "resnet34"  # default of the fastai crop classifier
 TRAIN_DEFAULT_EPOCHS = 10
-TRAIN_DEFAULT_MODEL_FILE = "crop_classifier.pkl"
+TRAIN_DEFAULT_MODEL_FILE = "crop_classifier.pkl"  # fastai crop classifier
+
+# --- Point-feature classifier (DINOv2 features read at the annotated pixel) ---
+POINT_DEFAULT_MODEL_FILE = "point_classifier.pt"
+POINT_ARCH_PREFIX = "dinov2"  # --arch values starting with this use point features
+POINT_HUB_REPO = "facebookresearch/dinov2"  # torch.hub repo (or a local clone)
+POINT_WINDOW_PX = 448  # model-input context window per point (multiple of 14)
+# Without a ground resolution, the window covers this fraction of the median
+# training image width (448 px windows: ~0.25 on 9568 px diver photos, ~1 on
+# 2816 px AUV frames - the best scales in the samoa tests).
+POINT_CONTEXT_FRACTION = 1 / 6
+POINT_BATCH_SIZE = 64  # windows per backbone forward pass
+POINT_IMAGE_PREFETCH = 32  # photos decoded ahead of the GPU (bounds memory)
+POINT_PROBE_CS = (1e-4, 1e-3, 1e-2, 0.1, 1.0)  # logistic-regression C grid
+POINT_PROBE_CV = 5  # cross-validation folds for choosing C
+POINT_CALIB_IMAGES = 500  # photos sampled for feature (calibration) statistics
+POINT_CALIB_PER_IMAGE = 4  # random patches per sampled photo
+POINT_CALIB_MARGIN = 0.1  # random patches avoid this fraction of each image edge
+POINT_FEATURES_DIR = "point_features"  # feature caches, under train --output
+# A projected annotation must land within this many px of its cam_x/cam_y for
+# the camera distance (ground resolution) to be trusted.
+POINT_GSD_PIXEL_TOL = 5.0
+# mm/px mode needs a ground resolution for at least this fraction of points
+POINT_GSD_MIN_FRACTION = 0.9
 TRAIN_ANNOTATIONS_FILE = "training_annotations.csv"
 # Editable label->training-class map (selection + hierarchical collapse). Seeded
 # from the label tree, hand-tunable, and read by both training and evaluation.

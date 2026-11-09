@@ -267,6 +267,54 @@ class TestClassifyCropsFlush(unittest.TestCase):
         self.assertEqual(learn.calls, 1)
 
 
+class _FakePointClassifier:
+    """Point-feature-classifier double: records the ground resolutions it gets."""
+
+    is_point_classifier = True
+    classes = ["A", "B"]
+    target_mm_px = 1.0
+
+    def __init__(self):
+        self.gsd = None
+
+    def classify_points(self, paths, xs, ys, gsd_mm=None, batch_size=64,
+                        progress=True):
+        self.gsd = list(gsd_mm)
+        n = len(paths)
+        probs = np.tile([0.2, 0.8], (n, 1)).astype(np.float32)
+        ok = np.ones(n, bool)
+        ok[-1] = False  # last point "unreadable"
+        probs[-1] = np.nan
+        return probs, ok
+
+
+class _FakeSensorCam(_FakeCam):
+    def __init__(self, filepath, fx):
+        super().__init__(filepath)
+        self.sensor = types.SimpleNamespace(fx=fx)
+
+
+class TestClassifyPointFeatures(unittest.TestCase):
+    """`_classify_point_features`: labels per query, ground resolution from depth."""
+
+    def test_labels_conf_and_ground_resolution(self):
+        best_cam = np.array([0, -1, 0, 0])  # query 1 unmatched
+        best_x = np.array([10.0, 0.0, 20.0, 30.0])
+        best_y = np.array([10.0, 0.0, 20.0, 30.0])
+        best_depth = np.array([4.0, 0.0, 8.0, 4.0])  # original units
+        clf = _FakePointClassifier()
+        labels, conf = seg._classify_point_features(
+            best_cam, best_x, best_y, best_depth,
+            [_FakeSensorCam("/x/photo.png", fx=2000.0)], clf,
+            depth_scale=0.5, verbose=False,
+        )
+        # depth 4 x 0.5 = 2 m at fx 2000 -> 1 mm/px; depth 8 -> 2 mm/px
+        np.testing.assert_allclose(clf.gsd, [1.0, 2.0, 1.0])
+        self.assertEqual(labels.tolist(), ["B", "", "B", ""])
+        self.assertAlmostEqual(conf[0], 0.8, places=6)
+        self.assertTrue(np.isnan(conf[1]) and np.isnan(conf[3]))
+
+
 _SEG_HEAD = ("id,orig_x,orig_y,orig_z,label,label_conf,world_x,world_y,world_z,"
              "cam_filepath,cam_x,cam_y,depth,pred_label,pred_conf,pred_n\n")
 

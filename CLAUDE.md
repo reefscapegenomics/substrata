@@ -44,6 +44,8 @@ Docs: Sphinx + myst-nb in `docs/` (`pip install -r docs/requirements.txt`, then 
 - `pointclouds.py` — `PointCloud` wrapper around open3d, plus streaming PLY tooling (`decimate_ply_file`, `repair_ply_for_open3d`, `stream_extract_neighborhoods_ply`) that parses PLY binaries directly so huge files never need to fit in memory; memory-safe vertex caps are computed from available RAM
 - `cameras.py` — `Cameras`/`Camera` (Metashape `.cams.xml` poses + sensors), image matching, video frame extraction, camera/depth-log time-sync
 - `annotations.py` — `Annotations` (CSV-backed point labels), `Scalebars`
+- `classification.py` — `substrata train` pipeline (label tree/map, collation, crops) and the fastai crop classifier; `get_image_classifier` also loads point classifiers, and every `classify_*` function accepts either kind
+- `pointfeatures.py` — point-feature classifier (default `train --arch dinov2_*`): frozen DINOv2 features read at the annotated pixel + linear probe (`PointFeatureClassifier`, `.pt` file); per-point resampling to a physical resolution (ground resolution = camera depth × world scale / fx), feature caches, and per-camera calibration (`substrata calibrate`)
 - `geom.py` — `Transform` (4×4) and `Vector` primitives used across all modules
 - `measurements.py` — terrain/ecology metrics (TPI/TRI, rugosity, fractal dimension, surface area, gap fraction, depth regression)
 - `visualizations.py` — open3d/matplotlib rendering, composite-view and QC PDF reports

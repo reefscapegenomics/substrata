@@ -54,8 +54,17 @@ def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
             CUDA, then Apple MPS, then CPU).
 
     Returns:
-        Loaded FastAI Learner placed on the selected device.
+        Loaded FastAI Learner placed on the selected device, or - for a
+        ``.pt``/``.pth`` file from ``substrata train --arch dinov2_*`` - a
+        :class:`substrata.pointfeatures.PointFeatureClassifier` (classifies
+        points from backbone features instead of crops; accepted by every
+        ``classify_*`` function here).
     """
+    from substrata import pointfeatures
+
+    if pointfeatures.is_point_classifier_path(checkpoint):
+        return pointfeatures.PointFeatureClassifier.load(checkpoint, device=device)
+
     from fastai.vision.all import load_learner  # lazy heavy import
 
     if not os.path.isfile(checkpoint):
@@ -233,6 +242,54 @@ def _result_from_probs(prob_list, vocab) -> Dict[str, Any]:
     }
 
 
+def _classify_matches_point_features(
+    image_matches: List[Any], clf: Any,
+    batch_size: int = settings.POINT_BATCH_SIZE, n_jobs: int = -1,
+    progress: bool = True,
+) -> List[Optional[Dict[str, Any]]]:
+    """Classify ImageMatches with a point-feature classifier.
+
+    Each match is classified at its pixel ``(x, y)`` on its photo; its ground
+    resolution (camera depth, see
+    :func:`substrata.pointfeatures.image_match_gsd_mm`) sets the resampling of
+    classifiers with a physical target resolution. Results are attached as
+    ``.classification`` like the crop path.
+    """
+    from substrata import pointfeatures
+
+    results: List[Optional[Dict[str, Any]]] = [None] * len(image_matches)
+
+    def _usable(m):
+        fp = getattr(m, "filepath", None)
+        has_xy = getattr(m, "x", None) is not None and getattr(m, "y", None) is not None
+        return bool(fp) and os.path.isfile(fp) and has_xy
+
+    usable = [i for i, m in enumerate(image_matches) if _usable(m)]
+    if not usable:
+        return results
+    matches = [image_matches[i] for i in usable]
+    gsd = None
+    if clf.target_mm_px:
+        gsd = [pointfeatures.image_match_gsd_mm(m) for m in matches]
+        n_missing = sum(g is None for g in gsd)
+        if n_missing:
+            logger.warning(
+                "%d of %d match(es) have no camera geometry; they are resampled "
+                "with the classifier's fixed scale %.3f.",
+                n_missing, len(matches), clf.scale_factor,
+            )
+    probs, ok = clf.classify_points(
+        [m.filepath for m in matches], [float(m.x) for m in matches],
+        [float(m.y) for m in matches], gsd_mm=gsd, batch_size=batch_size,
+        n_jobs=n_jobs, progress=progress,
+    )
+    for i, res in zip(usable, clf.results(probs, ok)):
+        results[i] = res
+        if res is not None:
+            setattr(image_matches[i], "classification", res)
+    return results
+
+
 def classify_image_matches_batch(
     image_matches: List[Any], classifier: Union[str, Any],
     crop_size: Optional[Union[int, Tuple[int, int]]] = None,
@@ -274,6 +331,13 @@ def classify_image_matches_batch(
     except Exception as e:  # noqa: BLE001
         logger.error(str(e))
         return results
+
+    from substrata import pointfeatures
+
+    if pointfeatures.is_point_classifier(learn):
+        return _classify_matches_point_features(
+            image_matches, learn, batch_size=batch_size, n_jobs=n_jobs
+        )
 
     # Report the inference device so it is clear whether classification is
     # GPU-accelerated (a CPU learner is the usual reason batching feels slow).
@@ -363,6 +427,13 @@ def classify_image_match(
     except Exception as e:
         logger.error(str(e))
         return None
+
+    from substrata import pointfeatures
+
+    if pointfeatures.is_point_classifier(learn):
+        return _classify_matches_point_features(
+            [image_match], learn, progress=False
+        )[0]
 
     try:
         # Crop centred on the matched pixel (image_match.x, image_match.y),
@@ -2071,7 +2142,7 @@ class PretrainedArch:
 
 def train_classifier(
     output_dir: str, model_path: str, label_map: Dict[str, str],
-    arch: str = settings.TRAIN_DEFAULT_ARCH,
+    arch: str = settings.TRAIN_DEFAULT_CROP_ARCH,
     epochs: int = settings.TRAIN_DEFAULT_EPOCHS,
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
     pretrained_weights: Optional[str] = None,

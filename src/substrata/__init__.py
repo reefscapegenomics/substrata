@@ -37,7 +37,7 @@ from .logging import logger
 _STAR_MODULES = (
     "annotations", "sidecars", "color_calibration", "pathrepair", "cameras", "pointclouds",
     "stratified", "initializer", "measurements", "visualizations", "geom", "settings",
-    "classification", "ortho", "animations", "segmentation",
+    "classification", "pointfeatures", "ortho", "animations", "segmentation",
 )
 _state = {"loaded": False, "loading": False}
 
