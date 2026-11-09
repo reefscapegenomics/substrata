@@ -110,6 +110,10 @@ TRAIN_EXAMPLES_PER_CLASS = 10  # example crops shown per category in the PDF
 TRAIN_EXAMPLE_ROWS_PER_PAGE = 8  # category rows per example-images PDF page
 # `train --pdf`: contact sheet of the training crops per training class
 TRAIN_CROPS_PDF_FILE = "training_crops.pdf"
+# Records the crop size of the crop folders, as crop filenames do not include it
+TRAIN_CROPS_INFO_FILE = "training_crops.json"
+# Attribute of an exported classifier (fastai learner) holding its training crop size
+CLASSIFIER_CROP_SIZE_ATTR = "substrata_crop_size"
 TRAIN_PDF_COLS = 11  # crops per row (A4 portrait)
 TRAIN_PDF_ROWS = 15  # rows per page
 TRAIN_PDF_MAX_PER_CLASS = TRAIN_PDF_COLS * TRAIN_PDF_ROWS  # one page per class

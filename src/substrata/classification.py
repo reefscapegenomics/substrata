@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import csv
 import re
 import hashlib
+import json
 import os
 from collections import Counter
 
@@ -96,6 +97,19 @@ def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
             except Exception:  # noqa: BLE001
                 pass
     return learn
+
+
+def classifier_crop_size(learn: Any) -> Optional[int]:
+    """The crop size (px) a classifier was trained on, if it records one.
+
+    ``substrata train`` stores it on the exported learner (see
+    :func:`train_classifier`); older classifiers return None.
+    """
+    try:
+        size = getattr(learn, settings.CLASSIFIER_CROP_SIZE_ATTR, None)
+    except Exception:  # noqa: BLE001 - fastai delegates unknown attributes
+        return None
+    return int(size) if size else None
 
 
 def _ensure_learner(classifier: Union[str, Any]):
@@ -1592,6 +1606,44 @@ def generate_crop(
     return True
 
 
+def stored_crop_size(output_dir: str, existing: Set[str]) -> Optional[int]:
+    """The crop size of the existing crops in ``output_dir``, if known.
+
+    Read from ``settings.TRAIN_CROPS_INFO_FILE``. Older crop folders have no
+    such file; their size is then the largest side of a sample of the crops
+    (crops at an image edge can be smaller).
+
+    Args:
+        output_dir: Base directory holding the crop folders.
+        existing: The existing crop paths (see :func:`existing_crops`).
+
+    Returns:
+        The crop size in pixels, or None if there are no crops to tell.
+    """
+    info_path = os.path.join(output_dir, settings.TRAIN_CROPS_INFO_FILE)
+    try:
+        with open(info_path) as f:
+            return int(json.load(f)["crop_size"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    size = None
+    for path in sorted(existing)[:50]:
+        try:
+            with Image.open(path) as im:
+                size = max(size or 0, *im.size)
+        except OSError:
+            continue
+    return size
+
+
+def _write_crop_size(output_dir: str, crop_size: int) -> None:
+    """Record the crop size of the crop folders (see :func:`stored_crop_size`)."""
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, settings.TRAIN_CROPS_INFO_FILE), "w") as f:
+        json.dump({"crop_size": int(crop_size)}, f)
+        f.write("\n")
+
+
 def sync_crops(
     annotations_path: str, output_dir: str, crop_size: int,
     split: Tuple[int, int, int] = settings.TRAIN_SPLIT,
@@ -1604,7 +1656,10 @@ def sync_crops(
     Deletes crops that no longer correspond to any annotation (after optional
     confirmation) and generates only the crops not already present. Crop
     generation runs in parallel (each crop is independent and writes its own
-    file).
+    file). Crop filenames do not include the size, so when ``crop_size``
+    differs from that of the existing crops (:func:`stored_crop_size`) all of
+    them are replaced; declining that deletion aborts, as a mixed-size set
+    would be trained on silently.
 
     Args:
         annotations_path: Consolidated training annotations CSV.
@@ -1622,12 +1677,22 @@ def sync_crops(
     """
     expected = plan_crops(annotations_path, output_dir, split, crop_dirs)
     existing = existing_crops(output_dir, crop_dirs)
+    old_size = stored_crop_size(output_dir, existing) if existing else None
+    resized = old_size is not None and old_size != crop_size
 
-    stale = sorted(existing - set(expected))
+    stale = sorted(existing if resized else existing - set(expected))
     deleted = 0
     removed_dirs = 0
-    if stale and delete_stale:
-        print(f"\n{len(stale)} redundant crop(s) no longer match any annotation.")
+    if stale and (delete_stale or resized):
+        if resized:
+            print(
+                f"\nThe crop size changed from {old_size} to {crop_size} px: all "
+                f"{len(stale)} existing crop(s) are replaced."
+            )
+        else:
+            print(
+                f"\n{len(stale)} redundant crop(s) no longer match any annotation."
+            )
         # Show a few examples before deleting: if the wrong output directory
         # was given, this surfaces it before any files are removed.
         n_preview = min(settings.TRAIN_DELETE_PREVIEW, len(stale))
@@ -1636,16 +1701,27 @@ def sync_crops(
             print(f"  {p}")
         do_delete = True
         if prompt:
-            ans = input(f"Delete {len(stale)} redundant crop(s)? [y/N]: ").strip()
+            ans = input(f"Delete {len(stale)} crop(s)? [y/N]: ").strip()
             do_delete = ans.lower() in ("y", "yes")
+        if resized and not do_delete:
+            raise SystemExit(
+                f"Kept the {old_size} px crops; use another --output for "
+                f"{crop_size} px crops, or --crop-size {old_size}."
+            )
         if do_delete:
             for p in stale:
                 try:
                     os.remove(p)
                     deleted += 1
+                    existing.discard(p)
                 except OSError as e:
                     logger.warning("Could not delete %s: %s", p, e)
             removed_dirs = _remove_empty_category_dirs(output_dir, crop_dirs)
+    if resized and existing:
+        raise SystemExit(
+            f"{len(existing)} crop(s) of {old_size} px could not be deleted."
+        )
+    _write_crop_size(output_dir, crop_size)
 
     to_make = sorted(set(expected) - existing)
     generated = 0
@@ -1999,6 +2075,7 @@ def train_classifier(
     epochs: int = settings.TRAIN_DEFAULT_EPOCHS,
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
     pretrained_weights: Optional[str] = None,
+    crop_size: Optional[int] = None,
 ) -> Any:
     """Train a fastai image classifier on the generated crops.
 
@@ -2021,6 +2098,9 @@ def train_classifier(
         pretrained_weights: Optional encoder checkpoint (e.g. BenthicNet's
             ResNet-50) to start from instead of the ImageNet weights; it must
             match ``arch``.
+        crop_size: Crop size (px) of the training crops, stored on the
+            exported learner so prediction and segmentation crop the same
+            (see :func:`classifier_crop_size`).
 
     Returns:
         The trained fastai Learner.
@@ -2075,6 +2155,8 @@ def train_classifier(
         arch_fn = custom
     learn = vision_learner(dls, arch_fn, metrics=[accuracy, error_rate])
     learn.fine_tune(epochs)
+    if crop_size:
+        setattr(learn, settings.CLASSIFIER_CROP_SIZE_ATTR, int(crop_size))
     learn.export(model_path)
     logger.info("Exported trained learner to %s", model_path)
     return learn

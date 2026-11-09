@@ -97,6 +97,7 @@ documents all modules, classes, and functions.
    getting_started
    projects
    command_line_usage
+   stratified_ply
 
 .. toctree::
    :maxdepth: 1

@@ -307,6 +307,90 @@ class TestTrainingCropsByClass(unittest.TestCase):
         self.assertEqual(len(everything["CB"][1]), 40)
 
 
+class TestSyncCropsSize(unittest.TestCase):
+    """A changed --crop-size replaces the existing crops (names lack the size)."""
+
+    def setUp(self):
+        from PIL import Image
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.ann = os.path.join(self.d, "training_annotations.csv")
+        _write_ann(self.ann, [
+            _ann_row(f"a{i}", "CB", f"/imgs/IMG_{i}.jpg", "100", "100")
+            for i in range(3)
+        ])
+        self._orig = cl.generate_crop
+
+        def fake_crop(cam_filepath, cam_x, cam_y, crop_size, out_path):
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            Image.new("RGB", (crop_size, crop_size)).save(out_path, "JPEG")
+            return True
+
+        cl.generate_crop = fake_crop
+
+    def tearDown(self):
+        cl.generate_crop = self._orig
+        self.tmp.cleanup()
+
+    def _sizes(self):
+        from PIL import Image
+
+        return {Image.open(p).size for p in cl.existing_crops(self.d)}
+
+    def _sync(self, size, **kw):
+        kw.setdefault("prompt", False)
+        return cl.sync_crops(self.ann, self.d, size, n_jobs=1, **kw)
+
+    def test_size_change_replaces_all_crops(self):
+        first = self._sync(224)
+        self.assertEqual((first["generated"], first["deleted"]), (3, 0))
+        again = self._sync(224)
+        self.assertEqual((again["generated"], again["skipped_existing"]), (0, 3))
+        resized = self._sync(24)
+        self.assertEqual((resized["deleted"], resized["generated"]), (3, 3))
+        self.assertEqual(self._sizes(), {(24, 24)})
+        self.assertEqual(cl.stored_crop_size(self.d, set()), 24)
+
+    def test_size_inferred_for_folders_without_the_info_file(self):
+        self._sync(48)
+        os.remove(os.path.join(self.d, cl.settings.TRAIN_CROPS_INFO_FILE))
+        same = self._sync(48)
+        self.assertEqual((same["deleted"], same["generated"]), (0, 0))
+        os.remove(os.path.join(self.d, cl.settings.TRAIN_CROPS_INFO_FILE))
+        self._sync(224)
+        self.assertEqual(self._sizes(), {(224, 224)})
+
+    def test_declining_the_replacement_aborts(self):
+        import builtins
+
+        self._sync(224)
+        orig_input = builtins.input
+        builtins.input = lambda *_: "n"
+        try:
+            with self.assertRaises(SystemExit):
+                self._sync(24, prompt=True)
+        finally:
+            builtins.input = orig_input
+        self.assertEqual(self._sizes(), {(224, 224)})
+
+
+class TestClassifierCropSize(unittest.TestCase):
+    """The crop size a classifier records (set by train, read by predict/segment)."""
+
+    def test_recorded_missing_and_raising(self):
+        attr = cl.settings.CLASSIFIER_CROP_SIZE_ATTR
+        recorded = types.SimpleNamespace(**{attr: 24})
+        self.assertEqual(cl.classifier_crop_size(recorded), 24)
+        self.assertIsNone(cl.classifier_crop_size(types.SimpleNamespace()))
+
+        class Delegating:  # fastai's GetAttr can raise other errors
+            def __getattr__(self, name):
+                raise RuntimeError(name)
+
+        self.assertIsNone(cl.classifier_crop_size(Delegating()))
+
+
 class TestLabelMap(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

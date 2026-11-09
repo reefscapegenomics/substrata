@@ -1698,6 +1698,7 @@ def save_training_crops_pdf(
     n_rows=settings.TRAIN_PDF_ROWS,
     thumb_px=settings.TRAIN_PDF_THUMB_PX,
     crop_dirs=settings.TRAIN_CROP_DIRS,
+    crop_px=None,
 ):
     """Save a contact sheet of training crops, one or more pages per class.
 
@@ -1714,6 +1715,8 @@ def save_training_crops_pdf(
         n_rows: Rows per page.
         thumb_px: Longest side of the embedded crops in pixels.
         crop_dirs: Train/validation/test folder names (for the split tags).
+        crop_px: Crop size in pixels, shown in the page headers (all crops are
+            drawn at the same size on the page).
 
     Returns:
         Number of pages written.
@@ -1747,6 +1750,8 @@ def save_training_crops_pdf(
                 pdf.add_page()
                 pdf.set_font("Helvetica", style="B", size=10)
                 title = f"{cls} - showing {len(items)} of {n_crops} crops"
+                if crop_px:
+                    title += f" ({crop_px} px)"
                 if n_pages > 1:
                     title += f" (page {page + 1}/{n_pages})"
                 pdf.text(margin, margin + 3.5, title)

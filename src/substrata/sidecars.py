@@ -6,7 +6,7 @@ An annotations/intercepts CSV may have a sidecar named after the full CSV filena
 holds what belongs to the annotation set rather than to the plot, and only what
 cannot be derived from the CSV:
 
-    type: intercepts               # annotations | intercepts
+    type: intercepts               # annotations | intercepts | segmentation
     plot_id: cur_sna_20m_20200303
     classes: classes.csv           # paths are relative to the sidecar's folder
     world_transform: [[...]]       # plot transform used to generate/annotate
@@ -25,6 +25,16 @@ cannot be derived from the CSV:
       position: auto               # or [x, y]
       slope_elevation_deg: 23.4
       bbox_orig: [[x, y, z], ...]  # derived: grid_bbox corners in orig coords
+    segmentation:                  # only for type: segmentation (substrata segment)
+      tag: v2                      # version name (in the file name, <id>_seg_v2_points.csv)
+      cell_size: 0.05
+      sampling: voxel              # voxel | xy_grid
+      crop_size: 224
+      occlusion: true
+      max_radius: 0.2              # if given: propagation cap (m) of the recoloured clouds
+      colors: {CS: '#ff0000', ...} # label colours used for the recoloured clouds
+    seg_ply_dec: ../x_seg_v2_dec.ply  # the recoloured clouds made from this set
+    seg_ply: ../x_seg_v2.ply
 
 The grid frame is ``grid_transform @ world_transform @ orig``.
 """
@@ -43,7 +53,9 @@ import yaml
 from substrata import settings
 
 # Sidecar keys that hold file/folder paths (stored relative to the sidecar)
-SIDECAR_PATH_KEYS = ("classes", "cropped_path", "classifier", "matched_to")
+SIDECAR_PATH_KEYS = (
+    "classes", "cropped_path", "classifier", "matched_to", "seg_ply", "seg_ply_dec",
+)
 
 
 def annotation_sidecar_path(csv_path: str) -> str:

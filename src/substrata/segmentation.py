@@ -1656,6 +1656,12 @@ _PLY_NP_DTYPE = {
 }
 
 
+def _parse_hex(s: str) -> Tuple[int, int, int]:
+    """``#rrggbb`` (or ``rrggbb``) as a 0-255 ``(r, g, b)`` tuple."""
+    h = str(s).strip().lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
 def _build_label_colors(
     codebook: List[str], overrides: Optional[Dict[str, Tuple[int, int, int]]] = None
 ) -> Dict[str, Tuple[int, int, int]]:
@@ -1695,6 +1701,10 @@ class Segmentation:
         label_colors: ``{label: (r, g, b)}`` 0-255 display colours.
         point_codes: optional ``(N,)`` int cache of per-point label codes for a
             specific cloud (``-1`` = unlabeled). Derived; not persisted by default.
+        query_cams: optional ``(Nq,)`` object array of the photo each query was
+            classified from (``""`` if unknown).
+        query_px: optional ``(Nq, 2)`` float pixel (x, y) of each query in that
+            photo (``nan`` if unknown).
     """
 
     query_coords: np.ndarray
@@ -1703,7 +1713,10 @@ class Segmentation:
     codebook: List[str]
     label_colors: Dict[str, Tuple[int, int, int]]
     point_codes: Optional[np.ndarray] = None
+    query_cams: Optional[np.ndarray] = None
+    query_px: Optional[np.ndarray] = None
     _tree: Any = field(default=None, repr=False, compare=False)
+    _codes: Any = field(default=None, repr=False, compare=False)
 
     @property
     def n_queries(self) -> int:
@@ -1716,8 +1729,14 @@ class Segmentation:
         labels: np.ndarray,
         conf: np.ndarray,
         label_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+        cams: Optional[np.ndarray] = None,
+        px: Optional[np.ndarray] = None,
     ) -> "Segmentation":
-        """Build a Segmentation, keeping only successfully-classified queries."""
+        """Build a Segmentation, keeping only successfully-classified queries.
+
+        ``cams`` / ``px``: optional photo filepath and pixel (x, y) per query
+        (see :attr:`query_cams` / :attr:`query_px`).
+        """
         matched = np.array([bool(l) for l in labels])
         if not matched.any():
             raise ValueError(
@@ -1730,7 +1749,89 @@ class Segmentation:
         qcf = np.asarray(conf, dtype=float)[matched]
         codebook = sorted(set(ql.tolist()))
         colors = _build_label_colors(codebook, label_colors)
-        return cls(qc, ql, qcf, codebook, colors)
+        qcam = None if cams is None else np.asarray(cams, dtype=object)[matched]
+        qpx = None if px is None else np.asarray(px, dtype=float)[matched]
+        return cls(qc, ql, qcf, codebook, colors, query_cams=qcam, query_px=qpx)
+
+    @classmethod
+    def from_annotations(
+        cls, csv_path: str, world_transform: Optional[np.ndarray] = None
+    ) -> "Segmentation":
+        """Read a segmentation from its annotation set (``<id>_seg[_<tag>]_points.csv``).
+
+        The CSV written by :meth:`to_annotations` (with its sidecar) is the
+        segmentation's source of truth. A point's label is its ``label`` when set
+        (checked by hand, confidence 1), else its ``pred_label`` (``pred_conf``);
+        points with neither are left out. Colours come from the sidecar's
+        ``segmentation.colors``; labels not in it get a tab20 colour.
+
+        Args:
+            csv_path: The annotations CSV.
+            world_transform: If given, the 4x4 transform applied to the CSV's
+                orig coords (e.g. the plot's current ``pcd.world_transform``);
+                otherwise the query points stay in the orig (raw PLY) frame.
+
+        Returns:
+            A :class:`Segmentation` (with :attr:`query_cams` / :attr:`query_px`).
+        """
+        import csv
+
+        from substrata import sidecars
+
+        with open(csv_path, newline="") as f:
+            rows = csv.reader(f)
+            head = [h.strip().strip('"') for h in next(rows)]
+            col = {h: i for i, h in enumerate(head)}
+            for need in ("orig_x", "orig_y", "orig_z"):
+                if need not in col:
+                    raise ValueError(f"{csv_path}: no {need} column")
+
+            def get(r, name):
+                i = col.get(name)
+                return r[i].strip() if i is not None and i < len(r) else ""
+
+            xyz, labels, conf, cams, px = [], [], [], [], []
+            for r in rows:
+                if not r:
+                    continue
+                label, c = get(r, "label"), 1.0
+                if not label:
+                    label, c = get(r, "pred_label"), get(r, "pred_conf")
+                    c = float(c) if c else np.nan
+                if not label:
+                    continue
+                xyz.append([float(get(r, k)) for k in ("orig_x", "orig_y", "orig_z")])
+                labels.append(label)
+                conf.append(c)
+                cams.append(get(r, "cam_filepath"))
+                x, y = get(r, "cam_x"), get(r, "cam_y")
+                px.append([float(x) if x else np.nan, float(y) if y else np.nan])
+        if not labels:
+            raise ValueError(f"{csv_path}: no labelled or predicted points")
+        qc = np.asarray(xyz, dtype=float)
+        if world_transform is not None:
+            wt = np.asarray(world_transform, dtype=float)
+            qc = qc @ wt[:3, :3].T + wt[:3, 3]
+        ql = np.array(labels, dtype=object)
+        codebook = sorted(set(labels))
+        hex_colors = (
+            sidecars.read_annotation_sidecar(csv_path).get("segmentation") or {}
+        ).get("colors") or {}
+        colors = _build_label_colors(
+            codebook, {k: _parse_hex(v) for k, v in hex_colors.items()}
+        )
+        return cls(
+            qc.astype(np.float32), ql, np.asarray(conf, dtype=float), codebook,
+            colors, query_cams=np.array(cams, dtype=object),
+            query_px=np.asarray(px, dtype=float),
+        )
+
+    def hex_colors(self) -> Dict[str, str]:
+        """The label colours as ``{label: "#rrggbb"}`` (for the sidecar)."""
+        return {
+            lbl: "#{:02x}{:02x}{:02x}".format(*self.label_colors[lbl])
+            for lbl in self.codebook
+        }
 
     def _query_tree(self):
         if self._tree is None:
@@ -1755,9 +1856,12 @@ class Segmentation:
         """
         if self.n_queries == 0:
             raise ValueError("Segmentation has no query points to propagate.")
-        code_of_query = np.array(
-            [self.codebook.index(l) for l in self.query_labels], dtype=np.int16
-        )
+        if self._codes is None:  # label code of each query (cached: propagate runs per chunk)
+            index = {l: i for i, l in enumerate(self.codebook)}
+            self._codes = np.array(
+                [index[l] for l in self.query_labels], dtype=np.int16
+            )
+        code_of_query = self._codes
         dist, idx = self._query_tree().query(points, k=1, workers=-1)
         codes = code_of_query[idx].astype(np.int16)
         if max_radius is not None:
@@ -1804,6 +1908,48 @@ class Segmentation:
         else:  # "keep": original colour
             out[~labeled] = oc[~labeled]
         return np.clip(out, 0.0, 1.0)
+
+    def to_annotations(
+        self, world_transform: Optional[np.ndarray] = None, id_prefix: str = "seg"
+    ):
+        """The classified query points as an annotation set.
+
+        Each point becomes an annotation ``<id_prefix>_<i>`` whose prediction is
+        in ``pred_label`` / ``pred_conf`` (``pred_n`` = 1, one crop each); its
+        ``label`` stays empty, as for :meth:`Annotations.predict`, so the set can
+        be checked by hand. The photo and pixel it was classified from (if
+        known) go in ``cam_filepath`` / ``cam_x`` / ``cam_y``. Read it back
+        with :meth:`from_annotations`.
+
+        Args:
+            world_transform: The 4x4 transform of the frame the query points are
+                in (``pcd.world_transform``), to also store orig coords.
+            id_prefix: Prefix of the annotation ids (e.g. the project id).
+
+        Returns:
+            An :class:`~substrata.annotations.Annotations`.
+        """
+        from substrata.annotations import Annotation, Annotations
+
+        anns = Annotations()
+        for i, (xyz, label, conf) in enumerate(
+            zip(self.query_coords, self.query_labels, self.query_conf)
+        ):
+            if not label:
+                continue
+            ann = Annotation(np.asarray(xyz, float), id=f"{id_prefix}_{i}")
+            ann.label, ann.label_conf = "", ""
+            ann.pred_label, ann.pred_conf, ann.pred_n = str(label), float(conf), 1
+            if self.query_cams is not None and self.query_cams[i]:
+                ann.cam_filepath = str(self.query_cams[i])
+                if self.query_px is not None and np.isfinite(self.query_px[i]).all():
+                    ann.cam_x, ann.cam_y = (float(v) for v in self.query_px[i])
+            anns.append(ann)
+        if world_transform is not None and not np.allclose(
+            world_transform, np.eye(4)
+        ):
+            anns.get_original_coords(world_transform)
+        return anns
 
     def summary(self, point_codes: Optional[np.ndarray] = None) -> Dict[str, int]:
         """Return {label: count}. Uses ``point_codes`` if given, else query labels."""
@@ -2222,7 +2368,14 @@ def segment_point_cloud(
     if verbose:
         print(f"[classify] {int((labels != '').sum()):,} classified")
 
-    return Segmentation.from_query_labels(qc, labels, conf, label_colors=label_colors)
+    cams_of = np.array(
+        [cam_list[c].filepath if c >= 0 else "" for c in best_cam], dtype=object
+    )
+    px = np.column_stack([best_x, best_y]).astype(float)
+    px[best_cam < 0] = np.nan
+    return Segmentation.from_query_labels(
+        qc, labels, conf, label_colors=label_colors, cams=cams_of, px=px
+    )
 
 
 def recolor_ply_file(

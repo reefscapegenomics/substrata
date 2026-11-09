@@ -65,7 +65,7 @@ The **point cloud** is `<id>.ply`. `substrata decimate` writes the `_dec50M.ply`
 copy, which is what a project opened without a YAML loads when it exists. A PLY
 reordered by `substrata stratify` stays `<id>.ply` and gains the small
 `<id>.strat.npz` index; its first N points are already a uniform subsample, so it
-needs no separate decimated copy.
+needs no separate decimated copy (format: {doc}`stratified_ply`).
 
 **Photos** sit in one or more folders named `<id>.<group>` (`.photos`, `.auv`,
 `.closeup`, `.videoframes`, …). The cameras find them through the paths in
@@ -109,7 +109,8 @@ it in the sidecar (`classifier`), so it is always clear which model labelled a s
 
 Files the CLI writes for a project go in the project folder as `<id>_<name>`, e.g.
 `<id>_scalebars.pdf`, `<id>_views.pdf`, `<id>_depth_residuals.pdf`,
-`<id>_colorcal.pdf`, `<id>_camsync.pdf`, `<id>_cams.mp4` and `<id>_seg.npz`. Most of
+`<id>_colorcal.pdf`, `<id>_camsync.pdf`, `<id>_cams.mp4` and `<id>_seg[_<tag>]_dec.ply`
+(the segmentation itself is the annotation set `<id>.annos/<id>_seg[_<tag>]_points.csv`). Most of
 these commands accept an output option to write somewhere else. The project YAML
 also records links to other plots, but these are ids (`parent_id`, `baseline_id`),
 not files. substrata looks for a folder with that id among the project's ancestor

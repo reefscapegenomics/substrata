@@ -267,5 +267,103 @@ class TestClassifyCropsFlush(unittest.TestCase):
         self.assertEqual(learn.calls, 1)
 
 
+_SEG_HEAD = ("id,orig_x,orig_y,orig_z,label,label_conf,world_x,world_y,world_z,"
+             "cam_filepath,cam_x,cam_y,depth,pred_label,pred_conf,pred_n\n")
+
+
+class TestFromAnnotations(unittest.TestCase):
+    """The points CSV (+ sidecar) is the segmentation's source of truth."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.csv = os.path.join(self.tmp.name, "x_seg_v1_points.csv")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, rows, colors=None):
+        with open(self.csv, "w") as f:
+            f.write(_SEG_HEAD)
+            for r in rows:
+                f.write(",".join(str(v) for v in r) + "\n")
+        if colors is not None:
+            import yaml
+
+            with open(self.csv + ".yaml", "w") as f:
+                yaml.safe_dump({"type": "segmentation",
+                                "segmentation": {"tag": "v1", "colors": colors}}, f)
+
+    def test_label_wins_over_prediction(self):
+        self._write([
+            ["x_0", 0, 0, 0, "", "", 0, 0, 0, "/p/a.jpg", 10, 20, "", "A", 0.8, 1],
+            ["x_1", 10, 0, 0, "C", "", 10, 0, 0, "", "", "", "", "B", 0.6, 1],
+            ["x_2", 5, 5, 0, "", "", 5, 5, 0, "", "", "", "", "", "", ""],
+        ], colors={"A": "#ff0000", "B": "#00ff00"})
+        s = seg.Segmentation.from_annotations(self.csv)
+        self.assertEqual(list(s.query_labels), ["A", "C"])  # x_2: neither, left out
+        self.assertEqual(s.codebook, ["A", "C"])
+        np.testing.assert_allclose(s.query_conf, [0.8, 1.0])
+        self.assertEqual(s.label_colors["A"], (255, 0, 0))  # sidecar colour
+        self.assertIn("C", s.label_colors)                  # new label: tab20
+        self.assertEqual(list(s.query_cams), ["/p/a.jpg", ""])
+        np.testing.assert_allclose(s.query_px[0], [10, 20])
+        self.assertTrue(np.isnan(s.query_px[1]).all())
+        np.testing.assert_array_equal(s.propagate(np.array([[9.0, 0, 0]])), [1])
+
+    def test_world_transform_applies_to_orig_coords(self):
+        self._write([["x_0", 1, 2, 3, "", "", 0, 0, 0, "", "", "", "", "A", 0.5, 1]])
+        wt = np.eye(4)
+        wt[:3, :3] *= 2.0
+        wt[:3, 3] = [10, 0, 0]
+        s = seg.Segmentation.from_annotations(self.csv, world_transform=wt)
+        np.testing.assert_allclose(s.query_coords[0], [12, 4, 6])
+        s0 = seg.Segmentation.from_annotations(self.csv)  # default: orig frame
+        np.testing.assert_allclose(s0.query_coords[0], [1, 2, 3])
+
+    def test_nothing_labelled_raises(self):
+        self._write([["x_0", 1, 2, 3, "", "", 0, 0, 0, "", "", "", "", "", "", ""]])
+        with self.assertRaises(ValueError):
+            seg.Segmentation.from_annotations(self.csv)
+
+    def test_hex_colors_roundtrip(self):
+        s = _make_seg(colors={"A": (255, 0, 16), "B": (0, 128, 255)})
+        h = s.hex_colors()
+        self.assertEqual(h, {"A": "#ff0010", "B": "#0080ff"})
+        self.assertEqual({k: seg._parse_hex(v) for k, v in h.items()}, s.label_colors)
+
+    def test_from_query_labels_keeps_cams_of_classified(self):
+        s = seg.Segmentation.from_query_labels(
+            np.zeros((3, 3)), np.array(["A", "", "B"], dtype=object), np.ones(3),
+            cams=np.array(["a.jpg", "b.jpg", "c.jpg"], dtype=object),
+            px=np.array([[1, 2], [3, 4], [5, 6]], dtype=float),
+        )
+        self.assertEqual(list(s.query_cams), ["a.jpg", "c.jpg"])
+        np.testing.assert_allclose(s.query_px, [[1, 2], [5, 6]])
+
+    def test_to_annotations_roundtrip(self):
+        try:
+            from substrata.annotations import Annotation, Annotations  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"substrata.annotations not importable: {e}")
+        s = seg.Segmentation.from_query_labels(
+            np.array([[0.0, 0, 0], [4.0, 2, 1]]), np.array(["A", "B"], dtype=object),
+            np.array([0.9, 0.7]),
+            cams=np.array(["/p/a.jpg", ""], dtype=object),
+            px=np.array([[100.0, 200.0], [np.nan, np.nan]]),
+        )
+        wt = np.eye(4)
+        wt[:3, 3] = [1, 2, 3]
+        s.query_coords = (s.query_coords + wt[:3, 3]).astype(np.float32)  # world frame
+        s.to_annotations(wt, id_prefix="x").save(self.csv)
+        s2 = seg.Segmentation.from_annotations(self.csv, world_transform=wt)
+        np.testing.assert_allclose(s2.query_coords, s.query_coords, atol=1e-5)
+        self.assertEqual(list(s2.query_labels), ["A", "B"])
+        np.testing.assert_allclose(s2.query_conf, [0.9, 0.7])
+        self.assertEqual(list(s2.query_cams), ["/p/a.jpg", ""])
+        np.testing.assert_allclose(s2.query_px[0], [100, 200])
+        s3 = seg.Segmentation.from_annotations(self.csv)  # orig frame
+        np.testing.assert_allclose(s3.query_coords[1], [4, 2, 1], atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

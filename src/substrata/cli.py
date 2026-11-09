@@ -980,11 +980,17 @@ def handle_views(args):
 
 
 def handle_segment(args):
-    """Segment the point cloud by classifying camera patches at query points."""
+    """Segment the point cloud by classifying camera patches at query points.
+
+    The classified query points are saved as an annotation set
+    (``<id>.annos/<id>_seg[_<tag>]_points.csv`` + sidecar), the segmentation's
+    source of truth. ``--from-points`` re-reads such a set (e.g. after checking
+    labels by hand) and only rewrites the recoloured clouds.
+    """
     import numpy as np
 
     from substrata.initializer import ProjectInitializer
-    from substrata import classification, segmentation
+    from substrata import segmentation
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
@@ -994,6 +1000,83 @@ def handle_segment(args):
 
     if init.pcd is None:
         raise SystemExit("No point cloud found to segment (provide --input).")
+    from_points = getattr(args, "from_points", None)
+    names = _seg_output_names(init, cwd, getattr(args, "tag", None))
+    if from_points:
+        points_csv = os.path.abspath(from_points)
+        if not os.path.isfile(points_csv):
+            raise SystemExit(f"No segmentation points CSV {points_csv}")
+        if getattr(args, "tag", None) is None:  # the clouds keep the set's own tag
+            names = _seg_output_names(
+                init, cwd, (sidecars.read_annotation_sidecar(points_csv)
+                            .get("segmentation") or {}).get("tag")
+            )
+        seg = segmentation.Segmentation.from_annotations(
+            points_csv, world_transform=init.pcd.world_transform
+        )
+        print(f"Read segmentation: {points_csv} ({seg.n_queries:,} query points)")
+    else:
+        seg, points_csv = _segment_classify(args, init, names)
+
+    # Propagate to the decimated cloud, print the category breakdown, and write a
+    # recoloured copy.
+    pts = np.asarray(init.pcd.points)
+    codes = seg.propagate(pts, max_radius=args.max_radius)
+    print("Categories:")
+    for lbl, cnt in sorted(seg.summary(codes).items(), key=lambda kv: -kv[1]):
+        print(f"  {lbl}: {cnt:,} ({100 * cnt / len(codes):.1f}%)")
+
+    ply_out = args.output_ply or names["ply_dec"]
+    _write_recolored_decimated(init.pcd, seg, codes, ply_out)
+    print(f"Saved recoloured decimated cloud: {ply_out}")
+    made = {"seg_ply_dec": ply_out, "seg_ply": None}  # None: not (re)made now
+
+    # Optional streaming full-size recolour.
+    if getattr(args, "full_ply", None) is not None:
+        full_in = args.full_ply or init.ply_full_path
+        if not full_in:
+            raise SystemExit("--full-ply given but no full-size PLY path found.")
+        full_out = names["ply"]
+        segmentation.recolor_ply_file(
+            full_in, full_out, seg,
+            world_transform=init.pcd.world_transform,
+            max_radius=args.max_radius,
+        )
+        print(f"Saved recoloured full-size cloud: {full_out}")
+        made["seg_ply"] = full_out
+
+    # The set's sidecar names the clouds made from it (and the colours used)
+    params = sidecars.read_annotation_sidecar(points_csv).get("segmentation") or {}
+    params = dict(params, colors={**(params.get("colors") or {}), **seg.hex_colors()},
+                  max_radius=None if args.max_radius is None else float(args.max_radius))
+    sidecars.write_annotation_sidecar(points_csv, {**made, "segmentation": params})
+
+
+def _seg_output_names(init, cwd, tag=None):
+    """Output paths of ``substrata segment`` (version ``tag``, if given).
+
+    ``points``: ``<id>.annos/<id>_seg[_<tag>]_points.csv`` (the source of truth);
+    ``ply_dec`` / ``ply``: ``<id>_seg[_<tag>]_dec.ply`` / ``<id>_seg[_<tag>].ply``
+    in the plot folder (large, so never in ``.annos``).
+    """
+    if tag is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+        raise SystemExit(f"Invalid --tag {tag!r}; use letters, digits, '.', '_' or '-'.")
+    stem = f"seg_{tag}" if tag else "seg"
+    annos_dir = init.annos_root or os.path.join(cwd, f"{init.id}.annos")
+    return {
+        "points": os.path.join(annos_dir, f"{init.id}_{stem}_points.csv"),
+        "ply_dec": _get_output_filepath(init, f"{stem}_dec.ply"),
+        "ply": _get_output_filepath(init, f"{stem}.ply"),
+    }
+
+
+def _segment_classify(args, init, names):
+    """Sample, match and classify query points; save them as the seg points CSV.
+
+    Returns ``(segmentation, points_csv)``.
+    """
+    from substrata import classification, segmentation
+
     if init.cams is None:
         raise SystemExit("No cameras found; segmentation needs camera poses + photos.")
 
@@ -1009,6 +1092,11 @@ def handle_segment(args):
             "the project YAML."
         )
     learn = classification.get_image_classifier(classifier_path)
+    crop_size = _classifier_crop_size(
+        [args.crop_size] if args.crop_size else None, learn,
+        (settings.TRAIN_CROP_SIZE, settings.TRAIN_CROP_SIZE),
+    )[0]
+    cell_size = args.cell_size or settings.DEFAULT_SEG_CELL_SIZE
 
     # Manual category colours: --color LABEL=RRGGBB (repeatable).
     label_colors = {}
@@ -1021,40 +1109,38 @@ def handle_segment(args):
     seg = segmentation.segment_point_cloud(
         init.pcd, init.cams, learn,
         world_transform=init.pcd.world_transform,
-        cell_size=args.cell_size,
+        cell_size=cell_size,
         sampling=args.sampling,
         occlusion=not args.no_occlusion,
         label_colors=label_colors or None,
+        crop_size=crop_size,
     )
 
-    npz_path = args.output_npz or _get_output_filepath(init, "seg.npz")
-    seg.save(npz_path)
-    print(f"Saved segmentation: {npz_path} ({seg.n_queries:,} query points)")
+    if args.output_npz:
+        seg.save(args.output_npz)
+        print(f"Saved segmentation: {args.output_npz} ({seg.n_queries:,} query points)")
 
-    # Propagate to the decimated cloud, print the category breakdown, and write a
-    # recoloured copy.
-    pts = np.asarray(init.pcd.points)
-    codes = seg.propagate(pts, max_radius=args.max_radius)
-    print("Categories:")
-    for lbl, cnt in sorted(seg.summary(codes).items(), key=lambda kv: -kv[1]):
-        print(f"  {lbl}: {cnt:,} ({100 * cnt / len(codes):.1f}%)")
-
-    ply_out = args.output_ply or _get_output_filepath(init, "seg_dec.ply")
-    _write_recolored_decimated(init.pcd, seg, codes, ply_out)
-    print(f"Saved recoloured decimated cloud: {ply_out}")
-
-    # Optional streaming full-size recolour.
-    if getattr(args, "full_ply", None) is not None:
-        full_in = args.full_ply or init.ply_full_path
-        if not full_in:
-            raise SystemExit("--full-ply given but no full-size PLY path found.")
-        full_out = _get_output_filepath(init, "seg.ply")
-        segmentation.recolor_ply_file(
-            full_in, full_out, seg,
-            world_transform=init.pcd.world_transform,
-            max_radius=args.max_radius,
-        )
-        print(f"Saved recoloured full-size cloud: {full_out}")
+    # The classified query points as an annotation set (predictions in pred_*,
+    # with the photo + pixel each was classified from): the source of truth
+    points_csv = names["points"]
+    os.makedirs(os.path.dirname(points_csv), exist_ok=True)
+    seg.to_annotations(init.pcd.world_transform, id_prefix=init.id).save(points_csv)
+    sidecars.write_annotation_sidecar(points_csv, {
+        "type": "segmentation",
+        "plot_id": init.id,
+        "world_transform": init.world_transform,
+        "classifier": classifier_path,
+        "segmentation": {
+            "tag": getattr(args, "tag", None),
+            "cell_size": float(cell_size),
+            "sampling": args.sampling,
+            "crop_size": int(crop_size),
+            "occlusion": not args.no_occlusion,
+            "colors": seg.hex_colors(),
+        },
+    }, update=False)
+    print(f"Saved classified query points: {points_csv} ({seg.n_queries:,})")
+    return seg, points_csv
 
 
 def _write_recolored_decimated(pcd, seg, codes, output_path):
@@ -3195,6 +3281,27 @@ def _size_arg(values, default):
     raise SystemExit("--size takes one value (square) or two values (W H).")
 
 
+def _classifier_crop_size(values, learn, default):
+    """Crop size ``(w, h)``: ``--size``/``--crop-size``, else the classifier's own.
+
+    Classifiers from ``substrata train`` record the crop size they were trained
+    on; older ones fall back to ``default`` (with a note).
+    """
+    from substrata import classification
+
+    if values:
+        return _size_arg(values, default)
+    stored = classification.classifier_crop_size(learn)
+    if stored:
+        print(f"Crop size {stored} px (as the classifier was trained)")
+        return (stored, stored)
+    print(
+        f"The classifier records no crop size; using {default[0]}x{default[1]} px "
+        "(pass the size it was trained on if that differs)."
+    )
+    return default
+
+
 def _load_annotation_project(args, need_annotations=True, use_ply=True):
     """Initialize the project in the CWD for the thumbnails/crops/predict commands.
 
@@ -3377,7 +3484,10 @@ def _predict_images(args):
 
     if not args.classifier:
         raise SystemExit("Image-only predict needs --classifier.")
-    crop_size = _size_arg(args.size, settings.PREDICTION_CROP_SIZE_DEFAULT)
+    learn = classification.get_image_classifier(args.classifier)
+    crop_size = _classifier_crop_size(
+        args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT
+    )
     margin = max(crop_size) // 2
     output_dir = args.output or os.getcwd()
     os.makedirs(output_dir, exist_ok=True)
@@ -3443,7 +3553,6 @@ def _predict_images(args):
                 print(f"Resampling; old points backed up to {backup}")
             anns = _sample(all_cams)
 
-    learn = classification.get_image_classifier(args.classifier)
     results = anns.classify_image_matches(
         learn, crop_size=crop_size, batch_size=args.batch_size, n_jobs=args.jobs,
     )
@@ -3489,9 +3598,11 @@ def handle_predict(args):
         raise SystemExit("No classifier: pass --classifier or set it in the YAML.")
     anns = init.annotations
     root = args.crops or anns.crops_root
-    crop_size = _size_arg(args.size, settings.PREDICTION_CROP_SIZE_DEFAULT)
 
     learn = classification.get_image_classifier(classifier_path)
+    crop_size = _classifier_crop_size(
+        args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT
+    )
     consensus = anns.predict(
         init.cams,
         learn,
@@ -4220,7 +4331,10 @@ def handle_train(args):
             ann_csv, output_dir, label_map, max_per_class=args.pdf_max
         )
         pdf_path = os.path.join(output_dir, settings.TRAIN_CROPS_PDF_FILE)
-        n_pages = visualizations.save_training_crops_pdf(groups, pdf_path)
+        n_pages = visualizations.save_training_crops_pdf(
+            groups, pdf_path,
+            crop_px=classification.stored_crop_size(output_dir, set()),
+        )
         print(
             f"Wrote training crops PDF: {pdf_path} ({len(groups)} class(es), "
             f"{n_pages} page(s))"
@@ -4449,7 +4563,7 @@ def handle_train(args):
     # --- Step 5: train ---
     learn = classification.train_classifier(
         output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs,
-        pretrained_weights=args.pretrained_weights,
+        pretrained_weights=args.pretrained_weights, crop_size=crop_size,
     )
 
     # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
@@ -4932,7 +5046,8 @@ def main():
         "segment",
         help=(
             "Segment the point cloud by classifying camera patches at sampled "
-            "query points; saves <id>_seg.npz + a recoloured cloud."
+            "query points; saves the points as <id>.annos/<id>_seg_points.csv "
+            "(the source of truth) and a recoloured cloud."
         ),
     )
     p_seg.add_argument(
@@ -4950,6 +5065,11 @@ def main():
     p_seg.add_argument(
         "--sampling", dest="sampling", choices=["voxel", "xy_grid"], default="voxel",
         help="Query sampling: 'voxel' (3D, default) or 'xy_grid' (top-down).",
+    )
+    p_seg.add_argument(
+        "--crop-size", dest="crop_size", type=int, default=None, metavar="PX",
+        help="Patch size in px. Default: the size the classifier was trained on "
+             f"(recorded by `substrata train`), else {settings.TRAIN_CROP_SIZE}.",
     )
     p_seg.add_argument(
         "--no-occlusion", dest="no_occlusion", action="store_true",
@@ -4977,11 +5097,25 @@ def main():
     )
     p_seg.add_argument(
         "--output-npz", dest="output_npz", type=str, default=None,
-        help="Segmentation .npz output path (default <id>_seg.npz).",
+        help="Also save the segmentation as a compact .npz at this path (the "
+             "points CSV is the source of truth; no .npz is written by default).",
     )
     p_seg.add_argument(
         "--output-ply", dest="output_ply", type=str, default=None,
-        help="Recoloured decimated PLY output path (default <id>_seg_dec.ply).",
+        help="Recoloured decimated PLY output path "
+             "(default <id>_seg[_<tag>]_dec.ply).",
+    )
+    p_seg.add_argument(
+        "--tag", dest="tag", type=str, default=None, metavar="NAME",
+        help="Version name: saves <id>.annos/<id>_seg_<NAME>_points.csv and "
+             "<id>_seg_<NAME>[_dec].ply, so several segmentations can coexist.",
+    )
+    p_seg.add_argument(
+        "--from-points", dest="from_points", type=str, default=None,
+        metavar="CSV",
+        help="Recolour from an existing segmentation points CSV (e.g. after "
+             "checking labels by hand: 'label' wins over 'pred_label') instead "
+             "of classifying again.",
     )
     p_seg.add_argument(
         "--local", dest="local", action="store_true",

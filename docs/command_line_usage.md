@@ -32,11 +32,13 @@ substrata decimate -c
 
 ## Stratifying PLY files
 
-Reorder a PLY so it can be read progressively and by region. The file stays the project's ordinary `<id>.ply` (same header, byte-identical points, only reordered) with a small index `<id>.strat.npz` next to it; a PLY counts as stratified when that index exists and matches it (`ProjectInitializer.ply_stratified`). The points are split into spatially compact clusters, each shuffled and written coarse-to-fine, so:
+Reorder a PLY so it can be read progressively and by region. The file stays the project's ordinary `<id>.ply` (same header plus a `comment substrata stratified v1` line, byte-identical points, only reordered) with a small index `<id>.strat.npz` next to it; a PLY counts as stratified when that index exists and matches it (`ProjectInitializer.ply_stratified`). The points are split into spatially compact clusters, each shuffled and written coarse-to-fine, so:
 
-- the first N points of the file are a uniform random subsample (a decimated cloud is just a prefix read, `StratifiedPly(path).read_prefix(n)`);
+- the first N points of the file are a uniform random subsample when N is a round boundary (a decimated cloud is just a prefix read, `StratifiedPly(path).read_prefix(n)` with n from `index.round_ends`);
 - a region can be read at any density without scanning the whole file (`StratifiedPly(path).query_box(lo, hi)`);
 - other PLY readers (Open3D, Metashape, CloudCompare) still read it as before.
+
+The file and index layout, for implementing readers in other software, is in {doc}`stratified_ply`.
 
 With no arguments, stratifies `<id>.ply` of the project in the CWD in place (it is written next to it first and checksummed, then swapped in). It prints the mode it will use and the RAM and disk space that needs.
 
@@ -185,9 +187,11 @@ With `--use_chunk_transform`, scale and orientation are taken from the `chunk_tr
 
 ## Segmentation
 
-Segment the point cloud by reusing the trained crop classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the 224 px patch, then propagate the labels to every point via nearest neighbour. Saves the classified query points to a compact `<id>_seg.npz` (the source of truth) plus a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance). Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
+Segment the point cloud by reusing the trained crop classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the patch around it, then propagate the labels to every point via nearest neighbour. The patch is as large as the classifier's training crops (recorded in the classifier by `substrata train`; `--crop-size` overrides it, and older classifiers without a recorded size use 224 px). Saves the classified query points as an annotation set `<id>.annos/<id>_seg_points.csv`, the segmentation's source of truth: predictions in `pred_label`/`pred_conf`, `label` left empty to check by hand, and the photo and pixel each point was classified from in `cam_filepath`/`cam_x`/`cam_y`. Its sidecar records `type: segmentation`, the classifier, cell size, sampling, crop size and the label colours. It also writes a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance) in the project folder; the sidecar names the recoloured clouds made from the set (`seg_ply_dec`, `seg_ply`). `--tag NAME` keeps versions side by side: `<id>.annos/<id>_seg_NAME_points.csv` and `<id>_seg_NAME[_dec].ply`. `--from-points CSV` skips sampling and classification and only recolours from an existing points CSV, where a hand-checked `label` wins over `pred_label` (the clouds keep that set's tag). `--output-npz` also saves the compact `.npz` of `Segmentation.save` (not written by default; `Segmentation.from_annotations` reads the CSV).
 
-Usage: `substrata segment [--input PLY] [--classifier PKL] [--cell-size M] [--sampling voxel|xy_grid] [--no-occlusion] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--output-npz NPZ] [--output-ply PLY]`
+Because the points CSV is an ordinary annotation set, its labels can be summarised like any other (e.g. cover per label over depth). With `voxel` sampling each point stands for about the same patch of surface (one per `--cell-size` cell), so a label's share of the points is its 3D (surface) cover; with `xy_grid` it is planar (top-down) cover. Query points that no photo saw, or that failed to classify, are left out, so the cover is of the observed surface. Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
+
+Usage: `substrata segment [--input PLY] [--classifier PKL] [--cell-size M] [--crop-size PX] [--sampling voxel|xy_grid] [--no-occlusion] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--tag NAME] [--from-points CSV] [--output-npz NPZ] [--output-ply PLY]`
 
 ```bash
 # Using default behavior (auto-detects project + classifier from CWD)
@@ -204,6 +208,12 @@ substrata segment --sampling xy_grid --no-occlusion
 
 # Also stream-recolour the full-size PLY to <id>_seg.ply
 substrata segment --full-ply
+
+# A second version, kept next to the first: <id>.annos/<id>_seg_v2_points.csv, <id>_seg_v2_dec.ply
+substrata segment --tag v2 --cell-size 0.10
+
+# After checking labels in that set by hand: recolour from it without classifying again
+substrata segment --from-points <id>.annos/<id>_seg_v2_points.csv --full-ply
 ```
 
 ## Color calibration
@@ -582,7 +592,7 @@ Predict a label for every annotation with a trained classifier (`substrata train
 
 The combined prediction is written to the `pred_label`, `pred_conf` and `pred_n` (number of crops used) columns of the annotations CSV; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF, unless `--no-write-crops` is given.
 
-The classifier input is cut from the centre of the stored crop when that crop is at least `--size` (default 224x224), giving the same pixels as cropping the photo but much faster, and without needing the photos. Otherwise it is cut from the photo.
+The classifier input is cut from the centre of the stored crop when that crop is at least `--size` (default: the crop size the classifier was trained on, as recorded by `substrata train`; 224x224 for older classifiers), giving the same pixels as cropping the photo but much faster, and without needing the photos. Otherwise it is cut from the photo.
 
 Do not run this while the same annotations file is open in reefcat, as both write the CSV.
 
@@ -598,7 +608,7 @@ substrata predict --classifier crop_classifier.pkl --method first
 
 ### Image-only mode (plain photos)
 
-With `--image-dir` or `--points`, `predict` works on plain photos instead of a 3-D project (no point cloud, cameras or YAML; `--classifier` is required). Each point is classified from a `--size` crop centred on it.
+With `--image-dir` or `--points`, `predict` works on plain photos instead of a 3-D project (no point cloud, cameras or YAML; `--classifier` is required). Each point is classified from a crop centred on it, sized as for `predict` above.
 
 - `--image-dir DIR`: random points are sampled on every image in `DIR` (searched recursively): `--n-points` per image (default 25), simple random or `--stratified` (one point per grid cell), kept at least half a crop from the image edges, reproducible with `--seed`. They are saved to `<output>/<DIR name>_points.csv` (`--output`, default CWD) and **reused** on later runs, so different classifiers are compared on the same points. Images added to the folder later get their own new points. `--resample` draws new points (the old file is backed up).
 - `--points CSV`: predict at given points instead: a points CSV from an earlier run (updated in place), or a CoralNet export (`Name`, `Row`, `Column`, `Label code`). For a CoralNet export the images are searched in `--image-dir` (default: the CSV's folder), the result is written to `<output>/<CSV name>_points.csv`, and the predictions are compared with the CoralNet labels (agreement and a per-class report). Labels the classifier does not predict are reported and left out of the comparison.
@@ -801,7 +811,13 @@ at the classifier's input resolution by default (`--crop-size`). Crop filenames
 encode the annotation id, source image, and pixel centre, so a changed
 annotation's stale crop is deleted and regenerated; emptied category folders are
 cleaned up, and a few example paths are shown before any deletion as a safeguard
-against pointing `--output` at the wrong directory.
+against pointing `--output` at the wrong directory. The filenames do not include
+the crop size. Instead, the output folder records it in `training_crops.json`.
+When `--crop-size` differs from the existing crops, all of them are replaced
+(after confirmation; declining stops the run, rather than training on a mix of
+sizes). Use a separate `--output` per crop size to keep several. The trained
+classifier records its crop size too, so `predict` and `segment` crop the same
+by default.
 
 **Crops are decoupled from category selection.** Folders are named by the
 *raw* label and crops are generated for every label *visible* in the tree —
