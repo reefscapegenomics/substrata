@@ -56,6 +56,7 @@ __all__ = [
     "point_key", "row_point_key", "CurationStore", "store_for_folder",
     "TileStore", "tile_store",
     "curation_dir", "pool_csvs", "score_training_points", "mine_pool",
+    "SourceLabels", "write_training_sources",
     "read_table", "import_decisions", "ring_offsets", "domain_statistics",
 ]
 
@@ -97,8 +98,8 @@ def _now() -> str:
 class CurationStore:
     """Curation decisions: an append-only JSON-lines file (plus read-only extras).
 
-    Each line is ``{"key", "action", "label"?, "reason"?, "orig_label"?, "id"?,
-    "photo"?, "x"?, "y"?, "time", "by"?}``; ``action`` is one of
+    Each line is ``{"key", "action", "label"?, "label_conf"?, "reason"?,
+    "orig_label"?, "id"?, "photo"?, "x"?, "y"?, "time", "by"?}``; ``action`` is one of
     ``settings.CURATION_ACTIONS``. The latest line per key wins; ``clear``
     withdraws the decision. Extra stores are read first, so the folder's own
     store overrides them.
@@ -181,13 +182,21 @@ class CurationStore:
             return row, None
         if e["action"] == "exclude":
             return None, "exclude"
-        if e["action"] == "relabel":
+        if e["action"] in ("relabel", "accept"):
             out = dict(row)
-            out["label"] = e["label"]
-            if "label_conf" in e:
+            if e["action"] == "relabel":
+                out["label"] = e["label"]
+            if e.get("label_conf") is not None:
                 out["label_conf"] = e["label_conf"]
-            return out, "relabel"
+            return out, e["action"]
         return row, e["action"]
+
+    def confidence(self, row: Dict[str, Any]) -> Optional[float]:
+        """The reviewer's confidence (``label_conf``) of the row's decision, or None."""
+        e = self.decision(row)
+        if e is None or e.get("label_conf") is None:
+            return None
+        return float(e["label_conf"])
 
     # -- writing ---------------------------------------------------------------
     def append(
@@ -197,7 +206,8 @@ class CurationStore:
 
         Raises:
             ValueError: on an unknown action, a relabel without a label, a
-                missing key, or a store opened without a writable path.
+                ``label_conf`` outside 0-1 (or on an exclude), a missing key,
+                or a store opened without a writable path.
         """
         if not self.path:
             raise ValueError("This curation store is read-only (no path).")
@@ -214,6 +224,19 @@ class CurationStore:
                 e["label"] = str(e.get("label") or "").strip()
                 if not e["label"]:
                     raise ValueError("A relabel decision needs a label.")
+            if e.get("label_conf") == "":
+                e.pop("label_conf")
+            if "label_conf" in e:
+                if e["action"] not in ("accept", "relabel"):
+                    raise ValueError("Only an accept or a relabel has a confidence.")
+                try:
+                    c = float(e["label_conf"])
+                except (TypeError, ValueError):
+                    c = -1.0
+                if not 0.0 <= c <= 1.0:
+                    raise ValueError(
+                        f"A confidence is between 0 and 1, not {e['label_conf']!r}.")
+                e["label_conf"] = c
             e.setdefault("time", _now())
             if by:
                 e.setdefault("by", by)
@@ -231,11 +254,25 @@ class CurationStore:
                 self._ingest(e)
         return lines
 
+    EXPORT_COLUMNS = ["photo", "x", "y", "id", "action", "orig_label", "label",
+                      "label_conf", "reason", "src", "time", "by", "key"]
+
     def export_csv(self, path: str) -> int:
-        """Write the current decisions as CSV; returns the number of rows."""
-        cols = ["key", "action", "label", "reason", "orig_label", "id", "photo",
-                "x", "y", "time", "by"]
-        rows = sorted(self.entries(), key=lambda e: e.get("time", ""))
+        """Write the current decision of each point as CSV (no history; cleared
+        points left out), by photo and position; returns the number of rows.
+        ``label`` is the new label of a relabel; ``src`` the table it came from
+        (training points or a pool). Reads back with :func:`import_decisions`."""
+        cols = self.EXPORT_COLUMNS
+
+        def order(e):
+            def num(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0.0
+            photo = str(e.get("photo") or "")
+            return (photo, num(e.get("y")), num(e.get("x")), e["key"])
+        rows = sorted(self.entries(), key=order)
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
@@ -266,7 +303,7 @@ def import_decisions(
     """Append decisions from a CSV (e.g. edited from contact sheets).
 
     Columns: ``action`` (accept / relabel / exclude / clear), optional
-    ``label`` and ``reason``, and the point as ``key``, or
+    ``label``, ``label_conf`` and ``reason``, and the point as ``key``, or
     ``cam_filepath``/``photo`` + ``cam_x``/``x`` + ``cam_y``/``y``, or ``id``
     (looked up in ``lookup``: id -> table row with ``key``).
 
@@ -306,12 +343,216 @@ def import_decisions(
             for k in ("label", "reason", "id"):
                 if r.get(k):
                     e[k] = r[k]
+            if action != "relabel":
+                e.pop("label", None)  # an export's accept / exclude rows: no new label
+            if r.get("label_conf") and action in ("accept", "relabel"):
+                try:
+                    c = float(r["label_conf"])
+                except ValueError:
+                    c = -1.0
+                if not 0.0 <= c <= 1.0:
+                    problems.append(
+                        f"line {n}: confidence {r['label_conf']!r} not in 0-1")
+                    continue
+                e["label_conf"] = c
             if ref:
                 e.setdefault("orig_label", ref.get("label") or "")
                 e.setdefault("id", ref.get("id"))
             entries.append(e)
     store.append(entries, by=by)
     return len(entries), problems
+
+
+# -- the training run's annotation files: label edits from the review grid ----------
+
+
+def write_training_sources(folder: str, paths: Sequence[str], fmt: str) -> str:
+    """Record the annotation CSVs a training run read (``training_sources.json``).
+
+    Args:
+        folder: The classifier folder.
+        paths: The annotation CSVs (CoralNet exports: the exports themselves).
+        fmt: ``"coralnet"`` or ``"annotations"`` (substrata annotation CSVs).
+    """
+    out = os.path.join(folder, settings.TRAIN_SOURCES_FILE)
+    os.makedirs(folder, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump({"format": fmt, "files": [os.path.abspath(p) for p in paths],
+                   "created": _now()}, f, indent=1)
+    return out
+
+
+def _is_nan_cell(v: Any) -> bool:
+    v = str(v or "").strip().lower()
+    return v in ("", "nan", "none")
+
+
+class SourceLabels:
+    """Edit the labels of training points in the annotation files they came from.
+
+    Image-only sources only: CoralNet exports (``Name``, ``Row``, ``Column``,
+    ``Label code``) and substrata annotation CSVs whose points have no 3-D
+    position. Points of point-cloud annotation sets are left alone (a label seen
+    in one image match may be an obstruction). A point is found by its curation
+    key (photo file name + rounded pixel). Each file is backed up once per
+    instance (``<folder>/backup/<name>_<time>.bak``) before its first edit; only
+    the label cell (and ``label_conf`` where the file has that column) changes.
+    """
+
+    def __init__(self, folder: str):
+        self.folder = folder
+        self.path = os.path.join(folder, settings.TRAIN_SOURCES_FILE)
+        self.files: List[str] = []
+        self.fmt = ""
+        self.problem = ""
+        self._index: Dict[str, Tuple[str, str]] = {}  # key -> (file, "image"|"3d")
+        self._mtimes: Dict[str, float] = {}
+        self._backed_up: set = set()
+        self._lock = threading.Lock()
+        if not os.path.isfile(self.path):
+            self.problem = (f"no {settings.TRAIN_SOURCES_FILE} in the folder "
+                            "(run `substrata train` once more to record the "
+                            "annotation files)")
+            return
+        with open(self.path) as f:
+            meta = json.load(f)
+        self.fmt = meta.get("format") or "annotations"
+        self.files = [p for p in meta.get("files") or [] if os.path.isfile(p)]
+        if not self.files:
+            self.problem = "the recorded annotation files are missing"
+
+    @property
+    def available(self) -> bool:
+        return not self.problem
+
+    # -- reading ---------------------------------------------------------------
+    def _rows(self, path: str):
+        from substrata import annotations as sa
+        return sa._read_csv_rows(path)
+
+    def _cols(self, low: List[str]) -> Dict[str, int]:
+        """Column indices of a file: photo, x, y, label (+ id, label_conf, 3-D)."""
+        if self.fmt == "coralnet":
+            lab = next((c.lower() for c in settings.CORALNET_LABEL_COLUMNS
+                        if c.lower() in low), None)
+            need = {"photo": "name", "x": "column", "y": "row", "label": lab}
+        else:
+            need = {"photo": "cam_filepath", "x": "cam_x", "y": "cam_y",
+                    "label": "label", "id": "id"}
+        if any(v is None or v not in low for v in need.values()):
+            return {}
+        out = {k: low.index(v) for k, v in need.items()}
+        for k in ("label_conf", "orig_x", "world_x"):
+            if self.fmt != "coralnet" and k in low:
+                out[k] = low.index(k)
+        return out
+
+    def _index_file(self, path: str) -> None:
+        for k in [k for k, v in self._index.items() if v[0] == path]:
+            del self._index[k]
+        rows, _eol, low = self._rows(path)
+        c = self._cols(low)
+        self._mtimes[path] = os.path.getmtime(path)
+        if not c:
+            return
+        for r in rows[1:]:
+            if len(r) <= max(c.values()):
+                continue
+            try:
+                key = point_key(r[c["photo"]], r[c["x"]], r[c["y"]])
+            except (ValueError, TypeError):
+                continue
+            three_d = any(not _is_nan_cell(r[c[k]]) for k in ("orig_x", "world_x")
+                          if k in c)
+            self._index.setdefault(key, (path, "3d" if three_d else "image"))
+
+    def _fresh(self) -> None:
+        for p in self.files:
+            if not os.path.isfile(p):
+                continue
+            if self._mtimes.get(p) != os.path.getmtime(p):
+                self._index_file(p)
+
+    def locate(self, key: str) -> Optional[Tuple[str, str]]:
+        """``(file, "image" | "3d")`` of a point, or None."""
+        with self._lock:
+            if not self.available:
+                return None
+            self._fresh()
+            return self._index.get(key)
+
+    def get(self, key: str) -> Optional[Dict[str, str]]:
+        """The point's label (and label_conf) in its file, or None."""
+        loc = self.locate(key)
+        if loc is None:
+            return None
+        rows, _eol, low = self._rows(loc[0])
+        c = self._cols(low)
+        for r in rows[1:]:
+            if self._is(r, c, key):
+                return {"label": r[c["label"]],
+                        "label_conf": r[c["label_conf"]] if "label_conf" in c
+                        else None}
+        return None
+
+    @staticmethod
+    def _is(r: List[str], c: Dict[str, int], key: str) -> bool:
+        if len(r) <= max(c.values()):
+            return False
+        try:
+            return point_key(r[c["photo"]], r[c["x"]], r[c["y"]]) == key
+        except (ValueError, TypeError):
+            return False
+
+    # -- writing ---------------------------------------------------------------
+    def set(self, key: str, label: str, label_conf: Any = "keep") -> Dict[str, Any]:
+        """Set a point's label in its annotation file.
+
+        Args:
+            key: The point's curation key.
+            label: The new label.
+            label_conf: The new ``label_conf`` (None: empty; ``"keep"``: as is);
+                only for files with that column.
+
+        Returns:
+            ``{"file", "old": {"label", "label_conf"}, "changed"}``.
+
+        Raises:
+            KeyError: the point is in none of the files.
+            ValueError: the point has a 3-D position (point-cloud set).
+        """
+        from substrata import annotations as sa
+        loc = self.locate(key)
+        if loc is None:
+            raise KeyError(f"{key} is in none of the training's annotation files")
+        path, kind = loc
+        if kind != "image":
+            raise ValueError(f"{key} is a point-cloud annotation (not edited)")
+        with self._lock:
+            rows, eol, low = self._rows(path)
+            c = self._cols(low)
+            old, changed = None, False
+            for r in rows[1:]:
+                if not self._is(r, c, key):
+                    continue
+                if old is None:
+                    conf = r[c["label_conf"]] if "label_conf" in c else None
+                    old = {"label": r[c["label"]], "label_conf": conf}
+                if r[c["label"]] != label:
+                    r[c["label"]], changed = label, True
+                if "label_conf" in c and label_conf != "keep":
+                    v = "" if label_conf is None else f"{float(label_conf):g}"
+                    if r[c["label_conf"]] != v:
+                        r[c["label_conf"]], changed = v, True
+            if old is None:
+                raise KeyError(key)
+            if changed:
+                if path not in self._backed_up:
+                    sa.backup_annotation_csv(path)
+                    self._backed_up.add(path)
+                sa._write_csv_rows(path, rows, eol)
+                self._mtimes[path] = os.path.getmtime(path)
+            return {"file": path, "old": old, "changed": changed}
 
 
 def read_table(path: str) -> List[Dict[str, str]]:
@@ -668,17 +909,20 @@ def score_training_points(
         print(f"Cross-validated probabilities ({folds} folds by photo, "
               f"{int(use.sum())} points) ...")
         c = float(clf.meta.get("probe_C") or 0.01)
-        probs = _cv_probabilities(z[use], cls[use], photo[use], classes, c, folds)
+        # every labelled class, also those the classifier never saw (all of a
+        # rare class's points in the validation / test split)
+        cv_classes = classes + sorted(set(cls[use].tolist()) - set(classes))
+        cv_col = {k: i for i, k in enumerate(cv_classes)}
+        probs = _cv_probabilities(z[use], cls[use], photo[use], cv_classes, c, folds)
         idx = np.nonzero(use)[0]
         good = np.isfinite(probs).all(1)
         for j, i in enumerate(idx):
             if not good[j]:
                 continue
             k = int(np.argmax(probs[j]))
-            cv_pred[i] = classes[k]
+            cv_pred[i] = cv_classes[k]
             cv_conf[i] = probs[j, k]
-            if cls[i] in col:
-                p_label[i] = probs[j, col[cls[i]]]
+            p_label[i] = probs[j, cv_col[cls[i]]]
         ev = pf.evaluate_predictions(cls[idx[good]].tolist(),
                                      [cv_pred[i] for i in idx[good]])
         cv_summary = {k: round(float(ev[k]), 4)

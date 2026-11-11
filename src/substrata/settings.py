@@ -208,6 +208,8 @@ TRAIN_ANNOTATIONS_FILE = "training_annotations.csv"
 # Editable label->training-class map (selection + hierarchical collapse). Seeded
 # from the label tree, hand-tunable, and read by both training and evaluation.
 TRAIN_LABEL_MAP_FILE = "training_label_map.csv"
+# the annotation CSVs a training run read (label edits from substrata-curate)
+TRAIN_SOURCES_FILE = "training_sources.json"
 TRAIN_SUMMARY_FILE = "training_summary.pdf"  # per-run settings + per-class counts
 TRAIN_SUMMARY_CLASSES_PER_PAGE = 40  # category bars per training-summary PDF page
 TRAIN_CM_ANNOTATE_MAX = 25  # max classes for per-cell count labels on the matrix
@@ -226,6 +228,10 @@ TRAIN_PDF_THUMB_PX = 128  # crops are downscaled to this size in the PDF
 
 # Label-tree (CATAMI hierarchy) rendering and consolidated-CSV layout.
 TRAIN_LABEL_COLUMN = "label"
+# Per annotation row: whether its image match (cam_filepath / cam_x / cam_y) is
+# used for training. A missing column or empty cell counts as True; only
+# false / 0 / no excludes the row.
+TRAIN_INCLUDE_COLUMN = "include_cam_in_training"
 TRAIN_LEVEL_COLUMNS = [f"CATAMI_LEVEL_{i}" for i in range(1, 8)]
 TRAIN_CROP_IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 TRAIN_ANN_COLUMNS = [
@@ -276,7 +282,29 @@ THUMBNAILS_DIR_SUFFIX = ".thumbnails"  # default thumbnails dir: <id>.thumbnails
 # Default label set: next to the annotations CSV, in <id>.annos/, else the
 # project folder (legacy); see ProjectInitializer.default_classes_path
 CLASSES_FILE = "classes.csv"
-MAX_PHOTOS_TO_CROP_DEFAULT = 10  # image matches cropped per annotation
+# Views per annotation. Cropped (substrata crops): the best views of the main camera type only (the training
+# view first); review tools show more (VIEWS_*) and cut the others from the photo on the fly. Predicted
+# (substrata predict): the best views of any camera, combined into one prediction.
+MAX_PHOTOS_TO_CROP_DEFAULT = 5
+CROPS_PER_OTHER_TYPE = 0
+VIEWS_MAX_DEFAULT = 10
+MAX_PHOTOS_TO_PREDICT_DEFAULT = 10
+# View selection (crops, training views). Occlusion is tested on the plot's
+# stratified PLY subsample (substrata.occlusion): a view is blocked when at
+# least OCCLUSION_BLOCKED_MIN subsample points lie on its line of sight. Only
+# the OCCLUSION_CHECK_VIEWS most relevant views of a point are tested.
+# 3: a single surface crossing the line of sight leaves ~4-5 subsample points;
+# real obstructions far more (median 20 in a judged sample)
+OCCLUSION_BLOCKED_MIN = 3
+OCCLUSION_CHECK_VIEWS = 40
+# Camera types: sensors with the same resolution (either orientation) and a
+# focal length within this fraction count as one type (e.g. two identical
+# cameras, or one AUV camera across missions). Views are chosen from the
+# set's main camera type; other types add at most VIEWS_PER_OTHER_TYPE views
+# (shown; cropped: CROPS_PER_OTHER_TYPE).
+CAMERA_TYPE_FOCAL_TOL = 0.03
+VIEWS_PER_OTHER_TYPE = 3
+MAIN_CAMERA_TYPE_SAMPLE = 200  # points used to find a set's main camera type
 # How per-crop predictions combine into one prediction per annotation:
 # "weighted" (relevance-weighted mean of class probabilities) or "first".
 PREDICTION_AGGREGATION = "weighted"

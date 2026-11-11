@@ -93,6 +93,13 @@ class TestKeysAndStore(unittest.TestCase):
             s.append([{"action": "accept"}])
         with self.assertRaises(ValueError):
             cur.CurationStore(None).append([{"key": "k", "action": "accept"}])
+        for bad in ({"action": "accept", "label_conf": 1.5},
+                    {"action": "relabel", "label": "Y", "label_conf": "high"},
+                    {"action": "exclude", "label_conf": 0.5}):
+            with self.assertRaises(ValueError):
+                s.append([dict(bad, key="k")])
+        s.append([{"key": "k", "action": "accept", "label_conf": "0.50"}])
+        self.assertEqual(s.get("k")["label_conf"], 0.5)
 
     def test_apply(self):
         s = cur.CurationStore(self.path)
@@ -113,6 +120,14 @@ class TestKeysAndStore(unittest.TestCase):
         self.assertEqual(s.apply(c)[1], "accept")
         # an accept no longer holds once the point's label changed
         self.assertEqual(s.apply(dict(c, label="Z")), (dict(c, label="Z"), None))
+        # a confidence goes with the decision into the row
+        s.append([{"key": cur.row_point_key(c), "action": "accept", "orig_label": "X",
+                   "label_conf": 0.75},
+                  {"key": cur.row_point_key(b), "action": "relabel", "label": "Y",
+                   "label_conf": 0.25}])
+        self.assertEqual(s.apply(c)[0]["label_conf"], 0.75)
+        self.assertEqual(s.apply(b)[0]["label_conf"], 0.25)
+        self.assertEqual((s.confidence(b), s.confidence(a)), (0.25, None))
 
     def test_extra_stores_are_read_only_and_overridden(self):
         other = os.path.join(self.d, "other.jsonl")
@@ -162,6 +177,95 @@ class TestKeysAndStore(unittest.TestCase):
             self.assertEqual(
                 {r["action"] for r in csv.DictReader(f)}, {"exclude", "relabel"}
             )
+        # the outcome per point (no history), by photo and position, with confidences
+        s.append([{"key": "I.jpg|3|4", "action": "relabel", "label": "Z",
+                   "label_conf": 0.25, "photo": "/q/I.jpg", "x": 3, "y": 4},
+                  {"key": "A.jpg|9|9", "action": "accept", "photo": "/q/A.jpg",
+                   "x": 9, "y": 9, "orig_label": "B", "label_conf": 1},
+                  {"key": "I.jpg|1|1", "action": "clear"}])
+        self.assertEqual(s.export_csv(out), 2)
+        with open(out) as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(list(rows[0]), cur.CurationStore.EXPORT_COLUMNS)
+        self.assertEqual([(r["photo"], r["action"], r["label"], r["label_conf"])
+                          for r in rows],
+                         [("/q/A.jpg", "accept", "", "1.0"),
+                          ("/q/I.jpg", "relabel", "Z", "0.25")])
+        # an export reads back, confidences included
+        s2 = cur.CurationStore(os.path.join(self.d, "s2.jsonl"))
+        n, problems = cur.import_decisions(s2, out)
+        self.assertEqual((n, problems), (2, []))
+        self.assertEqual(s2.get("I.jpg|3|4")["label_conf"], 0.25)
+        self.assertNotIn("label", s2.get("A.jpg|9|9"))
+
+
+class TestSourceLabels(unittest.TestCase):
+    """Label edits in the annotation files a training run read (image-only only)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_record(self):
+        src = cur.SourceLabels(self.d)
+        self.assertFalse(src.available)
+        self.assertIn("substrata train", src.problem)
+
+    def test_coralnet_export(self):
+        exp = os.path.join(self.d, "site", "annotations_a.csv")
+        os.makedirs(os.path.dirname(exp))
+        with open(exp, "w", newline="") as f:
+            f.write("Name,Row,Column,Label code,Extra\r\n"
+                    "f1.png,10,20,SP,x\r\nf1.png,30,40,CCA,y\r\n")
+        cur.write_training_sources(self.d, [exp], "coralnet")
+        src = cur.SourceLabels(self.d)
+        self.assertTrue(src.available)
+        k = cur.point_key("/frames/f1.png", 40, 30)  # x = Column, y = Row
+        self.assertEqual(src.get(k)["label"], "CCA")
+        res = src.set(k, "SAND", 0.5)  # no label_conf column: the label only
+        self.assertEqual((res["old"]["label"], res["changed"]), ("CCA", True))
+        with open(exp, newline="") as f:
+            text = f.read()
+        self.assertEqual(text, "Name,Row,Column,Label code,Extra\r\n"
+                               "f1.png,10,20,SP,x\r\nf1.png,30,40,SAND,y\r\n")
+        backups = os.listdir(os.path.join(self.d, "site", "backup"))
+        self.assertEqual(len(backups), 1)
+        src.set(k, "CCA")  # back: no second backup in the same session
+        self.assertEqual(len(os.listdir(os.path.join(self.d, "site", "backup"))), 1)
+        self.assertEqual(src.get(k)["label"], "CCA")
+        with self.assertRaises(KeyError):
+            src.set(cur.point_key("f9.png", 1, 1), "SP")
+
+    def test_annotation_csv_image_only_and_point_cloud(self):
+        path = os.path.join(self.d, "plot_points.csv")
+        rows = [
+            _row("/p/I1.jpg", 5, 6, "A", id="1", orig_x="nan", world_x="nan",
+                 label_conf="0.5"),
+            _row("/p/I2.jpg", 7, 8, "B", id="2", orig_x="1.5", world_x="2.0",
+                 label_conf=""),
+        ]
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        cur.write_training_sources(self.d, [path], "annotations")
+        src = cur.SourceLabels(self.d)
+        k1, k2 = cur.row_point_key(rows[0]), cur.row_point_key(rows[1])
+        src.set(k1, "C", 1.0)
+        self.assertEqual(src.get(k1), {"label": "C", "label_conf": "1"})
+        src.set(k1, "C", None)
+        self.assertEqual(src.get(k1)["label_conf"], "")
+        with self.assertRaises(ValueError):  # a point-cloud annotation is not edited
+            src.set(k2, "C")
+        self.assertEqual(src.get(k2)["label"], "B")
+        # an edit made elsewhere is seen (the file is re-read when it changes)
+        from substrata import annotations as sa
+        sa.update_annotation_csv_row(path, "1", {"label": "D"})
+        os.utime(path, (1, 1))
+        self.assertEqual(src.get(k1)["label"], "D")
 
 
 class TestTrainingHooks(unittest.TestCase):
@@ -229,6 +333,35 @@ class TestTrainingHooks(unittest.TestCase):
         self.assertEqual(got, {"m1_1": "A", "m1_2": "B", "m1_3": "B", "m1_4": "A"})
         self.assertEqual((n, n_conf), (4, 0))
         self.assertEqual(stats, Counter({"exclude": 1, "relabel": 1, "accept": 1}))
+
+    def test_collate_min_conf_applies_to_curated_confidences(self):
+        rows = self.rows
+        self.store.append(
+            [
+                # accepted at 0.25: now below --min_conf 0.5
+                {"key": cur.row_point_key(rows[2]), "action": "accept",
+                 "orig_label": "B", "label_conf": 0.25},
+                # relabelled with a high confidence: kept, with that label_conf
+                {"key": cur.row_point_key(rows[4]), "action": "relabel",
+                 "label": "A", "label_conf": 1.0},
+            ]
+        )
+        out = os.path.join(self.d, "training_annotations.csv")
+        n, _drop, n_conf = cl.collate_training_annotations(
+            [self.csv], "*_slope_intercepts.csv", {"A", "B"}, out, self.d,
+            prompt=False, min_conf=0.5, curation=self.store,
+        )
+        with open(out) as f:
+            got = {r["id"]: (r["label"], r["label_conf"]) for r in csv.DictReader(f)}
+        self.assertEqual(got, {"m1_1": ("A", ""), "m1_3": ("B", ""),
+                               "m1_4": ("A", "1.0")})
+        self.assertEqual((n, n_conf), (3, 1))
+        # without a threshold the confidence is only recorded
+        n, _drop, n_conf = cl.collate_training_annotations(
+            [self.csv], "*_slope_intercepts.csv", {"A", "B"}, out, self.d,
+            prompt=False, curation=self.store,
+        )
+        self.assertEqual((n, n_conf), (4, 0))
 
     def test_collate_keeps_gsd_and_domain(self):
         pool = os.path.join(self.d, "pool.csv")
@@ -467,6 +600,22 @@ class TestScoringAndPools(unittest.TestCase):
             [float(r["p_label"]) for r in rows],
             atol=2e-3,
         )
+
+    def test_score_with_a_class_the_classifier_never_saw(self):
+        # e.g. all points of a rare class ended up in the validation split
+        rows = cur.read_table(self.ann)
+        for r in rows[:4]:
+            r["label"] = "Tt"
+        with open(self.ann, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=settings.TRAIN_ANN_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        self.clf.label_map = dict(self.clf.label_map, Tt="T")
+        summary = cur.score_training_points(self.d, self.clf, progress=False, folds=3)
+        out = {r["id"]: r for r in cur.read_table(summary["table"])}
+        self.assertEqual(out["pt_0"]["cls"], "T")
+        self.assertTrue(0 <= float(out["pt_0"]["p_label"]) <= 1)
+        self.assertEqual(out["pt_0"]["ring_agree"], "")  # the classifier has no T
 
     def test_mine_pool(self):
         meta = cur.mine_pool(

@@ -162,8 +162,15 @@ class TestCropPaths(_TmpDirTest):
         im = _make_match(self.photo)
         self.assertEqual(
             im.crop_path(self.root),
-            os.path.join(self.root, "ann_0001", "site.auv", "IMG_0001.jpg"),
+            os.path.join(self.root, "ann_0001", "site.auv", "IMG_0001_200_150.jpg"),
         )
+
+    def test_find_crop_falls_back_to_name_without_pixel(self):
+        im = _make_match(self.photo)
+        older = os.path.join(self.root, "ann_0001", "site.auv", "IMG_0001.jpg")
+        os.makedirs(os.path.dirname(older))
+        Image.new("RGB", (10, 10)).save(older)
+        self.assertEqual(im.find_crop(self.root), older)
 
     def test_windows_style_photo_path(self):
         cam = cam_mod.Camera(cam_id=1, path=r"D:\photos\site.closeup\IMG_9.jpg")

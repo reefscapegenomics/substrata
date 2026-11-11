@@ -659,6 +659,43 @@ def load_classes(path: str) -> Tuple[Dict, Dict, List[str]]:
     return nodes, children, roots
 
 
+_FINGERPRINTS: Dict[Tuple[str, float, int], str] = {}
+
+
+def classifier_fingerprint(path: str) -> str:
+    """Which classifier made a prediction: ``<file stem>@<8 hex digits>``.
+
+    The digits are a hash of the file's contents (its label map included), so a
+    copied or moved classifier keeps its fingerprint and a retrained one gets a
+    new one. Stored next to predictions (``pred_model``) to tell current ones
+    from stale ones. Cached per file version (path, modification time, size).
+    """
+    path = os.path.abspath(path)
+    st = os.stat(path)
+    key = (path, st.st_mtime, st.st_size)
+    fp = _FINGERPRINTS.get(key)
+    if fp is None:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        fp = f"{os.path.splitext(os.path.basename(path))[0]}@{h.hexdigest()[:8]}"
+        _FINGERPRINTS[key] = fp
+    return fp
+
+
+def included_in_training(row: Dict[str, Any]) -> bool:
+    """Whether an annotation row's image match is used for training.
+
+    Reads ``settings.TRAIN_INCLUDE_COLUMN``: a missing column or an empty cell
+    counts as included; ``false``, ``0``, ``no`` (any case) exclude the row.
+    """
+    v = row.get(settings.TRAIN_INCLUDE_COLUMN)
+    if v is None:
+        return True
+    return str(v).strip().lower() not in ("false", "0", "no", "f", "n")
+
+
 def count_labels(
     files: List[str], class_codes: Optional[Set[str]], curation: Any = None,
 ) -> Tuple[Counter, Counter]:
@@ -670,6 +707,8 @@ def count_labels(
             collected separately as ``unknown``), or None to count every label.
         curation: Optional :class:`substrata.curation.CurationStore`; excluded
             points are not counted and relabelled ones count as their new label.
+            Rows not included in training (:func:`included_in_training`) are
+            not counted either.
 
     Returns:
         Tuple ``(counts, unknown)`` of Counters keyed by label/CPC code.
@@ -682,6 +721,8 @@ def count_labels(
             if settings.TRAIN_LABEL_COLUMN not in (reader.fieldnames or []):
                 continue
             for row in reader:
+                if not included_in_training(row):
+                    continue
                 if curation is not None:
                     row, _action = curation.apply(row)
                     if row is None:
@@ -1275,6 +1316,7 @@ def collate_training_annotations(
     output_path: str, model_path: str, prompt: bool = True,
     min_conf: Optional[float] = None, conf_strict: bool = False,
     curation: Any = None, curation_stats: Optional[Counter] = None,
+    skipped: Optional[Counter] = None,
 ) -> Tuple[int, int, int]:
     """Write a consolidated training annotations CSV.
 
@@ -1300,9 +1342,14 @@ def collate_training_annotations(
             ``min_conf`` > 0) instead of keeping it.
         curation: Optional :class:`substrata.curation.CurationStore` applied
             first (excluded points dropped, relabelled ones take their new
-            label); a curated label is kept whatever its ``label_conf``.
+            label); a curated label is kept whatever its ``label_conf``, unless
+            the decision has a confidence of its own (``min_conf`` then applies
+            to that).
         curation_stats: Optional Counter filled with the decisions applied
             (``exclude`` / ``relabel`` / ``accept``).
+        skipped: Optional Counter; ``not_in_training`` counts the rows left
+            out by ``settings.TRAIN_INCLUDE_COLUMN``
+            (:func:`included_in_training`).
 
     Returns:
         Tuple ``(n_written, n_dropped_missing_cam, n_dropped_low_conf)``.
@@ -1318,8 +1365,13 @@ def collate_training_annotations(
         with open(path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                action = None
+                if not included_in_training(row):
+                    if skipped is not None:
+                        skipped["not_in_training"] += 1
+                    continue
+                action = curated_conf = None
                 if curation is not None:
+                    curated_conf = curation.confidence(row)
                     row, action = curation.apply(row)
                     if curation_stats is not None and action:
                         curation_stats[action] += 1
@@ -1328,9 +1380,13 @@ def collate_training_annotations(
                 label = (row.get("label") or "").strip()
                 if label not in keep_labels:
                     continue
-                if min_conf is not None and action is None and not confidence_passes(
-                    row.get("label_conf"), min_conf, conf_strict
-                ):
+                # a curated label skips the threshold, unless the reviewer
+                # gave it a confidence
+                checked = min_conf is not None and (
+                    action is None or curated_conf is not None)
+                conf = (row.get("label_conf") if curated_conf is None
+                        else str(curated_conf))
+                if checked and not confidence_passes(conf, min_conf, conf_strict):
                     n_dropped_conf += 1
                     continue
                 cam_fp = (row.get("cam_filepath") or "").strip()
@@ -1450,6 +1506,7 @@ def link_image_dir(
 
 def convert_coralnet_csv(
     csv_path: str, image_index: Dict[str, Dict[str, str]], out_path: str,
+    include_column: bool = False,
 ) -> Dict[str, Any]:
     """Convert a CoralNet point export into a training annotations CSV.
 
@@ -1461,6 +1518,8 @@ def convert_coralnet_csv(
         csv_path: CoralNet annotations export.
         image_index: Output of :func:`index_image_dir`.
         out_path: Destination CSV (``settings.TRAIN_ANN_COLUMNS``).
+        include_column: Also write ``settings.TRAIN_INCLUDE_COLUMN`` (True for
+            every row), as an annotation set to edit from then on.
 
     Returns:
         Dict with ``folder`` (linked image folder), ``n_points``, ``n_written``,
@@ -1489,9 +1548,13 @@ def convert_coralnet_csv(
     blank = {col: "" for col in settings.TRAIN_ANN_COLUMNS}
     for axis in "xyz":
         blank[f"orig_{axis}"] = blank[f"world_{axis}"] = "nan"
+    columns = list(settings.TRAIN_ANN_COLUMNS)
+    if include_column:
+        columns.append(settings.TRAIN_INCLUDE_COLUMN)
+        blank[settings.TRAIN_INCLUDE_COLUMN] = "True"
     n_written = 0
     with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=settings.TRAIN_ANN_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         for i, row in enumerate(rows):
             name = (row.get("Name") or "").strip()

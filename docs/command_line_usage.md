@@ -167,7 +167,7 @@ substrata views --input pointcloud.ply --output_pdf views.pdf
 
 Calculate and apply scale and orientation transforms, then save to YAML. Also generates composite views and camera depth residuals PDFs.
 
-Usage: `substrata orient [--input PLY] [--use_chunk_transform [--north_up]] [--markers CSV] [--transform] [--manual]`
+Usage: `substrata orient [--input PLY] [--use_chunk_transform [--north_up]] [--markers CSV] [--transform] [--manual] [--slope]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -181,7 +181,12 @@ substrata orient --use_chunk_transform
 
 # Same, but keep the map north-up (+Y north) instead of +Y upslope
 substrata orient --use_chunk_transform --north_up
+
+# Orient, then align along the slope and save that frame
+substrata orient --slope
 ```
+
+With `--slope`, the oriented cloud is then aligned along its slope exactly as `substrata intercepts --slope` does (a plane is fitted to the terrain and rotated flat about its inlier centroid, then X is aligned with the footprint's principal axis), and the result is saved in the YAML `world_transform`. Z is then height above the slope plane rather than depth (`depth_in_m` still works, as it uses the original coordinates), and later `intercepts --slope` runs are close to a no-op. It runs after any other option, including `--transform`.
 
 With `--use_chunk_transform`, scale and orientation are taken from the `chunk_transform` stored in `<id>.meta.json` (written by `substrata metashape-export`) instead of being fitted to scalebars and camera depths. For a georeferenced chunk this transform maps to geocentric (ECEF) metres, so it is combined with a rotation into a local East-North-Up frame centred on the point cloud: +X east, +Y north, +Z ellipsoidal height (i.e. −depth when the camera references are depths). The cloud is then rotated about Z so +Y points upslope (shallow end at the top of top-down views, also for plots that are elongated downslope): of the plot footprint's long and short axes, the one closest to the fall line of a plane fitted to the terrain is aligned with +Y, so the plot edges stay parallel to X/Y (axis-aligned boxes fit snugly). The cloud is then shifted to positive X/Y; this rotation leaves scale and depth untouched. Add `--north_up` to skip the rotation and keep the georeferenced orientation (+X east, +Y north). The scale factor saved to the YAML is the uniform scale inside the chunk transform, and `up_vector`/`depth_offset`/`depth_per_unit` describe the same transform, so the depth residuals PDF still compares recorded and model depths. This option cannot be combined with `--manual` or `--markers`.
 
@@ -572,11 +577,21 @@ substrata thumbnails --size 1280 960 --overwrite
 
 ## Crops
 
-Save a crop centred on each image match of every annotation (up to `--max-photos` per annotation, best matches first). Crops belong to an annotations file, not to the model: they go in the set's `cropped_path` (from its sidecar), or next to the annotations CSV in `<annotations csv stem>.cropped/` by default. With `--annotations`, the given CSV's own sidecar applies, so e.g. `--annotations <id>.annos/<id>_slope_intercepts.csv` crops into `<id>_slope_intercepts.cropped/`. The layout is `<crops>/<ann_id>/<photo folder>/<filename>`, e.g. `<id>_ann.cropped/<id>_17/<id>.auv/G0012345.jpg`, so photos from `.photos`, `.auv` and `.closeup` folders never collide (see the layout in {doc}`projects`). Old crops stored as `<crops>/<ann_id>/<filename>` are still found and skipped.
+Save a crop centred on each image match of every annotation (up to `--max-photos` per annotation, best matches first). Crops belong to an annotations file, not to the model: they go in the set's `cropped_path` (from its sidecar), or next to the annotations CSV in `<annotations csv stem>.cropped/` by default. With `--annotations`, the given CSV's own sidecar applies, so e.g. `--annotations <id>.annos/<id>_slope_intercepts.csv` crops into `<id>_slope_intercepts.cropped/`. The layout is `<crops>/<ann_id>/<photo folder>/<photo stem>_<x>_<y>.jpg`, e.g. `<id>_ann.cropped/<id>_17/<id>.auv/G0012345_1520_988.jpg`, so photos from `.photos`, `.auv` and `.closeup` folders never collide (see the layout in {doc}`projects`), and the pixel tells whether a crop still shows the point (after the point moves, or the plot is aligned anew, its view lands elsewhere). Older crops named after the photo only (`<photo folder>/<photo file>`, or `<crops>/<ann_id>/<photo file>`) are still found and skipped.
 
-Matches whose crop would extend past the image edge are rejected, so every crop is centred on its annotation. With a point cloud, occluded matches are dropped and possibly obstructed ones are flagged in the crop's EXIF; `--no-ply` skips this for speed. Crops keep the photo's EXIF and are saved at JPEG quality 95.
+Matches whose crop would extend past the image edge are rejected, so every crop is centred on its annotation. Crops keep the photo's EXIF and are saved at JPEG quality 95.
 
-Usage: `substrata crops [--size W H] [--max-photos N] [--output DIR] [--overwrite] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+**Which views.** Cameras are grouped into camera types by sensor: the same resolution (either orientation) and a focal length within 3% (`CAMERA_TYPE_FOCAL_TOL`), whatever their folder. Two identical survey cameras, or one AUV camera across missions, are one type; a macro close-up camera or a GoPro is another. The set's main camera type is the one that sees most points best (the type of each sampled point's most relevant view; `--camera-type TYPE` to choose, `all` for every camera alike as before). Per annotation, `--max-photos` (default 5) views of the main type are cropped: unobstructed ones by relevance first, skipping views whose crop would run past the photo edge (so the training view always has a crop). Views are tested for occlusion in relevance order only until enough unobstructed ones are found. The crops are written by a pool of threads, each photo decoded once for all of its crops, while the next points' views are chosen (about 10 points/s on a 61 Mpx photo set). Other camera types are not cropped: review tools (substrata-explore) show more views, 10 of the main type and up to 3 of each other type (e.g. close-ups for identification), and cut the ones without a crop from the photo on the fly. `substrata predict` still combines up to 10 views of any camera.
+
+**Occlusion.** By default (`--occlusion auto`) the line of sight from each camera to the point is tested on the plot's stratified full-resolution PLY (`substrata stratify`; the same test substrata-explore uses): a view counts as obstructed when 3 or more subsample points lie on it (`OCCLUSION_BLOCKED_MIN`), and only the 40 most relevant views of a point are tested (`OCCLUSION_CHECK_VIEWS`). Nothing is dropped; obstructed views go last. Without a stratified PLY, `auto` falls back to the legacy test (`--occlusion cloud`): the YAML's point cloud is loaded and matches are dropped or flagged by reprojection error. `--occlusion none` (or `--no-ply`) skips the test. The obstruction flag is stored in the crop's EXIF.
+
+**Stale crops.** Before cropping, a point's stored crops that no longer show it are removed: a crop named `<photo stem>_<x>_<y>.jpg` whose photo, projected anew, no longer puts the point at that pixel (the point moved, or the plot was aligned anew). Crops that still show it are kept, chosen or not; older crops without the pixel in their name are left alone. The count is reported as `stale`.
+
+**Training views.** Each annotation's training view is its most relevant unobstructed view of the main camera type. It is written into the annotations CSV (`cam_filepath`, `cam_x`, `cam_y`, with `include_cam_in_training` = `True`) where `cam_filepath` is still empty; a view that is already set (e.g. the photo a manual annotation was made on) is kept. A CSV without `include_cam_in_training` gets the column, `True` for every row. The CSV is backed up first (`backup/`). Points whose tested views of the main type are all obstructed get no training view and are listed: they need a look. `--no-views` leaves the CSV alone.
+
+Other commands that use image matches with a point cloud (`substrata images`, benthic-fraction measurements, annotated videos) keep the legacy point-cloud test.
+
+Usage: `substrata crops [--size W H] [--max-photos N] [--output DIR] [--overwrite] [--occlusion auto|subsample|cloud|none] [--no-ply] [--camera-type TYPE|all] [--no-views] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
 # Default 800x800 crops (or the YAML crop_size), up to 10 photos per annotation
@@ -593,7 +608,9 @@ Predict a label for every annotation with a trained classifier (`substrata train
 - `weighted` (default): the mean of the class probabilities across crops, each crop weighted by its relevance (how close the camera is and how central the point is in the photo). Possibly obstructed crops are left out unless all crops are. A single overconfident crop cannot outvote several consistent ones.
 - `first`: the prediction for the best-ranked crop only.
 
-The combined prediction is written to the `pred_label`, `pred_conf` and `pred_n` (number of crops used) columns of the annotations CSV; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF, unless `--no-write-crops` is given.
+The combined prediction is written to the `pred_label`, `pred_conf`, `pred_n` (number of crops used), `pred_model` and `pred_agree` columns of the annotations CSV (only those columns change). `pred_agree` is the share of the crops used whose own prediction is the combined one: low when the views see different things, e.g. something in front of the point in some photos, so the point is worth a look through its views; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF (with `pred_model`), unless `--no-write-crops` is given.
+
+**Which classifier.** `pred_model` is the classifier's fingerprint, `<file stem>@<8 hex digits>` (e.g. `point_classifier@83d12e81`): the digits are a hash of the file's contents, label map included. A copied or moved classifier keeps its fingerprint; a retrained one gets a new one. So a stored prediction can be told apart from a stale one: substrata-explore marks predictions of an older version of a loaded classifier as stale and leaves them out of its prediction filters. `substrata predict` skips the annotations whose `pred_model` is already this classifier's (re-running after retraining redoes only the stale ones, and an interrupted run continues); `--redo` predicts them all. Predictions made before `pred_model` existed are treated as unknown.
 
 The classifier input is cut from the centre of the stored crop when that crop is at least `--size` (default: the crop size the classifier was trained on, as recorded by `substrata train`; 224x224 for older classifiers), giving the same pixels as cropping the photo but much faster, and without needing the photos. Otherwise it is cut from the photo.
 
@@ -601,7 +618,7 @@ A point-feature classifier (`point_classifier.pt`) is also accepted: it reads ea
 
 Do not run this while the same annotations file is open in reefcat, as both write the CSV.
 
-Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--batch-size N] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--redo] [--batch-size N] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
 # Classifier from the YAML; crops from `substrata crops`
@@ -885,6 +902,15 @@ exclusive. The confidence filter is applied while collating, and the number of
 annotations dropped below the threshold is reported alongside those dropped for
 missing camera fields.
 
+**Annotation CSVs from several folders.** `--sets FILE` takes the annotation CSVs from a text file, one path per line, instead of `PATTERN` in `--csv-path`: e.g. the sets of several plots, as substrata-explore's train tool writes it (`training_sets.txt` in the run folder).
+
+**Leaving image matches out of training.** An annotation row with
+`include_cam_in_training` = `False` (also `0` / `no`) is left out: its image
+match (`cam_filepath`, `cam_x`, `cam_y`) is not fit for training, e.g. the point
+is hidden behind something in that photo. A missing column or an empty cell
+counts as `True`. Left-out rows are not counted in the label list either, and
+the run reports how many there were.
+
 **Without a classes file.** `classes.csv` is only needed for the hierarchical
 (CATAMI) tree. When `--classes` is not given and there is no `classes.csv` in the
 CWD, the labels are listed as a flat table of counts instead and selected by
@@ -892,7 +918,16 @@ CWD, the labels are listed as a flat table of counts instead and selected by
 need the hierarchy and are unavailable. Use `--exclude-classes LABEL ...` (in
 either mode) to leave labels out entirely, so no crops are generated for them.
 
-**CoralNet point exports (image-only data).** With `--coralnet`, the matched
+**CoralNet point exports (image-only data).** To edit and train on a CoralNet
+export from then on, convert it once with `substrata import-coralnet EXPORT.csv
+[...] [--image-dir DIR] [--output CSV] [--overwrite]`: each export becomes
+`<export stem>_points.csv` next to it (`id`, `label`, `cam_filepath`, `cam_x` =
+`Column`, `cam_y` = `Row`, no 3-D position, `split_key` = image,
+`include_cam_in_training` = `True`). That CSV is the annotation set to relabel,
+include or exclude, and train on like any other (no `--coralnet`). An existing
+output is never overwritten without `--overwrite` (its edits would be lost).
+
+To train straight from the exports instead, use `--coralnet`: the matched
 CSVs (default pattern `*.csv`) are CoralNet exports with `Name`, `Row`,
 `Column` and `Label code` (or `Label`) columns: points on plain images, without
 point cloud or cameras. The images are searched (recursively) in `--image-dir`
@@ -956,7 +991,9 @@ tree, label map, `training_annotations.csv`) are as above; then:
 - *Curation.* Decisions recorded with `substrata curate` (`curation.jsonl` in
   the output folder) are applied while collating: excluded points are left out,
   relabelled points take their new label (also in the label tree counts), and
-  accepted points are kept whatever their `label_conf`. Points of the folder's
+  accepted points are kept whatever their `label_conf`. A decision made with a
+  confidence (keys 0-4 in the review grid) carries it as the point's
+  `label_conf`, and `--min_conf` then applies to it. Points of the folder's
   pools (`curate/pools/*.csv`) that were given a label join the training.
   `--curation JSONL` adds another folder's store (read-only; the folder's own
   decisions win), `--no-curation` ignores them all.
@@ -997,7 +1034,7 @@ inspect before training. After training, `--validate --pdf` or `--test --pdf`
 rebuilds the PDF from the existing crops and map without collating again, and then
 runs the evaluation.
 
-Usage: `substrata train [PATTERN] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes] [--curation JSONL ...] [--no-curation]`
+Usage: `substrata train [PATTERN | --sets FILE] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes] [--curation JSONL ...] [--no-curation]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, seed the map, and train a
@@ -1070,7 +1107,8 @@ point clouds.
 
 **Decisions** go to `curation.jsonl` in the folder, one JSON line per decision:
 `accept`, `relabel` (with the new label), `exclude` (with a reason: `mixed`,
-`misplaced`, `unclear`, `photo`, `other`) or `clear`. The file is append-only and
+`misplaced`, `unclear`, `photo`, `other`) or `clear`; an accept or relabel can
+carry the reviewer's confidence (`label_conf`, 0-1). The file is append-only and
 the latest line of a point wins. Points are keyed by the photo's file name and
 the rounded pixel (`IMG_1234.jpg|4021|2210`), not by row or id, so decisions
 survive regenerated training sets, other mixes of CSVs, renumbered ids and moved
@@ -1138,9 +1176,18 @@ hotkeys from `classes.csv`, and keys for accept / exclude / relabel / undo; see
 substrata-explore's documentation. Without it, `--sheets` writes contact sheets
 of the queues (`curate/review_sheets.pdf`; captions: id, label > predicted
 class, label probability), and `--import CSV` reads decisions from a CSV
-(`action`, `label`, `reason`, and the point as `key`, `cam_filepath` + `cam_x` +
-`cam_y`, or `id`). `--status` summarises the decisions, `--export CSV` writes
-them.
+(`action`, `label`, `label_conf`, `reason`, and the point as `key`,
+`cam_filepath`/`photo` + `cam_x`/`x` + `cam_y`/`y`, or `id`). `--status`
+summarises the decisions. `--export CSV` writes the outcome per point, no
+history (cleared points left out), sorted by photo and position: `photo`, `x`,
+`y`, `id`, `action`, `orig_label`, `label` (the new label of a relabel),
+`label_conf`, `reason`, `src` (training points or a pool), `time`, `by`, `key`.
+Filter it on `action` to find the relabels to carry over into the original
+annotation files; an edited copy reads back with `--import`. The review grid can also
+write relabels into the annotation files directly ("also edit the source
+annotations", off by default): `substrata train` records the files it read in
+`training_sources.json`, and only image-only points (CoralNet exports, or
+annotation CSVs without 3-D positions) are edited, after a backup of each file.
 
 Usage: `substrata curate [--folder DIR] [--model PT] [--annotations CSV] [{--mine IMAGES ... | --image-dir DIR | --points CSV [--image-dir DIR]} --name NAME [--gsd-mm MM] [--domain D] [--mine-images N] [--per-image/--n-points N] [--clusters K] [--seed N] [--resample]] [--status] [--export CSV] [--import CSV] [--sheets [--sheets-max N]] [--curation JSONL ...] [--batch-size N] [--jobs N] [--gui [GUI OPTIONS]]`
 

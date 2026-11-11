@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -41,6 +42,8 @@ __all__ = [
     "stratified_index_path",
     "is_stratified",
     "StratifiedPly",
+    "Occluder",
+    "ply_occluder",
     "stratify_ply",
     "stratify_space",
     "stratify_mode",
@@ -1244,3 +1247,183 @@ def _stratify_stream(src, *, h, grid, part, tmp_path, buffer_bytes, cluster_size
             os.remove(tmp_path)
     return dict(stats.result(), sum_xyz=sum_xyz, sum_rgb=sum_rgb, R=R, rc=rc,
                 starts=starts, header_len=len(header))
+
+
+# ---------------------------------------------------------------------------
+# Occlusion of image matches on the stratified subsample
+# ---------------------------------------------------------------------------
+#
+# A full-resolution cloud can hold billions of points, too many for an in-memory
+# ray test. Occluder tests the line of sight from a camera to a point against a
+# subsample of the stratified PLY (a few rounds per cluster, loaded on demand):
+# a view is blocked when enough subsample points lie on that segment
+# (settings.OCCLUSION_BLOCKED_MIN). Coordinates are in the plot's original
+# (model) frame, as the stratified PLY is. This is the default occlusion test for
+# choosing views (crops, training views, substrata-explore); the full point-cloud
+# reprojection test (ImageMatch.get_reprojection_error, pcd=) is unchanged.
+
+
+class Occluder:
+    """Approximate visibility of a point from a camera centre, tested on a
+    stratified PLY subsample."""
+
+    def __init__(
+        self, lp: StratifiedPly, points_per_cluster: int = 60_000,
+        cache_clusters: int = 600,
+    ):
+        self.lp = lp
+        idx = lp.index
+        cum = np.cumsum(idx.counts, axis=0)
+        # rounds to load per cluster: as many as fit in points_per_cluster
+        # (at least one)
+        self.rounds = np.maximum((cum <= points_per_cluster).sum(0), 1)
+        n = cum[self.rounds - 1, np.arange(idx.n_clusters)]
+        self.spacing = np.sqrt(np.maximum(idx.area, 1e-12) / np.maximum(n, 1))
+        self.lo, self.hi = idx.bbox_lo, idx.bbox_hi
+        self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._max = cache_clusters
+        self._lock = threading.Lock()
+
+    def _points(self, c: int) -> np.ndarray:
+        with self._lock:
+            if c in self._cache:
+                self._cache.move_to_end(c)
+                return self._cache[c]
+        pts = ply_xyz(self.lp.read_slices(c, 0, int(self.rounds[c])))
+        with self._lock:
+            self._cache[c] = pts
+            while len(self._cache) > self._max:
+                self._cache.popitem(last=False)
+        return pts
+
+    def _clusters_on_segment(self, eye, d, r):
+        """Clusters whose box (grown by r) the segment eye -> eye + d passes
+        through, nearest first."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv = 1.0 / d
+            t0 = (self.lo - r[:, None] - eye) * inv
+            t1 = (self.hi + r[:, None] - eye) * inv
+        tmin = np.nanmax(np.minimum(t0, t1), axis=1)
+        tmax = np.nanmin(np.maximum(t0, t1), axis=1)
+        hit = np.flatnonzero((tmax >= np.maximum(tmin, 0)) & (tmin <= 1))
+        order = np.argsort(tmin[hit])
+        return hit[order], np.maximum(tmin[hit][order], 0)
+
+    @staticmethod
+    def _surface_t(q: np.ndarray, u: np.ndarray, r, k: int = 3):
+        """Distance along ray u to the first surface: the k-th nearest point
+        within r of the ray."""
+        t = q @ u
+        near = (t > 0) & ((q * q).sum(1) - t * t < np.square(r))
+        ts = np.sort(t[near])
+        return ts[k - 1] if len(ts) >= k else None
+
+    def first_hit(
+        self, eye: np.ndarray, u: np.ndarray, max_dist: float,
+    ) -> np.ndarray | None:
+        """First cloud surface along the ray eye + t*u (u unit): coarse on the
+        subsample, then at full resolution around that spot. Returns the point
+        on the ray, or None if it hits nothing."""
+        r = 1.25 * self.spacing
+        best = None
+        for c, tmin in zip(*self._clusters_on_segment(eye, u * max_dist, r)):
+            if best is not None and tmin * max_dist > best + 4 * r[c]:
+                break  # every remaining cluster starts behind the surface found so far
+            t = self._surface_t(self._points(int(c)) - eye, u, r[c])
+            if t is not None and (best is None or t < best):
+                best = t
+        if best is None:
+            return None
+        coarse = eye + u * best
+        idx = self.lp.index
+        rf = 1.25 * np.sqrt(  # native spacing
+            np.maximum(idx.area, 1e-12) / np.maximum(idx.cluster_sizes, 1))
+        w = 4 * float(np.median(r))
+        pts = ply_xyz(self.lp.query_box(coarse - w, coarse + w))
+        cl = self.lp.clusters_in_box(coarse - w, coarse + w)
+        rad = float(np.median(rf[cl])) if len(cl) else w
+        fine = self._surface_t(pts - eye, u, rad) if len(pts) else None
+        return eye + u * (fine if fine is not None else best)
+
+    def distance(self, p: np.ndarray, r: float) -> float | None:
+        """Distance from p to the nearest subsample point, if one is within r
+        (else None)."""
+        p = np.asarray(p, float)
+        cl = np.flatnonzero(((self.lo - r <= p) & (p <= self.hi + r)).all(1))
+        best = None
+        for c in cl:
+            q = self._points(int(c)) - p
+            if not len(q):
+                continue
+            d = float(np.sqrt((q * q).sum(1).min()))
+            if d <= r and (best is None or d < best):
+                best = d
+        return best
+
+    def near_radius(self, p: np.ndarray, metres: float | None) -> float:
+        """How close (orig units) a point must be to count as on the cloud:
+        `metres` (None: no scale), but at least 10 local subsample spacings."""
+        p = np.asarray(p, float)
+        inside = np.flatnonzero(((self.lo <= p) & (p <= self.hi)).all(1))
+        sp = float(np.median(self.spacing[inside] if len(inside) else self.spacing))
+        return max(10 * sp, metres or 0.0)
+
+    def normal_at(self, p: np.ndarray) -> np.ndarray | None:
+        """Surface normal at p: smallest principal axis of the nearby subsample
+        points."""
+        p = np.asarray(p, float)
+        near = np.flatnonzero(((self.lo - 1e-9 <= p) & (p <= self.hi + 1e-9)).all(1))
+        if not len(near):
+            return None
+        w = 6 * float(np.median(self.spacing[near]))
+        cl = np.flatnonzero(((self.lo - w <= p) & (p <= self.hi + w)).all(1))
+        q = np.concatenate([self._points(int(c)) for c in cl]) - p
+        q = q[(q * q).sum(1) < w * w]
+        if len(q) < 8:
+            return None
+        q -= q.mean(0)
+        return np.linalg.eigh(q.T @ q)[1][:, 0]
+
+    def blockers(
+        self, eye: np.ndarray, p: np.ndarray, margin: float,
+        normal: np.ndarray | None = None,
+    ) -> int:
+        """Points of the subsample lying on the eye->p segment, ignoring
+        `margin` around p. With the surface `normal` at p, the ignored stretch
+        grows at grazing angles, where the line of sight
+        runs along p's own surface (within r of it for r / sin(angle))."""
+        d = p - eye
+        length = float(np.linalg.norm(d))
+        if length <= margin:
+            return 0
+        u = d / length
+        # a surface crossing the segment leaves ~5 points this close to it
+        r = 1.25 * self.spacing
+        if normal is not None:
+            near = np.flatnonzero(((self.lo <= p) & (p <= self.hi)).all(1))
+            rp = float(np.median(r[near])) if len(near) else float(np.median(r))
+            grazing = 1.5 * rp / max(abs(float(u @ normal)), 0.05)
+            margin = max(margin, min(grazing, 0.5 * length))
+        count = 0
+        for c in self._clusters_on_segment(eye, d, r)[0]:
+            q = self._points(int(c)) - eye
+            t = q @ u
+            m = (t > 0.02 * length) & (t < length - margin)
+            if not m.any():
+                continue
+            qm = q[m]
+            dist2 = (qm * qm).sum(1) - t[m] ** 2
+            count += int((dist2 < r[c] ** 2).sum())
+        return count
+
+    def line_of_sight_margin(self) -> float:
+        """Stretch around a point ignored by :meth:`blockers` (its own surface): a few
+        subsample spacings, at least 0.01 model units."""
+        return max(4 * float(np.median(self.spacing)), 0.01)
+
+
+def ply_occluder(ply_path: Optional[str]) -> Optional[Occluder]:
+    """An :class:`Occluder` on a stratified PLY (e.g. a plot's full-resolution
+    ``<id>.ply``, :attr:`ProjectInitializer.ply_full_path`), or None if it is
+    missing or not stratified."""
+    return Occluder(StratifiedPly(ply_path)) if is_stratified(ply_path) else None

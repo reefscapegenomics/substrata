@@ -1234,6 +1234,19 @@ def handle_orient(args):
         # Propagate updated world_transform to cameras/markers/annotations
         init.apply_world_transform(skip_pcd=True)
 
+    # Optionally align along slope (same as `intercepts --slope`), persisted
+    if getattr(args, "slope", False):
+        prev_transform = init.pcd.world_transform.copy()
+        _, slope_elev = init.pcd.apply_along_slope_transform()
+        print(f"Aligned along slope (elevation {slope_elev:.2f}°)")
+        # Propagate only the slope step (other objects already carry the rest)
+        slope_transform = init.pcd.world_transform @ np.linalg.inv(prev_transform)
+        for attr_name in ("cams", "markers", "annotations"):
+            obj = getattr(init, attr_name, None)
+            if obj is not None:
+                obj.transform_coords(slope_transform)
+        init.world_transform = init.pcd.world_transform
+
     if init.baseline_id:
         print(
             f"Warning: {init.id} inherits its frame from baseline "
@@ -3398,12 +3411,36 @@ def handle_crops(args):
 
     Saves crops centred on each annotation's image matches to the annotations'
     crops directory (``cropped_path`` or ``<annotations csv stem>.cropped``):
-    ``<crops>/<ann_id>/<photo folder>/<filename>``.
+    ``<crops>/<ann_id>/<photo folder>/<photo stem>_<x>_<y>.jpg``.
+
+    Views are chosen by :meth:`Annotation.select_views`: the main camera type
+    first (unobstructed by relevance, then obstructed), plus a few of each other
+    camera type. Occlusion is tested on the stratified PLY subsample when the
+    plot is stratified, else with the legacy point-cloud test. Each annotation's
+    training view (most relevant unobstructed view of the main type) is written
+    into the CSV where ``cam_filepath`` is empty (``--no-views``: not at all).
 
     Args:
         args: Arguments from argparse.
     """
-    init = _load_annotation_project(args, use_ply=not args.no_ply)
+    from substrata import annotations as annotations_mod
+    from substrata import cameras as cameras_mod
+    from substrata.stratified import ply_occluder
+
+    method = "none" if args.no_ply else args.occlusion
+    probe = occluder = None
+    if method in ("auto", "subsample"):
+        probe = _load_annotation_project(args, use_ply=False)
+        occluder = ply_occluder(probe.ply_full_path)
+        if occluder is None and method == "subsample":
+            raise SystemExit(
+                "No stratified full-resolution PLY: run `substrata stratify` "
+                "first, or use --occlusion cloud.")
+        method = "subsample" if occluder is not None else "cloud"
+    init = (probe if probe is not None and method != "cloud"
+            else _load_annotation_project(args, use_ply=method == "cloud"))
+    if method == "cloud" and init.pcd is None:
+        method = "none"
     anns = init.annotations
     root = args.output or anns.crops_root
     crop_size = _size_arg(
@@ -3411,17 +3448,44 @@ def handle_crops(args):
         (init.crop_size, init.crop_size) if init.crop_size
         else settings.CROP_SIZE_DEFAULT,
     )
+    types = cameras_mod.assign_camera_types(init.cams)
+    if args.camera_type == "all":
+        main_type = None
+    elif args.camera_type:
+        if args.camera_type not in types:
+            raise SystemExit(f"No camera type {args.camera_type!r}; types: {types}")
+        main_type = args.camera_type
+    else:
+        main_type = anns.main_camera_type(init.cams)
+    print(
+        f"Occlusion test: {method}. Camera types: {', '.join(types)}; views from "
+        f"{main_type or 'all cameras'}.")
     print(f"Saving {crop_size[0]}x{crop_size[1]} crops to {root}")
     counts = anns.save_crops(
         init.cams,
         root=root,
         crop_size=crop_size,
         max_cams=args.max_photos,
-        pcd=init.pcd,
+        pcd=init.pcd if method == "cloud" else None,
         overwrite=args.overwrite,
         n_jobs=args.jobs,
+        occluder=occluder,
+        main_type=main_type,
+        prune=True,
     )
     _print_status_counts("Crops", counts, root)
+    if args.no_views or not init.annotations_filepath:
+        return
+    views, review = annotations_mod.training_views(anns.data.values())
+    csv_path = init.annotations_filepath
+    annotations_mod.backup_annotation_csv(csv_path)
+    n = annotations_mod.set_training_views(csv_path, views)
+    print(
+        f"Training views: {n} written into {os.path.basename(csv_path)} (empty "
+        f"cam_filepath only; others kept). {len(review)} point(s) have no "
+        "unobstructed view of the main camera type and need a look"
+        + (f": {', '.join(review[:10])}{' ...' if len(review) > 10 else ''}"
+           if review else "") + ".")
 
 
 def _backup_file(path):
@@ -3435,6 +3499,45 @@ def _backup_file(path):
     backup = os.path.join(backup_dir, f"{os.path.basename(path)}_{timestamp}.bak")
     shutil.copy(path, backup)
     return backup
+
+
+def handle_import_coralnet(args):
+    """Convert CoralNet point exports into substrata annotation CSVs (image-only).
+
+    Each export becomes ``<export stem>_points.csv`` next to it (or ``--output``
+    for a single export): ``id``, ``label``, ``cam_filepath`` / ``cam_x`` /
+    ``cam_y``, no 3-D position, ``split_key`` = the image and
+    ``include_cam_in_training`` = True. That CSV is the annotation set from then
+    on (relabel and include/exclude it; train on it without ``--coralnet``); an
+    existing one is never overwritten without ``--overwrite``.
+    """
+    from substrata import classification
+
+    exports = [os.path.abspath(p) for p in args.exports]
+    if args.output and len(exports) > 1:
+        raise SystemExit("--output needs a single export.")
+    for path in exports:
+        if not os.path.isfile(path):
+            raise SystemExit(f"No such file: {path}")
+        if not _is_coralnet_csv(path):
+            raise SystemExit(f"{path} is not a CoralNet export (Name, Row, Column).")
+    for path in exports:
+        out = (os.path.abspath(args.output) if args.output
+               else f"{os.path.splitext(path)[0]}_points.csv")
+        if os.path.exists(out) and not args.overwrite:
+            print(f"Skipped {os.path.basename(path)}: {out} exists (--overwrite "
+                  "replaces it, losing the edits made to it).")
+            continue
+        image_dir = args.image_dir or os.path.dirname(path)
+        info = classification.convert_coralnet_csv(
+            path, classification.index_image_dir(image_dir), out,
+            include_column=True)
+        print(
+            f"{os.path.basename(path)} -> {out}: {info['n_written']} of "
+            f"{info['n_points']} points; images {info['n_images_found']}/"
+            f"{info['n_images']} found in {info['folder']}"
+            + (f" ({info['n_missing']} points on missing images dropped)"
+               if info["n_missing"] else ""))
 
 
 def _is_coralnet_csv(path):
@@ -3586,6 +3689,7 @@ def _predict_images(args):
                 print(f"Resampling; old points backed up to {backup}")
             anns = _sample(all_cams)
 
+    model = classification.classifier_fingerprint(args.classifier)  # (pred_model)
     if not pointfeatures.is_point_classifier(learn) and (args.gsd_mm or args.domain):
         raise SystemExit("--gsd-mm and --domain apply to point classifiers (.pt).")
     try:
@@ -3600,6 +3704,7 @@ def _predict_images(args):
             anns[ann_id].pred_label = res["label"]
             anns[ann_id].pred_conf = round(res["confidence"], 4)
             anns[ann_id].pred_n = 1
+            anns[ann_id].pred_model = model
     predicted = sum(1 for res in results.values() if res is not None)
     print(f"Predicted {predicted} of {len(results)} points.")
 
@@ -3643,6 +3748,15 @@ def handle_predict(args):
     crop_size = _classifier_crop_size(
         args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT
     )
+    # which classifier: stored with each prediction (pred_model); the points it
+    # already predicted are skipped unless --redo
+    model = classification.classifier_fingerprint(classifier_path)
+    ids = [a.id for a in anns.data.values()
+           if args.redo or getattr(a, "pred_model", None) != model]
+    skipped = len(anns.data) - len(ids)
+    print(f"Classifier {model}"
+          + (f"; {skipped} annotation(s) already predicted by it are skipped "
+             "(--redo: all)" if skipped else ""))
     consensus = anns.predict(
         init.cams,
         learn,
@@ -3650,17 +3764,27 @@ def handle_predict(args):
         max_cams=args.max_photos,
         pcd=init.pcd,
         root=root,
+        ids=ids,
         write_crops=not args.no_write_crops,
         method=args.method,
         batch_size=args.batch_size,
         n_jobs=args.jobs,
+        model=model,
     )
     predicted = sum(1 for c in consensus.values() if c)
     print(f"Predicted {predicted} of {len(consensus)} annotations ({args.method}).")
+    if not consensus:
+        return
+
+    # only the prediction columns change: every other column (include_cam_in_training, intercept fields,
+    # match links, ...) stays as it is
+    from substrata.annotations import set_predictions
 
     csv_path = init.annotations_filepath
     backup = _backup_file(csv_path)
-    anns.save(csv_path)
+    set_predictions(csv_path, {
+        i: (c["label"], c["confidence"], c["n"], model, anns.data[i].pred_agree) if c else None
+        for i, c in consensus.items()})
     print(f"Saved predictions to {csv_path} (backup: {backup})")
 
 
@@ -4454,15 +4578,27 @@ def handle_train(args):
         settings.TRAIN_ANNOTATIONS_FILE,
         settings.TRAIN_LABEL_MAP_FILE,
     }
-    csv_files = sorted(
-        f
-        for f in glob.glob(os.path.join(csv_path, pattern))
-        if os.path.basename(f) not in own_outputs
-    )
+    if getattr(args, "sets", None):  # an explicit list (e.g. from substrata-explore), any folders
+        with open(args.sets) as f:
+            csv_files = [os.path.abspath(ln.strip()) for ln in f if ln.strip() and not ln.startswith("#")]
+        missing = [p for p in csv_files if not os.path.isfile(p)]
+        if missing:
+            raise SystemExit(f"Annotation CSV(s) of {args.sets} not found: {', '.join(missing[:5])}")
+    else:
+        csv_files = sorted(
+            f
+            for f in glob.glob(os.path.join(csv_path, pattern))
+            if os.path.basename(f) not in own_outputs
+        )
     if not csv_files:
         raise SystemExit(
             f"No annotation CSVs match {pattern!r} in {csv_path}."
         )
+
+    # the annotation files read (substrata-curate can edit their labels)
+    from substrata import curation as _cur
+    _cur.write_training_sources(
+        output_dir, csv_files, "coralnet" if coralnet else "annotations")
 
     # --- Step 0 (--coralnet): convert point exports into standard CSVs ---
     if coralnet:
@@ -4594,14 +4730,21 @@ def handle_train(args):
         conf_is_strict = False
     ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
     curation_applied = Counter()
+    skipped = Counter()
     n_written, n_dropped, n_dropped_conf = (
         classification.collate_training_annotations(
             csv_files, pattern, visible_labels, ann_path, model_path,
             prompt=(interactive and not assume_yes),
             min_conf=min_conf, conf_strict=conf_is_strict,
             curation=curation_store, curation_stats=curation_applied,
+            skipped=skipped,
         )
     )
+    if skipped["not_in_training"]:
+        print(
+            f"Left out {skipped['not_in_training']} annotation(s) with "
+            f"{settings.TRAIN_INCLUDE_COLUMN} = False."
+        )
     if curation_store is not None:
         print(
             "Curation applied: "
@@ -5584,6 +5727,15 @@ def main():
         help="Optional markers CSV filepath to use for up vector calculation.",
     )
     p_orient.add_argument(
+        "--slope",
+        dest="slope",
+        action="store_true",
+        help=(
+            "After orienting, align the cloud along its slope (as "
+            "`intercepts --slope`) and save that in the world_transform."
+        ),
+    )
+    p_orient.add_argument(
         "--local",
         dest="local",
         action="store_true",
@@ -6419,8 +6571,9 @@ def main():
     p_crops.add_argument(
         "--max-photos", dest="max_photos", type=int,
         default=settings.MAX_PHOTOS_TO_CROP_DEFAULT,
-        help="Maximum image matches cropped per annotation. "
-             f"Default: {settings.MAX_PHOTOS_TO_CROP_DEFAULT}.",
+        help="Views of the main camera type cropped per annotation (the training "
+             "view first; other camera types are not cropped: review tools cut "
+             f"them on the fly). Default: {settings.MAX_PHOTOS_TO_CROP_DEFAULT}.",
     )
     p_crops.add_argument(
         "--output", dest="output", type=str, default=None,
@@ -6432,9 +6585,51 @@ def main():
     )
     p_crops.add_argument(
         "--no-ply", dest="no_ply", action="store_true",
-        help="Skip loading the point cloud (faster, but no occlusion filtering).",
+        help="No occlusion test (same as --occlusion none).",
+    )
+    p_crops.add_argument(
+        "--occlusion", dest="occlusion", default="auto",
+        choices=["auto", "subsample", "cloud", "none"],
+        help="Occlusion test for choosing views: 'subsample' tests the line of "
+             "sight on the stratified full-resolution PLY (needs `substrata "
+             "stratify`); 'cloud' is the legacy reprojection test on the "
+             "YAML's point cloud (loaded into memory); 'auto' (default): "
+             "subsample if the plot is stratified, else cloud.",
+    )
+    p_crops.add_argument(
+        "--camera-type", dest="camera_type", default=None, metavar="TYPE",
+        help="Main camera type to choose views from (as printed, e.g. "
+             "'9568x6376 f6460'). Default: the type that sees most points best; "
+             "'all' uses every camera alike (legacy).",
+    )
+    p_crops.add_argument(
+        "--no-views", dest="no_views", action="store_true",
+        help="Do not write training views into the annotations CSV.",
     )
     _add_annotation_project_args(p_crops)
+
+    # import-coralnet
+    p_icn = subparsers.add_parser(
+        "import-coralnet",
+        help="Convert CoralNet point exports into substrata annotation CSVs "
+             "(image-only), to edit and train on from then on.",
+    )
+    p_icn.add_argument("exports", nargs="+", help="CoralNet export CSV(s).")
+    p_icn.add_argument(
+        "--image-dir", dest="image_dir", default=None,
+        help="Directory holding the images, directly or in subfolders (searched "
+             "recursively; each export is linked to the subfolder holding most "
+             "of its images). Default: the export's folder.",
+    )
+    p_icn.add_argument(
+        "--output", dest="output", default=None,
+        help="Output CSV (single export only). Default: <export stem>_points.csv "
+             "next to the export.",
+    )
+    p_icn.add_argument(
+        "--overwrite", dest="overwrite", action="store_true",
+        help="Replace an existing output CSV (its edits are lost).",
+    )
 
     # predict
     p_predict = subparsers.add_parser(
@@ -6454,9 +6649,9 @@ def main():
     )
     p_predict.add_argument(
         "--max-photos", dest="max_photos", type=int,
-        default=settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        default=settings.MAX_PHOTOS_TO_PREDICT_DEFAULT,
         help="Maximum image matches used per annotation. "
-             f"Default: {settings.MAX_PHOTOS_TO_CROP_DEFAULT}.",
+             f"Default: {settings.MAX_PHOTOS_TO_PREDICT_DEFAULT}.",
     )
     p_predict.add_argument(
         "--method", dest="method", choices=["weighted", "first"],
@@ -6471,6 +6666,11 @@ def main():
     p_predict.add_argument(
         "--no-write-crops", dest="no_write_crops", action="store_true",
         help="Do not store each crop's own prediction in its EXIF.",
+    )
+    p_predict.add_argument(
+        "--redo", dest="redo", action="store_true",
+        help="Predict every annotation again, also those whose stored prediction "
+             "(pred_model) is already from this classifier.",
     )
     p_predict.add_argument(
         "--batch-size", dest="batch_size", type=int, default=64,
@@ -7227,6 +7427,11 @@ def main():
         ),
     )
     p_train.add_argument(
+        "--sets", dest="sets", type=str, default=None, metavar="FILE",
+        help="A text file listing the annotation CSVs to train on, one path per "
+             "line (any folders; instead of PATTERN / --csv-path).",
+    )
+    p_train.add_argument(
         "--label-map",
         dest="label_map",
         type=str,
@@ -7607,7 +7812,7 @@ def main():
     )
     p_cur.add_argument(
         "--export", default=None, metavar="CSV",
-        help="Write the current decisions as CSV.",
+        help="Write each point's current decision as CSV (no history), by photo.",
     )
     p_cur.add_argument(
         "--import", dest="import_csv", default=None, metavar="CSV",
@@ -7657,6 +7862,7 @@ def main():
         "images": handle_images,
         "thumbnails": handle_thumbnails,
         "crops": handle_crops,
+        "import-coralnet": handle_import_coralnet,
         "predict": handle_predict,
         "match-annotations": handle_match_annotations,
         "camsync": handle_camsync,

@@ -88,14 +88,16 @@ default annotations file is whatever the YAML's `annotations:` key names, e.g.
 `annotations: cur_sna_20m_20200303.annos/cur_sna_20m_20200303_ann.csv`.
 
 **Crops** (`substrata crops`) are stored per point and per photo:
-`<crops>/<point id>/<photo folder>/<photo filename>`. A point seen in several photos
-gets several crops, best matches first, up to `--max-photos`. Each one keeps the name
-of the photo it was cut from, and sits under the name of that photo's folder
+`<crops>/<point id>/<photo folder>/<photo stem>_<x>_<y>.jpg`. A point seen in several
+photos gets several crops (see `substrata crops` for which). Each one is named after the
+photo it was cut from and the point's pixel in it (so a crop of a point that has since
+moved no longer matches its view), and sits under the name of that photo's folder
 (`<id>.photos`, `<id>.auv`, `<id>.closeup`, …). This way, two photo groups whose
 cameras both produce an `IMG_0001.jpg` never overwrite each other's crops. Thumbnails
 mirror the photo folders the same way. A crop's EXIF records, for example, whether the point
-may be hidden in that photo, plus any prediction (see `read_crop_metadata`). Crops from the older layout,
-`<crops>/<point id>/<photo filename>`, are still found and are not cropped again. The
+may be hidden in that photo, plus any prediction (see `read_crop_metadata`). Crops with the older names,
+`<photo folder>/<photo filename>` or `<crops>/<point id>/<photo filename>`, are still
+found and are not cropped again. The
 crops folder defaults to `<csv stem>.cropped/` next to the CSV; to keep crops
 elsewhere (for example a folder shared with reefview), set `cropped_path` in the
 set's sidecar.

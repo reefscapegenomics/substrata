@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+from collections import Counter
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -67,6 +68,8 @@ class Annotations:
         ("pred_label", ["pred_label"], False),
         ("pred_conf", ["pred_conf"], False),
         ("pred_n", ["pred_n"], False),
+        ("pred_model", ["pred_model"], False),
+        ("pred_agree", ["pred_agree"], False),
     ]
 
     def __init__(
@@ -888,15 +891,34 @@ class Annotations:
         first = [self.data[i] for i in priority if i in selected]
         return first + [ann for ann in anns if ann.id not in priority_set]
 
+    def main_camera_type(
+        self, cams: Any, sample: int = settings.MAIN_CAMERA_TYPE_SAMPLE,
+    ) -> Optional[str]:
+        """The camera type that sees most of these annotations best
+        (:func:`main_camera_type`)."""
+        return main_camera_type(list(self.data.values()), cams, sample)
+
     def _collect_image_matches(
         self, anns: List["Annotation"], cams: Any, max_cams: Optional[int],
-        pcd: Optional[Any],
+        pcd: Optional[Any], occluder: Optional[Any] = None,
+        main_type: Optional[str] = None,
+        per_other_type: int = settings.VIEWS_PER_OTHER_TYPE,
+        clear_of_edge: Optional[Any] = None,
+        progress: bool = True,
     ) -> List[Tuple["Annotation", List[Any]]]:
-        """Image matches per annotation (sequential; occlusion checks use pcd)."""
+        """The views of each annotation (:meth:`Annotation.select_views`, which
+        also sets its ``training_view``), sequentially. With ``clear_of_edge``
+        (a crop size), views whose crop would run past the photo edge are
+        skipped in favour of the next ones (crops of those are refused)."""
         groups = []
-        for ann in tqdm(anns, desc="Finding image matches"):
+        for ann in (tqdm(anns, desc="Finding image matches") if progress else anns):
             try:
-                groups.append((ann, ann._matches_for_crops(cams, max_cams, pcd)))
+                views, _training = ann.select_views(
+                    cams, occluder=occluder, pcd=pcd, main_type=main_type,
+                    max_views=max_cams, per_other_type=per_other_type,
+                    clear_of_edge=clear_of_edge,
+                )
+                groups.append((ann, views))
             except Exception as e:  # noqa: BLE001 - skip, keep going
                 logger.warning("Image matching failed for %s: %s", ann.id, e)
         return groups
@@ -912,11 +934,18 @@ class Annotations:
         priority_ids: Optional[Iterable[str]] = None,
         overwrite: bool = False,
         n_jobs: int = -1,
+        occluder: Optional[Any] = None,
+        main_type: Optional[str] = None,
+        prune: bool = False,
+        per_other_type: int = settings.CROPS_PER_OTHER_TYPE,
+        on_progress: Optional[Callable[[int], None]] = None,
+        chunk: int = 100,
     ) -> Dict[str, int]:
         """Save crops for many annotations (see :meth:`Annotation.save_crops`).
 
-        Image matches are found per annotation, then all crops are written in
-        one pool of threads (photo decoding releases the GIL).
+        Views are chosen per annotation and the crops written by a pool of
+        threads, each photo decoded once for all of its crops (decoding releases
+        the GIL), chunk by chunk so that both run at the same time.
 
         Args:
             cams: Cameras to match against.
@@ -928,30 +957,85 @@ class Annotations:
             priority_ids: Annotation ids to process first (e.g. those in view).
             overwrite: Replace existing crops.
             n_jobs: Threads for writing crops (-1 = all cores, 1 = sequential).
+            occluder: Stratified-subsample occlusion test; with it (or with
+                ``main_type``) the views are chosen by
+                :meth:`Annotation.select_views`, which also sets each
+                annotation's ``training_view``.
+            main_type: The main camera type (:meth:`main_camera_type`).
+            prune: First delete each annotation's stale crops
+                (:meth:`Annotation.stale_crops`); counted as ``stale``.
+            per_other_type: Views cropped of each other camera type (with
+                ``main_type``; default none: review tools cut them on the fly).
+            on_progress: Called with the number of annotations done so far.
+            chunk: Annotations per chunk (views chosen while the previous
+                chunk's crops are written).
 
         Returns:
             Number of crops per status (``generated``, ``skipped``, ``rejected``,
-            ``failed``).
+            ``failed``; ``stale`` with ``prune``).
         """
         root = root if root is not None else self.crops_root
         if root is None:
             raise ValueError("No crops directory: pass root= or set crops_root.")
-        groups = self._collect_image_matches(
-            self._ordered(ids, priority_ids), cams, max_cams, pcd
-        )
-        matches = [im for _ann, ims in groups for im in ims]
-        with tqdm_joblib(tqdm(total=len(matches), desc="Saving crops")):
-            statuses = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(im.save_crop)(root, crop_size, overwrite) for im in matches
-            )
-        return cameras._count_statuses(statuses)
+        from concurrent.futures import ThreadPoolExecutor
+
+        anns = self._ordered(ids, priority_ids)
+        workers = n_jobs if n_jobs and n_jobs > 0 else min(16, os.cpu_count() or 4)
+        statuses: List[str] = []
+        n_stale = done = 0
+        bar = tqdm(total=len(anns), desc="Cropping (points)")
+        # In chunks: the views of the next chunk are chosen (sequential, Python)
+        # while the crops of the previous one are written by the threads (photo
+        # decoding and JPEG encoding run outside the GIL); each photo of a chunk
+        # is decoded once for all of its crops.
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            pending: List[Tuple[int, List[Any]]] = []
+            for start in range(0, len(anns), chunk):
+                part = anns[start:start + chunk]
+                groups = self._collect_image_matches(
+                    part, cams, max_cams, pcd, occluder=occluder, main_type=main_type,
+                    per_other_type=per_other_type, clear_of_edge=crop_size,
+                    progress=False,
+                )
+                if prune:
+                    for ann, _ims in groups:
+                        for path in ann.stale_crops(cams, root):
+                            os.remove(path)
+                            n_stale += 1
+                by_photo: Dict[str, List[Any]] = {}
+                for _ann, ims in groups:
+                    for im in ims:
+                        by_photo.setdefault(im.cam.filepath, []).append(im)
+                futures = [ex.submit(cameras.save_photo_crops, ims, root, crop_size, overwrite)
+                           for ims in by_photo.values()]
+                pending.append((len(part), futures))
+                while len(pending) > 1:  # one chunk ahead
+                    n, fs = pending.pop(0)
+                    for f in fs:
+                        statuses.extend(f.result())
+                    done += n
+                    bar.update(n)
+                    if on_progress:
+                        on_progress(done)
+            for n, fs in pending:
+                for f in fs:
+                    statuses.extend(f.result())
+                done += n
+                bar.update(n)
+                if on_progress:
+                    on_progress(done)
+        bar.close()
+        counts = cameras._count_statuses(statuses)
+        if prune:
+            counts["stale"] = n_stale
+        return counts
 
     def predict(
         self,
         cams: Any,
         classifier: Any,
         crop_size: Union[int, Tuple[int, int]] = settings.PREDICTION_CROP_SIZE_DEFAULT,
-        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_PREDICT_DEFAULT,
         pcd: Optional[Any] = None,
         root: Optional[str] = None,
         ids: Optional[Iterable[str]] = None,
@@ -959,6 +1043,7 @@ class Annotations:
         method: str = settings.PREDICTION_AGGREGATION,
         batch_size: int = 64,
         n_jobs: int = -1,
+        model: Optional[str] = None,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Predict labels for many annotations (see :meth:`Annotation.predict`).
 
@@ -980,6 +1065,10 @@ class Annotations:
                 :func:`classification.aggregate_predictions`).
             batch_size: Inference batch size.
             n_jobs: Threads for loading crops (-1 = all cores).
+            model: The classifier's fingerprint
+                (:func:`classification.classifier_fingerprint`), stored as
+                ``pred_model`` with each prediction; default: of ``classifier``
+                when it is a path.
 
         Returns:
             Mapping of annotation id to its consensus prediction
@@ -987,6 +1076,8 @@ class Annotations:
         """
         from substrata import classification
 
+        if model is None and isinstance(classifier, str):
+            model = classification.classifier_fingerprint(classifier)
         root = root if root is not None else self.crops_root
         groups = self._collect_image_matches(
             self._ordered(ids), cams, max_cams, pcd
@@ -1001,7 +1092,7 @@ class Annotations:
         for ann, ims in groups:
             end = start + len(ims)
             consensus[ann.id] = ann._apply_predictions(
-                ims, results[start:end], root, write_crops, method
+                ims, results[start:end], root, write_crops, method, model
             )
             start = end
         return consensus
@@ -1824,7 +1915,7 @@ class Annotations:
             getattr(ann, "pred_label", None) is not None for ann in self.data.values()
         )
         if with_preds:
-            col_headers.extend(["pred_label", "pred_conf", "pred_n"])
+            col_headers.extend(list(PREDICTION_COLUMNS))
         # Header - specific to InterceptAnnotation instances
         first_annotation = next(iter(self.data.values()), None)
         if isinstance(first_annotation, InterceptAnnotation):
@@ -1888,7 +1979,7 @@ class Annotations:
             depth_sensor_m = getattr(ann, "depth_sensor_m", None)
             row.append(depth_sensor_m if depth_sensor_m is not None else "")
             if with_preds:
-                for name in ("pred_label", "pred_conf", "pred_n"):
+                for name in PREDICTION_COLUMNS:
                     value = getattr(ann, name, None)
                     row.append(value if value is not None else "")
 
@@ -2029,6 +2120,9 @@ class Annotations:
         ann.pred_conf = float(pred_conf) if pred_conf is not None else None
         pred_n = get_value("pred_n")
         ann.pred_n = int(float(pred_n)) if pred_n is not None else None
+        ann.pred_model = get_value("pred_model")
+        pred_agree = get_value("pred_agree")
+        ann.pred_agree = float(pred_agree) if pred_agree is not None else None
 
     @staticmethod
     def __strip_post_fixes(ann_id: str) -> str:
@@ -2075,6 +2169,11 @@ class Annotation:
         self.pred_label: Optional[str] = None
         self.pred_conf: Optional[float] = None
         self.pred_n: Optional[int] = None
+        # which classifier made it (classification.classifier_fingerprint)
+        self.pred_model: Optional[str] = None
+        # the share of the views used whose own prediction is the consensus (low:
+        # the views see different things, e.g. something in front of the point)
+        self.pred_agree: Optional[float] = None
 
     @property
     def depth_in_m(self) -> float:
@@ -2320,8 +2419,18 @@ class Annotation:
         reprojection_threshold_discard: float = settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
         enabled_cameras_only: bool = True,
         debug: bool = False,
+        occluder: Optional[Any] = None,
+        blocked_min: int = settings.OCCLUSION_BLOCKED_MIN,
+        occlusion_check: int = settings.OCCLUSION_CHECK_VIEWS,
     ) -> List[Any]:
         """Get all cameras where the annotation is in view.
+
+        Occlusion: with ``pcd``, the reprojection test drops or flags matches
+        (unchanged). With ``occluder`` (a :class:`substrata.stratified.Occluder`)
+        instead, nothing is dropped: the ``occlusion_check`` most relevant
+        matches are tested on the stratified subsample (``m.blockers``, the
+        points on the line of sight) and flagged ``potentially_obstructed`` from
+        ``blocked_min`` on; untested ones keep ``blockers`` None.
 
         Args:
             cams: List of camera objects.
@@ -2333,6 +2442,10 @@ class Annotation:
             reprojection_threshold_discard: Threshold for discarding matches.
             enabled_cameras_only: Whether to only use enabled cameras.
             debug: Whether to print debug information.
+            occluder: Optional stratified-subsample occlusion test (see above);
+                ignored when ``pcd`` is given.
+            blocked_min: Subsample points on the line of sight that flag a match.
+            occlusion_check: How many of the most relevant matches are tested.
 
         Returns:
             List of image match objects.
@@ -2397,9 +2510,17 @@ class Annotation:
                     # If no pcd provided: add image_match regardless
                     image_matches.append(image_match)
 
+        if pcd is None and occluder is not None and image_matches:
+            self._flag_occluded(image_matches, occluder, blocked_min, occlusion_check)
+
         # If ImageMatches found, sort by relevance and obstruction
         if len(image_matches) > 0:
-            if pcd is not None:
+            if pcd is None and occluder is not None:
+                image_matches = sorted(
+                    image_matches,
+                    key=lambda x: (x.potentially_obstructed is True, x.relevance),
+                )
+            elif pcd is not None:
                 image_matches = sorted(
                     image_matches, key=lambda x: (x.potentially_obstructed, x.relevance)
                 )
@@ -2419,6 +2540,26 @@ class Annotation:
         self.image_matches = []
         self.image_match = None
         return []
+
+    def _flag_occluded(
+        self, image_matches: List[Any], occluder: Any, blocked_min: int,
+        occlusion_check: int, wants: Optional[Callable[[Any], bool]] = None,
+    ) -> None:
+        """Set ``blockers`` / ``potentially_obstructed`` on the most relevant
+        matches, tested on the stratified subsample (original frame). With
+        ``wants``, a match is only tested while ``wants(m)`` is true (asked in
+        relevance order, after the more relevant ones were tested); the others
+        keep ``blockers`` None."""
+        p = np.asarray(self.orig_coords, float)
+        normal = occluder.normal_at(p) if image_matches else None
+        margin = occluder.line_of_sight_margin()
+        for k, m in enumerate(sorted(image_matches, key=lambda x: x.relevance)):
+            if k >= occlusion_check or (wants is not None and not wants(m)):
+                m.blockers, m.potentially_obstructed = None, None
+                continue
+            T = np.asarray(m.cam.orig_camera_transform, float).reshape(4, 4)
+            m.blockers = occluder.blockers(T[:3, 3], p, margin, normal)
+            m.potentially_obstructed = m.blockers >= blocked_min
 
     def get_first_image_match(
         self,
@@ -2456,14 +2597,112 @@ class Annotation:
         else:
             return None
 
+    def select_views(
+        self,
+        cams: Any,
+        occluder: Optional[Any] = None,
+        pcd: Optional[Any] = None,
+        main_type: Optional[str] = None,
+        max_views: Optional[int] = settings.VIEWS_MAX_DEFAULT,
+        per_other_type: int = settings.VIEWS_PER_OTHER_TYPE,
+        enabled_cameras_only: bool = True,
+        clear_of_edge: Optional[Any] = None,
+    ) -> Tuple[List[Any], Optional[Any]]:
+        """The views to crop for this annotation, and its training view.
+
+        Views of the main camera type come first (unobstructed ones by
+        relevance, then obstructed ones), up to ``max_views``; then at most
+        ``per_other_type`` of each other camera type (for review, e.g. macro
+        close-ups). The training view is the most relevant unobstructed view of
+        the main type; None when every tested one is obstructed (the point needs
+        a look). Without an occlusion test (no ``occluder`` / ``pcd``) it is the
+        most relevant view of the main type.
+
+        Args:
+            cams: Cameras, with ``camera_type`` set
+                (:func:`substrata.cameras.assign_camera_types`); without it
+                every camera counts as one type.
+            occluder: Stratified-subsample occlusion test (default method).
+            pcd: Point cloud for the legacy reprojection test instead.
+            main_type: The main camera type (:meth:`Annotations.main_camera_type`).
+            max_views: Views of the main type to keep (None = all).
+            per_other_type: Views kept of each other camera type.
+            enabled_cameras_only: As for :meth:`get_image_matches`.
+            clear_of_edge: A crop size ``(w, h)``: views of the main type whose
+                crop would run past the photo edge are left out (also as the
+                training view), e.g. for stored crops.
+
+        With an ``occluder``, views are tested in relevance order only until
+        enough unobstructed ones are found (``max_views`` of the main type,
+        ``per_other_type`` of each other type); the others keep ``blockers``
+        None (untested), and count as unobstructed after the tested ones.
+
+        Returns:
+            Tuple ``(views, training_view)``; also stored as
+            ``self.training_view``.
+        """
+        ctype = lambda m: getattr(m.cam, "camera_type", None)  # noqa: E731
+        is_main = lambda m: main_type is None or ctype(m) == main_type  # noqa: E731
+        fits = lambda m: (  # noqa: E731
+            clear_of_edge is None or m.is_clear_from_image_edge(clear_of_edge))
+        if occluder is not None and pcd is None:
+            ms = self.get_image_matches(
+                cams, enabled_cameras_only=enabled_cameras_only) or []
+            clear: Dict[Any, int] = {}
+            last: List[Any] = []
+
+            def wants(m):  # still short of unobstructed views of m's kind?
+                if last and last[0].potentially_obstructed is False:
+                    g = last[0]
+                    key = ("main" if fits(g) else "edge") if is_main(g) else ctype(g)
+                    clear[key] = clear.get(key, 0) + 1
+                last.clear()
+                if is_main(m):
+                    if not fits(m):  # (no crop: only a fallback training view, while none is found)
+                        if clear.get("main", 0) or clear.get("edge", 0):
+                            return False
+                    elif max_views is not None and clear.get("main", 0) >= max_views:
+                        return False
+                elif main_type is None or clear.get(ctype(m), 0) >= per_other_type:
+                    return False
+                last.append(m)
+                return True
+
+            self._flag_occluded(ms, occluder, settings.OCCLUSION_BLOCKED_MIN,
+                                settings.OCCLUSION_CHECK_VIEWS, wants)
+            ms.sort(key=lambda x: (x.potentially_obstructed is True, x.relevance))
+        else:
+            # get_image_matches orders them: unobstructed by relevance, then
+            # obstructed (by relevance); filtering by type keeps that order
+            ms = self.get_image_matches(cams, pcd=pcd, occluder=occluder,
+                                        enabled_cameras_only=enabled_cameras_only) or []
+        main = [m for m in ms if is_main(m) and fits(m)]
+        views = main[:max_views]
+        # untested (no occluder / pcd): no flag, so the most relevant view. A view
+        # whose crop would run past the photo edge is the training view only when
+        # no other is unobstructed (it gets no stored crop)
+        edge = [m for m in ms if is_main(m) and not fits(m)]
+        ok = lambda m: getattr(m, "potentially_obstructed", None) is not True  # noqa: E731
+        training = main[0] if main and ok(main[0]) else next((m for m in edge if ok(m)), None)
+        if main_type is not None:
+            kept: Dict[Any, int] = {}
+            for m in ms:
+                t = ctype(m)
+                if t != main_type and kept.get(t, 0) < per_other_type:
+                    kept[t] = kept.get(t, 0) + 1
+                    views.append(m)
+        self.training_view = training
+        return views, training
+
     def _matches_for_crops(
         self, cams: Any, max_cams: Optional[int], pcd: Optional[Any],
         image_matches: Optional[List[Any]] = None,
     ) -> List[Any]:
-        """``image_matches`` if given, else freshly computed matches."""
+        """``image_matches`` if given, else the views of :meth:`select_views`
+        (all cameras alike)."""
         if image_matches is not None:
             return list(image_matches)
-        return self.get_image_matches(cams, max_cams, pcd=pcd) or []
+        return self.select_views(cams, pcd=pcd, max_views=max_cams)[0]
 
     def _resolve_crops_root(self, root: Optional[str]) -> Optional[str]:
         """``root`` or the parent's crops root (None if neither is known)."""
@@ -2475,6 +2714,42 @@ class Annotation:
         """Directory holding this annotation's crops: ``<crops root>/<id>``."""
         root = self._resolve_crops_root(root)
         return os.path.join(root, str(self.id)) if root is not None else None
+
+    def stale_crops(self, cams: Any, root: Optional[str] = None, tol: float = 2.0) -> List[str]:
+        """This annotation's stored crops that no longer show it.
+
+        A crop named ``<photo stem>_<x>_<y>.jpg`` (:func:`cameras.view_crop_name`)
+        is stale when the point, projected into that photo's camera now, is out
+        of view or more than ``tol`` px from ``(x, y)`` (the point moved, or the
+        plot was aligned anew). Crops of photos not among ``cams`` and older
+        crops without the pixel in their name are left alone.
+
+        Args:
+            cams: Cameras.
+            root: Crops directory (default: the parent's crops root).
+            tol: Pixel tolerance.
+
+        Returns:
+            The stale crops' paths.
+        """
+        d = self.crops_dir(root)
+        if d is None or not os.path.isdir(d):
+            return []
+        by_stem = {}
+        for cam in (cams.data.values() if hasattr(cams, "data") else cams):
+            fp = getattr(cam, "filepath", None) or ""
+            by_stem.setdefault(os.path.splitext(re.split(r"[\\/]", fp)[-1])[0], cam)
+        out = []
+        for folder, _dirs, files in os.walk(d):
+            for f in files:
+                m = re.match(r"^(.*)_(-?\d+)_(-?\d+)\.jpg$", f)
+                cam = by_stem.get(m.group(1)) if m else None
+                if cam is None:
+                    continue
+                x, y, *_ = cam.get_pixel_coords(self.orig_coords, use_orig_coords=True)
+                if x is None or abs(x - int(m.group(2))) > tol or abs(y - int(m.group(3))) > tol:
+                    out.append(os.path.join(folder, f))
+        return out
 
     def save_crops(
         self,
@@ -2526,7 +2801,7 @@ class Annotation:
         cams: Any,
         classifier: Any,
         crop_size: Union[int, Tuple[int, int]] = settings.PREDICTION_CROP_SIZE_DEFAULT,
-        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_CROP_DEFAULT,
+        max_cams: Optional[int] = settings.MAX_PHOTOS_TO_PREDICT_DEFAULT,
         pcd: Optional[Any] = None,
         image_matches: Optional[List[Any]] = None,
         root: Optional[str] = None,
@@ -2534,6 +2809,7 @@ class Annotation:
         method: str = settings.PREDICTION_AGGREGATION,
         batch_size: int = 64,
         n_jobs: int = -1,
+        model: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Predict this annotation's label from all of its image matches.
 
@@ -2555,6 +2831,8 @@ class Annotation:
             method: ``"weighted"`` or ``"first"``.
             batch_size: Inference batch size.
             n_jobs: Threads for loading crops (-1 = all cores).
+            model: The classifier's fingerprint, stored as ``pred_model``
+                (default: of ``classifier`` when it is a path).
 
         Returns:
             The consensus ``{"label", "confidence", "n"}``, or None.
@@ -2567,7 +2845,10 @@ class Annotation:
             matches, classifier, crop_size,
             batch_size=batch_size, n_jobs=n_jobs, crops_root=root,
         )
-        return self._apply_predictions(matches, results, root, write_crops, method)
+        if model is None and isinstance(classifier, str):
+            model = classification.classifier_fingerprint(classifier)
+        return self._apply_predictions(
+            matches, results, root, write_crops, method, model)
 
     def _apply_predictions(
         self,
@@ -2576,8 +2857,10 @@ class Annotation:
         root: Optional[str],
         write_crops: bool,
         method: str,
+        model: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Store the consensus on this annotation and per-crop results in EXIF."""
+        """Store the consensus on this annotation and per-crop results in EXIF,
+        each with ``model`` (the classifier's fingerprint) as ``pred_model``."""
         from substrata import classification
 
         consensus = classification.aggregate_predictions(
@@ -2586,6 +2869,11 @@ class Annotation:
         self.pred_label = consensus["label"] if consensus else None
         self.pred_conf = consensus["confidence"] if consensus else None
         self.pred_n = consensus["n"] if consensus else None
+        self.pred_model = model if consensus else None
+        done = [r for r in results if r]
+        self.pred_agree = (
+            round(sum(r["label"] == consensus["label"] for r in done) / len(done), 2)
+            if consensus and done else None)
         if write_crops and root is not None:
             for im, res in zip(image_matches, results):
                 path = im.find_crop(root) if res else None
@@ -2593,6 +2881,7 @@ class Annotation:
                     cameras._update_crop_metadata(path, {
                         "pred_label": res["label"],
                         "pred_conf": float(res.get("confidence") or 0.0),
+                        "pred_model": model or "",
                     })
         return consensus
 
@@ -3599,6 +3888,202 @@ def update_annotation_csv_row(path: str, ann_id: str, values: Dict[str, Any]) ->
     if not hit:
         raise KeyError(ann_id)
     _write_csv_rows(path, rows, eol)
+
+
+def main_camera_type(
+    anns: List["Annotation"], cams: Any,
+    sample: int = settings.MAIN_CAMERA_TYPE_SAMPLE,
+) -> Optional[str]:
+    """The camera type that sees most of these points best.
+
+    For an even sample of the annotations (or any points, e.g.
+    ``Annotation(orig_xyz)`` from a plot's cloud), the camera type of each one's
+    most relevant view (no occlusion test); the most frequent wins. Sets
+    ``camera_type`` on the cameras first if needed
+    (:func:`substrata.cameras.assign_camera_types`).
+
+    Args:
+        anns: The annotations / points.
+        cams: Cameras.
+        sample: Points sampled.
+
+    Returns:
+        The type name, or None if no point is in view.
+    """
+    cam_list = list(cams.data.values()) if hasattr(cams, "data") else list(cams)
+    if cam_list and not hasattr(cam_list[0], "camera_type"):
+        cameras.assign_camera_types(cam_list)
+    if not anns:
+        return None
+    step = max(1, len(anns) // max(1, sample))
+    votes: Counter = Counter()
+    for ann in anns[::step][:sample]:
+        ms = ann.get_image_matches(cam_list)
+        if ms:
+            votes[getattr(ms[0].cam, "camera_type", None)] += 1
+    votes.pop(None, None)
+    return votes.most_common(1)[0][0] if votes else None
+
+
+def _add_columns(rows: List[List[str]], low: List[str], columns: Iterable[str]) -> bool:
+    """Add the missing ``columns`` to CSV rows (header first, ``low`` its
+    lower-case names, updated): blank cells, but ``True`` in every row for
+    ``settings.TRAIN_INCLUDE_COLUMN`` (a missing column means all included).
+    Returns whether any was added."""
+    added = False
+    for c in columns:
+        if c in low:
+            continue
+        rows[0].append(c)
+        low.append(c)
+        for r in rows[1:]:
+            if r:
+                r.extend([""] * (len(rows[0]) - len(r)))
+                if c == settings.TRAIN_INCLUDE_COLUMN:
+                    r[-1] = "True"
+        added = True
+    return added
+
+
+def set_included_in_training(path: str, ids: Iterable[str], value: bool) -> int:
+    """Set ``settings.TRAIN_INCLUDE_COLUMN`` of these annotations' rows.
+
+    A CSV without the column gets it, ``True`` for every row; the file is
+    rewritten once (cells and line ending kept).
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        ids: Annotation ids.
+        value: Include (True) or leave out (False).
+
+    Returns:
+        The number of rows set.
+
+    Raises:
+        KeyError: If an id has no row.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    _add_columns(rows, low, (settings.TRAIN_INCLUDE_COLUMN,))
+    idc, ic = low.index("id"), low.index(settings.TRAIN_INCLUDE_COLUMN)
+    want, n = set(ids), 0
+    seen = set()
+    for r in rows[1:]:
+        if r and len(r) > idc and r[idc].strip() in want:
+            r.extend([""] * (len(rows[0]) - len(r)))
+            r[ic] = "True" if value else "False"
+            seen.add(r[idc].strip())
+            n += 1
+    missing = want - seen
+    if missing:
+        raise KeyError(sorted(missing)[0])
+    _write_csv_rows(path, rows, eol)
+    return n
+
+
+def training_views(anns: Iterable["Annotation"]) -> Tuple[Dict[str, Tuple[str, float, float]], List[str]]:
+    """The training views :meth:`Annotation.select_views` chose for these
+    annotations, for :func:`set_training_views`, and the ids of those without
+    one (every tested view of the main type obstructed: they need a look).
+    Annotations not run through ``select_views`` are left out of both."""
+    views, review = {}, []
+    for a in anns:
+        if not hasattr(a, "training_view"):
+            continue
+        tv = a.training_view
+        if tv is None:
+            review.append(a.id)
+        else:
+            views[a.id] = (tv.cam.filepath, tv.x, tv.y)
+    return views, review
+
+
+PREDICTION_COLUMNS = ("pred_label", "pred_conf", "pred_n", "pred_model", "pred_agree")
+
+
+def set_predictions(
+    path: str, preds: Dict[str, Optional[Tuple[Any, ...]]],
+) -> int:
+    """Write consensus predictions into an annotation CSV, leaving every other
+    cell (and column) as it is.
+
+    Sets ``pred_label`` / ``pred_conf`` / ``pred_n`` / ``pred_model`` /
+    ``pred_agree`` of the given ids (None: emptied, e.g. a point without any
+    view); the columns are added when missing. The file is rewritten once
+    (line ending kept).
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        preds: Annotation id -> (label, confidence, crops used, classifier
+            fingerprint[, share of the crops agreeing]) or None.
+
+    Returns:
+        The number of rows written.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    _add_columns(rows, low, PREDICTION_COLUMNS)
+    idc = low.index("id")
+    ci = [low.index(c) for c in PREDICTION_COLUMNS]
+    n = 0
+    for r in rows[1:]:
+        if not r or len(r) <= idc or r[idc].strip() not in preds:
+            continue
+        r.extend([""] * (len(rows[0]) - len(r)))
+        p = preds[r[idc].strip()]
+        agree = p[4] if p is not None and len(p) > 4 else None
+        vals = [""] * len(PREDICTION_COLUMNS) if p is None else [
+            p[0], f"{float(p[1]):.4f}", str(int(p[2])), p[3] or "",
+            "" if agree is None else f"{float(agree):.2f}"]
+        for i, v in zip(ci, vals):
+            r[i] = v
+        n += 1
+    _write_csv_rows(path, rows, eol)
+    return n
+
+
+def set_training_views(
+    path: str, views: Dict[str, Tuple[str, float, float]], overwrite: bool = False,
+) -> int:
+    """Write annotations' training views (image match) into their CSV rows.
+
+    Sets ``cam_filepath`` / ``cam_x`` / ``cam_y`` of the given ids, only where
+    ``cam_filepath`` is empty unless ``overwrite`` (an existing view, e.g. the
+    photo a manual annotation was made on, is kept), and marks those rows
+    included in training. A CSV without ``settings.TRAIN_INCLUDE_COLUMN`` gets it,
+    True for every row. The file is rewritten once (cells and line ending kept)
+    and only if something changed.
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        views: Annotation id -> (camera filepath, x, y).
+        overwrite: Replace views that are already set.
+
+    Returns:
+        The number of rows whose view was written.
+    """
+    rows, eol, low = _read_csv_rows(path)
+    head = rows[0]
+    inc = settings.TRAIN_INCLUDE_COLUMN
+    changed = _add_columns(rows, low, ("cam_filepath", "cam_x", "cam_y", inc))
+    ci = {c: low.index(c) for c in ("id", "cam_filepath", "cam_x", "cam_y", inc)}
+    n = 0
+    for r in rows[1:]:
+        if not r or len(r) <= ci["id"]:
+            continue
+        v = views.get(r[ci["id"]].strip())
+        if v is None:
+            continue
+        r.extend([""] * (len(head) - len(r)))
+        if r[ci["cam_filepath"]].strip() and not overwrite:
+            continue
+        fp, x, y = v
+        r[ci["cam_filepath"]] = str(fp)
+        r[ci["cam_x"]] = f"{float(x):.2f}"
+        r[ci["cam_y"]] = f"{float(y):.2f}"
+        r[ci[inc]] = "True"
+        n += 1
+    if n or changed:
+        _write_csv_rows(path, rows, eol)
+    return n
 
 
 def append_annotation_csv_row(path: str, values: Dict[str, Any]) -> None:

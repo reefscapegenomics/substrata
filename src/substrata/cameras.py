@@ -138,6 +138,36 @@ def _photo_folder_name(filepath: str) -> str | None:
     return parts[-2] if len(parts) >= 2 else None
 
 
+def view_crop_name(cam_filepath: str, x: float, y: float) -> str:
+    """File name of a view's crop: ``<photo stem>_<x>_<y>.jpg`` (integer pixel).
+
+    The pixel in the name tells whether a stored crop still shows the point: after
+    the point moves (or the plot is aligned anew) its projection lands elsewhere,
+    so the old crop no longer matches the current view.
+    """
+    stem = os.path.splitext(re.split(r"[\\/]", cam_filepath or "")[-1])[0]
+    return f"{stem}_{int(round(float(x)))}_{int(round(float(y)))}.jpg"
+
+
+def find_view_crop(
+    root: str, ann_id: str, cam_filepath: str, x: float, y: float,
+) -> str | None:
+    """An annotation's stored crop of one view (photo + pixel), if there is one.
+
+    Looks for ``<root>/<ann_id>/<photo folder>/<photo stem>_<x>_<y>.jpg``, then for
+    the older names without the pixel (``<photo folder>/<photo file>``, and the
+    legacy ``<root>/<ann_id>/<photo file>``), whose pixel is unknown.
+    """
+    base = os.path.join(root, str(ann_id))
+    folder = _photo_folder_name(cam_filepath)
+    sub = os.path.join(base, folder) if folder else base
+    photo = re.split(r"[\\/]", cam_filepath or "")[-1]
+    return _first_existing(
+        os.path.join(sub, view_crop_name(cam_filepath, x, y)),
+        os.path.join(sub, photo), os.path.join(base, photo),
+    )
+
+
 def _first_existing(*paths) -> str | None:
     """Return the first of ``paths`` that is an existing file, else None."""
     for path in paths:
@@ -152,6 +182,111 @@ def _count_statuses(statuses) -> dict:
     for status in statuses:
         counts[status] = counts.get(status, 0) + 1
     return counts
+
+
+def assign_camera_types(cams, focal_tol: float = settings.CAMERA_TYPE_FOCAL_TOL):
+    """Group cameras into camera types and set ``cam.camera_type`` on each.
+
+    A type is a sensor resolution (either orientation) with a focal length
+    within ``focal_tol`` (fraction): e.g. two identical cameras of one survey,
+    or an AUV camera across missions, are one type, whatever their folders; a
+    macro close-up camera or a GoPro is another. Cameras without a sensor get
+    ``camera_type`` None.
+
+    Args:
+        cams: Cameras (a :class:`Cameras` or a list).
+        focal_tol: Relative focal-length tolerance within a type.
+
+    Returns:
+        The type names (``"<long>x<short> f<focal px>"``), most cameras first.
+    """
+    cams = list(cams.data.values()) if hasattr(cams, "data") else list(cams)
+    types: list = []  # [short, long, fx, name, n]
+    for cam in cams:
+        sensor = getattr(cam, "sensor", None)
+        fx = getattr(sensor, "fx", None)
+        if sensor is None or not fx or not sensor.width or not sensor.height:
+            cam.camera_type = None
+            continue
+        short, long_ = sorted((int(sensor.width), int(sensor.height)))
+        for t in types:
+            same_lens = abs(float(fx) - t[2]) <= focal_tol * t[2]
+            if (t[0], t[1]) == (short, long_) and same_lens:
+                break
+        else:
+            t = [short, long_, float(fx), f"{long_}x{short} f{round(float(fx))}", 0]
+            types.append(t)
+        t[4] += 1
+        cam.camera_type = t[3]
+    return [t[3] for t in sorted(types, key=lambda t: -t[4])]
+
+
+def save_photo_crops(matches, root=None, crop_size=None, overwrite: bool = False) -> list:
+    """Save the crops of several matches of one photo, decoding the photo once.
+
+    As :meth:`ImageMatch.save_crop` for each match (all of the same camera /
+    photo): crops that would extend past the image edge are rejected, the
+    photo's EXIF is kept (minus its thumbnail) with ``potentially_obstructed``
+    in the UserComment, and crops are saved at ``settings.CROP_JPEG_QUALITY``.
+
+    Args:
+        matches: Image matches of one photo.
+        root: Crops directory (defaults as in :meth:`ImageMatch.crop_path`).
+        crop_size: Crop size ``(w, h)`` or int (default
+            ``settings.CROP_SIZE_DEFAULT``).
+        overwrite: Replace existing crops (an older-named one is removed).
+
+    Returns:
+        Per match ``"generated"``, ``"skipped"`` (already exists),
+        ``"rejected"`` (too close to the image edge) or ``"failed"`` (photo
+        missing or unreadable).
+    """
+    out = [None] * len(matches)
+    crop_w, crop_h = _size_pair(crop_size if crop_size is not None else settings.CROP_SIZE_DEFAULT)
+    todo = []
+    for i, m in enumerate(matches):
+        r = m._crops_root(root)
+        existing = m.find_crop(r)
+        if existing and not overwrite:
+            out[i] = "skipped"
+        else:
+            todo.append((i, m, r, existing))
+    if not todo:
+        return out
+    src = matches[todo[0][0]].cam.filepath
+    if not src or not os.path.isfile(src):
+        for i, *_ in todo:
+            out[i] = "failed"
+        return out
+    try:
+        with Image.open(src) as img:  # (decoded on the first crop, once)
+            exif_src = img.info.get("exif")
+            for i, m, r, existing in todo:
+                if not m.is_clear_from_image_edge((crop_w, crop_h), img.size):
+                    out[i] = "rejected"
+                    continue
+                # Same box arithmetic as visualizations.get_crop_img, so a centre
+                # crop of this crop equals a crop cut from the photo directly.
+                left = int(m.x - crop_w / 2)
+                top = int(m.y - crop_h / 2)
+                crop = img.crop((left, top, left + crop_w, top + crop_h))
+                if crop.mode not in ("RGB", "L"):
+                    crop = crop.convert("RGB")
+                exif_bytes = _exif_with_crop_metadata(exif_src, {
+                    "potentially_obstructed": bool(getattr(m, "potentially_obstructed", False)),
+                    "pred_label": "",
+                    "pred_conf": 0.0,
+                })
+                out_path = m.crop_path(r)
+                _save_image_atomic(
+                    crop, out_path, quality=settings.CROP_JPEG_QUALITY, exif=exif_bytes)
+                if existing and os.path.abspath(existing) != os.path.abspath(out_path):
+                    os.remove(existing)
+                out[i] = "generated"
+    except (OSError, ValueError) as e:
+        logger.warning("Could not crop %s: %s", src, e)
+        out = [o if o is not None else "failed" for o in out]
+    return out
 
 
 def _save_image_atomic(img, out_path: str, **save_kwargs) -> None:
@@ -217,7 +352,8 @@ def read_crop_metadata(path: str) -> dict | None:
 
     Reads crops written by reefcat (no ``"v"`` key) and by
     :meth:`ImageMatch.save_crop` alike. Typical keys: ``potentially_obstructed``,
-    ``pred_label`` and ``pred_conf``.
+    ``pred_label``, ``pred_conf`` and ``pred_model`` (the classifier's fingerprint,
+    :func:`classification.classifier_fingerprint`).
 
     Args:
         path: Crop image filepath.
@@ -3232,7 +3368,9 @@ class ImageMatch:
         return root
 
     def crop_path(self, root: str | None = None) -> str:
-        """Path of this match's crop: ``<root>/<ann_id>/<photo folder>/<filename>``.
+        """Path of this match's crop:
+        ``<root>/<ann_id>/<photo folder>/<photo stem>_<x>_<y>.jpg``
+        (:func:`view_crop_name`).
 
         Args:
             root: Crops directory. Defaults to the ``crops_root`` of the
@@ -3246,12 +3384,11 @@ class ImageMatch:
         parts = [root, str(self.annotation.id)]
         if folder is not None:
             parts.append(folder)
-        return os.path.join(*parts, self.filename)
+        return os.path.join(*parts, view_crop_name(self.cam.filepath, self.x, self.y))
 
     def find_crop(self, root: str | None = None) -> str | None:
-        """Existing crop for this match, in the current or legacy layout.
-
-        The legacy layout stored crops as ``<root>/<ann_id>/<filename>``.
+        """Existing crop for this match, also under the older names without the
+        pixel (:func:`find_view_crop`).
 
         Args:
             root: Crops directory (defaults as in :meth:`crop_path`).
@@ -3260,8 +3397,8 @@ class ImageMatch:
             str | None: The crop filepath, or None if there is none.
         """
         root = self._crops_root(root)
-        legacy = os.path.join(root, str(self.annotation.id), self.filename)
-        return _first_existing(self.crop_path(root), legacy)
+        return find_view_crop(
+            root, self.annotation.id, self.cam.filepath, self.x, self.y)
 
     def crop_metadata(self, root: str | None = None) -> dict | None:
         """Metadata stored in this match's crop (see :func:`read_crop_metadata`)."""
@@ -3313,47 +3450,7 @@ class ImageMatch:
             (too close to the image edge) or ``"failed"`` (photo missing or
             unreadable).
         """
-        root = self._crops_root(root)
-        existing = self.find_crop(root)
-        if existing and not overwrite:
-            return "skipped"
-        src = self.cam.filepath
-        if not src or not os.path.isfile(src):
-            return "failed"
-        if crop_size is None:
-            crop_size = settings.CROP_SIZE_DEFAULT
-        crop_w, crop_h = _size_pair(crop_size)
-        out_path = self.crop_path(root)
-        try:
-            with Image.open(src) as img:
-                if not self.is_clear_from_image_edge((crop_w, crop_h), img.size):
-                    return "rejected"
-                # Same box arithmetic as visualizations.get_crop_img, so a centre
-                # crop of this crop equals a crop cut from the photo directly.
-                left = int(self.x - crop_w / 2)
-                top = int(self.y - crop_h / 2)
-                crop = img.crop((left, top, left + crop_w, top + crop_h))
-                exif_bytes = _exif_with_crop_metadata(
-                    img.info.get("exif"),
-                    {
-                        "potentially_obstructed": bool(
-                            getattr(self, "potentially_obstructed", False)
-                        ),
-                        "pred_label": "",
-                        "pred_conf": 0.0,
-                    },
-                )
-            if crop.mode not in ("RGB", "L"):
-                crop = crop.convert("RGB")
-            _save_image_atomic(
-                crop, out_path, quality=settings.CROP_JPEG_QUALITY, exif=exif_bytes
-            )
-        except (OSError, ValueError) as e:
-            logger.warning("Could not crop %s: %s", src, e)
-            return "failed"
-        if existing and os.path.abspath(existing) != os.path.abspath(out_path):
-            os.remove(existing)
-        return "generated"
+        return save_photo_crops([self], root, crop_size, overwrite)[0]
 
     def get_mask_surface_area(self, predictor=None):
         """
