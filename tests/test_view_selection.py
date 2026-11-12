@@ -381,14 +381,18 @@ class TestSetPredictions(unittest.TestCase):
         path = os.path.join(d, "p_slope_intercepts.csv")
         _write(path, [["id", "label", "search_radius", "manual_id", INC],
                       ["a", "SP", "0.005", "m_1", "False"], ["b", "", "0.005", "", "True"]])
-        n = an.set_predictions(path, {"a": ("SP", 0.912345, 3, "clf@1234abcd", 0.667), "b": None})
+        top = an.format_pred_top({"SP": 0.912345, "CSE": 0.05, "MA": 0.03})
+        n = an.set_predictions(path, {"a": ("SP", 0.912345, 3, "clf@1234abcd", 0.667, top), "b": None})
         self.assertEqual(n, 2)
         rows = _read(path)
         self.assertEqual(list(rows[0]), ["id", "label", "search_radius", "manual_id", INC,
-                                         "pred_label", "pred_conf", "pred_n", "pred_model", "pred_agree"])
+                                         "pred_label", "pred_conf", "pred_n", "pred_model", "pred_agree",
+                                         "pred_top"])
         self.assertEqual([rows[0][c] for c in ("search_radius", "manual_id", INC, "pred_conf", "pred_model",
                                                 "pred_agree")],
                          ["0.005", "m_1", "False", "0.9123", "clf@1234abcd", "0.67"])
+        self.assertEqual(rows[0]["pred_top"], "SP:0.912;CSE:0.050;MA:0.030")
+        self.assertEqual(an.parse_pred_top(rows[0]["pred_top"]), {"SP": 0.912, "CSE": 0.05, "MA": 0.03})
         self.assertEqual(rows[1]["pred_label"], "")
         with open(path, "rb") as f:
             self.assertIn(b"\r\n", f.read())

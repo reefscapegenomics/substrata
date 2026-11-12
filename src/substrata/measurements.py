@@ -2256,6 +2256,21 @@ def create_xy_grid_cells_with_spread_filter(
     return filtered_bboxes
 
 
+def cloud_xy_histogram(points, step_size=0.1):
+    """The point counts of a cloud on an xy grid of ``step_size`` cells (what the box search maximises).
+
+    Returns ``(hist, x_edges, y_edges)``: ``hist[i, j]`` counts the points with x in
+    ``[x_edges[i], x_edges[i + 1])`` and y in ``[y_edges[j], y_edges[j + 1])``.
+    """
+    points = np.asarray(points)[:, :2]
+    x_min, y_min = np.min(points, axis=0)
+    x_max, y_max = np.max(points, axis=0)
+    x_edges = np.arange(x_min, x_max + step_size, step_size)
+    y_edges = np.arange(y_min, y_max + step_size, step_size)
+    hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=[x_edges, y_edges])
+    return hist, x_edges, y_edges
+
+
 def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=True):
     """
     Find the optimal rectangle (box) position from a point cloud using a convolution-based approach.
@@ -2271,19 +2286,9 @@ def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=Tru
       best_box   : tuple (x_min, y_min, x_max, y_max) of the optimal rectangle's bounding coordinates.
       best_count : int, the maximum point count found within that rectangle.
     """
-    # Extract x and y coordinates.
+    # A 2D histogram of the point cloud on a grid of the step size.
     points = np.asarray(pcd.points)[:, :2]
-
-    # Compute overall bounds.
-    x_min, y_min = np.min(points, axis=0)
-    x_max, y_max = np.max(points, axis=0)
-
-    # Create candidate grid edges using the step size.
-    x_edges = np.arange(x_min, x_max + step_size, step_size)
-    y_edges = np.arange(y_min, y_max + step_size, step_size)
-
-    # Build a 2D histogram of the point cloud.
-    hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=[x_edges, y_edges])
+    hist, x_edges, y_edges = cloud_xy_histogram(points, step_size)
 
     # Map rectangle dimensions to the number of bins.
     box_length_bins = int(np.round(box_length / step_size))
@@ -3054,3 +3059,77 @@ class DepthResidualAnalyzer:
             return filepath
         finally:
             matplotlib.use(backend_original, force=True)
+
+
+def depth_band_sample(
+    points: np.ndarray,
+    depth_min: float,
+    depth_max: float,
+    width_step: float,
+    depth_step: float,
+    seed: Optional[int] = None,
+) -> dict:
+    """Intercepts over a depth band: one point per cell of a grid across the band's whole width.
+
+    The cloud is in the world frame (z: depth, negative below the surface; x, y
+    horizontal, metres). Rows are depth intervals of ``depth_step`` from
+    ``depth_min`` to ``depth_max`` (positive metres); columns are intervals of
+    ``width_step`` across the slope (the horizontal direction along the depth
+    contours, from a plane fitted to the band), over all of the band's width.
+    In each cell the cloud point nearest a random position in it (across,
+    depth) is taken: like an intercept (the surface at a random position), not
+    a random cloud point, which would favour densely sampled parts. Cells
+    without cloud are left out. For training data at depths a plot's best box
+    leaves out, without searching for a box.
+
+    Args:
+        points: (N, 3) cloud points, world frame.
+        depth_min, depth_max: The band (metres; their order and sign do not
+            matter).
+        width_step: Column width across the slope (m).
+        depth_step: Row height in depth (m).
+        seed: Random seed (the same points again).
+
+    Returns:
+        dict: ``points`` (n, 3) the chosen points; ``cells`` (n, 2) their
+        [column, row]; ``across`` the across direction (2,) in x, y; ``u0`` the
+        across coordinate of column 0's edge; ``width`` the band's width (m);
+        ``columns``, ``rows``; ``cells_with_cloud`` (= n); ``band_points`` (cloud
+        points in the band); ``cloud_depth`` [min, max] of the whole cloud.
+    """
+    if width_step <= 0 or depth_step <= 0:
+        raise ValueError("width_step and depth_step must be positive")
+    pts = np.asarray(points, dtype=float)
+    depth = -pts[:, 2]
+    lo, hi = sorted((abs(float(depth_min)), abs(float(depth_max))))
+    if not hi > lo:
+        raise ValueError(f"an empty depth band ({depth_min:g} to {depth_max:g} m)")
+    span =[float(np.nanmin(depth)), float(np.nanmax(depth))] if len(pts) else [float("nan")] * 2
+    band = (depth >= lo) & (depth < hi)
+    if not band.any():
+        raise ValueError(f"no cloud between {lo:g} and {hi:g} m depth (the cloud spans "
+                         f"{span[0]:.1f} to {span[1]:.1f} m)")
+    P, d = pts[band], depth[band]
+    rng = np.random.default_rng(seed)
+    # the across direction: along the depth contours of a plane z = a x + b y + c fitted to the band
+    S = P if len(P) <= 200_000 else P[rng.choice(len(P), 200_000, replace=False)]
+    (a, b, _c), *_ = np.linalg.lstsq(np.c_[S[:, 0], S[:, 1], np.ones(len(S))], S[:, 2], rcond=None)
+    g = float(np.hypot(a, b))
+    across = np.array([-b, a]) / g if g > 1e-9 else np.array([1.0, 0.0])
+    u = P[:, :2] @ across
+    u0 = float(u.min())
+    col = ((u - u0) // width_step).astype(np.int64)
+    row = ((d - lo) // depth_step).astype(np.int64)
+    ncol = int(col.max()) + 1
+    nrow = int(np.ceil((hi - lo) / depth_step - 1e-9))
+    key = row * ncol + col
+    cells, inv = np.unique(key, return_inverse=True)
+    # a random position in each cell; its nearest point in (across, depth)
+    cu = u0 + (cells % ncol + rng.random(len(cells))) * width_step
+    cd = lo + (cells // ncol + rng.random(len(cells))) * depth_step
+    dist = (u - cu[inv]) ** 2 + (d - cd[inv]) ** 2
+    order = np.lexsort((dist, inv))
+    first = order[np.r_[0, np.flatnonzero(np.diff(inv[order])) + 1]]
+    return dict(points=P[first], cells=np.c_[cells % ncol, cells // ncol], across=across, u0=u0,
+                width=float(u.max() - u0), columns=ncol, rows=nrow, cells_with_cloud=len(cells),
+                band_points=int(band.sum()), cloud_depth=span)

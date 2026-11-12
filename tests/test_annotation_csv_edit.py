@@ -75,6 +75,17 @@ class TestAnnotationCsvEdit(unittest.TestCase):
             a.replace_annotation_csv_values(self.path, "nope", {"a": "b"}), 0
         )
 
+    def test_update_several_rows_at_once(self):
+        a.update_annotation_csv_rows(
+            self.path, {"pt_1": {"label": "ACRO"}, "pt_2": {"label": "PORI", "label_conf": 2}}
+        )
+        lines = self.read().split("\r\n")
+        self.assertTrue(lines[1].startswith("pt_1,") and ",ACRO," in lines[1])
+        self.assertEqual(lines[2], "pt_2,0.1,0.2,0.3,PORI,2,1,2,3,,,,,")
+        with self.assertRaises(KeyError):  # (an unknown id: nothing written)
+            a.update_annotation_csv_rows(self.path, {"pt_1": {"label": "X"}, "nope": {"label": "X"}})
+        self.assertIn(",ACRO,", self.read().split("\r\n")[1])
+
     def test_update_unknown_id(self):
         with self.assertRaises(KeyError):
             a.update_annotation_csv_row(self.path, "nope", {"label": "X"})

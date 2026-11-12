@@ -114,6 +114,16 @@ class TestSidecarReadWrite(unittest.TestCase):
         self.sidecars.write_annotation_sidecar(self.csv, {"x": 1}, update=False)
         self.assertEqual(self.sidecars.read_annotation_sidecar(self.csv), {"x": 1})
 
+    def test_write_replaces_whole_and_keeps_old_on_failure(self):
+        """The sidecar is written to a temporary file and moved into place:
+        a failed write leaves the old sidecar as it was, and no temporary
+        file behind."""
+        self.sidecars.write_annotation_sidecar(self.csv, {"type": "annotations"})
+        with self.assertRaises(yaml_lib.representer.RepresenterError):
+            self.sidecars.write_annotation_sidecar(self.csv, {"bad": object()})
+        self.assertEqual(self.sidecars.read_annotation_sidecar(self.csv), {"type": "annotations"})
+        self.assertEqual(sorted(os.listdir(self.proj)), ["cur_sna_ann.csv.yaml"])
+
 
 class TestInitializerSidecar(unittest.TestCase):
     def setUp(self):

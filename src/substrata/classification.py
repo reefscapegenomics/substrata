@@ -536,8 +536,9 @@ def aggregate_predictions(
             ``settings.PREDICTION_AGGREGATION``.
 
     Returns:
-        ``{"label", "confidence", "n"}`` (``n`` = number of crops used), or None
-        if there is no result.
+        ``{"label", "confidence", "n", "probs"}`` (``n`` = number of crops used;
+        ``probs``: the combined probability of every class), or None if there
+        is no result.
     """
     method = method or settings.PREDICTION_AGGREGATION
     pairs = [(im, res) for im, res in zip(image_matches, results) if res]
@@ -549,6 +550,8 @@ def aggregate_predictions(
             "label": res["label"],
             "confidence": float(res.get("confidence") or 0.0),
             "n": 1,
+            "probs": dict(res.get("probs") or {
+                res["label"]: float(res.get("confidence") or 0.0)}),
         }
     if method != "weighted":
         raise ValueError(f"Unknown prediction aggregation method: {method}")
@@ -570,7 +573,8 @@ def aggregate_predictions(
             totals[label] = totals.get(label, 0.0) + weight * float(prob)
         weight_sum += weight
     label = max(totals, key=totals.get)
-    return {"label": label, "confidence": totals[label] / weight_sum, "n": len(used)}
+    return {"label": label, "confidence": totals[label] / weight_sum, "n": len(used),
+            "probs": {c: v / weight_sum for c, v in totals.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -1358,10 +1362,15 @@ def collate_training_annotations(
     kept: List[Dict[str, str]] = []
     dir_mapping: Dict[str, str] = {}
     n_dropped_conf = 0
+    from substrata import sidecars  # lazy (light; avoids an import cycle)
+
     for path in csv_files:
         model_name = model_name_from_filename(path, pattern)
         file_dirs: Set[str] = set()
         rows: List[Dict[str, str]] = []
+        # a set of another camera (its sidecar `domain`, e.g. an image set of AUV frames): its points are
+        # standardised with that camera's statistics in training, as curate pools' points are
+        set_domain = str((sidecars.read_annotation_sidecar(path) or {}).get("domain") or "").strip()
         with open(path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -1392,6 +1401,8 @@ def collate_training_annotations(
                 cam_fp = (row.get("cam_filepath") or "").strip()
                 if cam_fp:
                     file_dirs.add(os.path.dirname(cam_fp))
+                if set_domain and not (row.get("domain") or "").strip():
+                    row["domain"] = set_domain
                 row["_model_name"] = model_name
                 rows.append(row)
         # Resolve this file's directories (per-model convention fallback).

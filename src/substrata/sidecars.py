@@ -43,6 +43,7 @@ from __future__ import annotations
 
 # Standard Library
 import os
+import threading
 from typing import Any, Dict
 
 # Third-Party Libraries
@@ -121,8 +122,18 @@ def write_annotation_sidecar(
             except ValueError:  # e.g. another drive on Windows
                 config[key] = path
     config = {k: _plain(v) for k, v in config.items() if v is not None}
-    with open(sidecar, "w") as f:
-        yaml.dump(config, f, Dumper=_SidecarDumper, sort_keys=False)
+    # Written to a temporary file and moved into place: a reader (or a crash)
+    # never sees a half-written sidecar, and an update keeps the old one if
+    # writing fails. (Named per process and thread: two writers never share
+    # one; not tempfile.mkstemp, whose 0600 mode the sidecar would keep.)
+    tmp = f"{sidecar}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            yaml.dump(config, f, Dumper=_SidecarDumper, sort_keys=False)
+        os.replace(tmp, sidecar)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return sidecar
 
 

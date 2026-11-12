@@ -176,6 +176,85 @@ def _first_existing(*paths) -> str | None:
     return None
 
 
+_HITS_CACHE: dict = {}  # the cameras' stacked projection parameters (pixel_hits), for the last list of cameras
+
+
+def _stacked_cameras(cams: list):
+    """The projection parameters of ``cams`` (orig frame) as arrays, made once per list of cameras (kept for the
+    last one; the cameras are held, so the ids sampled for its key cannot be reused). None if a camera lacks a
+    sensor or an orig transform (then per camera, as before). Poses and sensors are taken as fixed: what changes
+    them in place (camera sync, reverse_transform_coords, reading sensors) clears the cache; ``enabled`` is read
+    afresh by pixel_hits."""
+    n = len(cams)
+    key = (n, tuple(id(c) for c in cams[:: max(1, n // 64)]), id(cams[-1]))
+    got = _HITS_CACHE.get(key)
+    if got is not None:
+        return got
+    try:  # (the sensors first: a camera without one fails fast, before the costly inversion)
+        S = [c.sensor for c in cams]
+        par = {a: np.array([float(getattr(s, a)) for s in S]) for a in
+               ("k1", "k2", "k3", "p1", "p2", "fx", "fy", "cx", "cy", "width", "height")}
+        inv = np.linalg.inv(np.stack([np.asarray(c.orig_camera_transform, float).reshape(4, 4) for c in cams]))
+        centres = np.stack([np.asarray(c.orig_coords, float).reshape(3) for c in cams])
+    except (AttributeError, TypeError, ValueError):
+        return None
+    got = dict(cams=list(cams), inv=inv, centres=centres, **par)
+    _HITS_CACHE.clear()
+    _HITS_CACHE[key] = got
+    return got
+
+
+def pixel_hits(cams, coords, use_orig_coords: bool = True, enabled_only: bool = True) -> list:
+    """The cameras that see 3-D point ``coords`` in their image: [(camera, x, y, depth, relevance)] in the order
+    of ``cams``, as :meth:`Camera.get_pixel_coords` gives them one camera at a time, but in one set of numpy
+    operations over all cameras (orig frame): choosing views among tens of thousands of cameras (an AUV's) per
+    point took ~1 s that way. The math (Brown-Conrady distortion, the in-view test, the relevance metric) is
+    the same; other frames (``use_orig_coords`` False), or cameras without a sensor, go one camera at a time."""
+    cams = cams if isinstance(cams, list) else list(cams)
+    if not cams:
+        return []
+    st = _stacked_cameras(cams) if use_orig_coords else None
+    if st is None:
+        out = []
+        for cam in cams:
+            if enabled_only and getattr(cam, "enabled", True) is False:
+                continue
+            x, y, depth, rel = cam.get_pixel_coords(coords, use_orig_coords=use_orig_coords)
+            if x is not None:
+                out.append((cam, x, y, depth, rel))
+        return out
+    p = np.append(np.asarray(coords, float).ravel()[:3], 1.0)
+    proj = st["inv"] @ p
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xn, yn = proj[:, 0] / proj[:, 2], proj[:, 1] / proj[:, 2]
+        r2 = xn ** 2 + yn ** 2
+        radial = 1 + st["k1"] * r2 + st["k2"] * r2 ** 2 + st["k3"] * r2 ** 3
+        xd = xn * radial + 2 * st["p1"] * xn * yn + st["p2"] * (r2 + 2 * xn ** 2)
+        yd = yn * radial + st["p1"] * (r2 + 2 * yn ** 2) + 2 * st["p2"] * xn * yn
+        xi, yi = st["fx"] * xd + st["cx"], st["fy"] * yd + st["cy"]
+        ok = ((proj[:, 2] > 0) & (r2 * st["fx"] ** 2 < 1.01 * st["width"] ** 2)  # (in front of the camera)
+              & (xi >= 0) & (xi <= st["width"]) & (yi >= 0) & (yi <= st["height"]))
+    idx = np.flatnonzero(ok)
+    if enabled_only:  # (read afresh, of the hits only: cheap, and never stale)
+        idx = np.array([i for i in idx.tolist() if getattr(st["cams"][i], "enabled", True) is not False], int)
+    if not len(idx):
+        return []
+    dist_sq = ((st["centres"][idx] - p[:3]) ** 2).sum(1)
+    rm = (np.abs((np.abs(proj[idx, 2]) + dist_sq) / (st["fx"][idx] * st["fy"][idx]))
+          * (10 + np.abs(xi[idx] - 0.5 * st["width"][idx]) + np.abs(yi[idx] - 0.5 * st["height"][idx])))
+    return [(st["cams"][i], int(round(xi[i])), int(round(yi[i])), float(proj[i, 2]), r)
+            for i, r in zip(idx.tolist(), rm.tolist())]
+
+
+def _file_names(folder: str) -> set:
+    """The names of the files in ``folder`` (empty if it cannot be listed)."""
+    try:
+        with os.scandir(folder) as it:
+            return {e.name for e in it if e.is_file()}
+    except OSError:
+        return set()
+
+
 def _count_statuses(statuses) -> dict:
     """Count crop/thumbnail statuses, always including every status key."""
     counts = {status: 0 for status in _CROP_STATUSES}
@@ -1213,10 +1292,19 @@ class Cameras:
             dict: Mapping of camera id to the filepath that was checked, for
             every camera whose image is absent or unset.
         """
-        missing = {}
+        missing, listed = {}, {}
         for cam_id, cam in self.data.items():
             path = cam.orig_filepath if use_orig else cam.filepath
-            if not path or not os.path.isfile(path):
+            if not path:
+                missing[cam_id] = path
+                continue
+            folder, name = os.path.split(path)
+            names = listed.get(folder)
+            if names is None:
+                names = listed[folder] = _file_names(folder)
+            # (each folder listed once: one lookup per photo is slow where folders are not indexed, e.g.
+            # exFAT, 63k photos ~90 s; a name not listed is checked by itself, e.g. another case)
+            if name not in names and not os.path.isfile(path):
                 missing[cam_id] = path
         return missing
 
@@ -1337,6 +1425,7 @@ class Cameras:
                 self, "_no_sensor_message_printed", False
             )
             if cam_id in self.data:
+                _HITS_CACHE.clear()  # (sensors changed: pixel_hits restacks)
                 self.data[cam_id].sensor_id = sensor_id
                 self.data[cam_id].sensor = self.sensors.get(sensor_id)
                 if self.data[cam_id].sensor is not None:
@@ -1499,6 +1588,7 @@ class Cameras:
                     cam.camera_transform = other_cam.camera_transform
                     cam.orig_coords = other_cam.orig_coords
                     cam.orig_camera_transform = other_cam.orig_camera_transform
+                    _HITS_CACHE.clear()  # (orig pose changed: pixel_hits restacks)
                 if hasattr(cam, "missing_pose_from_meta"):
                     delattr(cam, "missing_pose_from_meta")
                 if hasattr(cam, "missing_pose_from_timematch"):
@@ -2535,6 +2625,7 @@ class Camera:
         Args:
             transform (np.ndarray): The transformation matrix to invert.
         """
+        _HITS_CACHE.clear()  # (orig pose changed: pixel_hits restacks)
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = self.__transform_coords(self.coords, inverse_transform)
         self.orig_camera_transform = np.dot(
@@ -2588,7 +2679,8 @@ class Camera:
         x_img = self.sensor.fx * x_dist + self.sensor.cx
         y_img = self.sensor.fy * y_dist + self.sensor.cy
         in_view = (
-            r2 * self.sensor.fx**2 < 1.01 * self.sensor.width**2
+            proj_point[2] > 0  # (in front of the camera: one behind it can project into the image too)
+            and r2 * self.sensor.fx**2 < 1.01 * self.sensor.width**2
             and 0 <= x_img <= self.sensor.width
             and 0 <= y_img <= self.sensor.height
         )
@@ -2660,7 +2752,8 @@ class Camera:
         y_img = s.fy * y_dist + s.cy
 
         in_view = (
-            (r2 * s.fx**2 < 1.01 * s.width**2)
+            (depth > 0)  # (in front of the camera)
+            & (r2 * s.fx**2 < 1.01 * s.width**2)
             & (x_img >= 0) & (x_img <= s.width)
             & (y_img >= 0) & (y_img <= s.height)
         )

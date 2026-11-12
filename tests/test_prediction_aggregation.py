@@ -88,7 +88,7 @@ class TestAggregatePredictions(unittest.TestCase):
         matches = [_match(1.0), _match(2.0), _match(3.0)]
         results = [None, _result({"C": 0.6, "S": 0.4}), _result({"S": 0.9})]
         agg = cl.aggregate_predictions(matches, results, "first")
-        self.assertEqual(agg, {"label": "C", "confidence": 0.6, "n": 1})
+        self.assertEqual(agg, {"label": "C", "confidence": 0.6, "n": 1, "probs": {"C": 0.6, "S": 0.4}})
 
     def test_overconfident_outlier_does_not_win(self):
         # Two consistent crops vs one very confident (but less relevant) one;

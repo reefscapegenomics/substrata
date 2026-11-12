@@ -196,7 +196,9 @@ Segment the point cloud by reusing a trained classifier: sample a grid of query 
 
 Because the points CSV is an ordinary annotation set, its labels can be summarised like any other (e.g. cover per label over depth). With `voxel` sampling each point stands for about the same patch of surface (one per `--cell-size` cell), so a label's share of the points is its 3D (surface) cover; with `xy_grid` it is planar (top-down) cover. Query points that no photo saw, or that failed to classify, are left out, so the cover is of the observed surface. Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
 
-Usage: `substrata segment [--input PLY] [--classifier PKL|PT] [--cell-size M] [--crop-size PX] [--sampling voxel|xy_grid] [--no-occlusion] [--views N] [--save-masks [DIR]] [--per-point] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--tag NAME] [--from-points CSV] [--output-npz NPZ] [--output-ply PLY]`
+A points CSV whose labels were checked by hand is not overwritten by a new run of the same version (use `--tag`, `--from-points` to recolour from it, or `--overwrite`).
+
+Usage: `substrata segment [--input PLY] [--classifier PKL|PT] [--cell-size M] [--crop-size PX] [--sampling voxel|xy_grid] [--no-occlusion] [--views N] [--save-masks [DIR]] [--per-point] [--max-radius M] [--color LABEL=RRGGBB ...] [--full-ply [PLY]] [--tag NAME] [--overwrite] [--from-points CSV] [--output-npz NPZ] [--output-ply PLY]`
 
 ```bash
 # Using default behavior (auto-detects project + classifier from CWD)
@@ -319,11 +321,24 @@ substrata cams2video --resolution 1920
 substrata cams2video --output_mp4 output.mp4
 ```
 
+## Image sets and points on photos (sample-points)
+
+An *image set* is a folder of photos without a 3-D model, laid out like a plot: `<id>/<id>.yaml` with `type: images` (optionally `photos_path`, `camera`, `gsd_mm`, `classes`), the photos in `<id>.photos/` (subfolders allowed), and its point sets in `<id>.annos/`. `substrata sample-points`, run in its folder, samples random points on every photo (`--n-points` per photo, `--stratified` for one per grid cell, `--seed` for the same points again, `--margin` px from the edges, default half a crop) into `<id>.annos/<id>[_TAG]_points.csv`: an annotation set with each point's photo and pixel (`cam_filepath`, `cam_x`, `cam_y`) and no 3-D coordinates, to label, predict and train on like any other. A folder with `<id>.photos/` but no `<id>.yaml` is marked as an image set first. A set with labels is never overwritten (`--tag` for another, or `--overwrite`); `--training-only` marks points for training only.
+
+`camera` names the photos' camera when it is not the one the classifier was trained on (e.g. `auv`): the set's sidecar then carries it as `domain`, and `substrata train` standardises those points with their camera's own feature statistics (as for `curate` pools). `gsd_mm` gives the photos' ground resolution for point classifiers (else they are scaled by their width).
+
+Usage: `substrata sample-points [--n-points N] [--stratified] [--seed N] [--margin PX] [--tag NAME] [--training-only] [--overwrite]`
+
 ## Z-intercepts calculation
 
 Find optimal box position, subdivide to grid, sample random points, and compute Z-intercepts. Optionally apply along-slope transform before processing.
 
-Usage: `substrata intercepts [--input PLY] [--box-length M] [--box-width M] [--box-size M] [--search-radius M] [--slope]`
+Usage: `substrata intercepts [--input PLY] [--box-length M] [--box-width M] [--box-size M] [--search-radius M] [--slope] [--position [X,Y]] [--depth-range MIN MAX [--width-step M] [--depth-step M] [--seed N]] [--plan] [--tag NAME] [--training-only] [--overwrite]`
+
+- `--tag NAME`: a new set next to the others, `<id>_<mode>_NAME_intercepts.csv` (and `<mode>_NAME_bbox.png`). An existing intercepts CSV with labels is never overwritten: the command stops and asks for a `--tag` (or `--overwrite`).
+- `--training-only`: points for training only, not a survey (e.g. a box elsewhere in the plot): the sidecar gets `purpose: training_only`, so cover summaries can leave them out.
+- `--depth-range MIN MAX`: instead of a box, a depth band (metres) across the plot's whole width: one intercept per cell of `--width-step` (across the slope, along the depth contours of a plane fitted to the band; default 1 m) by `--depth-step` (in depth; default 1 m), the cloud point nearest a random position in each cell (like an intercept, not a random cloud point, which would favour densely sampled parts); cells without cloud are left out. Saved as `<id>_depth[_TAG]_intercepts.csv`, the grid in the sidecar. No box is searched for, so it is quick on a big cloud (an AUV's 60-90 m band: seconds once the cloud is loaded): e.g. training data at depths the best box leaves out. With `--plan` it only reports the cells (with cloud, empty), the band's width and the cloud's depth range. `--seed` gives the same points again.
+- `--plan`: only find the box (or take `--position`) and print it as one `INTERCEPTS_PLAN {json}` line: the box in the grid frame (x along its length, y across), the grid -> orig transform, the cloud's median height in the box, its corners in orig coords, the cloud's extent, and the cloud's point counts on the box search's 0.1 m grid (with the box's own count, to compare a moved box). Nothing is written. substrata-explore's intercepts tab uses it to preview and move the box before generating with `--position`.
 
 ```bash
 # Using default behavior (top-down intercepts)
@@ -603,12 +618,12 @@ substrata crops --annotations other_ann.csv --size 1000 --overwrite
 
 ## Predict
 
-Predict a label for every annotation with a trained classifier (`substrata train`). Each image match is classified, and the results are combined into one prediction per annotation:
+Predict a label for every annotation with a trained classifier (`substrata train`). The views are chosen as `substrata crops` chooses them: of the main camera type (`--camera-type`; default: the type that sees most points best; `all`: every camera alike), tested for occlusion (`--occlusion auto|subsample|cloud|none`, as for crops; `--no-ply`: none), clear of the photo edge (views whose crop would run past it are skipped), up to `--max-photos` (default 10). Other camera types are not used. substrata-explore predicts (live, and "crop & predict") from the same views, so its predictions match these. Each view is classified, and the results are combined into one prediction per annotation:
 
 - `weighted` (default): the mean of the class probabilities across crops, each crop weighted by its relevance (how close the camera is and how central the point is in the photo). Possibly obstructed crops are left out unless all crops are. A single overconfident crop cannot outvote several consistent ones.
 - `first`: the prediction for the best-ranked crop only.
 
-The combined prediction is written to the `pred_label`, `pred_conf`, `pred_n` (number of crops used), `pred_model` and `pred_agree` columns of the annotations CSV (only those columns change). `pred_agree` is the share of the crops used whose own prediction is the combined one: low when the views see different things, e.g. something in front of the point in some photos, so the point is worth a look through its views; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF (with `pred_model`), unless `--no-write-crops` is given.
+The combined prediction is written to the `pred_label`, `pred_conf`, `pred_n` (number of crops used), `pred_model`, `pred_agree` and `pred_top` columns of the annotations CSV (only those columns change). `pred_top` holds the five most likely classes of the combined prediction with their probabilities (`CST:0.620;CSE:0.200;...`), so the probability the classifier gives a point's own label can be read later (substrata-explore's QC screening; a class not among the five has at most the fifth's probability). `pred_agree` is the share of the crops used whose own prediction is the combined one: low when the views see different things, e.g. something in front of the point in some photos, so the point is worth a look through its views; the CSV is backed up to `backup/` first. Each crop's own prediction is also stored in its EXIF (with `pred_model`), unless `--no-write-crops` is given.
 
 **Which classifier.** `pred_model` is the classifier's fingerprint, `<file stem>@<8 hex digits>` (e.g. `point_classifier@83d12e81`): the digits are a hash of the file's contents, label map included. A copied or moved classifier keeps its fingerprint; a retrained one gets a new one. So a stored prediction can be told apart from a stale one: substrata-explore marks predictions of an older version of a loaded classifier as stale and leaves them out of its prediction filters. `substrata predict` skips the annotations whose `pred_model` is already this classifier's (re-running after retraining redoes only the stale ones, and an interrupted run continues); `--redo` predicts them all. Predictions made before `pred_model` existed are treated as unknown.
 
@@ -618,7 +633,7 @@ A point-feature classifier (`point_classifier.pt`) is also accepted: it reads ea
 
 Do not run this while the same annotations file is open in reefcat, as both write the CSV.
 
-Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--redo] [--batch-size N] [--no-ply] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--redo] [--batch-size N] [--no-ply] [--occlusion auto|subsample|cloud|none] [--camera-type TYPE] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
 # Classifier from the YAML; crops from `substrata crops`

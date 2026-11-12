@@ -573,7 +573,11 @@ def image_match_gsd_mm(match: Any) -> Optional[float]:
     cam = getattr(match, "cam", None)
     sensor = getattr(cam, "sensor", None)
     fx = getattr(sensor, "fx", None)
-    scale = world_scale(getattr(getattr(cam, "parent", None), "world_transform", None))
+    parent = getattr(cam, "parent", None)
+    # metres per model unit: set on cameras loaded without their project's
+    # world_transform (e.g. by substrata-explore), else of their world_transform
+    scale = (getattr(parent, "metres_per_unit", None)
+             or world_scale(getattr(parent, "world_transform", None)))
     if not fx or scale is None:
         return None
     depth = getattr(match, "depth", None)

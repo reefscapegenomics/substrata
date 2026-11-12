@@ -70,6 +70,7 @@ class Annotations:
         ("pred_n", ["pred_n"], False),
         ("pred_model", ["pred_model"], False),
         ("pred_agree", ["pred_agree"], False),
+        ("pred_top", ["pred_top"], False),
     ]
 
     def __init__(
@@ -1044,6 +1045,10 @@ class Annotations:
         batch_size: int = 64,
         n_jobs: int = -1,
         model: Optional[str] = None,
+        occluder: Optional[Any] = None,
+        main_type: Optional[str] = None,
+        clear_of_edge: Optional[Any] = None,
+        per_other_type: int = settings.VIEWS_PER_OTHER_TYPE,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Predict labels for many annotations (see :meth:`Annotation.predict`).
 
@@ -1069,6 +1074,10 @@ class Annotations:
                 (:func:`classification.classifier_fingerprint`), stored as
                 ``pred_model`` with each prediction; default: of ``classifier``
                 when it is a path.
+            occluder, main_type, clear_of_edge, per_other_type: as for
+                :meth:`save_crops` / :meth:`Annotation.select_views` (the views
+                predicted are those that would be cropped; per_other_type=0:
+                the main camera type's only).
 
         Returns:
             Mapping of annotation id to its consensus prediction
@@ -1080,7 +1089,9 @@ class Annotations:
             model = classification.classifier_fingerprint(classifier)
         root = root if root is not None else self.crops_root
         groups = self._collect_image_matches(
-            self._ordered(ids), cams, max_cams, pcd
+            self._ordered(ids), cams, max_cams, pcd, occluder=occluder,
+            main_type=main_type, clear_of_edge=clear_of_edge,
+            per_other_type=per_other_type,
         )
         matches = [im for _ann, ims in groups for im in ims]
         results = classification.classify_image_matches_batch(
@@ -2123,6 +2134,7 @@ class Annotations:
         ann.pred_model = get_value("pred_model")
         pred_agree = get_value("pred_agree")
         ann.pred_agree = float(pred_agree) if pred_agree is not None else None
+        ann.pred_top = get_value("pred_top")
 
     @staticmethod
     def __strip_post_fixes(ann_id: str) -> str:
@@ -2174,6 +2186,8 @@ class Annotation:
         # the share of the views used whose own prediction is the consensus (low:
         # the views see different things, e.g. something in front of the point)
         self.pred_agree: Optional[float] = None
+        # the consensus' most likely classes, "CST:0.620;CSE:0.200;..." (format_pred_top)
+        self.pred_top: Optional[str] = None
 
     @property
     def depth_in_m(self) -> float:
@@ -2456,59 +2470,43 @@ class Annotation:
                 raise ValueError(
                     "The annotations transform does not match the pcd transform"
                 )
-        # Iterate over all cams to find matches
+        # The cameras that see the point (all at once: cameras.pixel_hits)
         image_matches = []
-        for cam in cams:
-            # Skip disabled cameras if enabled_cameras_only is True
-            if (
-                enabled_cameras_only
-                and hasattr(cam, "enabled")
-                and cam.enabled is False
-            ):
-                continue
-
-            # Get pixel coordinates for each camera
-            if use_orig_coords:
-                coords = self.orig_coords
-            else:
-                coords = self.coords
-            x, y, depth, relevance = cam.get_pixel_coords(
-                coords, use_orig_coords=use_orig_coords
-            )
-
-            # If pixel coordinates are within the camera bounds
-            if x is not None:
-                if debug:
-                    print(
-                        f"Cam {cam.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}"
-                    )
-
-                image_match = cameras.ImageMatch(
-                    cam, x, y, depth, relevance, annotation=self
+        coords = self.orig_coords if use_orig_coords else self.coords
+        for cam, x, y, depth, relevance in cameras.pixel_hits(
+            cams, coords, use_orig_coords=use_orig_coords, enabled_only=enabled_cameras_only
+        ):
+            if debug:
+                print(
+                    f"Cam {cam.cam_id} has pixel match at: {x}, {y}, {depth}, {relevance}"
                 )
-                # Classify according to reprojection error if pcd is provided
-                if pcd is not None:
-                    image_match.get_reprojection_error(pcd, intercept_radius)
-                    if debug:
-                        print(f"Reprojection error: {image_match.reprojection_error}")
-                    if image_match.reprojection_error is None:
-                        continue  # do not store if no intercept found
-                    elif (
-                        image_match.reprojection_error > reprojection_threshold_discard
-                    ):
-                        continue  # do not store if error exceeds threshold
-                    elif (
-                        image_match.reprojection_error
-                        >= reprojection_threshold_uncertain
-                    ):
-                        image_match.potentially_obstructed = True
-                        image_matches.append(image_match)
-                    else:
-                        image_match.potentially_obstructed = False
-                        image_matches.append(image_match)
-                else:
-                    # If no pcd provided: add image_match regardless
+
+            image_match = cameras.ImageMatch(
+                cam, x, y, depth, relevance, annotation=self
+            )
+            # Classify according to reprojection error if pcd is provided
+            if pcd is not None:
+                image_match.get_reprojection_error(pcd, intercept_radius)
+                if debug:
+                    print(f"Reprojection error: {image_match.reprojection_error}")
+                if image_match.reprojection_error is None:
+                    continue  # do not store if no intercept found
+                elif (
+                    image_match.reprojection_error > reprojection_threshold_discard
+                ):
+                    continue  # do not store if error exceeds threshold
+                elif (
+                    image_match.reprojection_error
+                    >= reprojection_threshold_uncertain
+                ):
+                    image_match.potentially_obstructed = True
                     image_matches.append(image_match)
+                else:
+                    image_match.potentially_obstructed = False
+                    image_matches.append(image_match)
+            else:
+                # If no pcd provided: add image_match regardless
+                image_matches.append(image_match)
 
         if pcd is None and occluder is not None and image_matches:
             self._flag_occluded(image_matches, occluder, blocked_min, occlusion_check)
@@ -2874,6 +2872,7 @@ class Annotation:
         self.pred_agree = (
             round(sum(r["label"] == consensus["label"] for r in done) / len(done), 2)
             if consensus and done else None)
+        self.pred_top = format_pred_top(consensus.get("probs")) if consensus else None
         if write_crops and root is not None:
             for im, res in zip(image_matches, results):
                 path = im.find_crop(root) if res else None
@@ -3868,9 +3867,23 @@ def update_annotation_csv_row(path: str, ann_id: str, values: Dict[str, Any]) ->
     Raises:
         KeyError: If no row has this id.
     """
+    update_annotation_csv_rows(path, {ann_id: values})
+
+
+def update_annotation_csv_rows(path: str, updates: Dict[str, Dict[str, Any]]) -> None:
+    """Set columns of several annotations' rows in one read and one write (as
+    update_annotation_csv_row, e.g. a class given to 200 selected points).
+
+    Args:
+        path: Annotation CSV (with an ``id`` column).
+        updates: Annotation id -> {column name -> new value}.
+
+    Raises:
+        KeyError: If an id has no row (nothing is written then).
+    """
     rows, eol, low = _read_csv_rows(path)
     head = rows[0]
-    for c in values:
+    for c in dict.fromkeys(c for values in updates.values() for c in values):  # (new columns in the order given)
         if c not in low:
             head.append(c)
             low.append(c)
@@ -3878,15 +3891,17 @@ def update_annotation_csv_row(path: str, ann_id: str, values: Dict[str, Any]) ->
                 if r:
                     r.extend([""] * (len(head) - len(r)))
     idc = low.index("id")
-    hit = False
+    hit = set()
     for r in rows[1:]:
-        if len(r) > idc and r[idc].strip() == ann_id:
+        values = updates.get(r[idc].strip()) if len(r) > idc else None
+        if values is not None:
             r.extend([""] * (len(head) - len(r)))
             for c, v in values.items():
                 r[low.index(c)] = "" if v is None else str(v)
-            hit = True
-    if not hit:
-        raise KeyError(ann_id)
+            hit.add(r[idc].strip())
+    missing = [i for i in updates if i not in hit]
+    if missing:
+        raise KeyError(missing[0] if len(missing) == 1 else missing)
     _write_csv_rows(path, rows, eol)
 
 
@@ -3915,6 +3930,9 @@ def main_camera_type(
         cameras.assign_camera_types(cam_list)
     if not anns:
         return None
+    types = {getattr(c, "camera_type", None) for c in cam_list} - {None}
+    if len(types) == 1:  # (one camera type: nothing to vote on; matching every point to every camera is slow,
+        return types.pop()  # e.g. an AUV's 63k photos, ~80 s)
     step = max(1, len(anns) // max(1, sample))
     votes: Counter = Counter()
     for ann in anns[::step][:sample]:
@@ -3997,7 +4015,32 @@ def training_views(anns: Iterable["Annotation"]) -> Tuple[Dict[str, Tuple[str, f
     return views, review
 
 
-PREDICTION_COLUMNS = ("pred_label", "pred_conf", "pred_n", "pred_model", "pred_agree")
+PREDICTION_COLUMNS = ("pred_label", "pred_conf", "pred_n", "pred_model", "pred_agree", "pred_top")
+PRED_TOP_N = 5  # classes kept in pred_top
+
+
+def format_pred_top(probs: Optional[Dict[str, float]], n: int = PRED_TOP_N) -> Optional[str]:
+    """The ``n`` most likely classes of a consensus, ``"CST:0.620;CSE:0.200"``
+    (``pred_top``): what a class not among them has is at most the last one's
+    probability. Lets a label be checked against the prediction later (how likely
+    the classifier finds the point's own label) without storing every class."""
+    if not probs:
+        return None
+    top = sorted(probs.items(), key=lambda t: -t[1])[:n]
+    return ";".join(f"{c}:{float(v):.3f}" for c, v in top)
+
+
+def parse_pred_top(text: Optional[str]) -> Dict[str, float]:
+    """``pred_top`` back to ``{class: probability}`` (empty if none)."""
+    out: Dict[str, float] = {}
+    for part in (text or "").split(";"):
+        c, _, v = part.rpartition(":")
+        if c:
+            try:
+                out[c] = float(v)
+            except ValueError:
+                pass
+    return out
 
 
 def set_predictions(
@@ -4007,14 +4050,14 @@ def set_predictions(
     cell (and column) as it is.
 
     Sets ``pred_label`` / ``pred_conf`` / ``pred_n`` / ``pred_model`` /
-    ``pred_agree`` of the given ids (None: emptied, e.g. a point without any
-    view); the columns are added when missing. The file is rewritten once
+    ``pred_agree`` / ``pred_top`` of the given ids (None: emptied, e.g. a point
+    without any view); the columns are added when missing. The file is rewritten once
     (line ending kept).
 
     Args:
         path: Annotation CSV (with an ``id`` column).
         preds: Annotation id -> (label, confidence, crops used, classifier
-            fingerprint[, share of the crops agreeing]) or None.
+            fingerprint[, share of the crops agreeing[, pred_top]]) or None.
 
     Returns:
         The number of rows written.
@@ -4030,9 +4073,10 @@ def set_predictions(
         r.extend([""] * (len(rows[0]) - len(r)))
         p = preds[r[idc].strip()]
         agree = p[4] if p is not None and len(p) > 4 else None
+        top = p[5] if p is not None and len(p) > 5 else None
         vals = [""] * len(PREDICTION_COLUMNS) if p is None else [
             p[0], f"{float(p[1]):.4f}", str(int(p[2])), p[3] or "",
-            "" if agree is None else f"{float(agree):.2f}"]
+            "" if agree is None else f"{float(agree):.2f}", top or ""]
         for i, v in zip(ci, vals):
             r[i] = v
         n += 1

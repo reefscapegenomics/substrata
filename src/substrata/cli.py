@@ -1016,6 +1016,11 @@ def handle_segment(args):
         )
         print(f"Read segmentation: {points_csv} ({seg.n_queries:,} query points)")
     else:
+        n_labelled = _labelled_rows(names["points"])
+        if n_labelled and not getattr(args, "overwrite", False):
+            raise SystemExit(f"{names['points']} exists with {n_labelled} point(s) labelled by hand: not overwritten. "
+                             "Use --tag NAME for a new version next to it, --from-points to recolour from it, or "
+                             "--overwrite.")
         seg, points_csv = _segment_classify(args, init, names)
 
     # Propagate to the decimated cloud, print the category breakdown, and write a
@@ -1457,6 +1462,15 @@ def handle_intercepts(args):
     from substrata.initializer import ProjectInitializer
     from substrata import measurements, visualizations
 
+    # --depth-range's arguments checked before the (slow) cloud is loaded
+    if getattr(args, "depth_range", None):
+        if getattr(args, "slope", False) or getattr(args, "position", None):
+            sys.exit("--depth-range takes no --slope or --position (it needs no box)")
+        if not (getattr(args, "width_step", 1.0) > 0 and getattr(args, "depth_step", 1.0) > 0):
+            sys.exit("--width-step and --depth-step must be positive")
+        if abs(args.depth_range[0]) == abs(args.depth_range[1]):
+            sys.exit(f"--depth-range {args.depth_range[0]:g} {args.depth_range[1]:g}: an empty band")
+
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
 
@@ -1471,9 +1485,17 @@ def handle_intercepts(args):
     if init.pcd.world_transform_is_identity:
         sys.exit("World transform is not set")
 
+    if getattr(args, "depth_range", None):  # a depth band across the plot's width: no box to find
+        return _depth_intercepts(args, init)
+
     # Optionally align along slope before proceeding
     if getattr(args, "slope", False):
         slope_normal, slope_elev = init.pcd.apply_along_slope_transform()
+
+    slope = getattr(args, "slope", False)
+    mode = "slope" if slope else "topdown"
+    tag = _intercepts_tag(getattr(args, "tag", None))
+    annos_dir, csv_path = _intercepts_csv(init, mode, tag, args)
 
     # Create bounding box, subdivide to grid, and visualize
     if getattr(args, "position", None):
@@ -1501,6 +1523,9 @@ def handle_intercepts(args):
             box_width=args.box_width,
             step_size=0.1,
         )
+    if getattr(args, "plan", False):  # the box only (e.g. a preview to adjust before generating): one JSON line
+        _print_intercepts_plan(init, optimal_bbox, mode, slope_elev if slope else None)
+        return
     try:
         bboxes = measurements.subdivide_boxes(optimal_bbox, args.box_size)
     except ValueError as e:
@@ -1515,14 +1540,7 @@ def handle_intercepts(args):
     )
 
     # Save the grid image and intercepts CSV, plus the CSV's sidecar YAML
-    slope = getattr(args, "slope", False)
-    mode = "slope" if slope else "topdown"
-    fig.savefig(_get_output_filepath(init, f"{mode}_bbox.png"))
-    # Annotation sets live in <id>.annos/ (with their sidecars and crops)
-    annos_dir = init.annos_root or os.path.join(os.getcwd(), f"{init.id}.annos")
-    os.makedirs(annos_dir, exist_ok=True)
-    csv_path = os.path.join(annos_dir, f"{init.id}_{mode}_intercepts.csv")
-    intercepts.save(csv_path)
+    fig.savefig(_get_output_filepath(init, f"{mode}{tag}_bbox.png"))
 
     # Grid frame = grid_transform @ world_transform @ orig, where grid_transform
     # is the slope alignment (identity for topdown)
@@ -1544,17 +1562,7 @@ def handle_intercepts(args):
         "slope_elevation_deg": float(slope_elev) if slope else None,
         "bbox_orig": bbox_orig,
     }
-    sidecar_path = sidecars.write_annotation_sidecar(
-        csv_path,
-        {
-            "type": "intercepts",
-            "plot_id": init.id,
-            "classes": init.classes_filepath,
-            "world_transform": init.world_transform,
-            "intercepts": grid,
-        },
-    )
-    print(f"Saved intercepts to {csv_path} (settings: {sidecar_path})")
+    _save_intercepts(init, intercepts, annos_dir, csv_path, grid, args)
 
     if slope:
         # additional visualization for sanity check
@@ -1565,6 +1573,186 @@ def handle_intercepts(args):
             point_size=1,
             output_filename=_get_output_filepath(init, "slope_pca.png"),
         )
+
+
+def handle_sample_points(args):
+    """Random points on an image set's photos (substrata.imagesets: <id>/<id>.yaml with type: images,
+    <id>.photos/), as an annotation set: <id>.annos/<id>[_<tag>]_points.csv (photo + pixel per point; no 3-D
+    coordinates) with its sidecar. A folder with a <id>.photos/ folder but no <id>.yaml is marked as an image set
+    first. A set with labels is never overwritten (use --tag, or --overwrite)."""
+    from substrata import imagesets
+    from substrata.cameras import Cameras
+
+    folder = os.getcwd()
+    sid = os.path.basename(folder)
+    if imagesets.image_set_yaml(folder) is None:
+        if not os.path.isdir(os.path.join(folder, f"{sid}.photos")):
+            sys.exit(f"{folder} is not an image set: it needs {sid}.yaml with 'type: images', or a {sid}.photos/ "
+                     "folder of photos")
+        if os.path.exists(os.path.join(folder, f"{sid}.yaml")):  # (a plot's: its photos are placed by its cameras)
+            sys.exit(f"{folder} is a plot ({sid}.yaml without 'type: images'), not an image set: points on its "
+                     "photos come from its 3-D points (substrata intercepts, crops)")
+        print(f"Marked {sid} as an image set: {imagesets.write_image_set_yaml(folder)}")
+    info = imagesets.read_image_set(folder)
+    if not os.path.isdir(info["photos"]):
+        sys.exit(f"No photos folder {info['photos']}")
+    tag = _intercepts_tag(getattr(args, "tag", None))
+    csv_path = os.path.join(info["annos"], f"{sid}{tag}_points.csv")
+    n_labelled = _labelled_rows(csv_path)
+    if n_labelled and not getattr(args, "overwrite", False):
+        sys.exit(f"{csv_path} exists with {n_labelled} labelled point(s): not overwritten. Use --tag NAME for a new "
+                 "set next to it, or --overwrite.")
+    cams = Cameras.from_image_dir(info["photos"], recursive=True)
+    if not cams.data:
+        sys.exit(f"No photos in {info['photos']}")
+    margin = args.margin if args.margin is not None else settings.CROP_SIZE_DEFAULT[0] // 2
+    print(f"Sampling {args.n_points} {'stratified' if args.stratified else 'random'} point(s) on each of "
+          f"{len(cams.data)} photos (at least {margin} px from the edges)")
+    anns = cams.get_random_image_points(args.n_points, margin=margin, stratified=args.stratified, seed=args.seed)
+    os.makedirs(info["annos"], exist_ok=True)
+    anns.save(csv_path, orig_coords_only=True)
+    sidecars.write_annotation_sidecar(csv_path, {
+        "type": "image_points",
+        **({"purpose": "training_only"} if getattr(args, "training_only", False) else {}),
+        # the image set's camera (its YAML `camera`): another camera's points are standardised with their own
+        # statistics in training (substrata train: the rows' domain)
+        **({"domain": info["camera"]} if info["camera"] else {}),
+        "plot_id": sid,
+        "classes": info["classes"],
+        "sampling": {"n_points": int(args.n_points), "stratified": bool(args.stratified), "seed": args.seed,
+                     "margin": int(margin), "photos": info["photos"], "n_photos": len(cams.data)},
+    }, update=False)
+    print(f"Saved sampled points to {csv_path} ({len(anns)} points)")
+
+
+def _intercepts_csv(init, mode: str, tag: str, args) -> tuple:
+    """(annos dir, CSV path) of a new intercepts set, <id>.annos/<id>_<mode>[_<tag>]_intercepts.csv; exits if
+    that set exists with labels (unless --plan or --overwrite)."""
+    annos_dir = init.annos_root or os.path.join(os.getcwd(), f"{init.id}.annos")
+    csv_path = os.path.join(annos_dir, f"{init.id}_{mode}{tag}_intercepts.csv")
+    if not getattr(args, "plan", False) and not getattr(args, "overwrite", False):
+        n_labelled = _labelled_rows(csv_path)
+        if n_labelled:
+            sys.exit(f"{csv_path} exists with {n_labelled} labelled point(s): not overwritten. Use --tag NAME "
+                     "for a new set next to it, or --overwrite.")
+    return annos_dir, csv_path
+
+
+def _save_intercepts(init, intercepts, annos_dir: str, csv_path: str, grid: dict, args) -> None:
+    """An intercepts set into <id>.annos/ (annotation sets live there, with their sidecars and crops), with its
+    sidecar (type intercepts, purpose training_only with --training-only, the grid in `intercepts`)."""
+    os.makedirs(annos_dir, exist_ok=True)
+    intercepts.save(csv_path)
+    purpose = {"purpose": "training_only"} if getattr(args, "training_only", False) else {}
+    sidecar_path = sidecars.write_annotation_sidecar(
+        csv_path,
+        {
+            "type": "intercepts",
+            **purpose,
+            "plot_id": init.id,
+            "classes": init.classes_filepath,
+            "world_transform": init.world_transform,
+            "intercepts": grid,
+        },
+    )
+    print(f"Saved intercepts to {csv_path} (settings: {sidecar_path})")
+
+
+def _depth_intercepts(args, init) -> None:
+    """substrata intercepts --depth-range MIN MAX: one intercept per cell of a grid over that depth band, across
+    the plot's whole width (measurements.depth_band_sample: --width-step across the slope, --depth-step in
+    depth; the cloud point nearest a random position in each cell; cells without cloud left out), as
+    <id>_depth[_<tag>]_intercepts.csv. For training data at depths the plot's best box leaves out, without
+    searching for a box (slow on a big cloud, e.g. an AUV's)."""
+    from substrata import measurements
+    lo, hi = sorted(abs(float(v)) for v in args.depth_range)
+    tag = _intercepts_tag(getattr(args, "tag", None))
+    annos_dir, csv_path = _intercepts_csv(init, "depth", tag, args)
+    try:
+        got = measurements.depth_band_sample(init.pcd.points, lo, hi, args.width_step, args.depth_step,
+                                             seed=getattr(args, "seed", None))
+    except ValueError as e:
+        sys.exit(str(e))
+    n_grid = got["columns"] * got["rows"]
+    print(f"Depth band {lo:g}-{hi:g} m (cloud {got['cloud_depth'][0]:.1f}-{got['cloud_depth'][1]:.1f} m): "
+          f"{got['band_points']:,} cloud points, {got['width']:.1f} m wide; grid {got['columns']} x {got['rows']} "
+          f"cells ({args.width_step:g} m across x {args.depth_step:g} m depth), {got['cells_with_cloud']} with cloud "
+          f"({n_grid - got['cells_with_cloud']} empty)")
+    if getattr(args, "plan", False):
+        print("INTERCEPTS_PLAN " + json.dumps(dict(
+            mode="depth", depth_range=[lo, hi], width=got["width"], columns=got["columns"], rows=got["rows"],
+            cells=got["cells_with_cloud"], band_points=got["band_points"], cloud_depth=got["cloud_depth"])),
+            flush=True)
+        return
+    intercepts = init.pcd.intercepts_at_points(got["points"], id_prefix=init.id)
+    grid = {
+        "mode": "depth",
+        "depth_range": [lo, hi],
+        "depth_step": float(args.depth_step),
+        "width_step": float(args.width_step),
+        "across": [float(v) for v in got["across"]],
+        "u0": got["u0"],
+        "width": got["width"],
+        "columns": got["columns"],
+        "rows": got["rows"],
+        "cells_with_cloud": got["cells_with_cloud"],
+        "seed": getattr(args, "seed", None),
+    }
+    _save_intercepts(init, intercepts, annos_dir, csv_path, grid, args)
+
+
+def _intercepts_tag(tag) -> str:
+    """``--tag NAME`` as the file-name part ``_NAME`` (letters, digits, _ - and . only), "" without one."""
+    if not tag:
+        return ""
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tag)).strip("-._")
+    if not clean:
+        sys.exit(f"--tag {tag!r}: use letters, digits, _, - or .")
+    return f"_{clean}"
+
+
+def _labelled_rows(csv_path: str) -> int:
+    """How many rows of an annotation CSV have a label (0 if there is no such file)."""
+    import csv
+    if not os.path.isfile(csv_path):
+        return 0
+    with open(csv_path, newline="") as f:
+        rows = csv.reader(f)  # (not DictReader: a segmentation's points CSV has millions of rows)
+        col = next((i for i, c in enumerate(next(rows, [])) if c.strip().lower() == "label"), None)
+        return 0 if col is None else sum(1 for r in rows if len(r) > col and r[col].strip())
+
+
+def _print_intercepts_plan(init, bbox, mode: str, slope_elev) -> None:
+    """``intercepts --plan``: the box found (or given) as one ``INTERCEPTS_PLAN {json}`` line: ``bbox`` (grid
+    frame: x along the box length, y across), ``grid_to_orig`` (4x4: grid frame -> the plot's orig frame, to
+    place a moved box), ``z`` (the cloud's median height in the box, grid frame), ``bbox_orig`` (its corners at
+    that height, orig frame), ``extent`` (the cloud's xy range, grid frame), ``mode``, ``slope_elevation_deg``,
+    ``cloud_grid`` (the point counts on the box search's 0.1 m grid, zlib + base64 uint32, with its origin, shape
+    and the box's own ``count``: to compare a moved box)."""
+    from substrata import measurements
+    pts = np.asarray(init.pcd.points)
+    if len(pts) > 2_000_000:  # (a sample is plenty for a median and a range)
+        pts = pts[np.random.default_rng(0).choice(len(pts), 2_000_000, replace=False)]
+    (x0, y0), (x1, y1) = [[float(v) for v in xy] for xy in bbox]
+    inside = (pts[:, 0] >= x0) & (pts[:, 0] <= x1) & (pts[:, 1] >= y0) & (pts[:, 1] <= y1)
+    z = float(np.median(pts[inside, 2])) if inside.any() else float(np.median(pts[:, 2]))
+    g2o = np.linalg.inv(np.asarray(init.pcd.world_transform, float))
+    corners = np.array([[x0, y0, z, 1], [x1, y0, z, 1], [x1, y1, z, 1], [x0, y1, z, 1]])
+    # the cloud on the box search's grid (find_optimal_box_position: the box with the most points), so that a
+    # moved box can be compared with this one without loading the cloud again
+    import base64
+    import zlib
+    step = 0.1
+    hist, xe, ye = measurements.cloud_xy_histogram(init.pcd.points, step)
+    i0, j0 = int(round((x0 - xe[0]) / step)), int(round((y0 - ye[0]) / step))
+    count = float(hist[max(i0, 0):i0 + int(round((x1 - x0) / step)), max(j0, 0):j0 + int(round((y1 - y0) / step))].sum())
+    grid = dict(step=step, x0=float(xe[0]), y0=float(ye[0]), shape=list(hist.shape), count=count,
+                counts=base64.b64encode(zlib.compress(hist.astype("<u4").tobytes())).decode())
+    plan = dict(mode=mode, bbox=[[x0, y0], [x1, y1]], z=z, grid_to_orig=g2o.tolist(), cloud_grid=grid,
+                bbox_orig=(g2o @ corners.T)[:3].T.tolist(),
+                extent=[[float(pts[:, 0].min()), float(pts[:, 1].min())], [float(pts[:, 0].max()), float(pts[:, 1].max())]],
+                slope_elevation_deg=None if slope_elev is None else float(slope_elev))
+    print("INTERCEPTS_PLAN " + json.dumps(plan), flush=True)
 
 
 def handle_intercepts_plot(args):
@@ -3406,6 +3594,66 @@ def handle_thumbnails(args):
     _print_status_counts("Thumbnails", counts, root)
 
 
+def _view_choice(args, use_ply: bool = True):
+    """The project and how views are chosen, as ``substrata crops`` does (shared
+    with ``substrata predict``, so that the views predicted are those cropped):
+    ``(init, occluder, pcd, main_type, method)``. ``args.occlusion`` (auto /
+    subsample / cloud / none; ``--no-ply``: none) and ``args.camera_type``."""
+    from substrata import cameras as cameras_mod
+    from substrata.stratified import ply_occluder
+
+    method = "none" if args.no_ply or not use_ply else args.occlusion
+    probe = occluder = None
+    if method in ("auto", "subsample"):
+        probe = _load_annotation_project(args, use_ply=False)
+        occluder = ply_occluder(probe.ply_full_path)
+        if occluder is None and method == "subsample":
+            raise SystemExit(
+                "No stratified full-resolution PLY: run `substrata stratify` "
+                "first, or use --occlusion cloud.")
+        method = "subsample" if occluder is not None else "cloud"
+    init = (probe if probe is not None and method != "cloud"
+            else _load_annotation_project(args, use_ply=method == "cloud"))
+    if method == "cloud" and init.pcd is None:
+        method = "none"
+    types = cameras_mod.assign_camera_types(init.cams)
+    if args.camera_type == "all":
+        main_type = None
+    elif args.camera_type:
+        if args.camera_type not in types:
+            raise SystemExit(f"No camera type {args.camera_type!r}; types: {types}")
+        main_type = args.camera_type
+    else:
+        main_type = init.annotations.main_camera_type(init.cams)
+    print(
+        f"Occlusion test: {method}. Camera types: {', '.join(types)}; views from "
+        f"{main_type or 'all cameras'}.")
+    return init, occluder, (init.pcd if method == "cloud" else None), main_type, method
+
+
+def _add_view_choice_args(p) -> None:
+    """--no-ply / --occlusion / --camera-type (crops, predict)."""
+    p.add_argument(
+        "--no-ply", dest="no_ply", action="store_true",
+        help="No occlusion test (same as --occlusion none).",
+    )
+    p.add_argument(
+        "--occlusion", dest="occlusion", default="auto",
+        choices=["auto", "subsample", "cloud", "none"],
+        help="Occlusion test for choosing views: 'subsample' tests the line of "
+             "sight on the stratified full-resolution PLY (needs `substrata "
+             "stratify`); 'cloud' is the legacy reprojection test on the "
+             "YAML's point cloud (loaded into memory); 'auto' (default): "
+             "subsample if the plot is stratified, else cloud.",
+    )
+    p.add_argument(
+        "--camera-type", dest="camera_type", default=None, metavar="TYPE",
+        help="Main camera type to choose views from (as printed, e.g. "
+             "'9568x6376 f6460'). Default: the type that sees most points best; "
+             "'all' uses every camera alike (legacy).",
+    )
+
+
 def handle_crops(args):
     """Handle the crops CLI command.
 
@@ -3424,23 +3672,8 @@ def handle_crops(args):
         args: Arguments from argparse.
     """
     from substrata import annotations as annotations_mod
-    from substrata import cameras as cameras_mod
-    from substrata.stratified import ply_occluder
 
-    method = "none" if args.no_ply else args.occlusion
-    probe = occluder = None
-    if method in ("auto", "subsample"):
-        probe = _load_annotation_project(args, use_ply=False)
-        occluder = ply_occluder(probe.ply_full_path)
-        if occluder is None and method == "subsample":
-            raise SystemExit(
-                "No stratified full-resolution PLY: run `substrata stratify` "
-                "first, or use --occlusion cloud.")
-        method = "subsample" if occluder is not None else "cloud"
-    init = (probe if probe is not None and method != "cloud"
-            else _load_annotation_project(args, use_ply=method == "cloud"))
-    if method == "cloud" and init.pcd is None:
-        method = "none"
+    init, occluder, pcd, main_type, method = _view_choice(args)
     anns = init.annotations
     root = args.output or anns.crops_root
     crop_size = _size_arg(
@@ -3448,25 +3681,13 @@ def handle_crops(args):
         (init.crop_size, init.crop_size) if init.crop_size
         else settings.CROP_SIZE_DEFAULT,
     )
-    types = cameras_mod.assign_camera_types(init.cams)
-    if args.camera_type == "all":
-        main_type = None
-    elif args.camera_type:
-        if args.camera_type not in types:
-            raise SystemExit(f"No camera type {args.camera_type!r}; types: {types}")
-        main_type = args.camera_type
-    else:
-        main_type = anns.main_camera_type(init.cams)
-    print(
-        f"Occlusion test: {method}. Camera types: {', '.join(types)}; views from "
-        f"{main_type or 'all cameras'}.")
     print(f"Saving {crop_size[0]}x{crop_size[1]} crops to {root}")
     counts = anns.save_crops(
         init.cams,
         root=root,
         crop_size=crop_size,
         max_cams=args.max_photos,
-        pcd=init.pcd if method == "cloud" else None,
+        pcd=pcd,
         overwrite=args.overwrite,
         n_jobs=args.jobs,
         occluder=occluder,
@@ -3737,7 +3958,10 @@ def handle_predict(args):
     if args.image_dir or args.points:
         return _predict_images(args)
 
-    init = _load_annotation_project(args, use_ply=not args.no_ply)
+    # the views `substrata crops` chooses (main camera type, occlusion test, clear
+    # of the photo edge), so that the views predicted are those cropped: the main
+    # camera type's only (as substrata-explore's review counts them)
+    init, occluder, pcd, main_type, _method = _view_choice(args)
     classifier_path = args.classifier or init.classifier_filepath
     if not classifier_path:
         raise SystemExit("No classifier: pass --classifier or set it in the YAML.")
@@ -3762,7 +3986,12 @@ def handle_predict(args):
         learn,
         crop_size=crop_size,
         max_cams=args.max_photos,
-        pcd=init.pcd,
+        pcd=pcd,
+        occluder=occluder,
+        main_type=main_type,
+        clear_of_edge=((init.crop_size, init.crop_size) if init.crop_size
+                       else settings.CROP_SIZE_DEFAULT),
+        per_other_type=0,
         root=root,
         ids=ids,
         write_crops=not args.no_write_crops,
@@ -3783,7 +4012,8 @@ def handle_predict(args):
     csv_path = init.annotations_filepath
     backup = _backup_file(csv_path)
     set_predictions(csv_path, {
-        i: (c["label"], c["confidence"], c["n"], model, anns.data[i].pred_agree) if c else None
+        i: (c["label"], c["confidence"], c["n"], model, anns.data[i].pred_agree,
+            anns.data[i].pred_top) if c else None
         for i, c in consensus.items()})
     print(f"Saved predictions to {csv_path} (backup: {backup})")
 
@@ -5831,6 +6061,11 @@ def main():
              "<id>_seg_<NAME>[_dec].ply, so several segmentations can coexist.",
     )
     p_seg.add_argument(
+        "--overwrite", dest="overwrite", action="store_true",
+        help="Replace an existing segmentation points CSV that has labels checked by "
+             "hand (otherwise refused: use --tag for a new version).",
+    )
+    p_seg.add_argument(
         "--from-points", dest="from_points", type=str, default=None,
         metavar="CSV",
         help="Recolour from an existing segmentation points CSV (e.g. after "
@@ -6144,6 +6379,27 @@ def main():
         help="Reset all paths to local (relative to project path).",
     )
 
+    # sample-points (image sets)
+    p_sp = subparsers.add_parser(
+        "sample-points",
+        help="Random points on an image set's photos (<id>/<id>.photos/), as an annotation set "
+             "<id>.annos/<id>[_TAG]_points.csv to label or predict.",
+    )
+    p_sp.add_argument("--n-points", dest="n_points", type=int, default=settings.IMAGE_POINTS_DEFAULT,
+                      help=f"Points per photo. Default: {settings.IMAGE_POINTS_DEFAULT}.")
+    p_sp.add_argument("--stratified", dest="stratified", action="store_true",
+                      help="One point per grid cell (stratified random) instead of simple random points.")
+    p_sp.add_argument("--seed", dest="seed", type=int, default=None, help="Random seed (reproducible points).")
+    p_sp.add_argument("--margin", dest="margin", type=int, default=None, metavar="PX",
+                      help=f"Minimum distance from the photo edges. Default: {settings.CROP_SIZE_DEFAULT[0] // 2} "
+                           "(half a crop, so a point's crop has no padding).")
+    p_sp.add_argument("--tag", dest="tag", type=str, default=None, metavar="NAME",
+                      help="A new set next to the others: <id>_NAME_points.csv.")
+    p_sp.add_argument("--training-only", dest="training_only", action="store_true",
+                      help="Points for training only, not a survey (sidecar purpose: training_only).")
+    p_sp.add_argument("--overwrite", dest="overwrite", action="store_true",
+                      help="Replace an existing points CSV that has labels (otherwise refused).")
+
     # intercepts
     p_intercepts = subparsers.add_parser(
         "intercepts",
@@ -6314,6 +6570,48 @@ def main():
         dest="slope",
         action="store_true",
         help="Apply along-slope transform to pointcloud before processing.",
+    )
+    p_intercepts.add_argument(
+        "--depth-range", dest="depth_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Instead of a box: a depth band (metres) across the plot's whole width, one intercept per cell of "
+             "--width-step across the slope by --depth-step in depth (the cloud point nearest a random position "
+             "in each cell; cells without cloud left out): <id>_depth[_NAME]_intercepts.csv. E.g. training data "
+             "at depths the best box leaves out, without searching for a box.",
+    )
+    p_intercepts.add_argument(
+        "--width-step", dest="width_step", type=float, default=1.0, metavar="M",
+        help="With --depth-range: the cells' width across the slope (m; default 1).",
+    )
+    p_intercepts.add_argument(
+        "--depth-step", dest="depth_step", type=float, default=1.0, metavar="M",
+        help="With --depth-range: the cells' height in depth (m; default 1).",
+    )
+    p_intercepts.add_argument(
+        "--seed", dest="seed", type=int, default=None,
+        help="With --depth-range: random seed (the same points again).",
+    )
+    p_intercepts.add_argument(
+        "--plan", dest="plan", action="store_true",
+        help="Only find the box (or take --position) and print it as one "
+             "'INTERCEPTS_PLAN {json}' line (box in the grid frame, its corners in "
+             "orig coords, the grid -> orig transform); nothing is written. For a "
+             "preview to adjust before generating (substrata-explore).",
+    )
+    p_intercepts.add_argument(
+        "--tag", dest="tag", type=str, default=None, metavar="NAME",
+        help="A new set next to the others: <id>_<mode>_NAME_intercepts.csv "
+             "(and <mode>_NAME_bbox.png).",
+    )
+    p_intercepts.add_argument(
+        "--training-only", dest="training_only", action="store_true",
+        help="Points for training only, not a survey (sidecar purpose: "
+             "training_only), e.g. a box elsewhere in the plot: left out of cover "
+             "summaries.",
+    )
+    p_intercepts.add_argument(
+        "--overwrite", dest="overwrite", action="store_true",
+        help="Replace an existing intercepts CSV that has labels (otherwise "
+             "refused: use --tag for a new set).",
     )
     p_intercepts.add_argument(
         "--local",
@@ -6583,25 +6881,7 @@ def main():
         "--overwrite", dest="overwrite", action="store_true",
         help="Regenerate existing crops.",
     )
-    p_crops.add_argument(
-        "--no-ply", dest="no_ply", action="store_true",
-        help="No occlusion test (same as --occlusion none).",
-    )
-    p_crops.add_argument(
-        "--occlusion", dest="occlusion", default="auto",
-        choices=["auto", "subsample", "cloud", "none"],
-        help="Occlusion test for choosing views: 'subsample' tests the line of "
-             "sight on the stratified full-resolution PLY (needs `substrata "
-             "stratify`); 'cloud' is the legacy reprojection test on the "
-             "YAML's point cloud (loaded into memory); 'auto' (default): "
-             "subsample if the plot is stratified, else cloud.",
-    )
-    p_crops.add_argument(
-        "--camera-type", dest="camera_type", default=None, metavar="TYPE",
-        help="Main camera type to choose views from (as printed, e.g. "
-             "'9568x6376 f6460'). Default: the type that sees most points best; "
-             "'all' uses every camera alike (legacy).",
-    )
+    _add_view_choice_args(p_crops)
     p_crops.add_argument(
         "--no-views", dest="no_views", action="store_true",
         help="Do not write training views into the annotations CSV.",
@@ -6676,10 +6956,7 @@ def main():
         "--batch-size", dest="batch_size", type=int, default=64,
         help="Inference batch size. Default: 64.",
     )
-    p_predict.add_argument(
-        "--no-ply", dest="no_ply", action="store_true",
-        help="Skip loading the point cloud (faster, but no occlusion filtering).",
-    )
+    _add_view_choice_args(p_predict)
     img_group = p_predict.add_argument_group(
         "image-only mode (plain photos, no project)",
         "Classify points on plain images instead of a 3-D project's "
@@ -7864,6 +8141,7 @@ def main():
         "crops": handle_crops,
         "import-coralnet": handle_import_coralnet,
         "predict": handle_predict,
+        "sample-points": handle_sample_points,
         "match-annotations": handle_match_annotations,
         "camsync": handle_camsync,
         "path-repair": handle_path_repair,

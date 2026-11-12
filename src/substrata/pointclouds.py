@@ -1022,18 +1022,7 @@ class PointCloud:
                     intercept_point.id = idx
                 intercept_points.append(intercept_point)
 
-        # Intercepts are in this cloud's (transformed) frame: record its
-        # world_transform and the matching original coords, so they line up
-        # with cameras/pcd (e.g. get_image_matches checks the transforms)
-        if not self.world_transform_is_identity:
-            intercept_points.get_original_coords(self.world_transform)
-
-        # Carry over the depth regression so depth_in_m works on the intercepts
-        for attr in ("up_vector", "depth_offset"):
-            if getattr(self, attr, None) is not None:
-                setattr(intercept_points, attr, getattr(self, attr))
-        if getattr(self, "depth_scale_factor", None) is not None:
-            intercept_points.depth_per_unit = self.depth_scale_factor
+        self._as_intercepts(intercept_points)
 
         # Provide a short output summary
         print(f"Intercept points returned: {len(intercept_points)}/{len(xy_coords)}")
@@ -1046,6 +1035,28 @@ class PointCloud:
                 f"{extrapolated_count}/{len(intercept_points)}"
             )
         return intercept_points
+
+    def _as_intercepts(self, intercept_points: "Annotations") -> "Annotations":
+        """Intercepts in this cloud's (transformed) frame: its world_transform and the matching original
+        coords recorded, so they line up with cameras/pcd (e.g. get_image_matches checks the transforms), and
+        the depth regression carried over so depth_in_m works on them."""
+        if not self.world_transform_is_identity:
+            intercept_points.get_original_coords(self.world_transform)
+        for attr in ("up_vector", "depth_offset"):
+            if getattr(self, attr, None) is not None:
+                setattr(intercept_points, attr, getattr(self, attr))
+        if getattr(self, "depth_scale_factor", None) is not None:
+            intercept_points.depth_per_unit = self.depth_scale_factor
+        return intercept_points
+
+    def intercepts_at_points(self, points: np.ndarray, id_prefix: str | None = None) -> "Annotations":
+        """Intercepts at points of this cloud (its frame), e.g. chosen by measurements.depth_band_sample."""
+        out = annotations.Annotations()
+        for idx, p in enumerate(np.asarray(points, dtype=float)):
+            a = annotations.InterceptAnnotation(p, 0.0, is_extrapolated=False)
+            a.id = f"{id_prefix}_{idx}" if id_prefix is not None else idx
+            out.append(a)
+        return self._as_intercepts(out)
 
     def get_z_intercept(
         self,
