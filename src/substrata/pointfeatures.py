@@ -994,7 +994,8 @@ def fit_point_probe(
     Returns:
         ``(classes, weights (K, C), bias (K,), chosen C)``.
     """
-    from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import f1_score
     from sklearn.model_selection import StratifiedKFold
 
     y = np.asarray(y)
@@ -1003,14 +1004,23 @@ def fit_point_probe(
     zs = (z - m) / s
     folds = min(cv, int(min(Counter(y.tolist()).values())))
     if folds >= 2 and len(cs) > 1:
-        lr = LogisticRegressionCV(
-            Cs=list(cs), cv=StratifiedKFold(folds, shuffle=True, random_state=seed),
-            class_weight="balanced", scoring="f1_macro", max_iter=5000,
-        ).fit(zs, y)
-        c = float(np.atleast_1d(lr.C_)[0])
+        # The C search by hand (as LogisticRegressionCV with scoring="f1_macro"
+        # would): that combination fails for two classes in some scikit-learn
+        # versions (1.9: make_scorer() got multiple values for 'pos_label').
+        splits = list(StratifiedKFold(folds, shuffle=True, random_state=seed).split(zs, y))
+
+        def cv_f1(c: float) -> float:
+            scores = []
+            for tr, te in splits:
+                fit = LogisticRegression(C=c, class_weight="balanced", max_iter=5000).fit(zs[tr], y[tr])
+                scores.append(f1_score(y[te], fit.predict(zs[te]), average="macro"))
+            return float(np.mean(scores))
+
+        f1s = [cv_f1(float(c)) for c in cs]
+        c = float(list(cs)[int(np.argmax(f1s))])  # (ties: the first, as LogisticRegressionCV)
     else:
         c = float(sorted(cs)[len(cs) // 2])
-        lr = LogisticRegression(C=c, class_weight="balanced", max_iter=5000).fit(zs, y)
+    lr = LogisticRegression(C=c, class_weight="balanced", max_iter=5000).fit(zs, y)
     classes = [str(k) for k in lr.classes_]
     w = np.asarray(lr.coef_, np.float64)
     b = np.asarray(lr.intercept_, np.float64)

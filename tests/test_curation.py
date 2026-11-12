@@ -19,7 +19,12 @@ from collections import Counter
 import numpy as np
 from PIL import Image
 
-from test_pointfeatures import (
+import test_pointfeatures
+
+if test_pointfeatures.torch is None:  # (FakeBackbone and the classifiers need torch)
+    raise unittest.SkipTest("torch is not installed")
+
+from test_pointfeatures import (  # noqa: E402
     FakeBackbone,
     _load,
     _make_classifier,

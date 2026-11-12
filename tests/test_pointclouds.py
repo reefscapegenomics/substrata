@@ -4,6 +4,7 @@ import logging
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # Third-Party Libraries
@@ -24,6 +25,7 @@ def _load_pointclouds():
     """
     if str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
+    before = set(sys.modules)
 
     pkg = sys.modules.get("substrata")
     if pkg is None:
@@ -68,7 +70,16 @@ def _load_pointclouds():
 
     if "substrata.pointclouds" not in sys.modules:
         _load("substrata.pointclouds", "pointclouds.py")
-    return sys.modules["substrata.pointclouds"]
+    mod = sys.modules["substrata.pointclouds"]
+    added = [n for n in set(sys.modules) - before
+             if n in ("substrata.annotations", "substrata.visualizations",
+                      "substrata.logging", "substrata.pointclouds")]
+    # The stubs (and a pointclouds bound to them) are this module's own: out of
+    # sys.modules again, so test modules collected after this one import the
+    # real substrata modules (e.g. test_curation needs annotations' CSV helpers).
+    for name in added:
+        sys.modules.pop(name, None)
+    return mod
 
 
 pcmod = _load_pointclouds()
@@ -126,10 +137,19 @@ class TestRemoveStrayXYPoints(unittest.TestCase):
     def test_preview_does_not_mutate(self):
         pts, colors, _, _ = _dense_with_strays()
         pc = _make_pc(pts, colors)
-        viz = sys.modules["substrata.visualizations"]
-        viz.plot_2d_calls.clear()
+        # A recording plot_2d for this test only: in a full test run the real
+        # substrata.visualizations may already be imported (by another test
+        # module), so the loader's stub is not necessarily the one in place.
+        viz = types.ModuleType("substrata.visualizations")
+        viz.plot_2d_calls = []
 
-        ret = pc.remove_stray_xy_points(density_frac=0.1, preview=True)
+        def _plot_2d(pcd, highlight_coords=None, **kwargs):
+            viz.plot_2d_calls.append({"pcd": pcd, "highlight_coords": highlight_coords})
+            return "FIG"
+
+        viz.plot_2d = _plot_2d
+        with mock.patch.dict(sys.modules, {"substrata.visualizations": viz}):
+            ret = pc.remove_stray_xy_points(density_frac=0.1, preview=True)
 
         self.assertEqual(ret, "FIG")
         self.assertEqual(len(pc.points), len(pts), "preview must not drop points")
