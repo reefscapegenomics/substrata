@@ -4,6 +4,8 @@ This package provides tools for working with point clouds, including
 loading, processing, and analyzing 3D point cloud data.
 """
 
+__version__ = "0.2.0.dev2"  # (the package's version: pyproject.toml reads it; substrata-explore checks it at start-up)
+
 import warnings
 
 # Suppress noisy tqdm warning emitted by tqdm.autonotebook when ipywidgets is missing.

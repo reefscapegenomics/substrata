@@ -17,8 +17,9 @@ class TestImageSets(unittest.TestCase):
         d = os.path.join(tempfile.mkdtemp(), "reef_auv")
         os.makedirs(os.path.join(d, "reef_auv.photos"))
         self.assertIsNone(imagesets.image_set_yaml(d))
-        with self.assertRaises(ValueError):
-            imagesets.read_image_set(d)
+        self.assertTrue(imagesets.is_image_set(d))  # (unmarked: <id>.photos/, no <id>.yaml or .ply)
+        info = imagesets.read_image_set(d)
+        self.assertEqual((info["yaml"], info["camera"], info["photos"]), (None, None, os.path.join(d, "reef_auv.photos")))
         y = imagesets.write_image_set_yaml(d, camera="auv")
         self.assertEqual(imagesets.image_set_yaml(d), y)
         info = imagesets.read_image_set(d)
@@ -30,6 +31,16 @@ class TestImageSets(unittest.TestCase):
         with open(os.path.join(plot, "plot_1.yaml"), "w") as f:
             f.write("cams_xml: plot_1.cams.xml\n")
         self.assertIsNone(imagesets.image_set_yaml(plot))
+        os.makedirs(os.path.join(plot, "plot_1.photos"))
+        self.assertFalse(imagesets.is_image_set(plot))  # (a plot has <id>.photos/ too)
+        with self.assertRaises(ValueError):
+            imagesets.read_image_set(plot)
+        annos_only = os.path.join(os.path.dirname(d), "reef_b")  # (points on photos elsewhere)
+        os.makedirs(os.path.join(annos_only, "reef_b.annos"))
+        self.assertFalse(imagesets.is_image_set(annos_only))
+        open(os.path.join(annos_only, "reef_b.annos", "reef_b_points.csv"), "w").close()
+        self.assertTrue(imagesets.is_image_set(annos_only))
+        self.assertFalse(imagesets.is_image_set(os.path.dirname(d)))  # (any other folder)
 
     def test_sample_points_refuses_a_plot(self):
         from argparse import Namespace

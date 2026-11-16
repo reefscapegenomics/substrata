@@ -323,7 +323,7 @@ substrata cams2video --output_mp4 output.mp4
 
 ## Image sets and points on photos (sample-points)
 
-An *image set* is a folder of photos without a 3-D model, laid out like a plot: `<id>/<id>.yaml` with `type: images` (optionally `photos_path`, `camera`, `gsd_mm`, `classes`), the photos in `<id>.photos/` (subfolders allowed), and its point sets in `<id>.annos/`. `substrata sample-points`, run in its folder, samples random points on every photo (`--n-points` per photo, `--stratified` for one per grid cell, `--seed` for the same points again, `--margin` px from the edges, default half a crop) into `<id>.annos/<id>[_TAG]_points.csv`: an annotation set with each point's photo and pixel (`cam_filepath`, `cam_x`, `cam_y`) and no 3-D coordinates, to label, predict and train on like any other. A folder with `<id>.photos/` but no `<id>.yaml` is marked as an image set first. A set with labels is never overwritten (`--tag` for another, or `--overwrite`); `--training-only` marks points for training only.
+An *image set* is a folder of photos without a 3-D model, laid out like a plot: `<id>/<id>.yaml` with `type: images` (optionally `photos_path`, `camera`, `gsd_mm`, `classes`), the photos in `<id>.photos/` (subfolders allowed), and its point sets in `<id>.annos/`. `substrata sample-points`, run in its folder, samples random points on every photo (`--n-points` per photo, `--stratified` for one per grid cell, `--seed` for the same points again, `--margin` px from the edges, default half a crop) into `<id>.annos/<id>[_TAG]_points.csv`: an annotation set with each point's photo and pixel (`cam_filepath`, `cam_x`, `cam_y`) and no 3-D coordinates, to label, predict and train on like any other. A folder with `<id>.photos/` but no `<id>.yaml` (or `<id>.ply`) is an image set already, with the defaults; `sample-points` writes its YAML (`type: images`) first. A set with labels is never overwritten (`--tag` for another, or `--overwrite`); `--training-only` marks points for training only.
 
 `camera` names the photos' camera when it is not the one the classifier was trained on (e.g. `auv`): the set's sidecar then carries it as `domain`, and `substrata train` standardises those points with their camera's own feature statistics (as for `curate` pools). `gsd_mm` gives the photos' ground resolution for point classifiers (else they are scaled by their width).
 
@@ -616,6 +616,33 @@ substrata crops
 substrata crops --annotations other_ann.csv --size 1000 --overwrite
 ```
 
+## Training views after the lens model fix (reproject-views)
+
+Since 0.2.0.dev1 substrata projects with Metashape's frame camera model exactly: P1 with x and P2 with y (they were
+the other way round, OpenCV's order), plus K4, P3, P4 and the skew B2, checked against Metashape's own
+`Calibration.project` and against the tie points of a Samoa project (`tests/test_lens_metashape.py`). A point's
+pixel moves by a few px on most sensors, up to tens near the photo edges and hundreds on a badly calibrated one. A
+view is also only in view up to the radius where the lens's distortion folds back: beyond it, points far outside the
+photo's field landed inside the image (on sa3_20m's PGRAM02, points ~50° off the axis in the middle of the photo).
+
+Views chosen anew (review, crops, predict) use the corrected model by themselves. The training views stored in
+annotation CSVs (`cam_x`, `cam_y`) are moved once, in each plot folder:
+
+```bash
+substrata reproject-views --dry-run   # what would change, per CSV of <plot>.annos/
+substrata reproject-views             # or name CSVs: substrata reproject-views <plot>.annos/x.csv
+```
+
+A row with a 3-D point and a training view on one of the plot's photos gets the corrected pixel when its stored
+pixel is where the old model put the point (within `--tol`, 1 px); a view the corrected model does not see the point
+in is cleared (`cam_filepath`, `cam_x`, `cam_y` emptied; `--keep-out-of-view` keeps them; a row left out of training
+keeps its view), and its id listed in `backup/<csv>_cleared_views_<time>.txt` (its label may have been given on the
+wrong crop). Other rows are left as they are and counted (a pixel placed elsewhere, a photo of another plot), as is
+every other cell. The CSV is backed up first; substrata-explore's grouping features of the set (made at the old
+pixels) go to `backup/` too. Running it again changes nothing. Then crop again (`substrata crops`, or
+substrata-explore's crop job: the cleared points get a new training view, crops at the old pixels are pruned as
+stale) and train again.
+
 ## Predict
 
 Predict a label for every annotation with a trained classifier (`substrata train`). The views are chosen as `substrata crops` chooses them: of the main camera type (`--camera-type`; default: the type that sees most points best; `all`: every camera alike), tested for occlusion (`--occlusion auto|subsample|cloud|none`, as for crops; `--no-ply`: none), clear of the photo edge (views whose crop would run past it are skipped), up to `--max-photos` (default 10). Other camera types are not used. substrata-explore predicts (live, and "crop & predict") from the same views, so its predictions match these. Each view is classified, and the results are combined into one prediction per annotation:
@@ -641,6 +668,66 @@ substrata predict
 
 # Explicit classifier, using only the best crop per annotation
 substrata predict --classifier crop_classifier.pkl --method first
+```
+
+### From one camera group (`--camera-group`)
+
+`--camera-group GROUP` predicts the set's points from the photos of **one camera group only, including cameras that are disabled in the project**. For example, it can use the AUV photos aligned into a diver plot, which the plot's cams.xml marks disabled so that they stay out of its point cloud. The results go to a **separate CSV**; the set's own CSV (labels, training views, its stored predictions) is not changed. This allows validation across camera systems, such as classifying the diver-labelled points of a plot from its AUV photos only.
+
+Choosing the group (`--camera-group list` prints the plot's groups, with how many cameras each has and how many are enabled):
+
+- **camera type**, as printed by crops and predict: one resolution, with the focal length within 3% (e.g. `'2848x2816 f3153'`);
+- **camera system**: a sensor resolution (`2848x2816`), i.e. every type of that resolution, whatever its calibrated focal length (substrata-explore chooses cameras this way across plots);
+- **camera group**, named by the photo folder and file-name prefix (`auv_PR`, `photos_PGRAM01`), or a folder's groups together (`auv`, `photos`);
+- `enabled`: the enabled cameras, the ones `substrata segment` uses;
+- `all`: every camera.
+
+`type:` / `group:` / `system:` say which is meant when a name is several.
+
+How views are chosen and combined (`--view-mode`):
+
+- `segment` (default): as `substrata segment` classifies its query points (the same code, `segmentation.classify_query_points`), so each point gets what a cover map made from that group's photos gives at it.
+  - Up to `--views` views (default `SEG_POINT_VIEWS` = 3), the most relevant (closest, most central).
+  - The reprojection occlusion test on the YAML's point cloud (`--no-ply`: none). The PLY is loaded, which takes a few minutes for a large plot.
+  - No photo-edge filter.
+  - A point classifier fuses the views' dense per-photo probability maps: the relevance-weighted mean (weight = relevance_min / relevance), then the most probable class.
+  - A crop classifier uses the best view.
+  - As in segment, a view that fails the occlusion test is dropped without being replaced by the next one, so a point can end up with no view even though cameras see it.
+- `predict`: as `substrata predict` above (the same views and consensus).
+  - Up to `--views` views (default `--max-photos`, 10).
+  - The stratified occlusion test (`--occlusion`).
+  - Only views whose crop fits in the photo.
+  - The relevance-weighted mean, with obstructed views left out unless all are.
+
+The output is `<set folder>/predictions/<set stem>__<group>__<mode>[__<tag>].csv` (`--tag NAME`, or `--output-csv PATH`). It has one row per point of the set, in the set's order, with these columns:
+
+- `id`, `label`: the set's label, copied for comparison.
+- `pred_label`, `pred_conf`: the fused probability of the predicted class (threshold this).
+- `pred_n`: the views used.
+- `pred_agree`: in segment mode, the weight share of the views whose own label is the fused one; in predict mode, the unweighted share.
+- `pred_top`.
+- `views_available`: the group's cameras that have the point in view (in front, inside the image), before the occlusion test, the edge filter and the limit of views.
+- `view_filepath`, `view_x`, `view_y`: the highest-weight view used (in predict mode, the most relevant unobstructed one).
+- `camera_group`, `view_mode`, `pred_model`.
+
+A point with no view has an empty `pred_label`, `pred_n` 0, and `views_available` showing whether any camera of the group saw it at all. The `predictions/` folder is not an annotation set (substrata-explore lists `.annos/*.csv` only).
+
+`<output>.json` records the run: the set, the classifier and its fingerprint, the group, its kind, its number of cameras and how many of them are disabled, the mode, views, occlusion test, edge filter, crop size, substrata's version, the time, and the counts (`points`, `with_view_available`, `predicted`, `no_view`).
+
+Usage: `substrata predict --camera-group GROUP [--view-mode segment|predict] [--views N] [--classifier PT|PKL] [--tag NAME] [--output-csv PATH] [--annotations CSV] [--no-ply] [--occlusion ...] [--batch-size N] [--jobs N]`
+
+```bash
+# The diver-labelled points of a plot from its AUV photos only, as the AUV cover map would classify them
+cd sam_sa3_40m_20250928
+substrata predict --annotations sam_sa3_40m_20250928.annos/sam_sa3_40m_20250928_slope_intercepts.csv \
+    --camera-group auv --classifier ../../classifiers/sav03/point_classifier.pt --tag sav03
+# -> sam_sa3_40m_20250928.annos/predictions/sam_sa3_40m_20250928_slope_intercepts__auv__segment__sav03.csv
+
+# The same points from the diver photos, as substrata predict would (for comparison)
+substrata predict --annotations ... --camera-group photos --view-mode predict --tag sav03
+
+# Which groups the plot has
+substrata predict --camera-group list
 ```
 
 ### Image-only mode (plain photos)

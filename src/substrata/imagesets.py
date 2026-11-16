@@ -10,6 +10,10 @@
         <id>.photos/                    the photos (subfolders allowed), or photos_path elsewhere
         <id>.annos/<id>[_<tag>]_points.csv   points on the photos (substrata sample-points), with their sidecars
 
+A folder named like a plot with ``<id>.photos/`` (or ``<id>.annos/`` with a ``*_points.csv``) and neither ``<id>.yaml``
+nor ``<id>.ply`` is an image set too, with the defaults (no camera, gsd_mm or classes): ``is_image_set``.
+``substrata sample-points`` writes its YAML; nothing else does.
+
 A points CSV holds each point's photo and pixel (``cam_filepath``, ``cam_x``, ``cam_y``); the 3-D coordinate columns
 are empty. Everything that works on a point's training view (thumbnails, labelling, predicting, grouping, training)
 works on these points the same way.
@@ -37,16 +41,39 @@ def image_set_yaml(folder: str) -> Optional[str]:
     return y if isinstance(data, dict) and data.get("type") == TYPE else None
 
 
+def _unmarked_image_set(folder: str) -> bool:
+    """No ``<id>.yaml`` or ``<id>.ply`` (not a plot), and ``<id>.photos/`` or a ``<id>.annos/*_points.csv``."""
+    sid = os.path.basename(folder)
+    if any(os.path.exists(os.path.join(folder, sid + ext)) for ext in (".yaml", ".ply")):
+        return False
+    if os.path.isdir(os.path.join(folder, f"{sid}.photos")):
+        return True
+    try:
+        return any(e.name.endswith("_points.csv") for e in os.scandir(os.path.join(folder, f"{sid}.annos")))
+    except OSError:
+        return False
+
+
+def is_image_set(folder: str) -> bool:
+    """Whether ``folder`` is an image set: marked by its YAML (``type: images``), or unmarked (see the module)."""
+    folder = os.path.abspath(folder)
+    return image_set_yaml(folder) is not None or _unmarked_image_set(folder)
+
+
 def read_image_set(folder_or_yaml: str) -> Dict[str, Any]:
-    """An image set's settings: ``id``, ``folder``, ``yaml``, ``photos`` (absolute), ``annos`` (``<id>.annos``),
-    ``camera``, ``gsd_mm`` and ``classes`` (absolute, or None). Raises ValueError if it is not an image set."""
+    """An image set's settings: ``id``, ``folder``, ``yaml`` (None if unmarked), ``photos`` (absolute), ``annos``
+    (``<id>.annos``), ``camera``, ``gsd_mm`` and ``classes`` (absolute, or None). Raises ValueError if it is not an
+    image set."""
     p = os.path.abspath(folder_or_yaml)
     folder = os.path.dirname(p) if p.endswith((".yaml", ".yml")) else p
     y = image_set_yaml(folder)
-    if y is None:
-        raise ValueError(f"{folder} is not an image set (no {os.path.basename(folder)}.yaml with type: images)")
-    with open(y) as f:
-        data = yaml.safe_load(f) or {}
+    if y is None and not _unmarked_image_set(folder):
+        raise ValueError(f"{folder} is not an image set (no {os.path.basename(folder)}.yaml with type: images, "
+                         f"and no {os.path.basename(folder)}.photos/ folder)")
+    data = {}
+    if y is not None:
+        with open(y) as f:
+            data = yaml.safe_load(f) or {}
     sid = os.path.basename(folder)
 
     def path(v):

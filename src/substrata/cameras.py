@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw
-from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist, squareform
 from tqdm import tqdm
@@ -176,44 +175,233 @@ def _first_existing(*paths) -> str | None:
     return None
 
 
-_HITS_CACHE: dict = {}  # the cameras' stacked projection parameters (pixel_hits), for the last list of cameras
+# --- Projection (3-D points -> pixels) -----------------------------------------
+# One core shared by Camera.get_pixel_coords (a point, one camera), Camera.project_points
+# (many points, one camera) and pixel_hits (a point, many cameras): _distort and
+# _relevance. The poses are inverted per call for one camera (always its current
+# pose); for many cameras they are stacked once (CameraStack), cached on their
+# Cameras and rebuilt after _projection_changed.
+
+_SENSOR_FIELDS = ("k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4", "b2", "fx", "fy", "cx", "cy", "width", "height",
+                  "r2_max")
+_STACKS_KEPT = 2  # camera stacks kept per Cameras (or for cameras without one, in _HITS_CACHE)
+_PROJ_STATE = {"gen": 0}  # bumped when poses or sensors change in place: every stack is rebuilt
+_HITS_CACHE: dict = {}  # stacks of camera lists that do not belong to a Cameras
 
 
-def _stacked_cameras(cams: list):
-    """The projection parameters of ``cams`` (orig frame) as arrays, made once per list of cameras (kept for the
-    last one; the cameras are held, so the ids sampled for its key cannot be reused). None if a camera lacks a
-    sensor or an orig transform (then per camera, as before). Poses and sensors are taken as fixed: what changes
-    them in place (camera sync, reverse_transform_coords, reading sensors) clears the cache; ``enabled`` is read
-    afresh by pixel_hits."""
-    n = len(cams)
-    key = (n, tuple(id(c) for c in cams[:: max(1, n // 64)]), id(cams[-1]))
-    got = _HITS_CACHE.get(key)
-    if got is not None:
-        return got
-    try:  # (the sensors first: a camera without one fails fast, before the costly inversion)
-        S = [c.sensor for c in cams]
-        par = {a: np.array([float(getattr(s, a)) for s in S]) for a in
-               ("k1", "k2", "k3", "p1", "p2", "fx", "fy", "cx", "cy", "width", "height")}
-        inv = np.linalg.inv(np.stack([np.asarray(c.orig_camera_transform, float).reshape(4, 4) for c in cams]))
-        centres = np.stack([np.asarray(c.orig_coords, float).reshape(3) for c in cams])
-    except (AttributeError, TypeError, ValueError):
-        return None
-    got = dict(cams=list(cams), inv=inv, centres=centres, **par)
+def _projection_changed() -> None:
+    """Camera poses, sensors or the cameras of a :class:`Cameras` changed: stacks are rebuilt on next use."""
+    _PROJ_STATE["gen"] += 1
     _HITS_CACHE.clear()
-    _HITS_CACHE[key] = got
-    return got
+
+
+def _lens(x, y, s):
+    """Metashape's frame camera distortion of normalised coordinates ``(x, y)`` (``X/Z``, ``Y/Z``) through
+    sensor ``s``: the distorted normalised coordinates ``(x', y')``. Agisoft Metashape manual, appendix
+    "Camera models" (frame cameras)::
+
+        r2 = x^2 + y^2
+        x' = x (1 + K1 r2 + K2 r2^2 + K3 r2^3 + K4 r2^4) + (P1 (r2 + 2 x^2) + 2 P2 x y) (1 + P3 r2 + P4 r2^2)
+        y' = y (1 + K1 r2 + K2 r2^2 + K3 r2^3 + K4 r2^4) + (P2 (r2 + 2 y^2) + 2 P1 x y) (1 + P3 r2 + P4 r2^2)
+
+    Note the tangential terms: Metashape's P1 goes with x (OpenCV's p2) and P2 with y (OpenCV's p1).
+    Checked against Metashape's own ``Calibration.project`` (tests/test_lens_metashape.py)."""
+    r2 = x * x + y * y
+    radial = 1 + r2 * (s.k1 + r2 * (s.k2 + r2 * (s.k3 + r2 * s.k4)))
+    tang = 1 + r2 * (s.p3 + r2 * s.p4)
+    x_dist = x * radial + (s.p1 * (r2 + 2 * x * x) + 2 * s.p2 * x * y) * tang
+    y_dist = y * radial + (s.p2 * (r2 + 2 * y * y) + 2 * s.p1 * x * y) * tang
+    return x_dist, y_dist
+
+
+def _lens_jacobian(x, y, s):
+    """The derivatives of :func:`_lens` at ``(x, y)``: ``(dx'/dx, dx'/dy, dy'/dx, dy'/dy)``."""
+    r2 = x * x + y * y
+    radial = 1 + r2 * (s.k1 + r2 * (s.k2 + r2 * (s.k3 + r2 * s.k4)))
+    d_radial = s.k1 + r2 * (2 * s.k2 + r2 * (3 * s.k3 + r2 * 4 * s.k4))  # (d radial / d r2)
+    tang = 1 + r2 * (s.p3 + r2 * s.p4)
+    d_tang = s.p3 + 2 * s.p4 * r2
+    tx = s.p1 * (r2 + 2 * x * x) + 2 * s.p2 * x * y
+    ty = s.p2 * (r2 + 2 * y * y) + 2 * s.p1 * x * y
+    xx = radial + 2 * x * x * d_radial + (6 * s.p1 * x + 2 * s.p2 * y) * tang + 2 * x * tx * d_tang
+    xy = 2 * x * y * d_radial + (2 * s.p1 * y + 2 * s.p2 * x) * tang + 2 * y * tx * d_tang
+    yx = 2 * x * y * d_radial + (2 * s.p2 * x + 2 * s.p1 * y) * tang + 2 * x * ty * d_tang
+    yy = radial + 2 * y * y * d_radial + (6 * s.p2 * y + 2 * s.p1 * x) * tang + 2 * y * ty * d_tang
+    return xx, xy, yx, yy
+
+
+def _r2_max(k1, k2, k3, k4, fx, width, height) -> float:
+    """The largest squared normalised radius a sensor images: below the radius where its radial distortion
+    folds back (``d/dr [r (1 + K1 r^2 + ... + K4 r^8)] = 1 + 3 K1 r^2 + 5 K2 r^4 + 7 K3 r^6 + 9 K4 r^8`` turns
+    0; beyond it, points outside the lens's field would land inside the image again), and within 1.01 times
+    the image's longer side of the axis (a bound where it never folds)."""
+    bound = 1.01 * max(width, height) ** 2 / fx**2
+    roots = np.roots([9 * k4, 7 * k3, 5 * k2, 3 * k1, 1.0]) if any((k1, k2, k3, k4)) else []
+    folds = [float(t.real) for t in roots if abs(t.imag) < 1e-12 and t.real > 0]
+    return min([bound, *folds])
+
+
+def _undistort(x_img, y_img, s, iterations: int = 20):
+    """The normalised coordinates ``(x, y)`` that sensor ``s`` images at pixel ``(x_img, y_img)``: the
+    inverse of :func:`_distort` (Newton's method on :func:`_lens`, from the undistorted guess). Scalars or
+    arrays. Converges to ~1e-12 px over the image for the calibrations Metashape produces (closer than
+    Metashape's own ``unproject``); NaN where there is no such point (a pixel the lens model cannot reach:
+    the far corners of a strongly distorted photo; or one beyond the fold, see :func:`_r2_max`)."""
+    y_d = (np.asarray(y_img, float) - s.cy) / s.fy
+    x_d = (np.asarray(x_img, float) - s.cx - s.b2 * y_d) / s.fx
+    x, y = x_d.copy(), y_d.copy()
+    for _ in range(iterations):
+        ex, ey = _lens(x, y, s)
+        ex, ey = ex - x_d, ey - y_d
+        a, b, c, d = _lens_jacobian(x, y, s)
+        det = a * d - b * c
+        x = x - (d * ex - b * ey) / det
+        y = y - (a * ey - c * ex) / det
+    ex, ey = _lens(x, y, s)
+    off = np.hypot(ex - x_d, ey - y_d) * s.fy > 1e-4  # (px: not converged, no solution)
+    bad = off | ~(x * x + y * y < s.r2_max)
+    if np.ndim(bad):
+        x, y = np.where(bad, np.nan, x), np.where(bad, np.nan, y)
+    elif bad:
+        x, y = np.float64(np.nan), np.float64(np.nan)
+    return x, y
+
+
+def _distort(xc, yc, zc, s):
+    """Pixels of camera-frame points ``(xc, yc, zc)`` through sensor ``s`` (a :class:`Sensor`, or a
+    :class:`CameraStack`, row by row): Metashape's frame camera model (:func:`_lens`: K1-K4 radial, P1-P4
+    tangential), then ``u = cx + x' fx + y' B2`` (fx = f + B1: affinity; B2: skew), ``v = cy + y' fy``.
+    Scalars or arrays (broadcast).
+
+    Returns:
+        ``(x_img, y_img, in_view)``, unrounded. In view: in front of the camera (one behind it can project
+        into the image too), within the radius the lens images (``r2_max``: before its distortion folds
+        back into the image, see :func:`_r2_max`) and inside the image, borders included.
+    """
+    x_norm = xc / zc
+    y_norm = yc / zc
+    r2 = x_norm**2 + y_norm**2
+    x_dist, y_dist = _lens(x_norm, y_norm, s)
+    x_img = s.fx * x_dist + s.b2 * y_dist + s.cx
+    y_img = s.fy * y_dist + s.cy
+    in_view = (
+        (zc > 0)
+        & (r2 < s.r2_max)
+        & (x_img >= 0) & (x_img <= s.width)
+        & (y_img >= 0) & (y_img <= s.height)
+    )
+    return x_img, y_img, in_view
+
+
+def _relevance(depth, dist_sq, x_img, y_img, fx, fy, width, height):
+    """Relevance of a view (lower is better): the point's depth plus its squared distance to the camera
+    centre, over fx * fy, times (10 + the pixel's distance from the image centre, L1)."""
+    return np.abs((np.abs(depth) + dist_sq) / (fx * fy)) * (
+        10 + np.abs(x_img - 0.5 * width) + np.abs(y_img - 0.5 * height)
+    )
+
+
+def can_project(cam, use_orig_coords: bool = True) -> bool:
+    """Whether ``cam`` can project points: it has a calibrated sensor and a pose of its own.
+
+    Not a camera whose sensor has no calibration in cams.xml (``sensor`` None: e.g. close-ups and video frames
+    left unaligned), nor one loaded with a placeholder pose (a null centre or transform in meta.json:
+    ``missing_pose_from_meta``), nor one without a pose in the frame asked for. Such cameras see nothing:
+    :func:`pixel_hits`, :meth:`Camera.get_pixel_coords` and :meth:`Camera.project_points` treat every point as
+    out of their view.
+    """
+    if getattr(cam, "sensor", None) is None or getattr(cam, "missing_pose_from_meta", False):
+        return False
+    attr = "orig_camera_transform" if use_orig_coords else "camera_transform"
+    return not hasattr(cam, attr) or getattr(cam, attr) is not None  # (a camera double may carry none)
+
+
+class CameraStack:
+    """The projection arrays of a list of cameras, one row per camera, in one frame.
+
+    Only the cameras that can project (:func:`can_project`: a calibrated sensor and a pose) are stacked.
+    Attributes: ``cams`` (those cameras), ``inv`` ``(M, 4, 4)`` inverse poses (world to camera), ``centres``
+    ``(M, 3)`` camera centres, and the sensors' ``_SENSOR_FIELDS`` (k1-k4, p1-p4, b2, fx fy cx cy width
+    height) as ``(M,)``
+    arrays; ``use_orig_coords`` the frame. Made by :meth:`Cameras.projection_arrays` and :func:`pixel_hits`
+    (cached; see :func:`_stack_for`). Raises AttributeError / TypeError / ValueError when a camera has no
+    ``sensor`` attribute at all (a double) or a pose cannot be read as a 4x4 matrix or inverted.
+    """
+
+    def __init__(self, cams, use_orig_coords: bool = True):
+        # (a camera double without a sensor attribute raises below: pixel_hits then asks it one at a time)
+        self.cams = [c for c in cams if not hasattr(c, "sensor") or can_project(c, use_orig_coords)]
+        self.use_orig_coords = bool(use_orig_coords)
+        self.gen = _PROJ_STATE["gen"]
+        sensors = [c.sensor for c in self.cams]  # (first: a camera without one fails before the inversion)
+        for a in _SENSOR_FIELDS:
+            setattr(self, a, np.array([float(getattr(s, a)) for s in sensors]))
+        poses = [c.orig_camera_transform if use_orig_coords else c.camera_transform for c in self.cams]
+        centres = [c.orig_coords if use_orig_coords else c.coords for c in self.cams]
+        self.inv = (np.linalg.inv(np.stack([np.asarray(t, float).reshape(4, 4) for t in poses])) if poses
+                    else np.zeros((0, 4, 4)))
+        self.centres = (np.stack([np.asarray(c, float).reshape(3) for c in centres]) if centres
+                        else np.zeros((0, 3)))
+
+    def __len__(self) -> int:
+        return len(self.cams)
+
+
+def _stack_for(cams: list, use_orig_coords: bool = True, owner=None):
+    """The :class:`CameraStack` of ``cams`` (a non-empty list), made once per list of cameras and frame.
+
+    Kept on ``owner`` (the :class:`Cameras` they come from; by default the first camera's parent), the last
+    ``_STACKS_KEPT`` lists, else in ``_HITS_CACHE``. A list is known by its length and a sample of its
+    cameras (held by the stack, so their ids cannot be reused). Poses and sensors are taken as fixed: what
+    changes them in place (world transforms, camera sync, reading sensors, replacing cameras) calls
+    :func:`_projection_changed`. ``enabled`` is not stacked, nor are cameras that cannot project
+    (:func:`can_project`). None if a pose cannot be read or inverted (then pixel_hits goes one camera at a
+    time); that is remembered too.
+    """
+    n = len(cams)
+    key = (bool(use_orig_coords), n, tuple(id(c) for c in cams[:: max(1, n // 64)]), id(cams[-1]))
+    owner = owner if owner is not None else getattr(cams[0], "parent", None)
+    store = owner.__dict__.setdefault("_proj_stacks", {}) if isinstance(owner, Cameras) else _HITS_CACHE
+    gen = _PROJ_STATE["gen"]
+    got = store.get(key)
+    if got is not None and got[0] == gen:
+        return got[1]
+    try:
+        st = CameraStack(cams, use_orig_coords)
+    except (AttributeError, TypeError, ValueError):
+        st = None
+    for k in [k for k, v in store.items() if v[0] != gen or k == key]:  # (stale ones go)
+        del store[k]
+    while len(store) >= _STACKS_KEPT:
+        del store[next(iter(store))]
+    store[key] = (gen, st)
+    return st
 
 
 def pixel_hits(cams, coords, use_orig_coords: bool = True, enabled_only: bool = True) -> list:
-    """The cameras that see 3-D point ``coords`` in their image: [(camera, x, y, depth, relevance)] in the order
-    of ``cams``, as :meth:`Camera.get_pixel_coords` gives them one camera at a time, but in one set of numpy
-    operations over all cameras (orig frame): choosing views among tens of thousands of cameras (an AUV's) per
-    point took ~1 s that way. The math (Brown-Conrady distortion, the in-view test, the relevance metric) is
-    the same; other frames (``use_orig_coords`` False), or cameras without a sensor, go one camera at a time."""
+    """The cameras that see 3-D point ``coords`` in their image.
+
+    As :meth:`Camera.get_pixel_coords` gives them one camera at a time, but in one set of numpy operations
+    over all cameras: choosing views among tens of thousands of cameras (an AUV's) per point took ~1 s that
+    way. Same projection core (Metashape's lens model, the in-view test, the relevance metric), on the
+    cameras' stacked poses and sensors (:class:`CameraStack`, cached on their :class:`Cameras`), in either
+    frame. Cameras without a calibrated sensor or a pose of their own (:func:`can_project`) see nothing.
+
+    Args:
+        cams: Cameras (a list, any iterable, or a :class:`Cameras`).
+        coords: The 3-D point, in the frame of ``use_orig_coords``.
+        use_orig_coords: The cameras' original poses (else their current, world-frame ones).
+        enabled_only: Skip cameras whose ``enabled`` is False (read afresh on every call).
+
+    Returns:
+        ``[(camera, x, y, depth, relevance)]`` in the order of ``cams``: ``x``, ``y`` rounded int pixels,
+        ``depth`` and ``relevance`` floats.
+    """
+    owner = cams if isinstance(cams, Cameras) else None
     cams = cams if isinstance(cams, list) else list(cams)
     if not cams:
         return []
-    st = _stacked_cameras(cams) if use_orig_coords else None
+    st = _stack_for(cams, use_orig_coords, owner)
     if st is None:
         out = []
         for cam in cams:
@@ -224,25 +412,18 @@ def pixel_hits(cams, coords, use_orig_coords: bool = True, enabled_only: bool = 
                 out.append((cam, x, y, depth, rel))
         return out
     p = np.append(np.asarray(coords, float).ravel()[:3], 1.0)
-    proj = st["inv"] @ p
+    proj = st.inv @ p
     with np.errstate(divide="ignore", invalid="ignore"):
-        xn, yn = proj[:, 0] / proj[:, 2], proj[:, 1] / proj[:, 2]
-        r2 = xn ** 2 + yn ** 2
-        radial = 1 + st["k1"] * r2 + st["k2"] * r2 ** 2 + st["k3"] * r2 ** 3
-        xd = xn * radial + 2 * st["p1"] * xn * yn + st["p2"] * (r2 + 2 * xn ** 2)
-        yd = yn * radial + st["p1"] * (r2 + 2 * yn ** 2) + 2 * st["p2"] * xn * yn
-        xi, yi = st["fx"] * xd + st["cx"], st["fy"] * yd + st["cy"]
-        ok = ((proj[:, 2] > 0) & (r2 * st["fx"] ** 2 < 1.01 * st["width"] ** 2)  # (in front of the camera)
-              & (xi >= 0) & (xi <= st["width"]) & (yi >= 0) & (yi <= st["height"]))
+        xi, yi, ok = _distort(proj[:, 0], proj[:, 1], proj[:, 2], st)
     idx = np.flatnonzero(ok)
     if enabled_only:  # (read afresh, of the hits only: cheap, and never stale)
-        idx = np.array([i for i in idx.tolist() if getattr(st["cams"][i], "enabled", True) is not False], int)
+        idx = np.array([i for i in idx.tolist() if getattr(st.cams[i], "enabled", True) is not False], int)
     if not len(idx):
         return []
-    dist_sq = ((st["centres"][idx] - p[:3]) ** 2).sum(1)
-    rm = (np.abs((np.abs(proj[idx, 2]) + dist_sq) / (st["fx"][idx] * st["fy"][idx]))
-          * (10 + np.abs(xi[idx] - 0.5 * st["width"][idx]) + np.abs(yi[idx] - 0.5 * st["height"][idx])))
-    return [(st["cams"][i], int(round(xi[i])), int(round(yi[i])), float(proj[i, 2]), r)
+    dist_sq = ((st.centres[idx] - p[:3]) ** 2).sum(1)
+    rm = _relevance(proj[idx, 2], dist_sq, xi[idx], yi[idx],
+                    st.fx[idx], st.fy[idx], st.width[idx], st.height[idx])
+    return [(st.cams[i], int(round(xi[i])), int(round(yi[i])), float(proj[i, 2]), r)
             for i, r in zip(idx.tolist(), rm.tolist())]
 
 
@@ -467,7 +648,11 @@ def _update_crop_metadata(path: str, updates: dict) -> None:
 
 
 class Sensor:
-    """Class that holds calibration parameters for a specific camera sensor."""
+    """Class that holds calibration parameters for a specific camera sensor (Metashape's frame camera
+    model: see :func:`_lens`)."""
+
+    # (defaults for the optional terms, also for a Sensor pickled before they were read)
+    b1 = b2 = k4 = p3 = p4 = 0.0
 
     def __init__(self, sensor_id, label, resolution, calibration_params):
         """Initialize a Sensor instance.
@@ -492,14 +677,28 @@ class Sensor:
         self.k1 = calibration_params["k1"]
         self.k2 = calibration_params["k2"]
         self.k3 = calibration_params["k3"]
+        self.k4 = calibration_params.get("k4", 0.0)
         self.p1 = calibration_params["p1"]
         self.p2 = calibration_params["p2"]
+        self.p3 = calibration_params.get("p3", 0.0)
+        self.p4 = calibration_params.get("p4", 0.0)
 
         # Derived parameters
         self.fx = self.f + self.b1
         self.fy = self.f
         self.cx = self.width / 2 + self.cx_metashape
         self.cy = self.height / 2 + self.cy_metashape
+
+    @property
+    def r2_max(self) -> float:
+        """The largest squared normalised radius this sensor images (:func:`_r2_max`), worked out once
+        for its terms."""
+        key = (self.k1, self.k2, self.k3, self.k4, self.fx, self.width, self.height)
+        got = self.__dict__.get("_r2_max")
+        if got is None or got[0] != key:
+            got = (key, _r2_max(*key))
+            self.__dict__["_r2_max"] = got
+        return got[1]
 
 
 class Cameras:
@@ -605,9 +804,31 @@ class Cameras:
 
     def __setitem__(self, key, value):
         self.data[key] = value
+        _projection_changed()
 
     def __delitem__(self, key):
         del self.data[key]
+        _projection_changed()
+
+    def __getstate__(self):
+        """Pickled / copied without the cached projection stacks (rebuilt on use)."""
+        state = self.__dict__.copy()
+        state.pop("_proj_stacks", None)
+        return state
+
+    def projection_arrays(self, use_orig_coords: bool = True) -> CameraStack | None:
+        """The cameras' poses and sensors stacked as arrays (:class:`CameraStack`), in ``data`` order.
+
+        Made once and cached (shared with :func:`pixel_hits` for the same cameras); rebuilt after poses,
+        sensors or the cameras change through this module (world transforms, camera sync, reading sensors,
+        setting or deleting cameras). Only the cameras that can project (:func:`can_project`); None if there
+        are no cameras or a pose cannot be read or inverted.
+
+        Args:
+            use_orig_coords: The original poses (else the current, world-frame ones).
+        """
+        cams = list(self.data.values())
+        return _stack_for(cams, use_orig_coords, owner=self) if cams else None
 
     def __contains__(self, key):
         return key in self.data
@@ -687,6 +908,7 @@ class Cameras:
         else:
             self.data[cam.cam_id] = cam
             self.data[cam.cam_id].parent = self
+            _projection_changed()
             # TO DO: any other changes (eg transforms) to be implemented on append?
 
     def transform_coords(self, transform_matrix):
@@ -1082,6 +1304,7 @@ class Cameras:
         Args:
             cams_meta_filepath (str): Path to the JSON file with camera metadata.
         """
+        _projection_changed()  # (cameras (re)loaded)
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
         n_placeholder = 0
@@ -1371,6 +1594,13 @@ class Cameras:
                     "p1": get_float_or_zero(calibration, "p1"),
                     "p2": get_float_or_zero(calibration, "p2"),
                 }
+                for name in ("k4", "p3", "p4"):  # (optional: Metashape writes them only when fitted)
+                    elem = calibration.find(name)
+                    try:
+                        calib_params[name] = float(elem.text) if elem is not None and elem.text else 0.0
+                    except ValueError:
+                        logger.warning(f"Invalid {name} value for sensor {sensor_id}, using default 0.0")
+                        calib_params[name] = 0.0
 
                 # Handle optional b1, b2 parameters
                 b1_elem = calibration.find("b1")
@@ -1425,7 +1655,7 @@ class Cameras:
                 self, "_no_sensor_message_printed", False
             )
             if cam_id in self.data:
-                _HITS_CACHE.clear()  # (sensors changed: pixel_hits restacks)
+                _projection_changed()  # (sensors changed: restack)
                 self.data[cam_id].sensor_id = sensor_id
                 self.data[cam_id].sensor = self.sensors.get(sensor_id)
                 if self.data[cam_id].sensor is not None:
@@ -1588,7 +1818,7 @@ class Cameras:
                     cam.camera_transform = other_cam.camera_transform
                     cam.orig_coords = other_cam.orig_coords
                     cam.orig_camera_transform = other_cam.orig_camera_transform
-                    _HITS_CACHE.clear()  # (orig pose changed: pixel_hits restacks)
+                    _projection_changed()  # (orig pose changed: restack)
                 if hasattr(cam, "missing_pose_from_meta"):
                     delattr(cam, "missing_pose_from_meta")
                 if hasattr(cam, "missing_pose_from_timematch"):
@@ -2615,6 +2845,7 @@ class Camera:
             transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
         if self.coords is not None:
+            _projection_changed()  # (world pose changed: restack)
             self.coords = self.__transform_coords(self.coords, transform_matrix)
             self.camera_transform = np.dot(transform_matrix, self.camera_transform)
 
@@ -2625,74 +2856,51 @@ class Camera:
         Args:
             transform (np.ndarray): The transformation matrix to invert.
         """
-        _HITS_CACHE.clear()  # (orig pose changed: pixel_hits restacks)
+        _projection_changed()  # (orig pose changed: restack)
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = self.__transform_coords(self.coords, inverse_transform)
         self.orig_camera_transform = np.dot(
             inverse_transform, self.camera_transform
         )  ### CHECK: changed this from camera_transform to orig_camera_transform
 
+    def _projection_pose(self, use_orig_coords):
+        """``(centre, 4x4 float pose)`` in the original or the current frame."""
+        if use_orig_coords:
+            cam_coords, cam_transform = self.orig_coords, self.orig_camera_transform
+        else:
+            cam_coords, cam_transform = self.coords, self.camera_transform
+        return cam_coords, np.array(cam_transform, dtype=float).reshape((4, 4))
+
     def get_pixel_coords(
         self, coords, use_orig_coords=False, required_to_be_in_view=True
     ):
-        """Compute the image pixel coordinates from original 3D coordinates.
+        """Compute the image pixel coordinates of one 3D point.
 
-        Projects a 3D point and applies lens distortion correction.
+        Projects the point through the camera's current pose (inverted per call)
+        and applies the lens distortion (Metashape's frame camera model, :func:`_lens`): the projection core
+        shared with :meth:`project_points` (many points) and
+        :func:`pixel_hits` (many cameras), which give the same values.
 
         Args:
-            coords (list or np.ndarray): The original 3D point.
+            coords (list or np.ndarray): The 3D point.
             use_orig_coords (bool): If True, use the original coordinates.
             required_to_be_in_view (bool): If True, only return the pixel coordinates if the point is in view.
 
         Returns:
-            tuple: (x, y, depth, relevance metric) or
-                   (None, None, None, None) if out of view.
+            tuple: (x, y, depth, relevance metric), x and y rounded int pixels
+                   (half to even), or (None, None, None, None) if out of view
+                   (behind the camera, beyond the image borders), and always for a camera that cannot
+                   project (:func:`can_project`: no calibrated sensor or no pose).
         """
-        if use_orig_coords:
-            cam_coords = self.orig_coords
-            cam_transform = self.orig_camera_transform
-        else:
-            cam_coords = self.coords
-            cam_transform = self.camera_transform
-
-        # Ensure array type and shape for inversion
-        cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
-
+        if not can_project(self, use_orig_coords):
+            return None, None, None, None
+        cam_coords, cam_transform = self._projection_pose(use_orig_coords)
         proj_point = np.dot(np.linalg.inv(cam_transform), np.append(coords, 1))
-        x_norm = proj_point[0] / proj_point[2]
-        y_norm = proj_point[1] / proj_point[2]
-
-        r2 = x_norm**2 + y_norm**2
-        radial = (
-            1 + self.sensor.k1 * r2 + self.sensor.k2 * r2**2 + self.sensor.k3 * r2**3
-        )
-        x_dist = (
-            x_norm * radial
-            + 2 * self.sensor.p1 * x_norm * y_norm
-            + self.sensor.p2 * (r2 + 2 * x_norm**2)
-        )
-        y_dist = (
-            y_norm * radial
-            + self.sensor.p1 * (r2 + 2 * y_norm**2)
-            + 2 * self.sensor.p2 * x_norm * y_norm
-        )
-        x_img = self.sensor.fx * x_dist + self.sensor.cx
-        y_img = self.sensor.fy * y_dist + self.sensor.cy
-        in_view = (
-            proj_point[2] > 0  # (in front of the camera: one behind it can project into the image too)
-            and r2 * self.sensor.fx**2 < 1.01 * self.sensor.width**2
-            and 0 <= x_img <= self.sensor.width
-            and 0 <= y_img <= self.sensor.height
-        )
+        s = self.sensor
+        x_img, y_img, in_view = _distort(proj_point[0], proj_point[1], proj_point[2], s)
         if in_view or not required_to_be_in_view:
             dist_sq = np.sum((cam_coords - coords) ** 2)
-            rm = np.abs(
-                (np.abs(proj_point[2]) + dist_sq) / (self.sensor.fx * self.sensor.fy)
-            ) * (
-                10
-                + np.abs(x_img - 0.5 * self.sensor.width)
-                + np.abs(y_img - 0.5 * self.sensor.height)
-            )
+            rm = _relevance(proj_point[2], dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
             return (int(round(x_img)), int(round(y_img)), float(proj_point[2]), rm)
         else:
             return None, None, None, None
@@ -2705,9 +2913,9 @@ class Camera:
         is the fast path used by point-cloud segmentation, where every query
         point must be tested against every camera; the per-point
         :meth:`get_pixel_coords` is far too slow at that scale. The projection
-        math (Brown-Conrady distortion, ``in_view`` test and ``relevance``
-        metric) is identical to :meth:`get_pixel_coords` - see the parity test
-        in ``tests/test_segmentation.py``.
+        core (Metashape's lens model, ``in_view`` test and ``relevance``
+        metric) is shared with :meth:`get_pixel_coords` and :func:`pixel_hits` -
+        see ``tests/test_projection_equivalence.py``.
 
         Args:
             coords: ``(N, 3)`` array (or a single ``(3,)`` point) of 3D points.
@@ -2716,53 +2924,32 @@ class Camera:
 
         Returns:
             Tuple ``(x, y, depth, relevance, in_view)`` of length-``N`` arrays
-            (``x``/``y`` are rounded integer pixels, ``in_view`` is boolean). For
-            a single input point, scalar values are returned. Unlike
-            :meth:`get_pixel_coords`, out-of-view points are *not* dropped - the
-            caller filters on ``in_view``.
+            (``x``/``y`` are integer-valued float pixels, rounded half to even,
+            ``in_view`` is boolean). For a single input point, scalar values are
+            returned. Unlike :meth:`get_pixel_coords`, out-of-view points are
+            *not* dropped - the caller filters on ``in_view``. A camera that
+            cannot project (:func:`can_project`) gives NaN for ``x``, ``y``,
+            ``depth`` and ``relevance`` and ``in_view`` False.
         """
         pts = np.asarray(coords, dtype=float)
         single = pts.ndim == 1
         pts = np.atleast_2d(pts)  # (N, 3)
+        if not can_project(self, use_orig_coords):
+            nan = np.full(pts.shape[0], np.nan)
+            if single:
+                return np.nan, np.nan, np.nan, np.nan, False
+            return nan, nan.copy(), nan.copy(), nan.copy(), np.zeros(pts.shape[0], bool)
 
-        if use_orig_coords:
-            cam_coords = self.orig_coords
-            cam_transform = self.orig_camera_transform
-        else:
-            cam_coords = self.coords
-            cam_transform = self.camera_transform
-        cam_transform = np.array(cam_transform, dtype=float).reshape((4, 4))
-
+        cam_coords, cam_transform = self._projection_pose(use_orig_coords)
         homog = np.hstack([pts, np.ones((pts.shape[0], 1))])  # (N, 4)
         proj = homog @ np.linalg.inv(cam_transform).T          # (N, 4)
         depth = proj[:, 2]
-        x_norm = proj[:, 0] / depth
-        y_norm = proj[:, 1] / depth
-
         s = self.sensor
-        r2 = x_norm**2 + y_norm**2
-        radial = 1 + s.k1 * r2 + s.k2 * r2**2 + s.k3 * r2**3
-        x_dist = (
-            x_norm * radial + 2 * s.p1 * x_norm * y_norm + s.p2 * (r2 + 2 * x_norm**2)
-        )
-        y_dist = (
-            y_norm * radial + s.p1 * (r2 + 2 * y_norm**2) + 2 * s.p2 * x_norm * y_norm
-        )
-        x_img = s.fx * x_dist + s.cx
-        y_img = s.fy * y_dist + s.cy
-
-        in_view = (
-            (depth > 0)  # (in front of the camera)
-            & (r2 * s.fx**2 < 1.01 * s.width**2)
-            & (x_img >= 0) & (x_img <= s.width)
-            & (y_img >= 0) & (y_img <= s.height)
-        )
+        x_img, y_img, in_view = _distort(proj[:, 0], proj[:, 1], depth, s)
 
         cam_center = np.asarray(cam_coords, dtype=float).ravel()[:3]
         dist_sq = np.sum((cam_center - pts) ** 2, axis=1)
-        relevance = np.abs((np.abs(depth) + dist_sq) / (s.fx * s.fy)) * (
-            10 + np.abs(x_img - 0.5 * s.width) + np.abs(y_img - 0.5 * s.height)
-        )
+        relevance = _relevance(depth, dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
 
         x_px = np.rint(x_img)
         y_px = np.rint(y_img)
@@ -2794,41 +2981,9 @@ class Camera:
             tuple: (origin, direction) where origin is a 3D point (the camera
             center) and direction is a normalized 3D vector in world coordinates.
         """
-        # Retrieve camera intrinsics and distortion parameters.
-        cx = self.sensor.cx
-        cy = self.sensor.cy
-        fx = self.sensor.fx
-        fy = self.sensor.fy
-        k1, k2, k3 = self.sensor.k1, self.sensor.k2, self.sensor.k3
-        p1, p2 = self.sensor.p1, self.sensor.p2
-
-        # Convert pixel coordinates to normalized (distorted) coords.
-        x_dist = (x_img - cx) / fx
-        y_dist = (y_img - cy) / fy
-
-        if use_optimization:
-            # Define error function for distortion inversion.
-            def error_func(norm_coords):
-                x_norm, y_norm = norm_coords
-                r2 = x_norm**2 + y_norm**2
-                radial = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
-                delta_x = 2 * p1 * x_norm * y_norm + p2 * (r2 + 2 * x_norm**2)
-                delta_y = p1 * (r2 + 2 * y_norm**2) + 2 * p2 * x_norm * y_norm
-                x_est = x_norm * radial + delta_x
-                y_est = y_norm * radial + delta_y
-                return (x_est - x_dist) ** 2 + (y_est - y_dist) ** 2
-
-            res = minimize(error_func, [x_dist, y_dist])
-            x_norm, y_norm = res.x
-        else:
-            x_norm, y_norm = x_dist, y_dist
-            for _ in range(iterations):
-                r2 = x_norm**2 + y_norm**2
-                radial = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
-                delta_x = 2 * p1 * x_norm * y_norm + p2 * (r2 + 2 * x_norm**2)
-                delta_y = p1 * (r2 + 2 * y_norm**2) + 2 * p2 * x_norm * y_norm
-                x_norm = (x_dist - delta_x) / radial
-                y_norm = (y_dist - delta_y) / radial
+        # The lens distortion undone (the inverse of _distort; use_optimization is no longer needed:
+        # Newton's method converges in a few steps either way).
+        x_norm, y_norm = (float(v) for v in _undistort(x_img, y_img, self.sensor, iterations))
 
         # Create a direction vector in camera space. Here, we assume the
         # image plane is at unit distance (z = 1).

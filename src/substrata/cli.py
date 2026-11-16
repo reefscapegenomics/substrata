@@ -3709,6 +3709,52 @@ def handle_crops(args):
            if review else "") + ".")
 
 
+def handle_reproject_views(args):
+    """Handle the reproject-views CLI command (substrata.lensfix): the training views of a plot's annotation
+    CSVs (``cam_x`` / ``cam_y``), written with the lens model before 0.2, moved to the corrected model's pixels.
+
+    Run in a plot folder. The CSVs: those given, else every ``<plot>.annos/*.csv``. ``--dry-run`` only reports.
+
+    Args:
+        args: Arguments from argparse.
+    """
+    from substrata import cameras as cameras_mod
+    from substrata import lensfix
+    from substrata.initializer import ProjectInitializer
+
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+    meta, xml = init.cams_meta_json_filepath, init.cams_xml_filepath
+    if not (meta and xml and os.path.isfile(meta) and os.path.isfile(xml)):
+        raise SystemExit(f"No cameras (meta.json and cams.xml) found for {base}.")
+    csvs = [os.path.abspath(c) for c in (args.csvs or lensfix.default_csvs(cwd, base))]
+    if not csvs:
+        raise SystemExit(f"No annotation CSVs given and none in {base}.annos/.")
+    print(f"Loading cameras from {os.path.basename(xml)}")
+    cams = cameras_mod.Cameras(meta, xml)
+    moved = cleared = 0
+    for path in csvs:
+        res = lensfix.reproject_views(path, cams, tol_px=args.tol, dry_run=args.dry_run,
+                                      keep_out_of_view=args.keep_out_of_view)
+        moved += res["counts"]["moved"]
+        cleared += res["counts"]["out_of_view"]
+        print(lensfix.summary(os.path.relpath(path, cwd), res))
+        if res["backup"]:
+            print(f"  backup: {os.path.relpath(res['backup'], cwd)}")
+        if res["cleared_list"]:
+            print(f"  cleared views' ids (labels to look at again): {os.path.relpath(res['cleared_list'], cwd)}")
+        if res["features"]:
+            print(f"  grouping features (made at the old pixels) moved to {os.path.relpath(res['features'], cwd)}")
+    if args.dry_run:
+        print(f"Dry run: {moved} training view(s) would move, {cleared} be cleared; nothing written.")
+    elif moved or cleared:
+        print(f"{moved} training view(s) moved, {cleared} cleared. Next: substrata-explore's crop job on these sets "
+              "(or `substrata crops`) writes the cleared points a new training view and makes the crops at the new "
+              "pixels (the old ones are pruned); then train again.")
+    else:
+        print("Nothing to move.")
+
+
 def _backup_file(path):
     """Copy ``path`` to ``backup/<name>_<timestamp>.bak`` next to it."""
     import shutil
@@ -3957,6 +4003,8 @@ def handle_predict(args):
 
     if args.image_dir or args.points:
         return _predict_images(args)
+    if getattr(args, "camera_group", None):
+        return _predict_camera_group(args)
 
     # the views `substrata crops` chooses (main camera type, occlusion test, clear
     # of the photo edge), so that the views predicted are those cropped: the main
@@ -4016,6 +4064,55 @@ def handle_predict(args):
             anns.data[i].pred_top) if c else None
         for i, c in consensus.items()})
     print(f"Saved predictions to {csv_path} (backup: {backup})")
+
+
+def _predict_camera_group(args):
+    """``substrata predict --camera-group``: the set's points from one camera
+    group's photos (see :mod:`substrata.grouppredict`), into a separate CSV."""
+    from substrata import classification, grouppredict
+
+    mode = args.view_mode
+    if args.camera_group == "list":
+        init = _load_annotation_project(args, need_annotations=False, use_ply=False)
+        for name, g in grouppredict.camera_groups(init.cams).items():
+            print(f"  {name!r}: {g['kind']}, {g['n']} cameras ({g['enabled']} enabled)")
+        return
+    if mode == "segment":
+        init = _load_annotation_project(args, use_ply=not args.no_ply)
+        occluder, pcd = None, init.pcd
+        occl = "cloud (reprojection)" if pcd is not None else "none"
+    else:
+        init, occluder, pcd, _main, occl = _view_choice(args)
+    try:
+        group, kind, cams = grouppredict.resolve_camera_group(init.cams, args.camera_group)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    n_off = sum(1 for c in cams if getattr(c, "enabled", True) is False)
+    print(f"Camera group {group!r} ({kind}): {len(cams)} cameras, {n_off} of them "
+          f"disabled in the project (used). Views: {mode} mode; occlusion test: {occl}.")
+    classifier_path = args.classifier or init.classifier_filepath
+    if not classifier_path:
+        raise SystemExit("No classifier: pass --classifier or set it in the YAML.")
+    learn = classification.get_image_classifier(classifier_path)
+    crop_size = _classifier_crop_size(args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT)
+    model = classification.classifier_fingerprint(classifier_path)
+    views = args.views or (settings.SEG_POINT_VIEWS if mode == "segment" else args.max_photos)
+    clear = ((init.crop_size, init.crop_size) if init.crop_size else settings.CROP_SIZE_DEFAULT)
+    res = grouppredict.predict_from_group(
+        init.annotations, cams, learn, mode=mode, views=views, pcd=pcd,
+        occluder=occluder, crop_size=crop_size, clear_of_edge=clear,
+        batch_size=args.batch_size, n_jobs=args.jobs,
+    )
+    csv_path = init.annotations_filepath
+    out = args.output_csv or grouppredict.output_path(csv_path, group, mode, args.tag)
+    meta = dict(annotations=os.path.abspath(csv_path), classifier=os.path.abspath(classifier_path),
+                camera_group_kind=kind, cameras=len(cams), cameras_disabled=n_off, views=views,
+                occlusion=occl, clear_of_edge=list(clear) if mode == "predict" else None,
+                crop_size=list(np.atleast_1d(crop_size).tolist()))
+    n = grouppredict.write_results(out, init.annotations, res, group=group, mode=mode, model=model, meta=meta)
+    print(f"{n['points']} points: {n['predicted']} predicted, {n['no_view']} without a view "
+          f"({n['points'] - n['with_view_available']} with no camera of the group in view). "
+          f"Saved {out} (+ .json)")
 
 
 def _add_annotation_project_args(parser, annotations=True):
@@ -4925,7 +5022,14 @@ def handle_train(args):
                 f"tree: {', '.join(sorted(missing))}. "
                 "Check the labels above (the code in brackets) and retry."
             )
-    if not training_labels:
+    # A kept (hand-edited) label map decides the classes itself: the bolded
+    # entries only seed a new map. (A flat classes file - every class at the
+    # root, none with subcategories - bolds nothing, but its map still works.)
+    kept_map = (
+        getattr(args, "keep_map", False) and os.path.isfile(map_path)
+        and any(classification.load_label_map(map_path).values())
+    )
+    if not training_labels and not kept_map:
         raise SystemExit("No bolded training labels were derived; nothing to do.")
 
     # Crops are generated for every visible label (independent of selection);
@@ -4934,9 +5038,14 @@ def handle_train(args):
         code for code, n in counts.items()
         if n >= settings.TRAIN_MIN_VISIBLE_COUNT
     }
+    seed = (
+        f"The label map {map_path} sets the training classes"
+        if kept_map else
+        f"The {len(training_labels)} bolded entries above seed the training "
+        "classes"
+    )
     print(
-        f"\nThe {len(training_labels)} bolded entries above seed the training "
-        f"classes; {'points are kept' if point_mode else 'crops are generated'} "
+        f"\n{seed}; {'points are kept' if point_mode else 'crops are generated'} "
         f"for all {len(visible_labels)} visible label(s)."
     )
     if not assume_yes:
@@ -6888,6 +6997,29 @@ def main():
     )
     _add_annotation_project_args(p_crops)
 
+    # reproject-views
+    p_rv = subparsers.add_parser(
+        "reproject-views",
+        help="Move training views (cam_x/cam_y) written before 0.2's lens model to the corrected pixels.",
+        description="Until 0.2 substrata put the lens model's P1 and P2 the other way round from Metashape and "
+                    "left out K4 and B2. Run in a plot folder: each annotation row with a 3-D point and a training "
+                    "view on this plot's photos gets the pixel the corrected model projects it to, where the stored "
+                    "one is the old model's (within --tol px); other rows are left as they are. The CSV is backed up "
+                    "first (backup/).",
+    )
+    p_rv.add_argument("csvs", nargs="*", metavar="CSV",
+                      help="Annotation CSVs. Default: every <plot>.annos/*.csv.")
+    p_rv.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="Report what would move; write nothing.")
+    p_rv.add_argument("--tol", dest="tol", type=float, default=1.0, metavar="PX",
+                      help="A stored pixel within this many px of the old model's projection was written from the "
+                           "point and is moved. Default: 1.0.")
+    p_rv.add_argument("--keep-out-of-view", dest="keep_out_of_view", action="store_true",
+                      help="Keep views the corrected model does not see the point in (default: cleared, for a new "
+                           "training view from a camera that sees it).")
+    p_rv.add_argument("--local", dest="local", action="store_true",
+                      help="Reset all paths to local (relative to project path).")
+
     # import-coralnet
     p_icn = subparsers.add_parser(
         "import-coralnet",
@@ -6957,6 +7089,42 @@ def main():
         help="Inference batch size. Default: 64.",
     )
     _add_view_choice_args(p_predict)
+    grp = p_predict.add_argument_group(
+        "camera group (predictions from one group's photos, into a separate CSV)",
+        "Classify the set's points from the photos of one camera group only, "
+        "disabled cameras included (e.g. AUV photos aligned into a diver plot). "
+        "Writes <set folder>/predictions/<set>__<group>__<mode>.csv (+ .json "
+        "with the run's settings); the set's own CSV is not changed.",
+    )
+    grp.add_argument(
+        "--camera-group", dest="camera_group", default=None, metavar="GROUP",
+        help="A camera type as printed (e.g. '2848x2816 f3153'), a camera group "
+             "(photo folder / file prefix, e.g. 'auv'), 'enabled' (the cameras "
+             "substrata segment uses) or 'all'; 'type:NAME' / 'group:NAME' when "
+             "a name is both. 'list' prints the groups.",
+    )
+    grp.add_argument(
+        "--view-mode", dest="view_mode", choices=["segment", "predict"],
+        default="segment",
+        help="segment (default): views and consensus as substrata segment (up "
+             f"to {settings.SEG_POINT_VIEWS} views, reprojection occlusion test "
+             "on the YAML's point cloud, no photo-edge filter, dense maps fused "
+             "by relevance). predict: as substrata predict (up to --max-photos "
+             "views, stratified occlusion test, crop clear of the photo edge).",
+    )
+    grp.add_argument(
+        "--views", dest="views", type=int, default=None,
+        help=f"Views per point (default: {settings.SEG_POINT_VIEWS} in segment "
+             "mode, --max-photos in predict mode).",
+    )
+    grp.add_argument(
+        "--output-csv", dest="output_csv", default=None,
+        help="Output CSV (default: see above).",
+    )
+    grp.add_argument(
+        "--tag", dest="tag", default=None,
+        help="Added to the default output name (e.g. the classifier's name).",
+    )
     img_group = p_predict.add_argument_group(
         "image-only mode (plain photos, no project)",
         "Classify points on plain images instead of a 3-D project's "
@@ -8139,6 +8307,7 @@ def main():
         "images": handle_images,
         "thumbnails": handle_thumbnails,
         "crops": handle_crops,
+        "reproject-views": handle_reproject_views,
         "import-coralnet": handle_import_coralnet,
         "predict": handle_predict,
         "sample-points": handle_sample_points,

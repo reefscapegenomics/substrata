@@ -856,14 +856,19 @@ def estimate_macro_camera_pose_from_gopro(
         raise ValueError("Macro camera must have sensor calibration parameters")
 
     sensor = macro_camera.sensor
+    # The lens distortion is undone first (substrata's Metashape model: OpenCV has no K4 and orders P1 / P2
+    # the other way round), so PnP sees an ideal pinhole camera of focal length fy, centre (cx, cy): the
+    # pixel threshold keeps its meaning.
+    from .cameras import _distort, _undistort
+    distorted_points = np.asarray(image_points, dtype=np.float64)
+    xn, yn = _undistort(distorted_points[:, 0], distorted_points[:, 1], sensor)
+    image_points = np.stack([sensor.fy * xn + sensor.cx, sensor.fy * yn + sensor.cy], axis=1).astype(np.float32)
     camera_matrix = np.array(
-        [[sensor.fx, 0, sensor.cx], [0, sensor.fy, sensor.cy], [0, 0, 1]],
+        [[sensor.fy, 0, sensor.cx], [0, sensor.fy, sensor.cy], [0, 0, 1]],
         dtype=np.float32,
     )
 
-    dist_coeffs = np.array(
-        [sensor.k1, sensor.k2, sensor.p1, sensor.p2, sensor.k3], dtype=np.float32
-    )
+    dist_coeffs = None
 
     # Step 5: Solve PnP problem
     try:
@@ -979,12 +984,12 @@ def estimate_macro_camera_pose_from_gopro(
         transform[:3, :3] = rmat
         transform[:3, 3] = tvec.flatten()
 
-        # Step 7: Calculate reprojection error
-        projected_points, _ = cv2.projectPoints(
-            object_points[inliers], rvec, tvec, camera_matrix, dist_coeffs
-        )
-        projected_points = projected_points.reshape(-1, 2)
-        actual_points = image_points[inliers]
+        # Step 7: Calculate reprojection error (in the photo's own pixels, through the lens model)
+        inl = np.asarray(inliers).reshape(-1)
+        in_cam = np.asarray(object_points, float)[inl] @ rmat.T + tvec.reshape(1, 3)
+        px, py, _ok = _distort(in_cam[:, 0], in_cam[:, 1], in_cam[:, 2], sensor)
+        projected_points = np.stack([px, py], axis=1)
+        actual_points = distorted_points[inl]
 
         reprojection_error = np.mean(
             np.linalg.norm(projected_points - actual_points, axis=1)
@@ -2082,6 +2087,8 @@ def _match_points_to_cameras_multi(
     intercept_radius: Optional[float] = None,
     discard_threshold: Optional[float] = None,
     verbose: bool = True,
+    include_disabled: bool = False,
+    return_available: bool = False,
 ):
     """Find each query point's ``views`` best cameras (vectorized, occlusion-aware).
 
@@ -2095,12 +2102,19 @@ def _match_points_to_cameras_multi(
     ``Annotations.get_first_image_matches``, which looped every camera per query
     and ran the ray-march per candidate (~15 min for 40 k queries).
 
+    Disabled cameras (``enabled`` False) are skipped unless
+    ``include_disabled`` (e.g. a camera group chosen for prediction, see
+    :mod:`substrata.grouppredict`).
+
     Returns:
         ``(cam, x, y, depth, rel, cam_list)``: ``(Nq, views)`` arrays sorted by
         relevance (column 0 = best view), with ``cam`` an int index into
         ``cam_list`` (``-1`` = no view / blocked, ``rel`` then ``inf``),
         ``x``/``y`` pixel coordinates and ``depth`` the point depth along the
-        camera axis in original-frame units.
+        camera axis in original-frame units. With ``return_available``, also
+        ``available``: ``(Nq,)`` the number of cameras that have the point in
+        view (in front, inside the image), before the occlusion test and the
+        limit of ``views``.
     """
     from substrata import settings
 
@@ -2123,6 +2137,8 @@ def _match_points_to_cameras_multi(
     else:
         orig = query_coords
 
+    from .cameras import can_project
+
     cam_list = list(cams)
     top_rel = np.full((n, views), np.inf)
     top_cam = np.full((n, views), -1, dtype=int)
@@ -2130,14 +2146,16 @@ def _match_points_to_cameras_multi(
     top_y = np.zeros((n, views))
     top_depth = np.zeros((n, views))
     rows = np.arange(n)
+    available = np.zeros(n, dtype=int)
 
     iterator = (
         tqdm(cam_list, desc="Projecting cameras", unit="cam") if verbose else cam_list
     )
     for ci, cam in enumerate(iterator):
-        if getattr(cam, "enabled", True) is False or cam.sensor is None:
-            continue
+        if (getattr(cam, "enabled", True) is False and not include_disabled) or not can_project(cam):
+            continue  # (disabled, or no calibrated sensor / no pose of its own)
         x, y, depth, rel, in_view = cam.project_points(orig, use_orig_coords=True)
+        available += in_view & (depth > 0)
         # Replace each query's worst kept view when this camera beats it.
         worst = np.argmax(top_rel, axis=1)
         better = in_view & (depth > 0) & (rel < top_rel[rows, worst])
@@ -2175,8 +2193,9 @@ def _match_points_to_cameras_multi(
 
     order = np.argsort(top_rel, axis=1, kind="stable")
     take = (lambda a: np.take_along_axis(a, order, axis=1))
-    return (take(top_cam), take(top_x), take(top_y), take(top_depth),
-            take(top_rel), cam_list)
+    out = (take(top_cam), take(top_x), take(top_y), take(top_depth),
+           take(top_rel), cam_list)
+    return out + (available,) if return_available else out
 
 
 def _match_points_to_cameras(
@@ -2437,7 +2456,8 @@ def _classify_dense_views(
         Dict of ``(Nq,)`` arrays: ``labels`` (``""`` unclassified), ``conf``
         (fused probability), ``n_views`` (views used), ``agreement`` (weight
         share of the views whose own label is the fused one), ``cam`` / ``x`` /
-        ``y`` (the highest-weight view used; ``-1`` / nan if none).
+        ``y`` (the highest-weight view used; ``-1`` / nan if none), ``probs``
+        (``(Nq, classes)`` fused probabilities, rows of 0 where unclassified).
     """
     import json
 
@@ -2509,7 +2529,7 @@ def _classify_dense_views(
     cam = np.where(ok, view_cam[rows, best], -1)
     return {
         "labels": labels, "conf": conf, "n_views": used.sum(1),
-        "agreement": agreement, "cam": cam,
+        "agreement": agreement, "cam": cam, "probs": probs,
         "x": np.where(ok, view_x[rows, best], np.nan),
         "y": np.where(ok, view_y[rows, best], np.nan),
     }
@@ -2595,8 +2615,76 @@ def segment_point_cloud(
             f"({sampling}, {cell_size * 100:.0f} cm)"
         )
 
-    from substrata import pointfeatures
+    res = classify_query_points(
+        qc, cams, learn, world_transform=world_transform, pcd=pcd,
+        occlusion=occlusion, label_colors=label_colors, crop_size=crop_size,
+        batch_size=batch_size, flush_batch=flush_batch, views=views,
+        dense=dense, mask_dir=mask_dir, cell_size=cell_size, verbose=verbose,
+    )
+    px = np.column_stack([res["x"], res["y"]]).astype(float)
+    if res["dense"]:
+        return Segmentation.from_query_labels(
+            qc, res["labels"], res["conf"], label_colors=label_colors,
+            cams=res["cam_paths"], px=px, n_views=res["n_views"],
+            agreement=res["agreement"],
+        )
+    return Segmentation.from_query_labels(
+        qc, res["labels"], res["conf"], label_colors=label_colors,
+        cams=res["cam_paths"], px=px,
+    )
 
+
+def classify_query_points(
+    qc: np.ndarray,
+    cams,
+    learn,
+    *,
+    world_transform: Optional[np.ndarray] = None,
+    pcd=None,
+    occlusion: bool = True,
+    label_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    crop_size: Optional[int] = None,
+    batch_size: int = 64,
+    flush_batch: int = 16384,
+    views: Optional[int] = None,
+    dense: bool = True,
+    mask_dir: Optional[str] = None,
+    cell_size: Optional[float] = None,
+    include_disabled: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Match world-frame query points ``qc`` to camera views and classify them, as
+    :func:`segment_point_cloud` does (its matching and classification; also used
+    by ``substrata predict --view-mode segment``, :mod:`substrata.grouppredict`).
+
+    A point-feature classifier with ``dense``: each query's ``views`` best views
+    (default ``settings.SEG_POINT_VIEWS``; relevance order, the reprojection
+    occlusion test on ``pcd`` when ``occlusion``), fused from dense per-photo
+    maps (:func:`_classify_dense_views`). Otherwise the best view only: a
+    window at its pixel (point classifier) or a ``crop_size`` crop.
+
+    Args:
+        qc: ``(Nq, 3)`` query points in the world frame of ``world_transform``.
+        cams: Cameras (a :class:`~substrata.cameras.Cameras` or a list).
+        learn: Loaded classifier.
+        include_disabled: Also use cameras with ``enabled`` False.
+        cell_size: Only for the crop footprint report of a crop classifier.
+        Others: as for :func:`segment_point_cloud`.
+
+    Returns:
+        Dict of ``(Nq,)`` arrays: ``labels`` (``""`` unclassified), ``conf``,
+        ``n_views`` (views used), ``agreement`` (dense: weight share of the views
+        whose own label is the fused one; else None), ``cam_paths`` (photo of
+        the highest-weight view used, ``""`` none), ``x`` / ``y`` (its pixel,
+        nan none), ``available`` (cameras with the point in view before the
+        occlusion test and the limit of views); ``probs`` (dense: ``(Nq,
+        classes)``, else None), ``classes`` and ``dense`` (bool).
+    """
+    from substrata import pointfeatures, settings
+
+    if crop_size is None:
+        crop_size = settings.TRAIN_CROP_SIZE
+    qc = np.asarray(qc, dtype=float).reshape(-1, 3)
     point_clf = pointfeatures.is_point_classifier(learn)
     # Depths are in the original frame; convert to world metres via the
     # world_transform's linear scale (cbrt of its 3x3 determinant).
@@ -2604,13 +2692,18 @@ def segment_point_cloud(
     if world_transform is not None:
         lin = np.asarray(world_transform, dtype=float)[:3, :3]
         depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
+    use_pcd = pcd if occlusion else None
+    classes = getattr(learn, "classes", None)
+    if classes is None:
+        classes = getattr(getattr(learn, "dls", None), "vocab", None)
+    classes = [str(c) for c in classes] if classes is not None else []
 
     if point_clf and dense:
         n_views = int(views or settings.SEG_POINT_VIEWS)
-        vc, vx, vy, vd, vr, cam_list = _match_points_to_cameras_multi(
-            qc, cams, world_transform=world_transform,
-            pcd=(pcd if occlusion else None), occlusion=occlusion,
-            views=n_views, verbose=verbose,
+        vc, vx, vy, vd, vr, cam_list, available = _match_points_to_cameras_multi(
+            qc, cams, world_transform=world_transform, pcd=use_pcd,
+            occlusion=occlusion, views=n_views, verbose=verbose,
+            include_disabled=include_disabled, return_available=True,
         )
         if verbose:
             print(f"[match] {int((vc[:, 0] >= 0).sum()):,}/{len(qc):,} queries "
@@ -2632,21 +2725,24 @@ def segment_point_cloud(
             [cam_list[c].filepath if c >= 0 else "" for c in res["cam"]],
             dtype=object,
         )
-        return Segmentation.from_query_labels(
-            qc, labels, res["conf"], label_colors=label_colors, cams=cams_of,
-            px=np.column_stack([res["x"], res["y"]]), n_views=res["n_views"],
-            agreement=res["agreement"],
-        )
+        return dict(labels=labels, conf=res["conf"], n_views=res["n_views"],
+                    agreement=res["agreement"], cam_paths=cams_of, x=res["x"],
+                    y=res["y"], available=available, probs=res["probs"],
+                    classes=list(learn.classes), dense=True)
 
-    best_cam, best_x, best_y, best_depth, cam_list = _match_points_to_cameras(
-        qc, cams, world_transform=world_transform,
-        pcd=(pcd if occlusion else None), occlusion=occlusion, verbose=verbose,
+    best_cam, best_x, best_y, best_depth, _rel, cam_list, available = _match_points_to_cameras_multi(
+        qc, cams, world_transform=world_transform, pcd=use_pcd,
+        occlusion=occlusion, views=1, verbose=verbose,
+        include_disabled=include_disabled, return_available=True,
     )
+    best_cam, best_x, best_y, best_depth = best_cam[:, 0], best_x[:, 0], best_y[:, 0], best_depth[:, 0]
     if verbose:
         print(f"[match] {int((best_cam >= 0).sum()):,}/{len(qc):,} queries matched")
         if not point_clf:
             _report_crop_footprint(
-                best_cam, best_depth, cam_list, crop_size, cell_size, depth_scale
+                best_cam, best_depth, cam_list, crop_size,
+                cell_size if cell_size is not None else settings.DEFAULT_SEG_CELL_SIZE,
+                depth_scale,
             )
 
     if point_clf:
@@ -2666,11 +2762,11 @@ def segment_point_cloud(
     cams_of = np.array(
         [cam_list[c].filepath if c >= 0 else "" for c in best_cam], dtype=object
     )
-    px = np.column_stack([best_x, best_y]).astype(float)
-    px[best_cam < 0] = np.nan
-    return Segmentation.from_query_labels(
-        qc, labels, conf, label_colors=label_colors, cams=cams_of, px=px
-    )
+    x = np.where(best_cam >= 0, best_x, np.nan).astype(float)
+    y = np.where(best_cam >= 0, best_y, np.nan).astype(float)
+    return dict(labels=labels, conf=conf, n_views=(labels != "").astype(int),
+                agreement=None, cam_paths=cams_of, x=x, y=y, available=available,
+                probs=None, classes=classes, dense=False)
 
 
 def recolor_ply_file(

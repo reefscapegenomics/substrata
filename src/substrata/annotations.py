@@ -906,6 +906,7 @@ class Annotations:
         per_other_type: int = settings.VIEWS_PER_OTHER_TYPE,
         clear_of_edge: Optional[Any] = None,
         progress: bool = True,
+        enabled_cameras_only: bool = True,
     ) -> List[Tuple["Annotation", List[Any]]]:
         """The views of each annotation (:meth:`Annotation.select_views`, which
         also sets its ``training_view``), sequentially. With ``clear_of_edge``
@@ -918,6 +919,7 @@ class Annotations:
                     cams, occluder=occluder, pcd=pcd, main_type=main_type,
                     max_views=max_cams, per_other_type=per_other_type,
                     clear_of_edge=clear_of_edge,
+                    enabled_cameras_only=enabled_cameras_only,
                 )
                 groups.append((ann, views))
             except Exception as e:  # noqa: BLE001 - skip, keep going
@@ -1049,6 +1051,8 @@ class Annotations:
         main_type: Optional[str] = None,
         clear_of_edge: Optional[Any] = None,
         per_other_type: int = settings.VIEWS_PER_OTHER_TYPE,
+        enabled_cameras_only: bool = True,
+        progress: bool = True,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Predict labels for many annotations (see :meth:`Annotation.predict`).
 
@@ -1078,6 +1082,9 @@ class Annotations:
                 :meth:`save_crops` / :meth:`Annotation.select_views` (the views
                 predicted are those that would be cropped; per_other_type=0:
                 the main camera type's only).
+            enabled_cameras_only: False: also disabled cameras (a camera group
+                chosen for prediction, :mod:`substrata.grouppredict`).
+            progress: Show a progress bar while choosing views.
 
         Returns:
             Mapping of annotation id to its consensus prediction
@@ -1091,7 +1098,8 @@ class Annotations:
         groups = self._collect_image_matches(
             self._ordered(ids), cams, max_cams, pcd, occluder=occluder,
             main_type=main_type, clear_of_edge=clear_of_edge,
-            per_other_type=per_other_type,
+            per_other_type=per_other_type, progress=progress,
+            enabled_cameras_only=enabled_cameras_only,
         )
         matches = [im for _ann, ims in groups for im in ims]
         results = classification.classify_image_matches_batch(

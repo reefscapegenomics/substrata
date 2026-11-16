@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "substrata"
-version         = "0.1.0"
+dynamic         = ["version"]  # (substrata.__version__)
 description     = "3-D point-cloud analysis for coral reef photogrammetry"
 readme          = "README.md"
 requires-python = ">=3.9"
@@ -36,3 +36,6 @@ Issues        = "https://github.com/reefscapegenomics/substrata/issues"
 
 [project.scripts]
 substrata = "substrata.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "substrata.__version__" }
