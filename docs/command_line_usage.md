@@ -380,6 +380,18 @@ The grid frame is `grid_transform @ world_transform @ orig`. The CSV's `orig_*` 
 
 **Annotation sidecars in general:** any annotations CSV may have an optional `<csv filename>.yaml` (the `.csv` is kept in the name, so a `<id>.csv` never clashes with the project's `<id>.yaml`). It holds the settings of that annotation set rather than the plot: `type`, `plot_id`, `classes`, `world_transform`, `last_highest_id` (the id high-water mark, so deleted ids are never reused) and, when not the default, `cropped_path` (default `<csv stem>.cropped`), `crop_size` and `classifier`. Paths are relative to the sidecar's folder. For the project's `annotations` file, `ProjectInitializer` takes these from the sidecar in preference to the legacy keys in `<id>.yaml`. A CSV without a sidecar works as before. Helpers: `substrata.read_annotation_sidecar` / `write_annotation_sidecar`.
 
+## Points that photos aim at (cams2annos)
+
+Targeted photos, e.g. close-ups (macro photos) of single colonies, each aim at one thing: the point where the ray through the photo's centre meets the cloud. `substrata cams2annos`, run in a plot's folder, finds that point for every camera of a camera group (`--group`, default `closeup`: the photos in `<id>.closeup/`; any group `predict --camera-group` takes) and saves them as an annotation set, `<id>.annos/<id>_<group>[_TAG]_targets.csv`, with each photo as its point's view (`cam_filepath`, `cam_x`, `cam_y`): one point per colony, to label from its close-up (e.g. to find all the Acroporas among the close-ups). The cameras need a pose and a calibration (aligned in Metashape, or for close-ups: `camsync --match-images`) and the plot a world transform (distances in metres). Close-ups posed by copying a GoPro frame's pose by time alone can aim metres away from what they show. A camera whose pose camsync estimated rather than matched (`pose_status` `estimated` in the meta JSON) gets its point all the same, marked `is_extrapolated` True (as `intercepts` marks a point it could only extrapolate), to check by hand.
+
+The ray (lens distortion undone) is followed from the camera in steps of `--search-radius` (default 3 mm) up to `--max-distance` (default 5 m); the first cloud point within that radius of the ray is the hit. A ray through a gap in the cloud (between branches, an edge) is tried again 3x wider, up to `--max-search-radius` (default 3 cm). The hit is refined to the point of that surface nearest the ray, and the view's pixel is that point projected into the photo (on sa3_40m's close-ups typically 10-60 px from the centre of an 8726 px photo), so the point and its view agree. Cameras whose ray meets no cloud, or that cannot project, are listed and left out. `--pixel X Y` follows another pixel than the centre.
+
+The CSV's extra columns: `search_radius` (the radius that hit), `target_distance` (camera to point, m) and `target_offset_px` (the view's pixel from the one followed). The sidecar has `type: camera_targets`, `purpose: training_only` (photos aimed at chosen things are not a random sample, so cover summaries leave them out) and the settings and missed cameras in `camera_targets`. A set with labels is never overwritten (`--tag` for another, or `--overwrite`).
+
+In Python: `pcd.camera_targets(cams, pixel=None, search_radius=0.003, max_search_radius=0.03, max_distance=5, id_prefix=None)` returns the Annotations (each an `InterceptAnnotation` with its camera as `image_match`), with `missed` the cameras left out.
+
+Usage: `substrata cams2annos [--group GROUP] [--pixel X Y] [--search-radius M] [--max-search-radius M] [--max-distance M] [--tag NAME] [--overwrite] [--input PLY]` (alias `cams-to-annos`)
+
 ## Intercepts plot
 
 Re-plot a saved intercepts CSV as a 2D grid of cells colored by the majority annotation label per cell — no bounding boxes needed. The orientation and exact generation grid are read from the CSV's sidecar (`<csv>.yaml`, written by `intercepts`) automatically, so the grid is axis-aligned and the generation cells (`grid_bbox`) are replayed exactly. `--yaml` overrides this, e.g. for an older `<id>_slope_intercepts.yaml` (which holds the combined `world_transform` and, if recent enough, `grid_bbox` at the top level). Without either, the project's `world_transform` is used (fine for top-down intercepts) and the grid is derived from the annotation extent at `--grid-size`.
@@ -845,6 +857,119 @@ substrata camsync -s 0 -u 1 --time-offset 12.5 --xyz 0,0.12,0
 # Render 20 image pairs in the sanity PDF instead of the default 9
 substrata camsync -s 0 -u 1 --time-offset 12.5 --pdf-pairs 20
 ```
+
+### Close-ups posed from image matches (`--match-images`)
+
+Copying a pose by time only works if the two cameras look at the same thing at the same moment. A diver's close-ups (macro photos of single colonies) and the GoPro video they film do not: the clocks differ by an unknown offset, and the close-up camera points elsewhere than the GoPro (on sa3_40m about 10° lower, 0.1-0.3 m in front of it), so a copied pose can be metres off. `--match-images` poses each close-up from the GoPro frames themselves (`substrata.imagesync`):
+
+1. **Time offset**: every close-up / frame pair within the offsets that could apply (`--offset-window MIN MAX`, default every offset at which a close-up falls within the frames' time span) is matched coarsely (SIFT, the whole frame at 1600 px). Each close-up that matches votes with its scores divided by its own best (so a few strong matches, such as a colour chart, cannot outvote the rest); the votes peak at the clocks' offset. The highest peaks (at most 3, 20 s apart) are then **confirmed** with the learned matcher on up to 12 close-ups each: the votes' peak is taken when it stands out (3x the median vote, nothing 20 s away above 0.6 of it, 3 close-ups whose own best is within 8 s) and at least 3 (and a quarter) of the sampled close-ups match there; otherwise the candidate that most close-ups match is taken, if that many match and twice as many as at the next candidate. If none is confirmed the command stops and asks for `--time-offset` (which skips the search). This also gives where a close-up's centre lies in a frame, how wide it appears there and how it is turned (sa4's GoPro was mounted upside down: its close-ups match turned 180°).
+2. **Matching**: each close-up against the frames within `--frames` s (default 3) of its offset time with a learned matcher (kornia's LoFTR, `--matcher loftr`; or DISK + LightGlue), first in a crop round that spot, then across the rest of the frame, then turned the other ways; a close-up that still matches nothing is also tried in the frames up to `--wide-frames` s off (default 8: the diver lingered at the colony). The learned matchers cope with the blur, the scale difference and the lighting far better than SIFT (sa3_40m: 78 of 83 close-ups matched, against 30), but not with a photo turned round, hence the turning.
+3. **Pose**: each match's frame pixel is followed along the frame's ray to the cloud, so the close-up's pixels see known 3-D points; PnP (RANSAC, then refined, the close-up's lens distortion undone) gives its pose.
+4. **Checks**: enough PnP inliers, a small reprojection error (0.7% of the photo's width), a distance from the camera to the point it aims at within 0.5-2x the other close-ups' median, and, unless `--no-check`, the other matcher's pose aiming within 2 cm of the same point across the view (along it, a branch tip and the base below it are the same colony; where it gives a pose: the PDF says which were checked). Close-ups that fail get no pose.
+
+A close-up whose time has no aligned frame near it (none within `--wide-frames` s) is reported as `no frames`, with the frames at those times that Metashape left unaligned. Either align those in Metashape (Align Selected Cameras) and export again, or add `--pose-frames`:
+
+- **`--pose-frames`** poses those frames here first (`substrata.framepose`), then matches the close-ups with them as with aligned ones. A frame is matched (LoFTR) with the posed photos that see where it should be looking (the survey photos and the aligned frames; `--frame-photos SENSOR ...` picks the sensors, by default every sensor but `-s` and `-u` that shows the reef in at least 60% of the best one's detail, px per m at the range its photos were taken from: photos from much further away, such as an AUV's, mostly match nothing), ranked by how alike their view is; the matched pixels are followed to the cloud and the frame posed by PnP, pooled over up to 4 photos that agree. Gaps are filled from their edges in, 1 s at a time, each posed frame guiding the next; a frame is only used, and only guides the next, when photos with a pose of their own (not other posed frames) agree on it, so an error does not carry along the chain. A frame with no posed frame within 10 s is first placed by image retrieval (`substrata.frameretrieval`: the 20 survey photos most like it by DINOv2 descriptors, checked with LoFTR). A close-up that still matches nothing is tried once more after the unaligned frames among its own (within `--frames` s) are posed too: e.g. 1-2 s either side of its time, while the aligned frames 3 s off show the reef next to it. The frames' poses are only used for this run; they are not saved. sa3_40m, aligned frames hidden and posed again: 2-3 mm from Metashape's (median). sa4_60m: 101 of 129 unaligned frames posed, close-ups posed 45 of 46 (26 without), ~26 min.
+- **`--frame-calibration OTHER.cams.xml`** gives the frames a lens where Metashape aligned none of them and so calibrated none (sa3_60m): the same sensor id's calibration in another plot shot with the same camera and settings (GoPro: 2-4 px apart between plots, against ~130 px of distortion). The camera may have been mounted the other way up there (sa4's GoPro is upside down relative to sa3's): `--frame-calibration-orientation auto` (default) poses a few frames, spread over the run, and keeps the lens as given or turned 180 deg, whichever fits their matches better (lower reprojection error for two thirds of them; otherwise kept as given, with a note); `same` or `turned` sets it. With `--pose-frames`, close-ups can then be posed in a plot where no frame was aligned.
+
+Where a close-up aims and what it sees on the reef are accurate to millimetres. Its exact position is less certain: over a flat patch through a narrow lens, tilting the camera and shifting it sideways look almost the same, so the centre can be a few cm off (with a tilt that makes up for it).
+
+A close-up without a good match still gets a pose, marked (`--no-estimate`: none):
+
+- **`estimated`**: no match (or one rejected for its range or error). Its pose is the pose of the frame at its time + offset (or 1 s off) combined with the rig: where the close-up camera sits and points relative to the GoPro mounted on it, the median over the posed close-ups and their frames. On sa3_40m and sa4_40m, estimating each posed close-up from the others this way, it aimed 4-6 cm from where its match puts it (median; 8-12 cm at p90), against 21-23 cm for the frame's pose copied as it is. A diver who moved off before or after taking the close-up makes it worse.
+- **`unverified`**: the two matchers disagree on where it aims (more than 2 cm apart); the main matcher's (LoFTR's) pose is kept.
+
+`<id>_camsync_images.pdf` shows the offset's scores and the rig, then the close-up next to its frame with its centre (red) and where its pose aims (green), for every close-up not posed outright, every posed one at an unusual range (beyond 1.5x or 1/1.5x the median) and a selection of the others (`--pdf-pairs`). `--dry-run` stops there. Otherwise, after a confirmation (or `--yes`), the meta JSON and cams.xml are backed up to `backup/`, the posed close-ups get their pose (enabled), the estimated and unverified ones theirs too but disabled, with `pose_status` `estimated` / `unverified` in the meta JSON (the posed: `matched`), the others a null pose (disabled), and `<id>_camsync_poses.json` is written for Metashape. `substrata cams2annos` then gives each close-up's target point; those from estimated poses are marked `is_extrapolated`, to check and correct by hand.
+
+Everything substrata needs is then in the plot's files: the poses are in the meta JSON (substrata reads camera poses from there; cams.xml only gets the enabled flags), so Metashape is not needed. `metashape-import-poses` only puts the same poses into the .psx, so that a later export from Metashape (which rewrites the meta JSON from the project) keeps them.
+
+A close-up sensor that Metashape never calibrated (none of its photos aligned) is used with its nominal lens: the `focal_length` and `pixel_width` in cams.xml, no distortion. Needs the plot's point cloud and world transform, and kornia (`pip install kornia`, or the `match` extra); the matchers' weights are downloaded on first use, and a GPU makes it fast (about 4-11 min a plot of 50-90 close-ups).
+
+```bash
+substrata camsync -s 2 -u 1 --match-images --dry-run   # look at <id>_camsync_images.pdf
+substrata camsync -s 2 -u 1 --match-images             # then save
+substrata metashape-import-poses                       # optional: the poses into the .psx
+```
+
+### Poses into Metashape (metashape-import-poses)
+
+`substrata metashape-import-poses [--psx PSX] [--poses JSON] [--chunk CHUNK] [--metashape PATH] [--dry-run] [--posed-only]` gives the cameras in the Metashape project the poses in `<id>_camsync_poses.json` (by camera key, checked against the label), by running `metashape_scripts/import_camera_poses.py` under Metashape's Python, and saves the project. Cameras marked `estimated` or `unverified` get their pose too and are disabled, so they can be found among the disabled cameras and checked (`--posed-only`: left as they are). Cameras without a pose in the file are left as they are. These cameras are not aligned by Metashape (they have no tie points), so Metashape keeps the given pose.
+
+## Video tracks (track-video)
+
+Places videos filmed over a plot on it, and finds where they stood still. Made for a **GRAV** camera on a sampling
+dive: a GoPro on a float at the top of a weighted pole, looking down on a diver who moves the pole to a coral, lets
+it settle and samples round it. The output tells, per stop, which video, when, and where in the plot: an annotator
+then only has to put each sample on the right coral (in substrata-explore, next to the video), not search the plot
+for where it was filmed (`substrata.videotrack`).
+
+Usage: `substrata track-video VIDEO_OR_FOLDER [...] [--plot PLOT ...] [--out DIR] [--work DIR] [--probe N] [--proxy] [--no-annotations] [--no-poses] [--redo]`
+
+```bash
+# three divers' GRAV videos on the 60 m and 40 m plots; H.264 copies for the browser
+substrata track-video Actioncams/HYD2511_GRAV02GOPRO_* Actioncams/HYD2511_GRAV03GOPRO_* \
+    --plot sam_sa3_60m/sam_sa3_60m_20250928 --plot sam_sa3_40m/sam_sa3_40m_20250928 --out sav03_grav --proxy
+substrata-explore --videos sav03_grav     # tracks and stops in 3D, the video player
+```
+
+1. **Keyframes**: a GoPro's HEVC has a keyframe every 1.001 s; those are decoded on their own (~20x real time, bound
+   by reading the file) at full size: one frame a second (other videos: sampled at 1 fps). Videos shorter than 5 s
+   are left out.
+2. **Stops**: the camera's motion between frames (the 30th percentile of the optical flow, so a diver moving in
+   front of the still reef does not count); still (< 1 px at 480 px wide) for 10 s or more is a stop.
+3. **Which plots**: 12 frames per video (still ones, spread over it) are placed by a seed search (below) on each plot; a video
+   is tracked on the plots where any was placed (`--probe 0`: on every plot).
+4. **Placing a frame**: LoFTR (kornia, half precision) between the frame (1280 px) and the plot's aligned survey
+   photos (640 px; sensors at least 0.6 as wide as the widest: no AUV or video frames), turned so the plot's +y is up
+   in each. A seed: the frame against a grid of photos 1.5 m apart (960 / 480 px, 4 quarter turns), then against
+   the photos round the best; tracking: the 5 photos nearest the last position (its turn first). 80 or more matches
+   consistent with one fundamental matrix place it; the frame centre is mapped into that photo (a homography of the
+   matches nearest it) and followed along the photo's ray to the cloud. While the camera is still, the position is
+   kept and checked every 8 s; lost, a seed is tried at still frames, at most every 6 s. The frame's **heading**
+   (where the top of the frame points) and **footprint** (how much reef it spans) come from points a little above
+   and right of the matches' middle, mapped the same way.
+5. **Sequences and estimates**: the videos of one camera (one folder) over one plot are one *sequence* (a dive's
+   samples there, in order, over a GoPro's split files and restarts; ordered by the creation times). Its stops are
+   numbered in order over its videos (`seq_stop`). A stop with no frame placed gets a rough position: interpolated
+   in time between the sequence's frames placed before and after it (at most 10 min apart), else the nearest placed
+   frame within 60 s on one side (`placed` = `estimated`).
+6. **Camera poses** (`substrata.videopose`; `--no-poses`: none): where the camera was at each stop and where it
+   looked, so a 3D viewer can show the plot as the video does. The stop's first and last frame placed by matching are
+   matched against the survey photos within 3 m (up to 30); each match's 3D point comes from that photo's depth map
+   (the cloud projected into it). One lens per camera setting (model, lens mode and frame size, from a GoPro's
+   metadata) is calibrated from all those frames together with their poses (a fisheye with the sides' stretch of a
+   GoPro's SuperView; fitted in pixels from the middle of the frame out), then each frame's pose; a stop takes its
+   frame with most inliers. On SAV03: 3 px median reprojection error, the two frames of a stop 4 cm / 1.3 deg apart,
+   cameras 1.6 m above the stop points; ~5 s a stop frame the first time (kept in `--work`).
+7. **Outputs** (`--out`, default `./videotrack`):
+   - `stops.csv`: per stop: sequence, diver (named in substrata-explore's video player: `labels.json` in `--out`),
+     plot, `seq_stop`, video, its stop number, start (m:ss.s) and end (s into the
+     file), duration, `placed` (matched / estimated / empty), x, y, z (the plot's world frame), frames placed by
+     matching and their spread (or `est_gap_s`: s to the nearest placed frame), `heading_deg` (degrees clockwise
+     from the world's +y) and `width_m`, the camera pose (`cam_x`, `cam_y`, `cam_z`; `cam_qx` .. `cam_qw`: a
+     quaternion, camera -> world, x right, y down, z forward; `pose_px`), the point id in the plot's stops set, the
+     video file;
+   - `track.csv` (every placed frame), `videos.csv`, `<plot>_map.jpg` (the plot from above: each sequence as a line
+     through its numbered stops, estimated ones `~n`, the placed frames faint), `README.txt` (the columns),
+     `videotrack.json` (for substrata-explore; with each camera setting's lens calibration and field of view);
+   - `proxies/<video>.mp4` with `--proxy` (720p H.264, NVENC when available): browsers on Linux mostly do not
+     play HEVC;
+   - per plot, the stops with a position as the point set `<id>.annos/<id>_video_stops.csv` (with its sidecar; the
+     `sequence`, `seq_stop`, `video`, `stop`, … columns kept; an estimated position has `is_extrapolated` True, as
+     intercepts and camera targets mark theirs), to move onto the sampled corals and label.
+     An existing set is only added to: stops never written to it become new points and the stop columns of its
+     points are brought up to date (backed up first), but its points are never moved, relabelled, removed, or added
+     again once you removed them (`--no-annotations`: none written).
+
+Keyframes, photo thumbnails (1/8) and each video's track per plot are kept in `--work` (default
+`~/.cache/substrata/videotrack`) and reused: running again (other outputs, `--proxy`) only redoes what is missing
+(`--redo`: track again). Needs ffmpeg and kornia (the `match` extra).
+
+On SAV03 (2025; three divers, 40 m and 60 m) whole-frame retrieval (DINOv2) did not find the survey photos a GRAV
+frame sees (the frame covers ~4 m of reef, a survey photo ~1 m, and a diver fills part of it), but LoFTR with a survey
+photo that sees the same reef gave 500-1,200 consistent matches across the strobe / ambient light gap (unrelated
+pairs: below ~45). A tracked frame takes ~0.1-0.8 s, a seed ~5-10 s (RTX 4080). The position is the frame centre's,
+near the pole's foot: within a metre or so of the sampled corals.
 
 ## Path repair (path-repair)
 

@@ -1058,6 +1058,109 @@ class PointCloud:
             out.append(a)
         return self._as_intercepts(out)
 
+    def camera_targets(
+        self,
+        cams,
+        pixel: Optional[Tuple[float, float]] = None,
+        search_radius: float = settings.CAMERA_TARGET_SEARCH_RADIUS,
+        max_search_radius: float = settings.CAMERA_TARGET_MAX_SEARCH_RADIUS,
+        max_distance: float = settings.MAX_DIST_FROM_ORIGIN_FOR_INTERCEPT_SEARCH,
+        id_prefix: str | None = None,
+    ) -> "Annotations":
+        """The points that cameras aim at: where the ray through each camera's ``pixel`` (default: the photo's
+        centre) first meets this cloud, as intercepts with that camera as their view.
+
+        For targeted photos, e.g. close-ups (macro photos) of single colonies: their centres become annotation
+        points (the colony), each with its photo as the view (``image_match``, saved as ``cam_filepath`` /
+        ``cam_x`` / ``cam_y``).
+
+        The ray (:meth:`Camera.pixel_to_ray`, lens distortion undone) is followed from the camera centre in steps
+        of ``search_radius`` (:meth:`get_intercept`); the first cloud point within ``search_radius`` of the ray is
+        the hit. A ray that passes a gap (e.g. between branches) is tried again with a radius three times as big,
+        up to ``max_search_radius``. The hit is then refined: of the cloud points near it on the same surface
+        (along the ray from the hit's distance less one radius to two radii further), the one nearest the ray. The
+        view's pixel is that point projected into the photo (a few tens of px from ``pixel`` on a close-up),
+        so point and view agree.
+
+        Args:
+            cams: A :class:`~substrata.cameras.Cameras` (or a list of cameras) in this cloud's frame (both
+                loaded with the same world transform, as the initializer does).
+            pixel: The pixel (x, y) to follow, the same for every photo; default each photo's centre.
+            search_radius: Distance (cloud units: metres with a world transform) from the ray within which a
+                cloud point is a hit, and the step along the ray.
+            max_search_radius: The largest radius tried for a ray that misses.
+            max_distance: How far from the camera to follow the ray.
+            id_prefix: IDs are ``<id_prefix>_<n>``, n the camera's position in ``cams`` (stable when run again
+                with the same cameras); without one, n.
+
+        Returns:
+            Annotations of :class:`~substrata.annotations.InterceptAnnotation` (``search_radius``: the radius
+            that hit), in this cloud's frame with the original coordinates (as :meth:`get_z_intercepts`). Each
+            has the camera as its only image match and ``meta_data`` ``target_distance`` (camera to point) and
+            ``target_offset_px`` (the view's pixel from ``pixel``); ``is_extrapolated`` for a camera whose pose
+            was estimated rather than matched (``pose_status`` ``estimated``). ``missed``: the file names of the cameras
+            whose ray met no cloud (or that cannot project: no calibration or pose), with the reason.
+        """
+        from substrata.cameras import ImageMatch, can_project
+
+        cam_list = list(cams.data.values()) if hasattr(cams, "data") else list(cams)
+        if not hasattr(self, "o3d_pcd_tree"):
+            self.build_kd_tree()
+        points = np.asarray(self.points)
+        out = annotations.Annotations()
+        missed = []
+        for n, cam in enumerate(tqdm(cam_list, desc="Camera targets")):
+            if not can_project(cam, use_orig_coords=False):
+                missed.append((cam.filename, "cannot project (no calibration or pose)"))
+                continue
+            s = cam.sensor
+            px = (s.width / 2.0, s.height / 2.0) if pixel is None else (float(pixel[0]), float(pixel[1]))
+            origin = np.asarray(cam.coords, dtype=float)
+            ray = np.asarray(cam.pixel_to_ray(*px), dtype=float)
+            hit, r = None, float(search_radius)
+            while hit is None:
+                hit = self.get_intercept(origin, r, vector=ray, max_dist_from_origin=max_distance)
+                if hit is None:
+                    if r >= max_search_radius:
+                        break
+                    r = round(min(r * 3.0, float(max_search_radius)), 9)
+            if hit is None:
+                missed.append((cam.filename, f"no cloud within {max_search_radius:g} of the ray"))
+                continue
+            p = self._nearest_to_ray(points, origin, ray, np.asarray(hit.coords, dtype=float), r)
+            x, y, depth, relevance = cam.get_pixel_coords(p)
+            if x is None:
+                missed.append((cam.filename, "the hit is out of the photo"))
+                continue
+            # (a camera whose pose was estimated, not matched: camsync --match-images' pose_status "estimated")
+            a = annotations.InterceptAnnotation(p, r, is_extrapolated=getattr(cam, "pose_status", None) == "estimated")
+            a.id = f"{id_prefix}_{n}" if id_prefix is not None else n
+            match = ImageMatch(cam, x, y, depth, relevance, annotation=a)
+            a.image_matches = [match]
+            a.image_match = match
+            a.meta_data["target_distance"] = round(float(np.linalg.norm(p - origin)), 4)
+            a.meta_data["target_offset_px"] = round(float(np.hypot(x - px[0], y - px[1])), 1)
+            out.append(a)
+        self._as_intercepts(out)
+        out.missed = missed
+        return out
+
+    def _nearest_to_ray(self, points: np.ndarray, origin: np.ndarray, ray: np.ndarray, hit: np.ndarray,
+                        radius: float) -> np.ndarray:
+        """Of the cloud points within 4 radii of ``hit``, on its surface along the ray (from its distance less
+        one radius to two radii further), the one nearest the ray (``hit`` itself if there are none)."""
+        _k, idx, _d = self.o3d_pcd_tree.search_radius_vector_3d(hit, 4.0 * radius)
+        idx = np.asarray(idx, dtype=int)
+        if not len(idx):
+            return hit
+        q = points[idx] - origin
+        t = q @ ray
+        perp = np.linalg.norm(q - np.outer(t, ray), axis=1)
+        t0 = float((hit - origin) @ ray)
+        perp[(t < t0 - radius) | (t > t0 + 2.0 * radius)] = np.inf
+        j = int(np.argmin(perp))
+        return points[idx[j]].astype(float) if np.isfinite(perp[j]) else hit
+
     def get_z_intercept(
         self,
         xy_coord: np.ndarray,

@@ -1701,6 +1701,74 @@ def _depth_intercepts(args, init) -> None:
     _save_intercepts(init, intercepts, annos_dir, csv_path, grid, args)
 
 
+def handle_cams2annos(args):
+    """substrata cams2annos: the points a camera group's photos aim at (PointCloud.camera_targets: where the ray
+    through each photo's centre, or --pixel, first meets the plot's cloud), as an annotation set with each photo as
+    its point's view: <id>.annos/<id>_<group>[_<tag>]_targets.csv. For close-ups (macro photos) of single colonies:
+    one point per colony, to label from its close-up. Targeted, so never a survey (sidecar purpose training_only)."""
+    from substrata.initializer import ProjectInitializer
+    from substrata import grouppredict
+
+    if not (0 < args.search_radius <= args.max_search_radius):
+        sys.exit("--search-radius must be positive and at most --max-search-radius")
+    base, cwd = _cwd_base()
+    init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
+    if getattr(args, "input", None):
+        init.pcd_filepath = args.input
+    init.initialize()
+    if init.pcd.world_transform_is_identity:
+        sys.exit("World transform is not set (the distances are in metres of the plot's frame)")
+    if init.cams is None or not init.cams.data:
+        sys.exit("The plot has no cameras")
+    try:
+        group, kind, cams = grouppredict.resolve_camera_group(init.cams, args.group)
+    except ValueError as e:
+        sys.exit(str(e))
+    name = re.sub(r"[^A-Za-z0-9.-]+", "-", group).strip("-.") or "cams"
+    tag = _intercepts_tag(getattr(args, "tag", None))
+    annos_dir = init.annos_root or os.path.join(os.getcwd(), f"{init.id}.annos")
+    csv_path = os.path.join(annos_dir, f"{init.id}_{name}{tag}_targets.csv")
+    n_labelled = _labelled_rows(csv_path)
+    if n_labelled and not getattr(args, "overwrite", False):
+        sys.exit(f"{csv_path} exists with {n_labelled} labelled point(s): not overwritten. Use --tag NAME for a new "
+                 "set next to it, or --overwrite.")
+    through = "each photo's centre" if args.pixel is None else "pixel {:g}, {:g}".format(*args.pixel)
+    print(f"Camera group {group!r} ({kind}): {len(cams)} cameras; following the ray through {through}")
+    targets = init.pcd.camera_targets(
+        cams, pixel=args.pixel, search_radius=args.search_radius, max_search_radius=args.max_search_radius,
+        max_distance=args.max_distance, id_prefix=f"{init.id}_{name}")
+    for fn, why in targets.missed:
+        print(f"  no point: {fn} ({why})")
+    if not len(targets):
+        sys.exit(f"None of the {len(cams)} cameras' rays met the cloud: nothing saved")
+    dist = [a.meta_data["target_distance"] for a in targets]
+    off = [a.meta_data["target_offset_px"] for a in targets]
+    print(f"{len(targets)} of {len(cams)} cameras: a point {min(dist):.2f}-{max(dist):.2f} m (median "
+          f"{float(np.median(dist)):.2f}) from the camera, its view {float(np.median(off)):.0f} px (median; "
+          f"max {max(off):.0f}) from the pixel followed")
+    n_est = sum(1 for a in targets if a.is_extrapolated)
+    if n_est:
+        print(f"  of which {n_est} from an estimated pose (camsync: no image match; is_extrapolated True, their "
+              "cameras disabled): check them")
+    os.makedirs(annos_dir, exist_ok=True)
+    targets.save(csv_path)
+    sidecar_path = sidecars.write_annotation_sidecar(csv_path, {
+        "type": "camera_targets",
+        "purpose": "training_only",  # (photos aimed at chosen things: not a random sample)
+        "plot_id": init.id,
+        "classes": init.classes_filepath,
+        "world_transform": init.world_transform,
+        "camera_targets": {
+            "camera_group": group, "group_kind": kind, "cameras": len(cams), "points": len(targets),
+            "pixel": list(args.pixel) if args.pixel is not None else "centre",
+            "search_radius": float(args.search_radius), "max_search_radius": float(args.max_search_radius),
+            "max_distance": float(args.max_distance),
+            "missed": [f"{fn}: {why}" for fn, why in targets.missed],
+        },
+    }, update=False)
+    print(f"Saved {len(targets)} points to {csv_path} (settings: {sidecar_path})")
+
+
 def _intercepts_tag(tag) -> str:
     """``--tag NAME`` as the file-name part ``_NAME`` (letters, digits, _ - and . only), "" without one."""
     if not tag:
@@ -2619,6 +2687,9 @@ def handle_camsync(args):
             f"{target_dates}."
         )
 
+    if getattr(args, "match_images", False):
+        return _camsync_match_images(init, pose_cams, updated_cams, pose_id, tgt_id, args)
+
     auto_time = bool(
         getattr(args, "auto_offsets", False) or getattr(args, "auto_time", False)
     )
@@ -2830,6 +2901,211 @@ def handle_camsync(args):
 
 
 
+def _camsync_match_images(init, pose_cams, updated_cams, pose_id, tgt_id, args):
+    """camsync --match-images (substrata.imagesync): the updated-target cameras (e.g. close-ups) posed from
+    image matches with the pose-source cameras (e.g. a GoPro's aligned video frames), instead of copying the
+    pose of the frame at the same time. The time offset is found from the images unless --time-offset is given.
+    Writes <id>_camsync_images.pdf (the check) and, unless --dry-run (after a confirmation unless --yes), the
+    poses into the meta JSON (backed up first; cameras without a good pose get none and are disabled) and
+    <id>_camsync_poses.json (for metashape-import-poses)."""
+    from substrata import imagesync
+    from substrata.cameras import can_project
+
+    for flag in ("auto_time", "auto_xyz", "auto_offsets", "xyz", "pose_time"):
+        if getattr(args, flag, None):
+            print(f"Note: --{flag.replace('_', '-')} is not used with --match-images.")
+    if getattr(init, "pcd", None) is None:
+        raise SystemExit("--match-images needs the plot's point cloud (the frames' matches are placed on it)")
+    if init.pcd.world_transform_is_identity:
+        raise SystemExit("World transform is not set (the checks are in metres)")
+    cal = getattr(args, "frame_calibration", None)
+    sensor_other = None
+    if cal:
+        from substrata import frameretrieval
+
+        orientation = getattr(args, "frame_calibration_orientation", "auto") or "auto"
+        turned = orientation == "turned"
+        try:
+            sensor = frameretrieval.sensor_from_cams_xml(cal, pose_id, as_sensor_id=pose_id, rotate180=turned)
+        except (KeyError, ValueError) as e:
+            raise SystemExit(f"--frame-calibration: {e}")
+        frameretrieval.give_sensor(init.cams, sensor)
+        for c in pose_cams.data.values():
+            c.sensor = sensor
+        if orientation == "auto":
+            sensor_other = frameretrieval.sensor_from_cams_xml(cal, pose_id, as_sensor_id=pose_id, rotate180=True)
+        print(f"Sensor {pose_id}: the calibration of sensor {pose_id} in {cal}" + (" turned 180 deg" if turned else "")
+              + f" (f {sensor.f:.0f} px)" + ("; whether it is turned 180 deg is told from the frames"
+                                              if orientation == "auto" else ""))
+    sources = [c for c in pose_cams.data.values() if can_project(c, use_orig_coords=False)]
+    pose_frames = bool(getattr(args, "pose_frames", False))
+    if not sources and not pose_frames:
+        raise SystemExit(f"None of sensor {pose_id}'s cameras has a pose: nothing to match against (--pose-frames "
+                         "poses them here, from the survey photos)")
+    if pose_frames and all(getattr(c, "sensor", None) is None for c in pose_cams.data.values()):
+        raise SystemExit(f"Sensor {pose_id} has no calibration (Metashape aligned none of its cameras): give one "
+                         "with --frame-calibration OTHER_PLOT.cams.xml (the same camera and settings in another plot)")
+    targets = sorted(updated_cams.data.values(), key=lambda c: c.filename)
+    if getattr(targets[0], "sensor", None) is None:
+        raise SystemExit(f"Sensor {tgt_id} has neither a calibration nor a focal length and pixel size in "
+                         "cams.xml: its lens is unknown")
+    if targets[0].sensor.calibration_class == "nominal":
+        print(f"Sensor {tgt_id} has no calibration: its nominal lens is used (f {targets[0].sensor.f:.0f} px, "
+              "no distortion)")
+    offset = getattr(args, "time_offset", None)
+    window = getattr(args, "offset_window", None)
+    check = None if getattr(args, "no_check", False) else ("lightglue" if args.matcher == "loftr" else "loftr")
+    photos = []
+    if getattr(args, "pose_frames", False):
+        from substrata import framepose
+
+        want = getattr(args, "frame_photos", None)
+        skip = {str(pose_id), str(tgt_id)}
+        photos = [c for c in init.cams.data.values()
+                  if (str(c.sensor_id) in {str(v) for v in want} if want else str(c.sensor_id) not in skip)
+                  and can_project(c, use_orig_coords=False)]
+        if not want:
+            photos, detail = framepose.photo_sensors(photos, init.pcd)
+            left = sorted(sid for sid in detail if sid not in {str(c.sensor_id) for c in photos})
+            if left:
+                print("--pose-frames: not matching with sensor(s) " + ", ".join(
+                    f"{sid} ({detail[sid]:.0f} px/m)" for sid in left) + " (much less detail of the reef than "
+                    "the others: photos from further away; --frame-photos to choose)")
+        print(f"--pose-frames: unaligned frames are posed from {len(photos)} posed photo(s) of sensor(s) "
+              + ", ".join(sorted({str(c.sensor_id) for c in photos})) + " and the aligned frames")
+    print(f"Posing {len(targets)} camera(s) of sensor {tgt_id} from {len(sources)} posed camera(s) of sensor "
+          f"{pose_id} ({args.matcher}" + (f", checked with {check})" if check else ")"))
+    try:
+        report = imagesync.pose_from_images(
+            targets, sources, init.pcd, offset=None if offset is None else int(round(offset)),
+            window=None if window is None else tuple(int(v) for v in window), matcher=args.matcher, check=check,
+            frames=args.frames, wide=getattr(args, "wide_frames", imagesync.MATCH_WIDE_FRAMES),
+            frames_all=list(pose_cams.data.values()), pose_frames=bool(getattr(args, "pose_frames", False)),
+            photos=photos, frame_sensor_other=sensor_other, estimate=not getattr(args, "no_estimate", False),
+            device=getattr(args, "device", None))
+    except ImportError as e:
+        raise SystemExit(str(e))
+    off = report["offset"]
+    print(f"Time offset votes (SIFT): peak {off.get('offset')} s, {off.get('prominence', 0):.1f}x the median vote "
+          f"(elsewhere at most {off.get('ambiguity', 1):.2f} of it), {off.get('n_agree', 0)} of "
+          f"{off.get('n_targets', 0)} close-ups agree (offsets {off.get('window')})")
+    pdf_path = _get_output_filepath(init, "camsync_images.pdf")
+    if report["time_offset"] is None:
+        imagesync.write_report_pdf(report, targets, pdf_path, title=f"{init.id}: camsync --match-images")
+        raise SystemExit(f"{off.get('reason')}. Give the offset with --time-offset, or the offsets to search with "
+                         f"--offset-window MIN MAX (check {pdf_path}).")
+    status = report["status"]
+    print(f"Using time offset {report['time_offset']} s" + (" (--time-offset)" if offset is not None else ""))
+    fp = report.get("frame_poses")
+    if fp:
+        n_used = sum(bool(r.get("used")) for r in fp.values())
+        n_from = sum(1 for s, n in status.values() if s == "posed" and "frame posed by substrata" in n)
+        print(f"Unaligned frames posed (--pose-frames): {n_used} of {len(fp)}; {n_from} close-up(s) posed from them")
+    counts = Counter(s for s, _n in status.values())
+    print("Close-ups: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    by_id = {str(c.cam_id): c for c in targets}
+    for cid, (s, note) in sorted(status.items(), key=lambda kv: by_id[kv[0]].filename):
+        if s not in ("posed", "no frames"):
+            print(f"  {by_id[cid].filename}: {s}" + (f" ({note})" if note else ""))
+    rig = report.get("rig")
+    if rig:
+        print(f"  (rig from {rig['n']} posed close-ups: spread {100 * rig['spread_m']:.1f} cm, "
+              f"{rig['spread_deg']:.1f} deg. Estimated and unverified poses are saved marked, their cameras "
+              "disabled: look at them)")
+    no_frames = [by_id[cid] for cid, (s, _n) in status.items() if s == "no frames"]
+    if no_frames:
+        within = max(args.frames, getattr(args, "wide_frames", 0) or 0)
+        unaligned = imagesync.unaligned_frames(no_frames, list(pose_cams.data.values()), report["time_offset"],
+                                               within)
+        names = sorted(c.filename for c in no_frames)
+        print(f"  {len(no_frames)} close-up(s) have no aligned frame within {within} s of their time "
+              f"({names[0]}" + (f" .. {names[-1]}" if len(names) > 1 else "") + ")"
+              + (f": {len(unaligned)} frame(s) of sensor {pose_id} at those times have no pose in Metashape "
+                 f"({unaligned[0].filename} .. {unaligned[-1].filename})"
+                 + (": substrata could not pose them either." if fp else
+                    ". --pose-frames poses them here (or align them in Metashape: Align Selected Cameras, and "
+                    "export again).") if unaligned else
+                 ": there are no frames at those times."))
+    unchecked = sum(1 for s, n in status.values() if s == "posed" and n == "unchecked")
+    if check and unchecked:
+        print(f"  ({unchecked} posed without a second opinion: {check} gave no pose)")
+    imagesync.write_report_pdf(report, targets, pdf_path, title=f"{init.id}: camsync --match-images",
+                               max_posed=max(0, int(args.pdf_pairs)))
+    print(f"Check: {pdf_path}")
+    n_posed = counts.get("posed", 0)
+    n_marked = counts.get("estimated", 0) + counts.get("unverified", 0)
+    if getattr(args, "dry_run", False):
+        print("Dry run: nothing saved.")
+        return
+    if not n_posed:
+        raise SystemExit("No close-up was posed: nothing saved.")
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            raise SystemExit("Saving needs --yes when not run in a terminal (look at the check PDF first).")
+        ans = input(f"\nSave the {n_posed} pose(s) to the meta JSON" + (
+            f", and the {n_marked} estimated / unverified (marked, disabled)" if n_marked else "")
+            + f" (the other {len(targets) - n_posed - n_marked} close-up(s) without a pose, disabled)? [y/N]: ")
+        if ans.strip().lower() not in ("y", "yes"):
+            raise SystemExit("Aborted: nothing saved.")
+    for path in (init.cams_meta_json_filepath, init.cams_xml_filepath):
+        if path and os.path.isfile(path):
+            print(f"Backed up {path} -> {_backup_file(path)}")
+    W = init.pcd.world_transform
+    for cid, c in by_id.items():
+        s = status.get(cid, ("",))[0]
+        if s in imagesync.POSED_STATUSES:
+            p = report["poses"][cid]
+            imagesync.set_pose(c, p["R"], p["C"], W)
+            c.enabled = s == "posed"
+            c.pose_status = "matched" if s == "posed" else s
+        else:
+            imagesync.clear_pose(c)
+            c.pose_status = None
+    init.cams.save()
+    poses_path = _get_output_filepath(init, "camsync_poses.json")
+    with open(poses_path, "w") as f:
+        json.dump(imagesync.poses_payload(report, targets, pose_source=pose_id, updated_target=tgt_id), f, indent=1)
+    print(f"Saved {n_posed} pose(s)" + (f" and {n_marked} marked estimated / unverified" if n_marked else "")
+          + f"; for Metashape: {poses_path} (substrata metashape-import-poses)")
+
+
+def handle_metashape_import_poses(args):
+    """Give cameras in a Metashape project the poses in a poses file (camsync --match-images'
+    <id>_camsync_poses.json), by running metashape_scripts/import_camera_poses.py under Metashape."""
+    from substrata.metashape_scripts import import_camera_poses as mip
+
+    psx, poses = mip.default_paths(os.getcwd(), getattr(args, "psx", None), getattr(args, "poses", None))
+    for p in (psx, poses):
+        if not os.path.isfile(p):
+            raise SystemExit(f"Not found: {p} (pass --psx / --poses)")
+    posed_only = bool(getattr(args, "posed_only", False))
+    with open(poses) as f:
+        payload = json.load(f)
+    plan = mip.planned_poses(payload, include_marked=not posed_only)
+    n_marked = sum(1 for k, _l, _t in plan if (payload["cameras"].get(k) or {}).get("status") in mip.MARKED)
+    print(f"{len(plan)} camera(s) with a pose in {poses}" + (
+        f" ({n_marked} marked estimated / unverified: set, and disabled)" if n_marked else ""))
+    if not plan:
+        return
+    exe = _find_metashape_executable(getattr(args, "metashape", None))
+    script = os.path.join(os.path.dirname(__file__), "metashape_scripts", "import_camera_poses.py")
+    cmd = [exe, "-platform", "offscreen", "-r", script, "--psx", os.path.abspath(psx), "--poses",
+           os.path.abspath(poses)]
+    if getattr(args, "chunk", None) is not None:
+        cmd += ["--chunk", str(args.chunk)]
+    if getattr(args, "dry_run", False):
+        cmd += ["--dry-run"]
+    if posed_only:
+        cmd += ["--posed-only"]
+    print("Running Metashape:\n  " + " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as e:
+        raise SystemExit(f"Failed to launch Metashape executable {exe!r}: {e}")
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"Metashape import failed (exit code {e.returncode}).")
+
+
 def _pr_prompt_duplicate(label, name, old_path, candidates):
     """Ask which of several same-named candidates to use.
 
@@ -3014,6 +3290,49 @@ def _print_skipped_dirs(plan, max_rows):
         print(f"    {d}  ({counts[d]})")
     if len(counts) > max_rows:
         print(f"    ... {len(counts) - max_rows} more")
+
+
+def handle_track_video(args):
+    """Place GRAV-style videos on plots: keyframes, motion, track and stops (:mod:`substrata.videotrack`).
+
+    Args:
+        args: Parsed command-line arguments.
+    """
+    from substrata import videotrack as vt
+
+    videos = vt.find_videos(args.videos)
+    if not videos:
+        raise SystemExit(f"No videos ({', '.join(vt.VIDEO_EXTS)}) in {' '.join(args.videos)}")
+    plots = args.plot or [os.getcwd()]
+    projects = []
+    for p in plots:
+        p = os.path.abspath(os.path.expanduser(p))
+        init = (
+            ProjectInitializer(yaml=p, local=getattr(args, "local", False))
+            if os.path.isfile(p)
+            else ProjectInitializer(path=p, local=getattr(args, "local", False))
+        )
+        init.initialize()
+        if init.pcd is None or init.cams is None:
+            raise SystemExit(f"{p}: track-video needs the plot's cloud and cameras")
+        projects.append(init)
+    out = os.path.abspath(args.out or os.path.join(os.getcwd(), "videotrack"))
+    work = os.path.abspath(
+        os.path.expanduser(args.work or os.path.join("~", ".cache", "substrata", "videotrack"))
+    )
+    print(f"{len(videos)} videos, {len(projects)} plots; work files in {work}")
+    vt.track_videos(
+        videos,
+        projects,
+        out,
+        work,
+        probe_frames=args.probe,
+        proxies=args.proxy,
+        annotations=not args.no_annotations,
+        redo=args.redo,
+        device=args.device,
+        poses=getattr(args, "poses", True),
+    )
 
 
 def handle_path_repair(args):
@@ -5792,6 +6111,21 @@ def main():
     )
 
     # metashape-export (initialize a substrata project folder from a .psx)
+    p_mip = subparsers.add_parser(
+        "metashape-import-poses",
+        help="Give cameras in the Metashape project the poses camsync --match-images found "
+             "(<id>_camsync_poses.json), by running Metashape's Python.",
+    )
+    p_mip.add_argument("--psx", dest="psx", type=str, default=None, help="Default: <folder>.psx in the CWD.")
+    p_mip.add_argument("--poses", dest="poses", type=str, default=None,
+                       help="Default: <folder>_camsync_poses.json in the CWD.")
+    p_mip.add_argument("--chunk", dest="chunk", type=str, default=None, help="Chunk label or 0-based index.")
+    p_mip.add_argument("--metashape", dest="metashape", type=str, default=None, help="The Metashape executable.")
+    p_mip.add_argument("--dry-run", dest="dry_run", action="store_true", help="Report only; the project is not saved.")
+    p_mip.add_argument("--posed-only", dest="posed_only", action="store_true",
+                       help="Only the posed cameras; not those camsync marked estimated / unverified (by default set "
+                            "too, and disabled).")
+
     p_meta = subparsers.add_parser(
         "metashape-export",
         help=(
@@ -6508,6 +6842,38 @@ def main():
                       help="Points for training only, not a survey (sidecar purpose: training_only).")
     p_sp.add_argument("--overwrite", dest="overwrite", action="store_true",
                       help="Replace an existing points CSV that has labels (otherwise refused).")
+
+    # cams2annos
+    p_c2a = subparsers.add_parser(
+        "cams2annos",
+        aliases=["cams-to-annos"],
+        help="The points a camera group's photos aim at (e.g. close-ups of colonies: where the ray through each "
+             "photo's centre meets the cloud), as an annotation set <id>.annos/<id>_<group>[_TAG]_targets.csv "
+             "with each photo as its point's view.",
+    )
+    p_c2a.add_argument("--group", dest="group", type=str, default="closeup",
+                       help="The camera group: a photo folder's group (closeup for <id>.closeup/), a camera type "
+                            "('8726x5840 f23610'), a camera system ('8726x5840'), enabled or all (as predict "
+                            "--camera-group). Default: closeup.")
+    p_c2a.add_argument("--pixel", dest="pixel", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                       help="Follow the ray through this pixel instead of each photo's centre.")
+    p_c2a.add_argument("--search-radius", dest="search_radius", type=float,
+                       default=settings.CAMERA_TARGET_SEARCH_RADIUS, metavar="M",
+                       help="A cloud point this close to the ray (metres) is a hit; a ray through a gap is tried "
+                            f"again 3x wider. Default: {settings.CAMERA_TARGET_SEARCH_RADIUS:g}.")
+    p_c2a.add_argument("--max-search-radius", dest="max_search_radius", type=float,
+                       default=settings.CAMERA_TARGET_MAX_SEARCH_RADIUS, metavar="M",
+                       help=f"The widest tried. Default: {settings.CAMERA_TARGET_MAX_SEARCH_RADIUS:g}.")
+    p_c2a.add_argument("--max-distance", dest="max_distance", type=float,
+                       default=settings.MAX_DIST_FROM_ORIGIN_FOR_INTERCEPT_SEARCH, metavar="M",
+                       help="How far from the camera to follow the ray (metres). Default: "
+                            f"{settings.MAX_DIST_FROM_ORIGIN_FOR_INTERCEPT_SEARCH:g}.")
+    p_c2a.add_argument("--tag", dest="tag", type=str, default=None, metavar="NAME",
+                       help="A new set next to the others: <id>_<group>_NAME_targets.csv.")
+    p_c2a.add_argument("--overwrite", dest="overwrite", action="store_true",
+                       help="Replace an existing set that has labels (otherwise refused).")
+    p_c2a.add_argument("--input", "--ply", dest="input", type=str, default=None,
+                       help="Optional explicit input PLY path (overrides the plot's).")
 
     # intercepts
     p_intercepts = subparsers.add_parser(
@@ -7489,6 +7855,78 @@ def main():
         action="store_true",
         help="Skip confirmation prompt after auto offset reports (non-interactive).",
     )
+    p_camsync.add_argument(
+        "--match-images",
+        dest="match_images",
+        action="store_true",
+        help=(
+            "Pose the updated-target cameras (e.g. close-ups) from image matches with the pose-source cameras "
+            "(e.g. a GoPro's aligned video frames) instead of copying the pose of the frame at the same time; "
+            "the time offset is found from the images unless --time-offset is given. Writes <id>_camsync_images.pdf "
+            "and, after a confirmation (or --yes), the poses into the meta JSON and <id>_camsync_poses.json. "
+            "Needs kornia (pip install kornia); a GPU makes it fast."
+        ),
+    )
+    p_camsync.add_argument(
+        "--offset-window", dest="offset_window", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="--match-images: the time offsets (s) to search. Default: every offset at which a close-up falls "
+             "within the pose-source cameras' time span.",
+    )
+    p_camsync.add_argument(
+        "--matcher", dest="matcher", choices=["loftr", "lightglue"], default="loftr",
+        help="--match-images: the matcher (kornia's LoFTR or DISK + LightGlue); the other checks it. Default: loftr.",
+    )
+    p_camsync.add_argument(
+        "--no-check", dest="no_check", action="store_true",
+        help="--match-images: no second matcher's opinion (faster; outliers are then caught by the range check only).",
+    )
+    p_camsync.add_argument(
+        "--frames", dest="frames", type=int, default=3, metavar="S",
+        help="--match-images: frames tried on either side of a close-up's offset time (s). Default: 3.",
+    )
+    p_camsync.add_argument(
+        "--wide-frames", dest="wide_frames", type=int, default=8, metavar="S",
+        help="--match-images: for a close-up that matches none of those, frames up to this far off (s; the diver "
+             "lingered, or the frames at its time are not aligned). 0: none. Default: 8.",
+    )
+    p_camsync.add_argument(
+        "--pose-frames", dest="pose_frames", action="store_true",
+        help="--match-images: pose the pose-source frames Metashape left unaligned at the times of close-ups that "
+             "have no aligned frame (and those between them and the nearest aligned ones), from image matches with "
+             "the other posed photos (e.g. the survey photos) and the aligned frames; the close-ups are then matched "
+             "with those too. The frames' poses are not saved. Adds about 10 s a frame.",
+    )
+    p_camsync.add_argument(
+        "--frame-photos", dest="frame_photos", nargs="+", default=None, metavar="SENSOR",
+        help="--pose-frames: the sensor(s) whose posed photos the frames are matched with. Default: every sensor "
+             "but the pose source and the updated target.",
+    )
+    p_camsync.add_argument(
+        "--no-estimate", dest="no_estimate", action="store_true",
+        help="--match-images: no pose for a close-up without a good match (by default it gets one from its frame's "
+             "pose and the rig, marked estimated, its camera disabled; one the two matchers disagree on keeps the "
+             "main matcher's, marked unverified).",
+    )
+    p_camsync.add_argument(
+        "--frame-calibration", dest="frame_calibration", default=None, metavar="CAMS_XML",
+        help="--match-images: the pose source's lens from another plot's cams.xml (its sensor of the same id, e.g. "
+             "the GoPro's where Metashape aligned its frames), for a plot where it has none. Only used in memory.",
+    )
+    p_camsync.add_argument(
+        "--frame-calibration-orientation", dest="frame_calibration_orientation", choices=["auto", "same", "turned"],
+        default="auto",
+        help="--frame-calibration: whether the camera was mounted the same way up there or turned 180 deg (the "
+             "principal point and tangential terms mirrored; e.g. the GoPro on sa4 vs sa3). auto (default): "
+             "told from the frames (with --pose-frames: a few posed through both, the better fitting kept).",
+    )
+    p_camsync.add_argument(
+        "--device", dest="device", type=str, default=None,
+        help="--match-images: torch device (default: cuda if available, else cpu).",
+    )
+    p_camsync.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="--match-images: report and write the check PDF only; nothing saved.",
+    )
 
     # transform
     p_transform = subparsers.add_parser(
@@ -7592,6 +8030,57 @@ def main():
     )
 
     # path-repair
+    p_tv = subparsers.add_parser(
+        "track-video",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help=(
+            "Place videos filmed over a plot (e.g. a GRAV camera filming coral "
+            "sampling) on the plot: a track and the stops, as CSVs, maps and an "
+            "annotation set of the stops."
+        ),
+        epilog=(
+            "One frame a second (a GoPro's keyframes) is matched with LoFTR to the\n"
+            "plot's aligned survey photos; the frame centre is followed to the cloud.\n"
+            "Stops are where the camera stood still for 10 s or more. Each video is\n"
+            "first probed on each plot (12 frames) and tracked where it was found.\n"
+            "\n"
+            "Outputs (--out, default ./videotrack): stops.csv, track.csv, videos.csv,\n"
+            "<plot>_map.jpg, README.txt, videotrack.json (substrata-explore --videos),\n"
+            "proxies/ with --proxy. Per plot the stops become the point set\n"
+            "<id>.annos/<id>_video_stops.csv (never overwritten; --no-annotations).\n"
+            "Keyframes, photo thumbnails and tracks are kept in --work and reused."
+        ),
+    )
+    p_tv.add_argument("videos", nargs="+", help="Video files or folders (searched recursively).")
+    p_tv.add_argument(
+        "--plot",
+        action="append",
+        metavar="PLOT",
+        help="Plot folder or YAML (repeatable; default: the project in the CWD).",
+    )
+    p_tv.add_argument("--out", help="Output folder (default ./videotrack).")
+    p_tv.add_argument(
+        "--work", help="Folder for keyframes, thumbnails and tracks (default ~/.cache/substrata/videotrack)."
+    )
+    p_tv.add_argument(
+        "--probe",
+        type=int,
+        default=12,
+        help="Frames tried per video and plot to tell whether it is on the plot (0: track on every plot).",
+    )
+    p_tv.add_argument("--proxy", action="store_true", help="Also write H.264 copies for the browser.")
+    p_tv.add_argument(
+        "--no-annotations", action="store_true", help="Do not write the stops as annotation sets."
+    )
+    p_tv.add_argument("--redo", action="store_true", help="Track again even where a track was kept.")
+    p_tv.add_argument(
+        "--no-poses", dest="poses", action="store_false",
+        help="Leave out the stops' camera poses (the lens calibrated from the stop frames, each stop's camera "
+        "position and orientation: substrata.videopose; ~3 s a stop frame the first time).",
+    )
+    p_tv.add_argument("--device", help="Torch device (default cuda if available).")
+    p_tv.add_argument("--local", action="store_true", help="Use local paths (see other commands).")
+
     p_pathrepair = subparsers.add_parser(
         "path-repair",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -8292,6 +8781,7 @@ def main():
         "decimate": handle_decimate,
         "stratify": handle_stratify,
         "metashape-export": handle_metashape_export,
+        "metashape-import-poses": handle_metashape_import_poses,
         "ply-repair": handle_ply_repair,
         "head": handle_head,
         "scalebars": handle_scalebars,
@@ -8302,6 +8792,8 @@ def main():
         "firefish": handle_firefish,
         "cams2video": handle_cams2video,
         "intercepts": handle_intercepts,
+        "cams2annos": handle_cams2annos,
+        "cams-to-annos": handle_cams2annos,
         "intercepts-plot": handle_intercepts_plot,
         "align": handle_align,
         "images": handle_images,
@@ -8314,6 +8806,7 @@ def main():
         "match-annotations": handle_match_annotations,
         "camsync": handle_camsync,
         "path-repair": handle_path_repair,
+        "track-video": handle_track_video,
         "transform": handle_transform,
         "baseline": handle_baseline,
         "train": handle_train,

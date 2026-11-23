@@ -29,6 +29,10 @@ dependencies = [
     "piexif",
 ]
 
+[project.optional-dependencies]
+# camsync --match-images: learned matchers (LoFTR, DISK + LightGlue); torch comes with it
+match = ["kornia>=0.7"]
+
 [project.urls]
 Homepage      = "https://github.com/reefscapegenomics/substrata"
 Documentation = "https://substrata.readthedocs.io/"

@@ -301,6 +301,18 @@ def _relevance(depth, dist_sq, x_img, y_img, fx, fy, width, height):
     )
 
 
+def _put_pose_status(entry: dict, cam) -> None:
+    """A meta JSON camera entry gets the camera's ``pose_status`` (where its pose came from, e.g. camsync
+    --match-images' ``matched`` / ``estimated`` / ``unverified``); a camera whose ``pose_status`` is None has it
+    removed; one without the attribute keeps what the file has."""
+    if not hasattr(cam, "pose_status"):
+        return
+    if cam.pose_status:
+        entry["pose_status"] = str(cam.pose_status)
+    else:
+        entry.pop("pose_status", None)
+
+
 def can_project(cam, use_orig_coords: bool = True) -> bool:
     """Whether ``cam`` can project points: it has a calibrated sensor and a pose of its own.
 
@@ -647,6 +659,24 @@ def _update_crop_metadata(path: str, updates: dict) -> None:
     piexif.insert(_exif_with_crop_metadata(path, data), path)
 
 
+def _nominal_sensor(sensor_elem, sensor_id, label, resolution) -> "Sensor | None":
+    """A sensor Metashape did not calibrate (none of its photos aligned, e.g. close-ups) from its nominal lens: the
+    ``focal_length`` (mm) and ``pixel_width`` (mm) properties in cams.xml, the principal point at the centre and no
+    distortion (``calibration_class`` "nominal"). None without those properties. Its cameras still have no pose
+    until one is given (e.g. ``camsync --match-images``), so they see nothing until then."""
+    props = {p.get("name"): p.get("value") for p in sensor_elem.findall("property")}
+    try:
+        f_mm, px_mm = float(props.get("focal_length")), float(props.get("pixel_width"))
+    except (TypeError, ValueError):
+        return None
+    if not (f_mm > 0 and px_mm > 0):
+        return None
+    params = {k: 0.0 for k in ("cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4")}
+    sensor = Sensor(sensor_id, label, resolution, dict(params, f=f_mm / px_mm))
+    sensor.calibration_class = "nominal"
+    return sensor
+
+
 class Sensor:
     """Class that holds calibration parameters for a specific camera sensor (Metashape's frame camera
     model: see :func:`_lens`)."""
@@ -688,6 +718,8 @@ class Sensor:
         self.fy = self.f
         self.cx = self.width / 2 + self.cx_metashape
         self.cy = self.height / 2 + self.cy_metashape
+        # "adjusted": Metashape's calibration (cams.xml); "nominal": the lens's focal length only (_nominal_sensor)
+        self.calibration_class = "adjusted"
 
     @property
     def r2_max(self) -> float:
@@ -1338,6 +1370,8 @@ class Cameras:
                     self.data[cam_id].center_crs = cam_data["center_crs"]
                 if "enabled" in cam_data:
                     self.data[cam_id].enabled = bool(cam_data["enabled"])
+                if cam_data.get("pose_status"):
+                    self.data[cam_id].pose_status = str(cam_data["pose_status"])
             else:
                 self.data[cam_id] = Camera(
                     self,
@@ -1397,9 +1431,15 @@ class Cameras:
                 )
                 continue
             if getattr(cam, "missing_pose_from_meta", False):
-                # Still only the placeholder pose from load; keep the null pose
+                # Still only the placeholder pose from load; keep the null pose (or write one: a pose taken
+                # away, imagesync.clear_pose)
+                if getattr(cam, "pose_cleared", False):
+                    cameras_out[cam_id]["center"] = None
+                    cameras_out[cam_id]["transform"] = None
+                    cameras_out[cam_id].pop("center_crs", None)
                 if hasattr(cam, "enabled"):
                     cameras_out[cam_id]["enabled"] = bool(cam.enabled)
+                _put_pose_status(cameras_out[cam_id], cam)
                 continue
             center = cam.orig_coords if cam.orig_coords is not None else cam.coords
             transform = (
@@ -1410,12 +1450,18 @@ class Cameras:
             if center is None or transform is None:
                 logger.warning("Skipping %s: missing center or transform", cam_id)
                 continue
-            cameras_out[cam_id]["center"] = np.asarray(center, dtype=float).tolist()
+            center = np.asarray(center, dtype=float)
+            was = cameras_out[cam_id].get("center")
+            if was is None or was == "null" or not np.allclose(np.asarray(was, dtype=float), center, rtol=0, atol=1e-9):
+                # A new pose (camsync): the CRS centre exported from Metashape no longer belongs to it
+                cameras_out[cam_id].pop("center_crs", None)
+            cameras_out[cam_id]["center"] = center.tolist()
             cameras_out[cam_id]["transform"] = (
                 np.asarray(transform, dtype=float).reshape(4, 4).tolist()
             )
             if hasattr(cam, "enabled"):
                 cameras_out[cam_id]["enabled"] = bool(cam.enabled)
+            _put_pose_status(cameras_out[cam_id], cam)
 
         data["cameras"] = cameras_out
 
@@ -1631,9 +1677,17 @@ class Cameras:
                 sensor = Sensor(sensor_id, label, resolution, calib_params)
                 self.sensors[sensor_id] = sensor
             else:
-                logger.warning(
-                    f"No calibration found for sensor {sensor_id}, skipping..."
-                )
+                sensor = _nominal_sensor(sensor_elem, sensor_id, label, resolution)
+                if sensor is not None:
+                    self.sensors[sensor_id] = sensor
+                    logger.info(
+                        f"No calibration for sensor {sensor_id}: its nominal lens (f {sensor.f:.0f} px, "
+                        "no distortion)"
+                    )
+                else:
+                    logger.warning(
+                        f"No calibration found for sensor {sensor_id}, skipping..."
+                    )
 
         # 2. Parse cameras and assign sensor references
         cameras_section = root.find(".//cameras")

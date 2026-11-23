@@ -61,6 +61,10 @@ MAX_DIST_FROM_ORIGIN_FOR_INTERCEPT_SEARCH = 5
 MAX_SEARCH_RADIUS_FOR_INTERCEPT_SEARCH = 0.1
 
 DEFAULT_INTERCEPT_SEARCH_RADIUS = 0.005
+# substrata cams2annos (PointCloud.camera_targets): the ray through a photo's centre meets the cloud where a cloud
+# point is this close to it (metres; then 3x, up to the max, for a ray through a gap)
+CAMERA_TARGET_SEARCH_RADIUS = 0.003
+CAMERA_TARGET_MAX_SEARCH_RADIUS = 0.03
 DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN = 0.01
 DEFAULT_REPROJECTION_THRESHOLD_DISCARD = 0.5
 

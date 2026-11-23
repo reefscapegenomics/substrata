@@ -127,11 +127,13 @@ class TestCamerasSave(unittest.TestCase):
                     "center": [1.0, 2.0, 3.0],
                     "transform": np.eye(4).tolist(),
                     "path": "/tmp/placeholder_a.jpg",
+                    "center_crs": [-172.5, -13.4, -16.0],
                 },
                 "cam_b": {
                     "center": [0.0, 0.0, 0.0],
                     "transform": np.eye(4).tolist(),
                     "path": "/tmp/placeholder_b.jpg",
+                    "center_crs": [-172.5, -13.4, -16.0],
                 },
             }
         }
@@ -152,8 +154,11 @@ class TestCamerasSave(unittest.TestCase):
             self.assertEqual(ca["center"], [10.0, 20.0, 30.0])
             self.assertEqual(len(ca["transform"]), 4)
             self.assertEqual(ca["transform"][0][0], 2.0)
+            # a moved camera's exported CRS centre is stale: dropped; an unmoved one's kept
+            self.assertNotIn("center_crs", ca)
             cb = out["cameras"]["cam_b"]
             self.assertEqual(cb["center"], [0.0, 0.0, 0.0])
+            self.assertEqual(cb["center_crs"], [-172.5, -13.4, -16.0])
 
     def test_save_keeps_null_pose_for_unposed_placeholder(self) -> None:
         Cameras = _load_cameras_class()
