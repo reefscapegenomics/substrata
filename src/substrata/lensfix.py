@@ -1,7 +1,7 @@
 """Training views written before substrata 0.2's lens model, moved to where the corrected model projects them.
 
 Until 0.2 substrata projected with P1 and P2 the other way round from Metashape (OpenCV's order) and without K4
-and B2 (affinity B1 was there; see ``cameras._lens``). The training view an annotation CSV stores (``cam_filepath``,
+and B2 (affinity B1 was there; see ``cameras.lens_distortion``). The training view an annotation CSV stores (``cam_filepath``,
 ``cam_x``, ``cam_y``: the photo and pixel its training crop is cut at) was worked out with that model, a few pixels
 from the right one on most sensors and up to hundreds near the edges of a badly calibrated one. ``substrata
 reproject-views`` (:func:`reproject_views`) moves them: for each row with a 3-D point (``orig_x/y/z``) and a training
@@ -31,13 +31,14 @@ import glob
 import os
 import shutil
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 import numpy as np
 
 from . import annotations as annotations_mod
 from . import settings
-from .cameras import _distort
+from .cameras import camera_points_to_pixels, int_pixel
+from .fileio import path_lock
 
 # A stored pixel within this many px of where the old model put the 3-D point was written from it (substrata stores
 # the rounded pixel: up to 0.71 px from the unrounded projection).
@@ -79,7 +80,7 @@ def plan(csv_path: str, cams, tol_px: float = TOL_PX) -> Dict[str, Any]:
     point: kept), ``not_in_plot`` (the photo is not one of this plot's cameras), ``out_of_view`` (the old model's view,
     not in view by the corrected one: to clear, see the module docstring), ``out_of_view_kept`` (such a view of a row
     left out of training, or one not written by the old model: kept)."""
-    rows, _eol, low = annotations_mod._read_csv_rows(csv_path)
+    rows, _eol, low = annotations_mod.read_csv_rows(csv_path)
     col = {c: i for i, c in enumerate(low)}
     counts = dict(rows=len(rows) - 1, with_view=0, moved=0, current=0, elsewhere=0, not_in_plot=0, out_of_view=0,
                   out_of_view_kept=0)
@@ -110,7 +111,7 @@ def plan(csv_path: str, cams, tol_px: float = TOL_PX) -> Dict[str, Any]:
         p = np.linalg.inv(pose) @ np.append(xyz, 1.0)
         s = cam.sensor
         with np.errstate(divide="ignore", invalid="ignore"):
-            nx, ny, ok = _distort(p[0], p[1], p[2], s)
+            nx, ny, ok = camera_points_to_pixels(p[0], p[1], p[2], s)
             ox, oy = legacy_pixels(p[0], p[1], p[2], s)
         if not ok:
             excluded = inc is not None and _cell(r, col, settings.TRAIN_INCLUDE_COLUMN.lower()
@@ -121,7 +122,7 @@ def plan(csv_path: str, cams, tol_px: float = TOL_PX) -> Dict[str, Any]:
             else:
                 counts["out_of_view_kept"] += 1
             continue
-        new = (float(int(round(float(nx)))), float(int(round(float(ny)))))
+        new = (float(int_pixel(float(nx), s.width)), float(int_pixel(float(ny), s.height)))
         if (sx, sy) == new:
             counts["current"] += 1
         elif np.hypot(sx - ox, sy - oy) <= tol_px:
@@ -136,23 +137,24 @@ def plan(csv_path: str, cams, tol_px: float = TOL_PX) -> Dict[str, Any]:
 def set_view_pixels(csv_path: str, pixels: Dict[str, tuple], clear: Iterable[str] = ()) -> int:
     """Set ``cam_x`` / ``cam_y`` of these ids' rows (``%.2f``) and empty the training view (``cam_filepath``,
     ``cam_x``, ``cam_y``) of the ``clear`` ids; every other cell as it is. Returns the rows changed."""
-    rows, eol, low = annotations_mod._read_csv_rows(csv_path)
-    idc, fc, xc, yc = low.index("id"), low.index("cam_filepath"), low.index("cam_x"), low.index("cam_y")
-    clear = set(clear)
-    n = 0
-    for r in rows[1:]:
-        if len(r) <= max(idc, fc, xc, yc):
-            continue
-        key = r[idc].strip()
-        if key in pixels:
-            x, y = pixels[key]
-            r[xc], r[yc] = f"{float(x):.2f}", f"{float(y):.2f}"
-            n += 1
-        elif key in clear:
-            r[fc] = r[xc] = r[yc] = ""
-            n += 1
-    if n:
-        annotations_mod._write_csv_rows(csv_path, rows, eol)
+    with path_lock(csv_path):  # (read to write: no other edit of the file in between)
+        rows, eol, low = annotations_mod.read_csv_rows(csv_path)
+        idc, fc, xc, yc = low.index("id"), low.index("cam_filepath"), low.index("cam_x"), low.index("cam_y")
+        clear = set(clear)
+        n = 0
+        for r in rows[1:]:
+            if len(r) <= max(idc, fc, xc, yc):
+                continue
+            key = r[idc].strip()
+            if key in pixels:
+                x, y = pixels[key]
+                r[xc], r[yc] = f"{float(x):.2f}", f"{float(y):.2f}"
+                n += 1
+            elif key in clear:
+                r[fc] = r[xc] = r[yc] = ""
+                n += 1
+        if n:
+            annotations_mod.write_csv_rows(csv_path, rows, eol)
     return n
 
 

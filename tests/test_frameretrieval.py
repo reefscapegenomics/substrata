@@ -127,7 +127,7 @@ class TestSensors(unittest.TestCase):
         self._run("""
             import numpy as np
             from substrata import frameretrieval as fr
-            from substrata.cameras import _distort
+            from substrata.cameras import camera_points_to_pixels
             s = fr.sensor_from_cams_xml(XML, 2)
             assert s.calibration_class == "borrowed" and s.sensor_id == 2, (s.calibration_class, s.sensor_id)
             assert abs(s.cx - (1920 + 1.70)) < 1e-9 and abs(s.cy - (1080 + 9.09)) < 1e-9
@@ -137,8 +137,8 @@ class TestSensors(unittest.TestCase):
             # image point turned round: (W - u, H - v)
             rng = np.random.default_rng(1)
             P = np.c_[rng.uniform(-0.8, 0.8, (200, 2)) * 0.5, np.full(200, 0.5)]
-            u, v, ok = _distort(P[:, 0], P[:, 1], P[:, 2], s)
-            u2, v2, ok2 = _distort(-P[:, 0], -P[:, 1], P[:, 2], r)
+            u, v, ok = camera_points_to_pixels(P[:, 0], P[:, 1], P[:, 2], s)
+            u2, v2, ok2 = camera_points_to_pixels(-P[:, 0], -P[:, 1], P[:, 2], r)
             assert np.allclose(u2, 3840 - u, atol=1e-6) and np.allclose(v2, 2160 - v, atol=1e-6)
             assert np.array_equal(ok, ok2)
             assert np.allclose(fr.rotated_180(s).cx, r.cx) and np.allclose(fr.rotated_180(s).p1, r.p1)

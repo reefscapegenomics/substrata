@@ -1,6 +1,7 @@
 # Standard Library
 import argparse
 import ast
+import copy
 from collections import Counter
 import json
 import os
@@ -23,6 +24,8 @@ from substrata.pointclouds import (
 from substrata.initializer import ProjectInitializer
 from substrata.annotations import Annotations, Scalebars
 from substrata import settings, sidecars
+from substrata.fileio import atomic_write
+from substrata.frames import uniform_scale
 
 # ---------------------------- helpers: parents & defaults ----------------------------
 
@@ -36,14 +39,17 @@ def _cwd_base():
 
 
 def _infer_target_depth(base: str, explicit_depth):
+    """The target depth (negative metres, as FireFish depths) of a plot.
+
+    An explicit depth is used as its negated absolute value (``20`` and ``-20``
+    both mean 20 m below the surface); else it is read from ``_<int>m_`` in the
+    folder name (``cur_sna_20m_20200303`` -> -20); else None.
+    """
     if explicit_depth is not None:
-        return explicit_depth
+        return -abs(float(explicit_depth))
     m = re.search(r"_(\d+)m_", base)
     if m:
-        try:
-            return -int(m.group(1))
-        except Exception:
-            return None
+        return -float(m.group(1))
     return None
 
 
@@ -61,6 +67,30 @@ def _parse_hex_color(s: str):
         return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
     except ValueError:
         raise SystemExit(f"Invalid hex colour {s!r}; expected 6 hex digits.")
+
+
+def _resolve_seed(args, what: str = "points") -> int:
+    """``args.seed``, or a new random seed when none was given (set on ``args``
+    and printed, so the sampling is recorded and can be repeated)."""
+    seed = getattr(args, "seed", None)
+    if seed is None:
+        import secrets
+
+        seed = secrets.randbelow(2**31)
+        print(f"Random seed {seed} (--seed {seed} samples the same {what} again)")
+    args.seed = int(seed)
+    return args.seed
+
+
+def _parse_label_color_specs(specs) -> dict:
+    """``{label: (r, g, b)}`` from repeated ``--color LABEL=RRGGBB`` options."""
+    out = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            raise SystemExit(f"Invalid --color {spec!r}; expected LABEL=RRGGBB.")
+        lbl, hexv = spec.split("=", 1)
+        out[lbl] = _parse_hex_color(hexv)
+    return out
 
 
 def _load_label_colors(path: str):
@@ -256,77 +286,10 @@ def _resolve_dates(cams, flag_value: str | None, label: str, interactive: bool):
 
 
 def _camsync_summary_figure(summary: dict):
-    """Return a matplotlib Figure with a text summary of the camsync run."""
-    import matplotlib
+    """The camsync run-summary page (:func:`substrata.visualizations.camsync_summary_figure`)."""
+    from substrata import visualizations  # lazy: figures only
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    lines: list[str] = []
-    s = summary
-
-    def add(label: str, value: object) -> None:
-        lines.append(f"{label}: {value}")
-
-    fig = plt.figure(figsize=(8.5, 11))
-    ax = fig.add_subplot(111)
-    ax.axis("off")
-
-    fig.suptitle("Camsync - run summary", fontsize=12, y=0.98)
-
-    def _fmt_cli(val: object) -> str:
-        return "(not set)" if val is None else repr(val)
-
-    add("Project path", s.get("project_path", ""))
-    add("Working directory", s.get("cwd", ""))
-    add("Project id", s.get("project_id", ""))
-    lines.append("")
-    add("Pose source sensor_id", s.get("pose_source", ""))
-    add("Updated target sensor_id", s.get("updated_target", ""))
-    lines.append("")
-    ox = s.get("offset_xyz")
-    if ox is not None:
-        oa = np.asarray(ox, dtype=float).ravel()
-        add(
-            "offset_xyz (pose-local m; applied to sync)",
-            f"[{oa[0]:.6g}, {oa[1]:.6g}, {oa[2]:.6g}]",
-        )
-    else:
-        add("offset_xyz (pose-local)", "none (poses copied without xyz offset)")
-    lines.append("")
-    add("time_offset_sec (applied to target EXIF)", s.get("time_offset_sec", ""))
-    add("scale_factor (project / initializer)", s.get("scale_factor", ""))
-    lines.append("")
-    add("Flag --auto-offsets", s.get("auto_offsets", ""))
-    add("Flag --auto-time", s.get("auto_time", ""))
-    add("Flag --auto-xyz", s.get("auto_xyz", ""))
-    add("Flag --yes", s.get("assume_yes", ""))
-    add("Flag --local", s.get("local", ""))
-    lines.append("")
-    add("spatial_max_dist (m, for --auto-time)", s.get("spatial_max_dist", ""))
-    add("min_spatial_pairs (for --auto-time)", s.get("min_spatial_pairs", ""))
-    lines.append("")
-    add(
-        "CLI --time-offset (ignored if --auto-time)",
-        _fmt_cli(s.get("cli_time_offset")),
-    )
-    add("CLI --xyz (ignored if --auto-xyz)", _fmt_cli(s.get("cli_xyz")))
-    lines.append("")
-    add("PDF intercept_search_radius", s.get("intercept_search_radius", ""))
-    add("Point cloud loaded (intercept highlights)", s.get("pcd_loaded", ""))
-
-    text = "\n".join(lines)
-    ax.text(
-        0.06,
-        0.94,
-        text,
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        family="monospace",
-        fontsize=8,
-    )
-    return fig
+    return visualizations.camsync_summary_figure(summary)
 
 
 def _write_camsync_sanity_pdf(
@@ -340,164 +303,14 @@ def _write_camsync_sanity_pdf(
     max_pairs: int = settings.CAMSYNC_PDF_PAIRS,
     intercept_search_radius: float = 0.01,
 ) -> None:
-    """Write a PDF: first a text summary page, then pose/target image pairs.
+    """The camsync sanity PDF (:func:`substrata.visualizations.write_camsync_sanity_pdf`)."""
+    from substrata import visualizations  # lazy: figures only
 
-    Pairs are spread over pages of at most ``settings.CAMSYNC_PDF_PAIRS_PER_PAGE``
-    rows each.
-
-    Titles use raw EXIF from each file (``get_datetime_original(None)``). Brackets
-    label ``dt`` (seconds) applied for sync on the target side only (pose uses 0 s).
-    If
-    ``pcd`` is set, draws the same PCD intercept (ray from target camera along its
-    viewing axis) highlighted on both images, matching ``sandbox_macros`` notebook
-    logic.
-
-    Args:
-        pose_cams: Pose-source :class:`~substrata.cameras.Cameras` subset.
-        updated_cams: Updated-target :class:`~substrata.cameras.Cameras` subset.
-        output_path: Destination ``.pdf`` path.
-        time_offset_sec: Seconds applied to updated-target EXIF for time alignment.
-        pcd: Optional loaded :class:`~substrata.pointclouds.PointCloud` for intercepts.
-        camsync_summary: Optional dict for the first-page run summary (see
-            :func:`_camsync_summary_figure`).
-        max_pairs: Number of match rows to render (default
-            ``settings.CAMSYNC_PDF_PAIRS``).
-        intercept_search_radius: Step radius for :meth:`PointCloud.get_intercept`
-            (default 0.01, same as sandbox notebook).
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    from PIL import Image, ImageDraw
-
-    if pcd is None:
-        print(
-            "Camsync sanity PDF: no point cloud loaded; "
-            "intercept highlights skipped."
-        )
-
-    targets = sorted(
-        updated_cams.data.values(),
-        key=lambda c: (c.datetime is None, str(c.datetime), str(c.cam_id)),
+    visualizations.write_camsync_sanity_pdf(
+        pose_cams, updated_cams, output_path, time_offset_sec=time_offset_sec,
+        pcd=pcd, camsync_summary=camsync_summary, max_pairs=max_pairs,
+        intercept_search_radius=intercept_search_radius,
     )
-    pairs: list[tuple] = []
-    for tcam in targets:
-        pcam = pose_cams.get_camera_by_datetime(tcam.datetime)
-        if pcam is not None:
-            pairs.append((pcam, tcam))
-        if len(pairs) >= max_pairs:
-            break
-
-    if not pairs:
-        print("Camsync sanity PDF skipped: no time-matched pairs with pose cameras.")
-        return
-
-    def _exif_title_line(cam, is_target: bool) -> str:
-        raw = cam.get_datetime_original(None)
-        if raw is None:
-            raw = "(no EXIF DateTimeOriginal)"
-        k = float(time_offset_sec)
-        if is_target:
-            bracket = f"(sync dt={k:+.4g} s to target EXIF)"
-        else:
-            bracket = "(sync dt=0 s)"
-        return f"{raw} {bracket}"
-
-    def _pixel_highlight_from_cam(cam, world_pt: np.ndarray):
-        px = cam.get_pixel_coords(
-            world_pt, required_to_be_in_view=False, use_orig_coords=False
-        )
-        if px is None or px[0] is None:
-            return None
-        return (int(px[0]), int(px[1]))
-
-    def _rgb_with_highlight(fp: str, highlight_xy: tuple[int, int] | None):
-        if not fp or not os.path.isfile(fp):
-            return None
-        try:
-            image = Image.open(fp).convert("RGB")
-        except OSError:
-            return None
-        if highlight_xy is not None:
-            x, y = highlight_xy
-            w, h = image.size
-            r = max(12, min(50, min(w, h) // 8))
-            draw = ImageDraw.Draw(image)
-            draw.ellipse(
-                (x - r, y - r, x + r, y + r),
-                fill=(255, 0, 0),
-            )
-        return np.asarray(image)
-
-    pdf = PdfPages(output_path)
-    if camsync_summary is not None:
-        fig_sum = _camsync_summary_figure(camsync_summary)
-        pdf.savefig(fig_sum)
-        plt.close(fig_sum)
-
-    n_total = len(pairs)
-    per_page = max(1, int(settings.CAMSYNC_PDF_PAIRS_PER_PAGE))
-    for start in range(0, n_total, per_page):
-        page_pairs = pairs[start : start + per_page]
-        n = len(page_pairs)
-        fig, axes = plt.subplots(n, 2, figsize=(10, max(2.5, 2.6 * n)))
-        axes = np.atleast_2d(axes)
-
-        for i, (pose_cam, tgt_cam) in enumerate(page_pairs):
-            pose_hl = None
-            tgt_hl = None
-            if pcd is not None:
-                origin = np.asarray(tgt_cam.coords, dtype=float).ravel()[:3]
-                icpt = pcd.get_intercept(
-                    origin,
-                    intercept_search_radius,
-                    vector=tgt_cam.vector,
-                )
-                if icpt is not None:
-                    world_pt = np.asarray(icpt.coords, dtype=float).ravel()[:3]
-                    pose_hl = _pixel_highlight_from_cam(pose_cam, world_pt)
-                    tgt_hl = _pixel_highlight_from_cam(tgt_cam, world_pt)
-
-            for j, (cam, col_title, is_tgt, hl) in enumerate(
-                (
-                    (pose_cam, "source (pose)", False, pose_hl),
-                    (tgt_cam, "target", True, tgt_hl),
-                )
-            ):
-                ax = axes[i, j]
-                fp = cam.filepath
-                rgb = _rgb_with_highlight(fp, hl) if fp else None
-                if rgb is not None:
-                    ax.imshow(rgb)
-                else:
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "(missing or unreadable image)",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                        fontsize=9,
-                    )
-                ax.set_axis_off()
-                short = os.path.basename(fp) if fp else "(no path)"
-                dt_line = _exif_title_line(cam, is_tgt)
-                ax.set_title(f"{col_title}\n{dt_line}\n{short}", fontsize=7)
-
-        page_range = f"pairs {start + 1}-{start + n} of {n_total}"
-        fig.suptitle(
-            "Camsync sanity check: pose vs target pairs (EXIF time match), "
-            f"{page_range}",
-            fontsize=10,
-        )
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    pdf.close()
-    print(f"Wrote camsync sanity PDF: {output_path} ({n_total} pairs)")
 
 
 def _print_spatial_time_report(report: dict, scale_factor: float) -> None:
@@ -607,8 +420,9 @@ def handle_decimate(args):
         input_path=input_path,
         output_path=output_path,
         target_points=args.points,
-        show_progress=True,
+        progress=True,
         color_correction=color_correction,
+        seed=getattr(args, "seed", 0),
     )
 
 
@@ -707,7 +521,7 @@ def handle_ply_repair(args):
         out_path = repair_ply_for_open3d(
             input_path=input_path,
             output_path=args.output,
-            show_progress=True,
+            progress=True,
         )
         print(f"Repaired PLY written to: {out_path}")
         return
@@ -727,7 +541,7 @@ def handle_ply_repair(args):
         out_path = repair_ply_for_open3d(
             input_path=backup_path,
             output_path=input_path,
-            show_progress=True,
+            progress=True,
         )
     except Exception:
         # Restore the original on failure so the caller isn't left without a PLY.
@@ -806,7 +620,7 @@ def handle_scalebars(args):
 
     Loads the PLY (optionally stream-decimated to --points) and the markers
     CSV, builds Scalebars from the RGL target definitions, and writes a PDF.
-    With --save_yaml the computed scale factor is persisted to the project
+    With --save-yaml the computed scale factor is persisted to the project
     YAML.
 
     Args:
@@ -848,7 +662,7 @@ def handle_scalebars(args):
 
     # 6) optionally persist scale factor to YAML
     if getattr(args, "save_yaml", False):
-        scale_factor = sb.calc_scalefactor()
+        scale_factor = sb.calc_scale_factor()
         if scale_factor is not None:
             init.scale_factor = float(scale_factor)
         else:
@@ -889,6 +703,11 @@ def handle_colors(args):
     # memory-aware cap will still protect against OOM on huge files.
     points_cap = getattr(args, "points", None)
 
+    # The cloud and the markers must be in the same frame, and that frame in
+    # metres: the sampling radius and plane tolerance
+    # (settings.DEFAULT_COLOR_CALIBRATION_RADIUS / _PLANE_EPSILON) are metres.
+    # Both are therefore taken into the project's world frame.
+    world = np.asarray(init.world_transform, dtype=float)
     if points_cap is not None:
         pcd_path = init.ply_filepath
         if not pcd_path:
@@ -897,7 +716,9 @@ def handle_colors(args):
                 "specifies a ply file."
             )
         pcd = PointCloud(pcd_path, max_points=int(points_cap))
+        pcd.apply_transform(world)
         markers = Annotations(markers_path, orig_coords_only=True)
+        markers.apply_transform(world)
     else:
         init.initialize(apply_color_correction=False)
         if init.pcd is None:
@@ -906,7 +727,10 @@ def handle_colors(args):
                 "specifies a ply file."
             )
         if args.markers:
+            # init.markers (if any) were moved into the world frame by
+            # initialize(); a CSV given here is read in the model frame
             markers = Annotations(args.markers, orig_coords_only=True)
+            markers.apply_transform(world)
         else:
             markers = init.markers
         if markers is None:
@@ -914,6 +738,10 @@ def handle_colors(args):
                 "No markers loaded. Provide --markers or ensure markers exist in the project."
             )
         pcd = init.pcd
+    if np.allclose(world, np.eye(4)):
+        print("Warning: the project has no world_transform: the colour sampling "
+              "radii are in metres, so the cloud is assumed to be in metres "
+              "(run `substrata orient` first otherwise).", file=sys.stderr)
 
     ex_idx = getattr(args, "exclude_indices", None) or None
     ex_names = getattr(args, "exclude_names", None) or None
@@ -941,13 +769,25 @@ def handle_colors(args):
             init.color_correction = cc.color_correction
             yaml_path = init.yaml_path or os.path.join(init.path or cwd, f"{init.id}.yaml")
             if os.path.isfile(yaml_path):
-                # Only this key changes: comments and relative paths are kept
-                set_project_yaml_keys(
-                    yaml_path, {"color_correction": init.color_correction}
-                )
+                # Only this key changes: comments and relative paths are kept.
+                # The fit's quality is recorded with it (read by nothing; the
+                # initializer uses matrix and offset only).
+                fs = cc.fit_stats or {}
+                entry = dict(init.color_correction)
+                if fs:
+                    entry.update(
+                        fit_rmse=round(float(fs["rmse"]), 3),
+                        fit_patches=f"{fs['n_patches_fit']}/{fs['n_patches']}",
+                        fit_space=str(fs["space"]),
+                    )
+                set_project_yaml_keys(yaml_path, {"color_correction": entry})
             else:
                 init.save_config_to_yaml(yaml_path)
             print(f"Saved colour correction to YAML: {yaml_path}")
+            if cc.fit_stats:
+                print(f"  fit RMSE {cc.fit_stats['rmse']:.2f} RGB units on "
+                      f"{cc.fit_stats['n_patches_fit']}/{cc.fit_stats['n_patches']} "
+                      f"patches ({cc.fit_stats['space']})")
     else:
         print("Not saving the colour correction (--no-save-yaml)")
 
@@ -1098,19 +938,14 @@ def _segment_classify(args, init, names):
             "the project YAML."
         )
     learn = classification.get_image_classifier(classifier_path)
-    crop_size = _classifier_crop_size(
+    crop_size = resolve_crop_size(
         [args.crop_size] if args.crop_size else None, learn,
         (settings.TRAIN_CROP_SIZE, settings.TRAIN_CROP_SIZE),
     )[0]
     cell_size = args.cell_size or settings.DEFAULT_SEG_CELL_SIZE
 
     # Manual category colours: --color LABEL=RRGGBB (repeatable).
-    label_colors = {}
-    for spec in getattr(args, "color", None) or []:
-        if "=" not in spec:
-            raise SystemExit(f"Invalid --color {spec!r}; expected LABEL=RRGGBB.")
-        lbl, hexv = spec.split("=", 1)
-        label_colors[lbl] = _parse_hex_color(hexv)
+    label_colors = _parse_label_color_specs(getattr(args, "color", None))
 
     from substrata import pointfeatures
 
@@ -1134,6 +969,7 @@ def _segment_classify(args, init, names):
         views=views,
         dense=dense,
         mask_dir=mask_dir,
+        scale_factor=init.scale_factor,
     )
     if mask_dir:
         print(f"Saved per-photo masks: {mask_dir}")
@@ -1184,7 +1020,7 @@ def handle_orient(args):
 
     Runs the scale_and_orient workflow (using marker depths from --markers
     or camera depths otherwise) unless --manual is set, or applies the
-    Metashape chunk_transform (as a local ENU frame) with --use_chunk_transform.
+    Metashape chunk_transform (as a local ENU frame) with --use-chunk-transform.
     Optionally applies
     an interactively entered manual transform, and propagates the world
     transform to cameras/markers/annotations. Writes the project YAML plus
@@ -1208,10 +1044,10 @@ def handle_orient(args):
 
     use_chunk = getattr(args, "use_chunk_transform", False)
     if getattr(args, "north_up", False) and not use_chunk:
-        raise SystemExit("--north_up requires --use_chunk_transform")
+        raise SystemExit("--north-up requires --use-chunk-transform")
     if use_chunk and (getattr(args, "manual", False) or args.markers):
         raise SystemExit(
-            "--use_chunk_transform cannot be combined with --manual or --markers"
+            "--use-chunk-transform cannot be combined with --manual or --markers"
         )
 
     depth_markers = None
@@ -1226,7 +1062,7 @@ def handle_orient(args):
         depth_markers_filepath = getattr(args, "markers", None)
         if depth_markers_filepath is not None:
             depth_markers = Annotations(depth_markers_filepath, orig_coords_only=True)
-        init.scale_and_orient(depth_markers=depth_markers)
+        init.scale_and_orient(depth_markers=depth_markers, plot=False)
 
     # Handle optional manual transform
     if getattr(args, "transform", False) or getattr(args, "manual", False):
@@ -1249,7 +1085,7 @@ def handle_orient(args):
         for attr_name in ("cams", "markers", "annotations"):
             obj = getattr(init, attr_name, None)
             if obj is not None:
-                obj.transform_coords(slope_transform)
+                obj.apply_transform(slope_transform)
         init.world_transform = init.pcd.world_transform
 
     if init.baseline_id:
@@ -1329,24 +1165,28 @@ def handle_firefish(args):
         print(f"Scale factor: {init.scale_factor}")
 
     # Run up-vector determination (on unscaled/unoriented pointcloud)
-    init.up_vector, init.depth_offset, init.depth_per_unit = ff.determine_up_vector(
-        filtered_cams,
-        target_depth,
-        init.pcd,
-        distance_scale_factor=init.scale_factor,
-        offset=args.offset,
-        camdepths_filepath=cam_depths_file,
-        pdf_output_filepath=pdf_output,
-        depth_and_outlier_threshold=depth_and_outlier_threshold,
-        beam_half_angle=args.beam_half_angle,
-        distance_percentile=(
-            None if args.distance_percentile < 0 else args.distance_percentile
-        ),
-        sonar_offset=args.sonar_offset,
-        recompute_camdists=args.recompute_camdists,
-        depth_sensor_offset=args.depth_sensor_offset,
-        water_level=args.water_level,
-    )
+    try:
+        (init.up_vector, init.depth_offset,
+         init.depth_per_unit) = ff.determine_up_vector(
+            filtered_cams,
+            target_depth,
+            init.pcd,
+            distance_scale_factor=init.scale_factor,
+            offset=args.offset,
+            camdepths_filepath=cam_depths_file,
+            pdf_output_filepath=pdf_output,
+            depth_and_outlier_threshold=depth_and_outlier_threshold,
+            beam_half_angle=args.beam_half_angle,
+            distance_percentile=(
+                None if args.distance_percentile < 0 else args.distance_percentile
+            ),
+            sonar_offset=args.sonar_offset,
+            recompute_camdists=args.recompute_camdists,
+            depth_sensor_offset=args.depth_sensor_offset,
+            water_level=args.water_level,
+        )
+    except ValueError as e:  # e.g. no FireFish record in the target depth band
+        raise SystemExit(str(e))
     # Residual analyses on the full container use the same sensor positions
     init.cams.depth_sensor_offset = args.depth_sensor_offset
     init.cams.depth_sensor_offset_scale = init.scale_factor
@@ -1490,6 +1330,16 @@ def handle_intercepts(args):
 
     # Optionally align along slope before proceeding
     if getattr(args, "slope", False):
+        # a sample of the cloud before the alignment, for the slope_pca.png figure
+        # (the fitted slope plane is drawn in the frame it was fitted in)
+        from substrata.pointclouds import SimplePointCloud, get_decimated_pcd
+
+        sample = get_decimated_pcd(init.pcd, 50000)  # (the cloud itself if small)
+        s_pts = np.array(sample.points, dtype=float, copy=True)
+        s_cols = np.array(sample.colors, dtype=float, copy=True)
+        slope_sample = SimplePointCloud(
+            s_pts, s_cols if s_cols.shape == s_pts.shape else None
+        )
         slope_normal, slope_elev = init.pcd.apply_along_slope_transform()
 
     slope = getattr(args, "slope", False)
@@ -1565,12 +1415,16 @@ def handle_intercepts(args):
     _save_intercepts(init, intercepts, annos_dir, csv_path, grid, args)
 
     if slope:
-        # additional visualization for sanity check
-        a, b, c, d, inliers_idx = measurements.get_best_fit_plane_PCA(init.pcd)
+        # Sanity check: the slope plane of the alignment, with the angle stored in
+        # the sidecar (slope_elevation_deg), on the cloud before the alignment
+        # (the plane is drawn through the sample's centroid)
+        n = np.asarray(slope_normal, dtype=float)[:3]
+        d = -float(n @ np.asarray(slope_sample.points, dtype=float).mean(axis=0))
         visualizations.visualize_elevation_angle(
-            init.pcd,
-            [a, b, c, d],
+            slope_sample,
+            [n[0], n[1], n[2], d],
             point_size=1,
+            elev_deg=slope_elev,
             output_filename=_get_output_filepath(init, "slope_pca.png"),
         )
 
@@ -1608,7 +1462,8 @@ def handle_sample_points(args):
     margin = args.margin if args.margin is not None else settings.CROP_SIZE_DEFAULT[0] // 2
     print(f"Sampling {args.n_points} {'stratified' if args.stratified else 'random'} point(s) on each of "
           f"{len(cams.data)} photos (at least {margin} px from the edges)")
-    anns = cams.get_random_image_points(args.n_points, margin=margin, stratified=args.stratified, seed=args.seed)
+    seed = _resolve_seed(args)
+    anns = cams.get_random_image_points(args.n_points, margin=margin, stratified=args.stratified, seed=seed)
     os.makedirs(info["annos"], exist_ok=True)
     anns.save(csv_path, orig_coords_only=True)
     sidecars.write_annotation_sidecar(csv_path, {
@@ -1668,9 +1523,10 @@ def _depth_intercepts(args, init) -> None:
     lo, hi = sorted(abs(float(v)) for v in args.depth_range)
     tag = _intercepts_tag(getattr(args, "tag", None))
     annos_dir, csv_path = _intercepts_csv(init, "depth", tag, args)
+    seed = _resolve_seed(args)
     try:
         got = measurements.depth_band_sample(init.pcd.points, lo, hi, args.width_step, args.depth_step,
-                                             seed=getattr(args, "seed", None))
+                                             seed=seed)
     except ValueError as e:
         sys.exit(str(e))
     n_grid = got["columns"] * got["rows"]
@@ -1875,7 +1731,7 @@ def handle_intercepts_plot(args):
         )
 
     # Load in the original frame, then apply the orientation exactly once so the
-    # grid becomes axis-aligned (transform_coords compounds, so do not re-apply).
+    # grid becomes axis-aligned (apply_transform compounds, so do not re-apply).
     anns = Annotations(ann_path, orig_coords_only=True)
     anns.apply_transform(transform)
 
@@ -2102,7 +1958,10 @@ def _align_on_cameras(
         raise SystemExit(f"align --cameras: {e}")
 
     # Residuals in target raw units (and metres when the target is scaled)
-    residuals = np.linalg.norm(T.apply_to_points(p) - q, axis=1)
+    from substrata.measurements import camera_residuals
+
+    res = camera_residuals(T.apply_to_points(p), q, inliers)
+    residuals = res["residuals"]
     unit = "raw" + (" / m" if to_m else "")
 
     def _fmt(r):
@@ -2114,10 +1973,10 @@ def _align_on_cameras(
         print(f"  {name}: {_fmt(r)}")
     r_in = residuals[inliers]
     print(f"Fit on {int(inliers.sum())} inlier camera(s), residuals ({unit}):")
-    print(f"  RMS:    {_fmt(float(np.sqrt(np.mean(r_in**2))))}")
-    print(f"  median: {_fmt(float(np.median(r_in)))}")
+    print(f"  RMS:    {_fmt(res['rms'])}")
+    print(f"  median: {_fmt(res['median'])}")
     print(f"  max:    {_fmt(float(r_in.max()))}")
-    scale = np.cbrt(np.linalg.det(T.mat[:3, :3]))
+    scale = uniform_scale(T.mat)
     print(f"  Scale (source → target raw): {scale:.6f}")
     return {
         "T": T.as_ndarray(),
@@ -2317,17 +2176,14 @@ def _save_align_qc_pdf(
 ):
     """Write the align QC PDF (summary, cameras, context, correspondence).
 
-    Everything is drawn in the oriented target frame (metres when the target
-    has a scale/orientation). The target is (re)loaded without the --points
-    cap so the overlap is dense enough for meaningful point distances.
+    Everything is in the oriented target frame (metres when the target has a
+    scale/orientation). The target is (re)loaded without the --points cap so
+    the overlap is dense enough for meaningful point distances. The statistics
+    are :func:`substrata.measurements.camera_residuals` and
+    :func:`~substrata.measurements.pcd_correspondence`; the pages are drawn by
+    :func:`substrata.visualizations.save_align_qc_pdf`.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    from substrata import visualizations
+    from substrata import measurements, visualizations
     from substrata.geom import Transform
     from substrata.pointclouds import PointCloud, SimplePointCloud
 
@@ -2353,7 +2209,6 @@ def _save_align_qc_pdf(
         tgt_pcd.colors,
     )
 
-    figs = []
     summary = [
         "substrata align QC",
         "",
@@ -2362,19 +2217,17 @@ def _save_align_qc_pdf(
         f"method: {_align_method(args)}",
         f"frame:  {'oriented target' if oriented else 'raw target'} ({units})",
     ]
+    cam_src = cam_tgt = cam_res = None
     if cam_fit is not None:
-        inl = cam_fit["inliers"]
-        res = np.linalg.norm(
-            Transform(T_final).apply_to_points(cam_fit["src_xyz"])
-            - Transform(W_t).apply_to_points(cam_fit["tgt_xyz"]),
-            axis=1,
-        )
+        cam_src = Transform(T_final).apply_to_points(cam_fit["src_xyz"])
+        cam_tgt = Transform(W_t).apply_to_points(cam_fit["tgt_xyz"])
+        cam_res = measurements.camera_residuals(cam_src, cam_tgt, cam_fit["inliers"])
         summary += [
             "",
-            f"cameras matched: {len(inl)}, kept: {int(inl.sum())}, "
-            f"rejected: {int((~inl).sum())}",
+            f"cameras matched: {len(cam_res['inliers'])}, "
+            f"kept: {cam_res['n_inliers']}, rejected: {cam_res['n_rejected']}",
             f"camera residual RMS (kept, final transform): "
-            f"{np.sqrt(np.mean(res[inl] ** 2)):.4f} {units}",
+            f"{cam_res['rms']:.4f} {units}",
         ]
     if metrics is not None:
         stage = "ICP refinement" if cam_fit is not None else "registration"
@@ -2382,7 +2235,7 @@ def _save_align_qc_pdf(
             f"  {k}: {round(v, 4) if isinstance(v, float) else v}"
             for k, v in metrics.items()
         ]
-    scale = np.cbrt(np.linalg.det(T_raw[:3, :3]))
+    scale = uniform_scale(T_raw)
     with np.printoptions(precision=6, suppress=True):
         summary += [
             "",
@@ -2393,42 +2246,16 @@ def _save_align_qc_pdf(
         ]
         if oriented:
             summary += ["", "raw source → oriented target:", str(T_final)]
-    fig = visualizations.plot_text("\n".join(summary), width=11, height=8.5)
-    fig.axes[0].texts[0].set_fontfamily("monospace")
-    fig.axes[0].texts[0].set_fontsize(9)
-    figs.append(fig)
-
+    corr = measurements.pcd_correspondence(src_qc, tgt_qc, units=units, labels=labels)
+    cameras = None
     if cam_fit is not None:
-        figs.append(
-            visualizations.plot_camera_correspondence(
-                Transform(T_final).apply_to_points(cam_fit["src_xyz"]),
-                Transform(W_t).apply_to_points(cam_fit["tgt_xyz"]),
-                inliers=cam_fit["inliers"],
-                units=units,
-                labels=labels,
-                title="Matched camera residuals (final transform)",
-            )
-        )
-    figs.append(
-        visualizations.plot_pcd_context(
-            src_qc, tgt_qc, labels=labels, units=units, title="Location in target"
-        )
+        cameras = (cam_src, cam_tgt, cam_fit["inliers"], cam_res)
+    visualizations.save_align_qc_pdf(
+        args.pdf, "\n".join(summary), src_qc, tgt_qc, corr, labels=labels,
+        units=units, cameras=cameras,
     )
-    fig, stats = visualizations.plot_pcd_correspondence(
-        src_qc,
-        tgt_qc,
-        labels=labels,
-        units=units,
-        title="Correspondence in the overlap",
-        return_stats=True,
-    )
-    figs.append(fig)
-    print("Point-cloud correspondence:", {k: round(v, 4) for k, v in stats.items()})
-
-    with PdfPages(args.pdf) as pdf:
-        for fig in figs:
-            pdf.savefig(fig)
-            plt.close(fig)
+    print("Point-cloud correspondence:",
+          {k: round(v, 4) for k, v in corr.stats.items()})
     print(f"Wrote align QC PDF: {args.pdf}")
 
 
@@ -2605,7 +2432,7 @@ def handle_camsync(args):
         spatial_nearest_time_offset_report,
         xyz_offset_datetime_matches_report,
     )
-    from substrata.firefish import get_time_diff_in_secs
+    from substrata.firefish import get_time_diff_s
     from substrata.initializer import ProjectInitializer
 
     _base, cwd = _cwd_base()
@@ -2746,7 +2573,7 @@ def handle_camsync(args):
                     "set --time-offset or adjust --spatial-max-dist / "
                     "--min-spatial-pairs."
                 )
-            time_offset = float(get_time_diff_in_secs(dt_pose, dt_tgt))
+            time_offset = float(get_time_diff_s(dt_pose, dt_tgt))
             print(
                 "Spatial auto time failed or too few inliers; falling back to "
                 f"earliest-EXIF delta: k = {time_offset} s "
@@ -2767,7 +2594,7 @@ def handle_camsync(args):
             chosen_pose_ts = _parse_pose_time_arg(
                 cli_pose_time, fallback_date=suggested_pose_ts[:10]
             )
-            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
+            time_offset = float(get_time_diff_s(chosen_pose_ts, dt_tgt))
             print(
                 f"Using --pose-time {cli_pose_time!r} -> {chosen_pose_ts} "
                 f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
@@ -2791,20 +2618,20 @@ def handle_camsync(args):
                 chosen_pose_ts = _parse_pose_time_arg(
                     raw, fallback_date=suggested_pose_ts[:10]
                 )
-            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
+            time_offset = float(get_time_diff_s(chosen_pose_ts, dt_tgt))
             print(
                 f"Using pose-source timestamp {chosen_pose_ts} "
                 f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
             )
         else:
             chosen_pose_ts = suggested_pose_ts
-            time_offset = float(get_time_diff_in_secs(chosen_pose_ts, dt_tgt))
+            time_offset = float(get_time_diff_s(chosen_pose_ts, dt_tgt))
             print(
                 f"Using suggested pose-source timestamp {chosen_pose_ts} "
                 f"(target earliest {dt_tgt}); time_offset = {time_offset} s."
             )
 
-    updated_cams.get_datetime_originals(offset_secs=time_offset)
+    updated_cams.get_datetime_originals(offset_s=time_offset)
 
     offset_xyz = None
     xyz_report = None
@@ -2927,9 +2754,9 @@ def _camsync_match_images(init, pose_cams, updated_cams, pose_id, tgt_id, args):
         turned = orientation == "turned"
         try:
             sensor = frameretrieval.sensor_from_cams_xml(cal, pose_id, as_sensor_id=pose_id, rotate180=turned)
+            frameretrieval.give_sensor(init.cams, sensor)  # (ValueError: another resolution)
         except (KeyError, ValueError) as e:
             raise SystemExit(f"--frame-calibration: {e}")
-        frameretrieval.give_sensor(init.cams, sensor)
         for c in pose_cams.data.values():
             c.sensor = sensor
         if orientation == "auto":
@@ -3063,7 +2890,7 @@ def _camsync_match_images(init, pose_cams, updated_cams, pose_id, tgt_id, args):
             c.pose_status = None
     init.cams.save()
     poses_path = _get_output_filepath(init, "camsync_poses.json")
-    with open(poses_path, "w") as f:
+    with atomic_write(poses_path, "w") as f:
         json.dump(imagesync.poses_payload(report, targets, pose_source=pose_id, updated_target=tgt_id), f, indent=1)
     print(f"Saved {n_posed} pose(s)" + (f" and {n_marked} marked estimated / unverified" if n_marked else "")
           + f"; for Metashape: {poses_path} (substrata metashape-import-poses)")
@@ -3693,7 +3520,7 @@ def handle_path_repair(args):
         n_left = len(aplan.skipped) + len(aplan.missing)
         print(f"Warning: {n_left} annotation image path(s) still missing.")
     if cams is not None:
-        still = cams.missing_image_paths(use_orig=True)
+        still = cams.missing_image_paths(use_orig_filepath=True)
         if still:
             print(f"Warning: {len(still)} camera image(s) still missing:")
             for cam_id, path in sorted(still.items())[:max_rows]:
@@ -3821,7 +3648,7 @@ def _size_arg(values, default):
     raise SystemExit("--size takes one value (square) or two values (W H).")
 
 
-def _classifier_crop_size(values, learn, default):
+def resolve_crop_size(values, learn, default):
     """Crop size ``(w, h)``: ``--size``/``--crop-size``, else the classifier's own.
 
     Classifiers from ``substrata train`` record the crop size they were trained
@@ -3853,6 +3680,9 @@ def _classifier_crop_size(values, learn, default):
         "(pass the size it was trained on if that differs)."
     )
     return default
+
+
+_classifier_crop_size = resolve_crop_size  # deprecated alias (renamed 2026-11-25)
 
 
 def _load_annotation_project(args, need_annotations=True, use_ply=True):
@@ -4135,7 +3965,7 @@ def _is_coralnet_csv(path):
     return {"Name", "Row", "Column"} <= set(header)
 
 
-def _write_cover_table(anns, out_path):
+def _write_cover_table(anns, output_path):
     """Write per-image percent cover of the predicted labels (plus an ALL row)."""
     import pandas as pd
 
@@ -4155,12 +3985,19 @@ def _write_cover_table(anns, out_path):
     n_points = df["image"].value_counts()
     cover.insert(0, "n_points", n_points.reindex(cover.index).fillna(len(df)))
     cover["n_points"] = cover["n_points"].astype(int)
-    cover.to_csv(out_path)
+    with atomic_write(output_path, "w", newline="") as f:
+        cover.to_csv(f)
     return cover
 
 
-def _print_label_agreement(anns, vocab):
-    """Compare predictions with existing labels (e.g. CoralNet annotations)."""
+def _print_label_agreement(anns, vocab, label_map=None):
+    """Compare predictions with existing labels (e.g. CoralNet annotations).
+
+    With the classifier's ``label_map`` (raw label -> training class) the
+    existing labels are first mapped to the classes the classifier predicts,
+    as in training (``CST`` -> ``CORAL``); labels the map leaves out are not
+    compared.
+    """
     from sklearn.metrics import classification_report
 
     pairs = [
@@ -4169,6 +4006,12 @@ def _print_label_agreement(anns, vocab):
         if ann.pred_label is not None
         and getattr(ann, "label", None) not in (None, "", "None")
     ]
+    if label_map:
+        n_all = len(pairs)
+        pairs = [(label_map[y], p) for y, p in pairs if label_map.get(y)]
+        if len(pairs) < n_all:
+            print(f"{n_all - len(pairs)} labelled point(s) have labels the "
+                  "classifier's label map leaves out; not compared.")
     if not pairs:
         return
     known = [(y, p) for y, p in pairs if y in vocab]
@@ -4207,7 +4050,7 @@ def _predict_images(args):
     if not args.classifier:
         raise SystemExit("Image-only predict needs --classifier.")
     learn = classification.get_image_classifier(args.classifier)
-    crop_size = _classifier_crop_size(
+    crop_size = resolve_crop_size(
         args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT
     )
     margin = max(crop_size) // 2
@@ -4218,7 +4061,7 @@ def _predict_images(args):
     def _sample(cams):
         return cams.get_random_image_points(
             args.n_points, margin=margin, stratified=args.stratified,
-            seed=args.seed,
+            seed=_resolve_seed(args),
         )
 
     if args.points and args.resample:
@@ -4302,7 +4145,13 @@ def _predict_images(args):
     if _write_cover_table(anns, cover_path) is not None:
         print(f"Saved per-image cover (% of points) to {cover_path}")
     vocab = learn.vocab if pointfeatures.is_point_classifier(learn) else learn.dls.vocab
-    _print_label_agreement(anns, {str(v) for v in vocab})
+    label_map = getattr(learn, "label_map", None)
+    if not label_map:  # a crop classifier: the label map of its training folder
+        map_path = os.path.join(os.path.dirname(os.path.abspath(args.classifier)),
+                                settings.TRAIN_LABEL_MAP_FILE)
+        if os.path.isfile(map_path):
+            label_map = classification.load_label_map(map_path)
+    _print_label_agreement(anns, {str(v) for v in vocab}, label_map)
 
 
 def handle_predict(args):
@@ -4336,7 +4185,7 @@ def handle_predict(args):
     root = args.crops or anns.crops_root
 
     learn = classification.get_image_classifier(classifier_path)
-    crop_size = _classifier_crop_size(
+    crop_size = resolve_crop_size(
         args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT
     )
     # which classifier: stored with each prediction (pred_model); the points it
@@ -4413,14 +4262,14 @@ def _predict_camera_group(args):
     if not classifier_path:
         raise SystemExit("No classifier: pass --classifier or set it in the YAML.")
     learn = classification.get_image_classifier(classifier_path)
-    crop_size = _classifier_crop_size(args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT)
+    crop_size = resolve_crop_size(args.size, learn, settings.PREDICTION_CROP_SIZE_DEFAULT)
     model = classification.classifier_fingerprint(classifier_path)
     views = args.views or (settings.SEG_POINT_VIEWS if mode == "segment" else args.max_photos)
     clear = ((init.crop_size, init.crop_size) if init.crop_size else settings.CROP_SIZE_DEFAULT)
     res = grouppredict.predict_from_group(
         init.annotations, cams, learn, mode=mode, views=views, pcd=pcd,
         occluder=occluder, crop_size=crop_size, clear_of_edge=clear,
-        batch_size=args.batch_size, n_jobs=args.jobs,
+        scale_factor=init.scale_factor, batch_size=args.batch_size, n_jobs=args.jobs,
     )
     csv_path = init.annotations_filepath
     out = args.output_csv or grouppredict.output_path(csv_path, group, mode, args.tag)
@@ -4456,17 +4305,180 @@ def _add_annotation_project_args(parser, annotations=True):
     )
 
 
+def _selected_annotations(annotations, labels=None, ids=None) -> list:
+    """The annotations (in file order) with one of ``labels`` and one of ``ids`` (None: any)."""
+    keep = []
+    for ann in annotations.data.values():
+        if labels and getattr(ann, "label", None) not in labels:
+            continue
+        if ids and str(ann.id) not in ids:
+            continue
+        keep.append(ann)
+    return keep
+
+
+def _images_pages(args, auto: bool) -> bool:
+    """``substrata images --layout pages`` (or ``auto``): one page per annotation (annotationpages.py).
+
+    Close-ups: ``--closeup`` (a camera group, type or folder as ``predict --camera-group`` takes), else the
+    set's stored views when they are close-ups (:func:`annotationpages.closeup_camera_types`). Overview: the
+    most relevant unobstructed view of the main camera type among the other cameras
+    (:meth:`Annotation.select_views`). Returns False when ``auto`` finds no close-ups (then the grid is made).
+    """
+    from substrata import annotationpages as ap
+    from substrata import grouppredict
+    from substrata.cameras import assign_camera_types, pixel_hits
+    from substrata.pointfeatures import world_scale
+    from substrata.stratified import ply_occluder
+    from tqdm import tqdm
+
+    base, cwd = _cwd_base()
+    init = _load_annotation_project(args, use_ply=False)
+    cams = list(init.cams.data.values()) if hasattr(init.cams, "data") else list(init.cams)
+    assign_camera_types(cams)
+    by_path = {c.filepath: c for c in cams}
+    by_name = {os.path.basename(c.filepath): c for c in cams}
+    anns = _selected_annotations(init.annotations, args.labels, args.ids)
+    if not anns:
+        raise SystemExit("No annotations (after --labels / --ids).")
+    stored = {}
+    for a in anns:
+        if a.cam_filepath:
+            c = by_path.get(a.cam_filepath) or by_name.get(os.path.basename(a.cam_filepath))
+            if c is not None:
+                stored[a.id] = c
+    if args.closeup:
+        try:
+            name, kind, members = grouppredict.resolve_camera_group(cams, args.closeup)
+        except ValueError as e:
+            raise SystemExit(str(e))
+        closeups, why = set(members), f"camera {kind} {name}"
+    else:
+        set_type = (init.annotations.sidecar or {}).get("type")
+        main_all = init.annotations.main_camera_type(cams) if set_type != "camera_targets" else None
+        types = ap.closeup_camera_types([c.camera_type for c in stored.values()], set_type, main_all)
+        closeups = {c for c in cams if c.camera_type in types}
+        why = (f"the set's camera targets ({', '.join(sorted(types))})" if set_type == "camera_targets"
+               else f"stored views of camera type {', '.join(sorted(types))}")
+        if not closeups:
+            if auto:
+                return False
+            why = "none"
+    overview_cams = [c for c in cams if c not in closeups]
+    if args.camera_type == "all":
+        main_type = None
+    elif args.camera_type:
+        main_type = args.camera_type
+    else:
+        main_type = init.annotations.main_camera_type(overview_cams)
+    method = "none" if args.no_ply else args.occlusion
+    occluder = pcd = None
+    if method in ("auto", "subsample"):
+        occluder = ply_occluder(init.ply_full_path)
+        if occluder is None and method == "subsample":
+            raise SystemExit("No stratified full-resolution PLY: run `substrata stratify` first, or use "
+                             "--occlusion cloud.")
+        method = "subsample" if occluder is not None else "cloud"
+    if method == "cloud":
+        full = _load_annotation_project(args, use_ply=True)
+        pcd = full.pcd
+        method = "cloud" if pcd is not None else "none"
+    scale = None if init.world_transform_is_identity else world_scale(init.world_transform)
+    if scale is None and init.scale_factor:
+        scale = float(init.scale_factor)
+    print(f"Pages for {len(anns)} annotations. Close-ups: {why}. Overview: "
+          f"{main_type or 'any camera'}. Occlusion test: {method}.")
+
+    extra = {}
+    if init.annotations_filepath and args.info:
+        import pandas as pd
+
+        df = pd.read_csv(init.annotations_filepath, dtype=str, keep_default_na=False)
+        cols = [c for c in args.info if c in df.columns]
+        extra = {r["id"]: {c: r[c] for c in cols if r[c]} for _, r in df.iterrows()}
+    csv_name = os.path.basename(init.annotations_filepath or "")
+    plot = init.id or base
+
+    def m_per_px(depth, cam):
+        fx = float(getattr(cam.sensor, "fx", 0) or 0)
+        return depth * scale / fx if scale and fx > 0 and depth and depth > 0 else None
+
+    def view(cam, x, y, depth, title, notes=""):
+        return ap.PageView(cam.filepath, float(x), float(y), m_per_px(depth, cam), title, notes)
+
+    def pages():
+        for a in tqdm(anns, desc="Pages"):
+            # overview: most relevant unobstructed view of the main type, else the most relevant one
+            views, best = a.select_views(overview_cams, occluder=occluder, pcd=pcd, main_type=main_type,
+                                         max_views=1, per_other_type=0,
+                                         clear_of_edge=settings.PAGES_CLEAR_OF_EDGE_PX)
+            ov = best if best is not None else (views[0] if views else None)
+            overview = None
+            if ov is not None:
+                flag = {True: "flagged obstructed", False: "unobstructed"}.get(
+                    getattr(ov, "potentially_obstructed", None), "not tested for occlusion")
+                dist = f"distance {ov.depth * scale:.2f} m   " if scale else ""
+                overview = view(ov.cam, ov.x, ov.y, ov.depth, "Overview", f"{dist}{flag}")
+            # close-up: the stored one, else the most relevant close-up camera that sees the point
+            closeup = None
+            cam = stored.get(a.id)
+            if cam is not None and cam in closeups:
+                # the stored close-up (its pixel, e.g. the camera target's), also when its camera is disabled:
+                # camsync keeps the poses it estimated rather than matched disabled (cams2annos marks their
+                # points is_extrapolated); the depth only gives the scale
+                hits = [h for h in pixel_hits([cam], a.orig_coords, enabled_only=False) if h[3] > 0]
+                depth = hits[0][3] if hits else None
+                x, y = ((a.cam_x, a.cam_y) if a.cam_x is not None
+                        else (hits[0][1], hits[0][2]) if hits else (None, None))
+                if x is not None:
+                    notes = [f"distance {depth * scale:.2f} m" if scale and depth else ""]
+                    if getattr(cam, "enabled", True) is False:
+                        notes.append("camera disabled (e.g. an estimated pose): check the overview match")
+                    closeup = view(cam, x, y, depth, "Close-up", "   ".join(n for n in notes if n))
+            elif closeups:  # the most relevant (enabled) close-up camera that sees the point
+                hits = sorted((h for h in pixel_hits(list(closeups), a.orig_coords) if h[3] > 0),
+                              key=lambda h: h[4])
+                if hits:
+                    c, x, y, depth, _rel = hits[0]
+                    dist = f"distance {depth * scale:.2f} m" if scale else ""
+                    closeup = view(c, x, y, depth, "Close-up", dist)
+            label = getattr(a, "label", None) or "unlabelled"
+            short = str(a.id)[len(plot) + 1:] if str(a.id).startswith(f"{plot}_") else str(a.id)
+            sub = [f"annotation {a.id}"]
+            if not init.world_transform_is_identity:
+                x, y, z = (float(v) for v in a.coords)
+                sub += [f"depth {-z:.1f} m", f"world xyz {x:.2f}, {y:.2f}, {z:.2f}"]
+            sub += [f"{k} {v}" for k, v in extra.get(str(a.id), {}).items()] + [csv_name]
+            yield ap.annotation_page(f"{plot}   ·   {short}   ·   {label}", "    ".join(sub), overview, closeup,
+                                     zoom_m=args.zoom, contrast=args.contrast)
+
+    out = args.pdf_output or os.path.join(
+        cwd, f"{os.path.splitext(csv_name)[0] or base}_pages.pdf")
+    n = ap.save_pages_pdf(pages(), out)
+    print(f"Saved {n} pages to {out}")
+    return True
+
+
 def handle_images(args):
     """Handle the image matching CLI command.
 
-    Uses project initializer to load data and optionally apply a transform.
-    Generates cropped image match visualizations and saves them to PDF.
+    ``--layout grid``: the first image match of each annotation, cropped, in a grid PDF (optionally after a
+    transform). ``--layout pages`` (or ``auto`` when the set's stored views are close-ups, or ``--closeup``): one
+    page per annotation (:func:`_images_pages`).
 
     Args:
         args: Arguments from argparse.
     """
     from substrata.initializer import ProjectInitializer
     from substrata import visualizations
+
+    layout = getattr(args, "layout", "grid")
+    if layout == "pages" or getattr(args, "closeup", None) or layout == "auto":
+        if getattr(args, "transform", False):
+            if layout == "pages" or args.closeup:
+                raise SystemExit("--transform applies to the grid layout only.")
+        elif _images_pages(args, auto=layout == "auto" and not args.closeup):
+            return
 
     base, cwd = _cwd_base()
     init = ProjectInitializer(path=cwd, local=getattr(args, "local", False))
@@ -4518,6 +4530,10 @@ def handle_images(args):
     #     init.annotations.apply_transform(init.world_transform)
     # elif init.scale_factor is not None:
     #     init.annotations.apply_transform(geom.Transform.from_scale(init.scale_factor))
+
+    if getattr(args, "labels", None) or getattr(args, "ids", None):
+        keep = {a.id for a in _selected_annotations(init.annotations, args.labels, args.ids)}
+        init.annotations.data = {k: v for k, v in init.annotations.data.items() if k in keep}
 
     # Validate that we have cameras and annotations
     if not init.cams or len(init.cams) == 0:
@@ -4613,7 +4629,7 @@ def handle_match_annotations(args):
     random_anns = Annotations(args.random, orig_coords_only=True)
     manual_anns = Annotations(manual_path, orig_coords_only=True)
     for anns in (random_anns, manual_anns):
-        anns.transform_coords(init.world_transform)
+        anns.apply_transform(init.world_transform)
     print(f"Random annotations: {len(random_anns)} ({args.random})")
     print(f"Manual annotations: {len(manual_anns)} ({manual_path})")
     skip_ids = set() if args.redo_all else get_matched_annotation_ids(args.random)
@@ -4758,7 +4774,7 @@ def _project_yamls(target: str) -> list[str]:
 def _frame_change(W_old: np.ndarray, W_new: np.ndarray) -> str:
     """Describe the world-frame change ``W_new @ inv(W_old)`` in a few words."""
     D = W_new @ np.linalg.inv(W_old)
-    s = float(np.cbrt(np.linalg.det(D[:3, :3])))
+    s = uniform_scale(D)
     cos = (np.trace(D[:3, :3] / s) - 1) / 2
     angle = float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
     return (
@@ -5048,7 +5064,7 @@ def handle_metashape_export(args):
                 input_path=paths["ply"],
                 output_path=dec_ply_path,
                 target_points=50_000_000,
-                show_progress=True,
+                progress=True,
             )
 
     # Finish the folder in the conda env: build a starter YAML pointing at the
@@ -5092,10 +5108,13 @@ def handle_train(args):
          --model-path convention only when a hard-coded directory is missing.
       3. Write a consolidated training annotations CSV (exact-match labels,
          remapped paths, model-prefixed integer ids).
-      4. Incrementally sync train/validation/test crops (80/10/10).
-      5. Train a fastai classifier (skipped with --test/--validate) and write a
-         training_summary.pdf (run settings + per-class crop counts + metrics).
-      6. Report stats on validation (default) or test (--test) crops.
+      4. Incrementally sync train/validation/test crops (80/10/10; the split
+         grouped by photo by default, --split-by).
+      5. Train the classifier (skipped with --test/--validate): a point-feature
+         classifier (default --arch; no crops needed) or a fastai crop
+         classifier, and write a training_summary.pdf (run settings +
+         per-class counts + metrics).
+      6. Report stats on validation (default) or test (--test) points/crops.
 
     ``--validate`` and ``--test`` both skip steps 1-5 and only re-run the
     evaluation/reporting, on the validation and test crops respectively.
@@ -5212,7 +5231,7 @@ def handle_train(args):
     if not use_tree:
         if args.tips_only or getattr(args, "collapse", False):
             raise SystemExit(
-                "--tips_only/--collapse need a classes file (--classes)."
+                "--tips-only/--collapse need a classes file (--classes)."
             )
         print(
             f"No classes file ({classes_path}); selecting labels from a flat "
@@ -5378,7 +5397,7 @@ def handle_train(args):
             raise SystemExit("Aborted.")
 
     # --- Steps 2 & 3: verify paths and write consolidated annotations ---
-    # --min_conf keeps empty label_conf rows; --min_conf_strict treats empty
+    # --min-conf keeps empty label_conf rows; --min-conf-strict treats empty
     # as 0. They are mutually exclusive (enforced by argparse).
     min_conf = getattr(args, "min_conf", None)
     conf_strict = getattr(args, "min_conf_strict", None)
@@ -5387,6 +5406,7 @@ def handle_train(args):
     else:
         conf_is_strict = False
     ann_path = os.path.join(output_dir, settings.TRAIN_ANNOTATIONS_FILE)
+    split_by = getattr(args, "split_by", None) or settings.TRAIN_SPLIT_BY
     curation_applied = Counter()
     skipped = Counter()
     n_written, n_dropped, n_dropped_conf = (
@@ -5395,7 +5415,7 @@ def handle_train(args):
             prompt=(interactive and not assume_yes),
             min_conf=min_conf, conf_strict=conf_is_strict,
             curation=curation_store, curation_stats=curation_applied,
-            skipped=skipped,
+            skipped=skipped, split_by=split_by,
         )
     )
     if skipped["not_in_training"]:
@@ -5496,6 +5516,7 @@ def handle_train(args):
             "(none)" if curation_store is None else _counts_text(
                 curation_applied, "no decision applied"),
         ),
+        ("Split grouping (--split-by)", split_by),
         ("Annotation pattern", pattern),
         ("CSV files scanned", len(csv_files)),
         ("Training classes", len(training_classes)),
@@ -5509,7 +5530,7 @@ def handle_train(args):
             clf, run = pointfeatures.train_point_classifier(
                 ann_path, label_map, output_dir, model_file, backbone=args.arch,
                 feature_mm_px=args.feature_mm_px, feature_scale=args.feature_scale,
-                batch_size=args.batch_size, n_jobs=args.jobs,
+                batch_size=args.batch_size, n_jobs=args.jobs, split_by=split_by,
             )
         except (ValueError, FileNotFoundError) as e:
             raise SystemExit(str(e))
@@ -5526,7 +5547,7 @@ def handle_train(args):
             ("Backbone", args.arch),
             ("Resolution", run["plan"].description),
             ("Window (model px)", clf.window),
-            ("Probe C", clf.meta.get("probe_C")),
+            ("Probe C (CV folds grouped by photo)", clf.meta.get("probe_C")),
             ("Calibration patches", clf.meta.get("n_calibration_patches")),
             ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
         ] + selection_info
@@ -5547,6 +5568,7 @@ def handle_train(args):
     learn = classification.train_classifier(
         output_dir, model_file, label_map, arch=args.arch, epochs=args.epochs,
         pretrained_weights=args.pretrained_weights, crop_size=crop_size,
+        seed=settings.TRAIN_SEED,
     )
 
     # --- Step 5b: training-run summary PDF (settings + per-class counts) ---
@@ -5557,6 +5579,7 @@ def handle_train(args):
         ("Epochs", args.epochs),
         ("Crop size (px)", crop_size),
         ("Input size (px)", settings.TRAIN_IMAGE_SIZE),
+        ("Random seed", settings.TRAIN_SEED),
         ("Train/val/test split (%)", "/".join(map(str, settings.TRAIN_SPLIT))),
     ] + selection_info
     summary_pdf = os.path.join(output_dir, settings.TRAIN_SUMMARY_FILE)
@@ -5608,6 +5631,10 @@ def handle_calibrate(args):
         args.images if len(args.images) <= 5 else args.images[:5] + ["..."]
     )
     cal.save(out)
+    sc = list(cal.meta["calibration"]["scales"].values())
+    print(f"Patches resampled at scale {min(sc):.3f}-{max(sc):.3f} "
+          f"({cal.meta['calibration']['scale_rule']}), as prediction resamples "
+          "these photos.")
     shift = float(np.mean(np.abs(cal.target_mean - clf.source_mean) / clf.source_std))
     print(
         f"Wrote {out} ({cal.meta['calibration']['n_patches']} patches; mean "
@@ -5639,13 +5666,11 @@ def handle_curate_gui(argv):
 
 
 def _curate_sheets(folder, max_per_sheet):
-    """Contact sheets of the review queues (PDF), from curate/points.csv."""
-    import tempfile
-    from io import BytesIO
+    """Contact sheets of the review queues (PDF), from curate/points.csv.
 
-    import numpy as np
-    from PIL import Image, ImageDraw
-
+    The queues (open points sorted by their review scores) are chosen here; the
+    sheets are drawn by :func:`substrata.visualizations.save_curation_sheets_pdf`.
+    """
     from substrata import curation as cur
     from substrata import visualizations
 
@@ -5674,36 +5699,9 @@ def _curate_sheets(folder, max_per_sheet):
             sorted([r for r in open_rows if np.isfinite(f(r["novelty"]))],
                    key=lambda r: -f(r["novelty"])),
     }
-    tiles = cur.tile_store(folder)
     pdf_path = os.path.join(out_dir, "review_sheets.pdf")
-    with tempfile.TemporaryDirectory() as tmp:
-        groups = {}
-        for title, items in queues.items():
-            out = []
-            for r in items[:max_per_sheet]:
-                dst = os.path.join(tmp, r["tile"])
-                tile = tiles.get(r["tile"])
-                if tile is None:
-                    continue
-                if not os.path.isfile(dst):
-                    try:
-                        with Image.open(BytesIO(tile[0])) as im:
-                            im = im.convert("RGB")
-                            d = ImageDraw.Draw(im)
-                            x, y = f(r["tile_x"]), f(r["tile_y"])
-                            if np.isfinite(x) and np.isfinite(y):
-                                for c, w in (((0, 0, 0), 3), ((255, 60, 60), 1)):
-                                    d.line([(x - 9, y), (x - 3, y)], fill=c, width=w)
-                                    d.line([(x + 3, y), (x + 9, y)], fill=c, width=w)
-                                    d.line([(x, y - 9), (x, y - 3)], fill=c, width=w)
-                                    d.line([(x, y + 3), (x, y + 9)], fill=c, width=w)
-                            im.save(dst, quality=90)
-                    except OSError:
-                        continue
-                caption = f"{r['label']}>{r['cv_pred'] or '?'} {f(r['p_label']):.2f}"
-                out.append((dst, r["id"], caption, ""))
-            groups[title] = (len(items), out)
-        n_pages = visualizations.save_training_crops_pdf(groups, pdf_path)
+    n_pages = visualizations.save_curation_sheets_pdf(
+        queues, cur.tile_store(folder), pdf_path, max_per_sheet)
     print(f"Wrote {pdf_path} ({n_pages} page(s)). Captions: id, label>predicted "
           "class and the cross-validated probability of the label. Record "
           "decisions in a CSV (id, action, label, reason) and read it with "
@@ -5831,11 +5829,16 @@ def handle_curate(args):
         summary = cur.score_training_points(
             folder, clf, args.annotations, batch_size=args.batch_size,
             n_jobs=args.jobs,
+            splits=None if getattr(args, "all_splits", False)
+            else settings.CURATION_SPLITS,
         )
     except (ValueError, FileNotFoundError) as e:
         raise SystemExit(str(e))
     cv = summary["cv"]
-    print(f"Scored {summary['n_points']} training point(s) -> {summary['table']}")
+    print(f"Scored {summary['n_points']} of {summary['n_training_points']} training "
+          f"point(s) ({'/'.join(summary['splits'])} split"
+          f"{'s' if len(summary['splits']) > 1 else ''}; --all-splits for all) "
+          f"-> {summary['table']}")
     if cv:
         print(f"  cross-validated ({cv['folds']} folds by photo): accuracy "
               f"{cv['accuracy']:.3f}, macro-F1 {cv['macro_f1']:.3f}")
@@ -5886,29 +5889,38 @@ def handle_masks(args):
     # ground resolution first; else the training camera's fixed scale, or the
     # width rule for another camera (as predict and curate pools)
     widths = ({} if clf.target_mm_px and args.gsd_mm
-              else pointfeatures._image_widths(images))
+              else pointfeatures.image_widths(images))
     photo_scales = [pointfeatures.photo_scale(clf, args.gsd_mm, widths.get(p))
                     for p in images]
     scale = float(np.median(photo_scales))
     out_dir = args.output or os.path.join(os.getcwd(), settings.MASKS_DEFAULT_DIR)
     os.makedirs(out_dir, exist_ok=True)
-    overrides = {}
-    for spec in getattr(args, "color", None) or []:
-        if "=" not in spec:
-            raise SystemExit(f"Invalid --color {spec!r}; expected LABEL=RRGGBB.")
-        lbl, hexv = spec.split("=", 1)
-        overrides[lbl] = _parse_hex_color(hexv)
-    colors = segmentation._build_label_colors(list(clf.classes), overrides or None)
+    overrides = _parse_label_color_specs(getattr(args, "color", None))
+    colors = segmentation.build_label_colors(list(clf.classes), overrides or None)
 
+    from substrata import classification
+
+    fingerprint = classification.classifier_fingerprint(clf_path)
     index_path = os.path.join(out_dir, settings.MASKS_INDEX_FILE)
     index = {"classes": list(clf.classes), "photos": {}}
     if os.path.isfile(index_path) and not args.overwrite:
         with open(index_path) as f:
             old = json.load(f)
-        if old.get("classes") == list(clf.classes):
+        # existing masks are kept only when made by this very classifier
+        # (same file content: a retrained model with the same classes differs)
+        # at the same ground resolution
+        same = (old.get("classifier_fingerprint") == fingerprint
+                and old.get("classes") == list(clf.classes)
+                and old.get("gsd_mm") == args.gsd_mm)
+        if same:
             index["photos"] = old.get("photos", {})
+        elif old.get("photos"):
+            print(f"Existing masks in {out_dir} were made by another classifier "
+                  f"({old.get('classifier_fingerprint') or 'unrecorded'}) or "
+                  "ground resolution; all photos are redone.")
     index.update({
         "classifier": os.path.abspath(clf_path),
+        "classifier_fingerprint": fingerprint,
         "colors": {c: list(v) for c, v in colors.items()},
         "gsd_mm": args.gsd_mm, "scale": scale,
     })
@@ -5925,7 +5937,7 @@ def handle_masks(args):
           f"done) at scale {span} -> {out_dir}")
 
     def write_index():
-        with open(index_path, "w") as f:
+        with atomic_write(index_path, "w") as f:
             json.dump(index, f, indent=1)
 
     n_done = 0
@@ -5950,7 +5962,7 @@ def handle_masks(args):
     write_index()
 
     cover_path = os.path.join(out_dir, settings.MASKS_COVER_FILE)
-    with open(cover_path, "w", newline="") as f:
+    with atomic_write(cover_path, "w", newline="") as f:
         w = csv.writer(f)
         head = ["photo", "width", "height", "cell_px", "mean_conf"]
         w.writerow(head + list(clf.classes))
@@ -5961,22 +5973,45 @@ def handle_masks(args):
     print(f"Wrote {n_done} new mask pair(s); index {index_path}; cover {cover_path}")
 
 
-def main():
-    """Build the argparse CLI and dispatch to the selected subcommand handler.
+class _AliasHelpFormatter(argparse.HelpFormatter):
+    """Help formatter that hides an option's underscore spelling (``--save_yaml``)
+    when it has a hyphen one (``--save-yaml``): the underscore spellings are
+    kept as aliases of older scripts, the hyphen ones are documented."""
 
-    Defines all subcommands (decimate, ply-repair, head, scalebars, views, orient,
-    colors, firefish, cams2video, intercepts, intercepts-plot, align, images,
-    match-annotations, camsync, path-repair, transform, train, calibrate,
-    masks, curate, metashape-export),
-    parses the arguments, and calls the matching handle_* function.
+    def _format_action_invocation(self, action):
+        shown = [o for o in action.option_strings
+                 if not ("_" in o and o.replace("_", "-") in action.option_strings)]
+        if shown and len(shown) != len(action.option_strings):
+            action = copy.copy(action)
+            action.option_strings = shown
+        return super()._format_action_invocation(action)
+
+
+class _AliasRawDescriptionHelpFormatter(
+    _AliasHelpFormatter, argparse.RawDescriptionHelpFormatter,
+):
+    """:class:`_AliasHelpFormatter` keeping the description's line breaks."""
+
+
+def _use_alias_formatter(parser: argparse.ArgumentParser) -> None:
+    """Give ``parser`` and its subcommands the alias-hiding help formatter."""
+    parsers = [parser]
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            parsers += list(dict.fromkeys(action.choices.values()))
+    for p in parsers:
+        raw = issubclass(p.formatter_class, argparse.RawDescriptionHelpFormatter)
+        p.formatter_class = (_AliasRawDescriptionHelpFormatter if raw
+                             else _AliasHelpFormatter)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The argparse parser of every ``substrata`` subcommand.
+
+    Options are spelled with hyphens (``--save-yaml``); the older underscore
+    spellings (``--save_yaml``) still parse (same ``dest``) but are hidden from
+    the help.
     """
-    # explore: the interactive viewer (the substrata-explore package), its own arguments
-    if len(sys.argv) > 1 and sys.argv[1] == "explore":
-        return handle_explore(sys.argv[2:])
-    # curate --gui: the review grid (substrata-explore), its own arguments
-    if len(sys.argv) > 2 and sys.argv[1] == "curate" and "--gui" in sys.argv[2:]:
-        return handle_curate_gui([a for a in sys.argv[2:] if a != "--gui"])
-
     parser = argparse.ArgumentParser(description="Substrata CLI Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
@@ -6018,6 +6053,14 @@ def main():
         help="Number of points to keep (default: 50,000,000).",
     )
     p_dec.add_argument(
+        "--seed",
+        dest="seed",
+        type=int,
+        default=0,
+        help="Random seed of the sample (default 0: the same input gives the same "
+        "output; recorded in the output header).",
+    )
+    p_dec.add_argument(
         "--local",
         dest="local",
         action="store_true",
@@ -6025,6 +6068,7 @@ def main():
     )
     p_dec.add_argument(
         "-c",
+        "--color-calibrate",
         "--color_calibrate",
         dest="color_calibrate",
         action="store_true",
@@ -6285,6 +6329,7 @@ def main():
         help="Optional explicit markers CSV path (overrides initializer).",
     )
     p_sb.add_argument(
+        "--output-pdf",
         "--output_pdf",
         dest="output_pdf",
         type=str,
@@ -6301,6 +6346,7 @@ def main():
     )
     p_sb.add_argument(
         "-s",
+        "--save-yaml",
         "--save_yaml",
         dest="save_yaml",
         action="store_true",
@@ -6326,6 +6372,7 @@ def main():
         help="Optional explicit input PLY path (overrides initializer).",
     )
     p_views.add_argument(
+        "--output-pdf",
         "--output_pdf",
         dest="output_pdf",
         type=str,
@@ -6371,8 +6418,8 @@ def main():
         ),
     )
     p_orient.add_argument(
-        "--use_chunk_transform",
         "--use-chunk-transform",
+        "--use_chunk_transform",
         dest="use_chunk_transform",
         action="store_true",
         help=(
@@ -6383,12 +6430,12 @@ def main():
         ),
     )
     p_orient.add_argument(
-        "--north_up",
         "--north-up",
+        "--north_up",
         dest="north_up",
         action="store_true",
         help=(
-            "With --use_chunk_transform: keep the georeferenced orientation "
+            "With --use-chunk-transform: keep the georeferenced orientation "
             "(+X east, +Y north) instead of rotating +Y upslope."
         ),
     )
@@ -6430,7 +6477,8 @@ def main():
     )
     p_seg.add_argument(
         "--classifier", dest="classifier", type=str, default=None,
-        help="Classifier .pkl (overrides the project YAML 'classifier').",
+        help="Classifier: a point classifier (.pt) or a fastai crop classifier "
+             "(.pkl). Overrides the project YAML 'classifier'.",
     )
     p_seg.add_argument(
         "--cell-size", dest="cell_size", type=float, default=None,
@@ -6546,6 +6594,7 @@ def main():
         help="Optional markers CSV path (overrides initializer / YAML).",
     )
     p_colors.add_argument(
+        "--output-pdf",
         "--output_pdf",
         dest="output_pdf",
         type=str,
@@ -6565,6 +6614,7 @@ def main():
     )
     p_colors.add_argument(
         "-s",
+        "--save-yaml",
         "--save_yaml",
         dest="save_yaml",
         action="store_true",
@@ -6633,10 +6683,13 @@ def main():
     p_ff.add_argument(
         "--target-depth",
         dest="target_depth",
-        type=int,
+        type=float,
         default=None,
         help=(
-            "Optional target depth in meters. Default: extracted from <cwd_basename> pattern _<int>m_."
+            "Plot depth below the surface in metres (20 or -20: 20 m deep). "
+            "Only FireFish records within --depth-outlier-threshold of it are "
+            "used to find the time offset. Default: from the folder name "
+            "(_<int>m_, e.g. cur_sna_20m_20200303)."
         ),
     )
     p_ff.add_argument(
@@ -6651,18 +6704,21 @@ def main():
     p_ff.add_argument(
         "--depth-outlier-threshold",
         dest="depth_outlier_thresh",
-        type=int,
+        type=float,
         default=settings.FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD,
         help=(
-            "Optional depth/outlier threshold (meters). Defaults to FireFish.determine_up_vector default."
+            "Metres; used twice: altitudes at or above it are dropped as "
+            "outliers, and the depth band around --target-depth is +/- this. "
+            "Default: %(default)s."
         ),
     )
     p_ff.add_argument(
+        "--cams-group",
         "--cams_group",
         dest="cams_group",
         type=str,
         default=None,
-        help=("Optional camera group name to subset (uses Cameras.subset_by_group)."),
+        help="Only use the cameras of this camera group (Cameras.group).",
     )
     p_ff.add_argument(
         "--offset",
@@ -6752,6 +6808,7 @@ def main():
     )
     p_ff.add_argument(
         "-s",
+        "--save-yaml",
         "--save_yaml",
         dest="save_yaml",
         action="store_true",
@@ -6802,13 +6859,15 @@ def main():
         help=("Optional width to resize images when creating frames (pixels)."),
     )
     p_c2v.add_argument(
+        "--cams-group",
         "--cams_group",
         dest="cams_group",
         type=str,
         default=None,
-        help=("Optional camera group name to subset (uses Cameras.subset_by_group)."),
+        help="Only use the cameras of this camera group (Cameras.group).",
     )
     p_c2v.add_argument(
+        "--output-mp4",
         "--output_mp4",
         dest="output_mp4",
         type=str,
@@ -7282,6 +7341,7 @@ def main():
         ),
     )
     p_images.add_argument(
+        "--output-pdf",
         "--pdf-output",
         dest="pdf_output",
         type=str,
@@ -7307,6 +7367,49 @@ def main():
         action="store_true",
         help="Reset all paths to local (relative to project path).",
     )
+    p_images.add_argument(
+        "--layout", dest="layout", default="auto", choices=["auto", "grid", "pages"],
+        help="'grid': each annotation's first image match, cropped, in a grid. 'pages': one page per "
+             "annotation (overview zoomed on the point, its close-up, the close-up at 100%%). 'auto' "
+             "(default): pages when the set's stored views (cam_filepath) are close-ups (a cams2annos "
+             "camera-targets set, or photos of a camera type other than the main one), else grid.",
+    )
+    p_images.add_argument(
+        "--closeup", dest="closeup", default=None, metavar="GROUP",
+        help="Close-up cameras for pages (a camera group, type or photo folder, as `predict "
+             f"--camera-group` takes, e.g. '{settings.PAGES_CLOSEUP_GROUP}'); implies --layout pages. "
+             "Default: the stored views when they are close-ups.",
+    )
+    p_images.add_argument(
+        "--labels", dest="labels", nargs="+", default=None, metavar="LABEL",
+        help="Only annotations with one of these labels.",
+    )
+    p_images.add_argument(
+        "--ids", dest="ids", nargs="+", default=None, metavar="ID",
+        help="Only these annotation ids.",
+    )
+    p_images.add_argument(
+        "--zoom", dest="zoom", type=float, default=settings.PAGES_ZOOM_M, metavar="M",
+        help="Pages: overview zoom width in metres, at least (wider to show "
+             f"{settings.PAGES_ZOOM_CLOSEUP:g}x the close-up's frame). Default: {settings.PAGES_ZOOM_M:g}.",
+    )
+    p_images.add_argument(
+        "--contrast", dest="contrast", default=settings.CONTRAST_METHOD_DEFAULT,
+        choices=["none", "stretch", "stretch-rgb", "clahe"],
+        help="Pages: display contrast (substrata.imageadjust): 'stretch' brightens with one stretch for all "
+             "channels (colours kept), 'stretch-rgb' per channel (also removes a colour cast), 'clahe' "
+             f"local contrast, 'none'. Default: {settings.CONTRAST_METHOD_DEFAULT}.",
+    )
+    p_images.add_argument(
+        "--info", dest="info", nargs="*", default=["label_conf", "label_source"], metavar="COLUMN",
+        help="Pages: annotation CSV columns shown in each page's header when set. "
+             "Default: label_conf label_source.",
+    )
+    p_images.add_argument(
+        "--photo-path-replace", dest="photo_path_replace", nargs=2, default=None, metavar=("OLD", "NEW"),
+        help="Pages: remap camera photo paths (substring OLD -> NEW).",
+    )
+    _add_view_choice_args(p_images)
 
     # thumbnails
     p_thumbs = subparsers.add_parser(
@@ -7416,14 +7519,17 @@ def main():
     )
     p_predict.add_argument(
         "--classifier", dest="classifier", type=str, default=None,
-        help="fastai classifier (.pkl). Default: classifier in the YAML.",
+        help="Classifier: a point classifier (.pt) or a fastai crop classifier "
+             "(.pkl). Default: classifier in the YAML.",
     )
     p_predict.add_argument(
         "--size", dest="size", type=int, nargs="+", default=None,
         metavar="PX",
-        help="Classifier input crop size W H (or one value). Default: "
+        help="Classifier input crop size W H (or one value). Default: the crop "
+             "classifier's training crop size; for point classifiers and older "
+             "crop classifiers "
              f"{settings.PREDICTION_CROP_SIZE_DEFAULT[0]} "
-             f"{settings.PREDICTION_CROP_SIZE_DEFAULT[1]}.",
+             f"{settings.PREDICTION_CROP_SIZE_DEFAULT[1]} (stored crops only).",
     )
     p_predict.add_argument(
         "--max-photos", dest="max_photos", type=int,
@@ -7647,6 +7753,7 @@ def main():
         help="Output CSV. Default: <random>_matched.csv.",
     )
     p_match.add_argument(
+        "--output-pdf",
         "--pdf-output",
         dest="pdf_output",
         type=str,
@@ -7698,8 +7805,9 @@ def main():
             "updated-target sensor using EXIF time matching; writes meta JSON."
         ),
         epilog=(
-            "Per-camera poses are written to the cameras meta JSON only; .cams.xml is "
-            "not modified (this tool reads sensor calibration from XML).\n"
+            "Per-camera poses are written to the cameras meta JSON (backed up first). "
+            ".cams.xml keeps its calibration; with --match-images its cameras' enabled "
+            "flags are updated too (backed up first).\n"
             "Use --auto-time / --auto-xyz / --auto-offsets for spatial and median-offset "
             "estimation (see --help on those flags). Auto modes print detailed reports "
             "and prompt before saving unless you pass --yes."
@@ -7952,12 +8060,14 @@ def main():
         ),
     )
     p_transform.add_argument(
+        "--no-header",
         "--no_header",
         dest="no_header",
         action="store_true",
         help="Set header=False when loading annotations (default: header=True).",
     )
     p_transform.add_argument(
+        "--ignore-header",
         "--ignore_header",
         dest="ignore_header",
         action="store_true",
@@ -8215,8 +8325,10 @@ def main():
     p_train = subparsers.add_parser(
         "train",
         help=(
-            "Train a FastAI crop classifier: collate labelled annotations "
-            "across CSVs, generate train/val/test crops, train, and report "
+            "Train a classifier: collate labelled annotations across CSVs, "
+            "split them into train/validation/test (by photo), train a "
+            "point-feature classifier (default, --arch dinov2) or a fastai "
+            "crop classifier (a torchvision --arch, e.g. resnet34), and report "
             "stats."
         ),
     )
@@ -8237,7 +8349,7 @@ def main():
         help=(
             "Classes CSV path with the CATAMI hierarchy (default: classes.csv "
             "in CWD). Optional: without one, labels are selected from a flat "
-            "list of counts (no --tips_only/--collapse)."
+            "list of counts (no --tips-only/--collapse)."
         ),
     )
     p_train.add_argument(
@@ -8294,9 +8406,12 @@ def main():
         dest="min_count",
         type=int,
         default=1,
-        help="Only display/train tree items with aggregated count >= this.",
+        help=("Bold (train) tree tips whose aggregated count is >= this, and "
+              "parents with subcategories whose own count is >= this (all "
+              "entries stay listed)."),
     )
     p_train.add_argument(
+        "--tips-only",
         "--tips_only",
         action="store_true",
         help="Only bold tip entries (do not bold heavy parent nodes).",
@@ -8309,7 +8424,7 @@ def main():
         metavar="LABEL",
         help=(
             "Explicit list of category labels to train on (the codes shown in "
-            "brackets in the tree). Overrides --min-count/--tips_only: exactly "
+            "brackets in the tree). Overrides --min-count/--tips-only: exactly "
             "these are bolded and trained. Errors if any is absent from the "
             "tree."
         ),
@@ -8337,6 +8452,7 @@ def main():
     )
     conf_group = p_train.add_mutually_exclusive_group()
     conf_group.add_argument(
+        "--min-conf",
         "--min_conf",
         dest="min_conf",
         type=float,
@@ -8345,19 +8461,31 @@ def main():
         help=(
             "Only train on annotations whose label_conf is >= this value. "
             "Annotations with an empty (no value) label_conf are included by "
-            "default. Mutually exclusive with --min_conf_strict."
+            "default. Mutually exclusive with --min-conf-strict."
         ),
     )
     conf_group.add_argument(
+        "--min-conf-strict",
         "--min_conf_strict",
         dest="min_conf_strict",
         type=float,
         default=None,
         metavar="CONF",
         help=(
-            "Like --min_conf, but treats an empty (no value) label_conf as 0, "
+            "Like --min-conf, but treats an empty (no value) label_conf as 0, "
             "so such annotations are excluded whenever CONF > 0. Mutually "
-            "exclusive with --min_conf."
+            "exclusive with --min-conf."
+        ),
+    )
+    p_train.add_argument(
+        "--split-by", dest="split_by", choices=settings.TRAIN_SPLIT_BY_CHOICES,
+        default=settings.TRAIN_SPLIT_BY,
+        help=(
+            "What shares a train/validation/test split: 'photo' (default; all "
+            "points of a photo, so near-identical neighbouring points never sit "
+            "on both sides), 'plot' (all points of an annotation file's plot) or "
+            "'point' (each point on its own: the behaviour before 2026-11, "
+            "optimistic metrics; to reproduce older runs)."
         ),
     )
     p_train.add_argument(
@@ -8382,7 +8510,7 @@ def main():
         action="store_true",
         help=(
             "Preserve the existing label map (append only newly-seen labels) "
-            "instead of re-seeding it from the current --min-count/--tips_only/"
+            "instead of re-seeding it from the current --min-count/--tips-only/"
             "--include-classes/--collapse selection. Use this after hand-editing "
             "the map (e.g. between --prepare-only and training)."
         ),
@@ -8690,6 +8818,12 @@ def main():
         "in the folder).",
     )
     p_cur.add_argument(
+        "--all-splits", dest="all_splits", action="store_true",
+        help="Score and list the validation and test points for review too. By "
+        "default only the train split is: relabelling held-out points where the "
+        "model disagrees tunes them towards the model and inflates its metrics.",
+    )
+    p_cur.add_argument(
         "--mine", nargs="+", default=None, metavar="IMAGES",
         help="Sample unlabelled points from these photos (files, folders, glob "
         "patterns, or a text file listing photos) into a clustered pool.",
@@ -8775,6 +8909,24 @@ def main():
         help="Photo decoding threads (-1 = all cores). Default: -1.",
     )
 
+    _use_alias_formatter(parser)
+    return parser
+
+
+def main():
+    """Run the ``substrata`` command line: parse the arguments with
+    :func:`build_parser` (every subcommand; ``substrata -h`` lists them) and
+    call the subcommand's ``handle_*`` function. ``explore`` and
+    ``curate --gui`` hand their arguments to substrata-explore unparsed.
+    """
+    # explore: the interactive viewer (the substrata-explore package), its own arguments
+    if len(sys.argv) > 1 and sys.argv[1] == "explore":
+        return handle_explore(sys.argv[2:])
+    # curate --gui: the review grid (substrata-explore), its own arguments
+    if len(sys.argv) > 2 and sys.argv[1] == "curate" and "--gui" in sys.argv[2:]:
+        return handle_curate_gui([a for a in sys.argv[2:] if a != "--gui"])
+
+    parser = build_parser()
     args = parser.parse_args()
 
     handlers = {

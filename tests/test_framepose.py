@@ -188,7 +188,7 @@ _POSE = _SETUP + textwrap.dedent(
     f = camera(cams, "F", np.eye(3), [0, 0, 0], gopro_s)
     isy.set_pose(f, r["R"], r["C"], W)
     X = r["aim"]
-    want = cm._distort(*((X - C_true) @ R_true.T.T), gopro_s)[:2]
+    want = cm.camera_points_to_pixels(*((X - C_true) @ R_true.T.T), gopro_s)[:2]
     x, y, *_ = f.get_pixel_coords(X)
     assert abs(x - want[0]) < 15 and abs(y - want[1]) < 15, ((x, y), want)
     print("OK")

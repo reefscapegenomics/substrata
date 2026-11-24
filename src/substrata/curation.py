@@ -50,6 +50,7 @@ from PIL import Image
 
 # Local Modules
 from substrata import settings
+from substrata.fileio import atomic_write, path_lock
 from substrata.logging import logger
 
 __all__ = [
@@ -119,6 +120,7 @@ class CurationStore:
             if path in self.extra:
                 raise FileNotFoundError(f"Curation store not found: {path}")
             return
+        n_bad = 0
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -128,9 +130,10 @@ class CurationStore:
                     e = json.loads(line)
                     self._ingest(e)
                 except (ValueError, KeyError, TypeError):
-                    self.n_bad_lines += 1
-        if self.n_bad_lines:
-            logger.warning("%s: %d unreadable line(s) skipped", path, self.n_bad_lines)
+                    n_bad += 1
+        self.n_bad_lines += n_bad  # (over all files read)
+        if n_bad:
+            logger.warning("%s: %d unreadable line(s) skipped", path, n_bad)
 
     def _ingest(self, e: Dict[str, Any]) -> None:
         key = str(e["key"])
@@ -273,7 +276,7 @@ class CurationStore:
             photo = str(e.get("photo") or "")
             return (photo, num(e.get("y")), num(e.get("x")), e["key"])
         rows = sorted(self.entries(), key=order)
-        with open(path, "w", newline="") as f:
+        with atomic_write(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for e in rows:
@@ -376,7 +379,7 @@ def write_training_sources(folder: str, paths: Sequence[str], fmt: str) -> str:
     """
     out = os.path.join(folder, settings.TRAIN_SOURCES_FILE)
     os.makedirs(folder, exist_ok=True)
-    with open(out, "w") as f:
+    with atomic_write(out, "w") as f:
         json.dump({"format": fmt, "files": [os.path.abspath(p) for p in paths],
                    "created": _now()}, f, indent=1)
     return out
@@ -394,9 +397,11 @@ class SourceLabels:
     ``Label code``) and substrata annotation CSVs whose points have no 3-D
     position. Points of point-cloud annotation sets are left alone (a label seen
     in one image match may be an obstruction). A point is found by its curation
-    key (photo file name + rounded pixel). Each file is backed up once per
-    instance (``<folder>/backup/<name>_<time>.bak``) before its first edit; only
-    the label cell (and ``label_conf`` where the file has that column) changes.
+    key (photo file name + rounded pixel); a point listed in several of the
+    files is edited in each of them (``train`` reads them all). Each file is
+    backed up once per instance (``<folder>/backup/<name>_<time>.bak``) before
+    its first edit; only the label cell (and ``label_conf`` where the file has
+    that column) changes.
     """
 
     def __init__(self, folder: str):
@@ -405,7 +410,8 @@ class SourceLabels:
         self.files: List[str] = []
         self.fmt = ""
         self.problem = ""
-        self._index: Dict[str, Tuple[str, str]] = {}  # key -> (file, "image"|"3d")
+        # file -> {key: "image" | "3d"} of its points
+        self._index: Dict[str, Dict[str, str]] = {}
         self._mtimes: Dict[str, float] = {}
         self._backed_up: set = set()
         self._lock = threading.Lock()
@@ -428,7 +434,7 @@ class SourceLabels:
     # -- reading ---------------------------------------------------------------
     def _rows(self, path: str):
         from substrata import annotations as sa
-        return sa._read_csv_rows(path)
+        return sa.read_csv_rows(path)
 
     def _cols(self, low: List[str]) -> Dict[str, int]:
         """Column indices of a file: photo, x, y, label (+ id, label_conf, 3-D)."""
@@ -448,8 +454,8 @@ class SourceLabels:
         return out
 
     def _index_file(self, path: str) -> None:
-        for k in [k for k, v in self._index.items() if v[0] == path]:
-            del self._index[k]
+        keys: Dict[str, str] = {}
+        self._index[path] = keys
         rows, _eol, low = self._rows(path)
         c = self._cols(low)
         self._mtimes[path] = os.path.getmtime(path)
@@ -464,7 +470,8 @@ class SourceLabels:
                 continue
             three_d = any(not _is_nan_cell(r[c[k]]) for k in ("orig_x", "world_x")
                           if k in c)
-            self._index.setdefault(key, (path, "3d" if three_d else "image"))
+            if keys.get(key) != "3d":  # a 3-D row of the point wins
+                keys[key] = "3d" if three_d else "image"
 
     def _fresh(self) -> None:
         for p in self.files:
@@ -473,13 +480,20 @@ class SourceLabels:
             if self._mtimes.get(p) != os.path.getmtime(p):
                 self._index_file(p)
 
-    def locate(self, key: str) -> Optional[Tuple[str, str]]:
-        """``(file, "image" | "3d")`` of a point, or None."""
+    def locate_all(self, key: str) -> List[Tuple[str, str]]:
+        """``(file, "image" | "3d")`` of every file listing a point, in the
+        order of the files."""
         with self._lock:
             if not self.available:
-                return None
+                return []
             self._fresh()
-            return self._index.get(key)
+            return [(p, self._index[p][key]) for p in self.files
+                    if key in self._index.get(p, {})]
+
+    def locate(self, key: str) -> Optional[Tuple[str, str]]:
+        """``(file, "image" | "3d")`` of a point (its first file), or None."""
+        found = self.locate_all(key)
+        return found[0] if found else None
 
     def get(self, key: str) -> Optional[Dict[str, str]]:
         """The point's label (and label_conf) in its file, or None."""
@@ -515,44 +529,53 @@ class SourceLabels:
                 only for files with that column.
 
         Returns:
-            ``{"file", "old": {"label", "label_conf"}, "changed"}``.
+            ``{"file", "files", "old": {"label", "label_conf"}, "changed"}``:
+            ``file`` the first file listing the point (``old`` is its label
+            there), ``files`` every file that changed.
 
         Raises:
             KeyError: the point is in none of the files.
-            ValueError: the point has a 3-D position (point-cloud set).
+            ValueError: the point has a 3-D position (point-cloud set) in one
+                of them.
         """
         from substrata import annotations as sa
-        loc = self.locate(key)
-        if loc is None:
+        found = self.locate_all(key)
+        if not found:
             raise KeyError(f"{key} is in none of the training's annotation files")
-        path, kind = loc
-        if kind != "image":
+        if any(kind != "image" for _p, kind in found):
             raise ValueError(f"{key} is a point-cloud annotation (not edited)")
         with self._lock:
-            rows, eol, low = self._rows(path)
-            c = self._cols(low)
-            old, changed = None, False
-            for r in rows[1:]:
-                if not self._is(r, c, key):
-                    continue
-                if old is None:
-                    conf = r[c["label_conf"]] if "label_conf" in c else None
-                    old = {"label": r[c["label"]], "label_conf": conf}
-                if r[c["label"]] != label:
-                    r[c["label"]], changed = label, True
-                if "label_conf" in c and label_conf != "keep":
-                    v = "" if label_conf is None else f"{float(label_conf):g}"
-                    if r[c["label_conf"]] != v:
-                        r[c["label_conf"]], changed = v, True
+            old, changed_files = None, []
+            for path, _kind in found:
+                # (the file's lock from read to write: other editors of the CSV,
+                # e.g. the viewer's annotation edits, hold it too)
+                with path_lock(path):
+                    rows, eol, low = self._rows(path)
+                    c = self._cols(low)
+                    changed = False
+                    for r in rows[1:]:
+                        if not self._is(r, c, key):
+                            continue
+                        if old is None:
+                            conf = r[c["label_conf"]] if "label_conf" in c else None
+                            old = {"label": r[c["label"]], "label_conf": conf}
+                        if r[c["label"]] != label:
+                            r[c["label"]], changed = label, True
+                        if "label_conf" in c and label_conf != "keep":
+                            v = "" if label_conf is None else f"{float(label_conf):g}"
+                            if r[c["label_conf"]] != v:
+                                r[c["label_conf"]], changed = v, True
+                    if changed:
+                        if path not in self._backed_up:
+                            sa.backup_annotation_csv(path)
+                            self._backed_up.add(path)
+                        sa.write_csv_rows(path, rows, eol)
+                        self._mtimes[path] = os.path.getmtime(path)
+                        changed_files.append(path)
             if old is None:
                 raise KeyError(key)
-            if changed:
-                if path not in self._backed_up:
-                    sa.backup_annotation_csv(path)
-                    self._backed_up.add(path)
-                sa._write_csv_rows(path, rows, eol)
-                self._mtimes[path] = os.path.getmtime(path)
-            return {"file": path, "old": old, "changed": changed}
+            return {"file": found[0][0], "files": changed_files, "old": old,
+                    "changed": bool(changed_files)}
 
 
 def read_table(path: str) -> List[Dict[str, str]]:
@@ -792,14 +815,22 @@ def score_training_points(
     folder: str, clf: Any, ann_path: Optional[str] = None,
     batch_size: int = settings.POINT_BATCH_SIZE, n_jobs: int = -1,
     folds: int = settings.CURATION_CV_FOLDS, progress: bool = True,
+    splits: Optional[Sequence[str]] = settings.CURATION_SPLITS,
 ) -> Dict[str, Any]:
     """Score the training points of a classifier folder for review.
 
-    Writes ``curate/points.csv`` (one row per training point; see
+    Writes ``curate/points.csv`` (one row per scored point; see
     ``POINT_COLUMNS``), ``curate/meta.json`` and a thumbnail per point under
-    ``curate/tiles/``. Point features come from the training cache (no new
-    extraction when ``train`` ran on the same points); the neighbourhood ring
-    is read in the same windows, extracted once and cached.
+    ``curate/tiles/``. Point features come from the training cache, read at
+    the training scales (:func:`substrata.pointfeatures.training_scales`; no
+    new extraction when ``train`` ran on the same points); the neighbourhood
+    ring is read in the same windows, extracted once and cached.
+
+    Only the points of ``splits`` are scored and listed (default
+    ``settings.CURATION_SPLITS``: the train split). Relabelling validation or
+    test points where the model disagrees with them would tune the held-out
+    labels towards the model and inflate its metrics; pass ``None`` (``curate
+    --all-splits``) to review every split.
 
     Scores (NaN where they do not apply):
       * ``p_label``, ``cv_pred``, ``cv_conf``: cross-validated probability of
@@ -824,22 +855,19 @@ def score_training_points(
     rows = pf.read_training_points(ann_path, None)
     if not rows:
         raise ValueError(f"No training points in {ann_path}.")
-    n = len(rows)
-    cls = np.array([clf.label_map.get(r["label"].strip()) or "" for r in rows])
+    unknown = set(splits or ()) - set(pf.SPLIT_NAMES)
+    if unknown:
+        raise ValueError(f"Unknown split(s) {sorted(unknown)}; "
+                         f"choose from {list(pf.SPLIT_NAMES)}.")
     out_dir = curation_dir(folder)
     os.makedirs(out_dir, exist_ok=True)
     tiles = tile_store(folder)
 
-    # Scales and centre features exactly as training (cache hits)
-    gsd = None
-    if clf.target_mm_px:
-        gsd = pf._fill_gsd(rows, pf.resolve_training_gsd(rows, os.path.join(
-            folder, settings.POINT_FEATURES_DIR, "gsd_cache.json")))
-    scales = clf.scales_for(gsd, n)
+    # Scales and centre features exactly as training (cache hits). All rows
+    # go through the cache (it keeps exactly the keys it is given), then the
+    # rows outside `splits` are dropped.
+    scales = pf.training_scales(clf, rows, folder)
     keys = [pf.row_key(r) for r in rows]
-    paths = [r["cam_filepath"] for r in rows]
-    xs = [r["_x"] for r in rows]
-    ys = [r["_y"] for r in rows]
     model_cache: Dict[str, Any] = {}
 
     def loader():
@@ -848,11 +876,26 @@ def score_training_points(
         return model_cache["m"]
 
     feats, ok = pf.cached_features(
-        keys, paths, xs, ys, scales,
-        pf._cache_file(folder, clf.backbone, clf.window, "points"), loader,
+        keys, [r["cam_filepath"] for r in rows], [r["_x"] for r in rows],
+        [r["_y"] for r in rows], scales,
+        pf.feature_cache_path(folder, clf.backbone, clf.window, "points"), loader,
         clf.window, batch_size, n_jobs, desc="Point features",
-        offsets=pf._train_offsets(keys, clf.window, clf.meta.get("train_offsets")),
+        offsets=pf.enabled_training_offsets(keys, clf.window, clf.meta.get("train_offsets")),
     )
+    n_all = len(rows)
+    if splits:
+        wanted = {pf.SPLIT_NAMES.index(v) for v in splits}
+        sel = np.array([r["_split"] in wanted for r in rows], bool)
+        rows = [r for r, k in zip(rows, sel) if k]
+        keys = [k for k, keep in zip(keys, sel) if keep]
+        scales, feats, ok = scales[sel], feats[sel], ok[sel]
+        if not rows:
+            raise ValueError(f"No {'/'.join(splits)} points in {ann_path}.")
+    n = len(rows)
+    cls = np.array([clf.label_map.get(r["label"].strip()) or "" for r in rows])
+    paths = [r["cam_filepath"] for r in rows]
+    xs = [r["_x"] for r in rows]
+    ys = [r["_y"] for r in rows]
 
     # Ring features (cached) and thumbnails, in one pass over the photos
     ring = ring_offsets()
@@ -888,9 +931,12 @@ def score_training_points(
         ring_feats[todo] = rf
         ring_ok[todo] = rok
         stored = tiles.positions(names)
+    # as stored (float16), so the scores do not depend on the cache
+    ring_feats = ring_feats.astype(np.float16).astype(np.float32)
     keep = np.nonzero(ring_ok)[0]
-    np.savez(ring_path, keys=np.array([full_keys[i] for i in keep]),
-             feats=ring_feats[keep].reshape(len(keep), -1).astype(np.float16))
+    with atomic_write(ring_path, "wb") as f:  # (ring_path ends in .npz)
+        np.savez(f, keys=np.array([full_keys[i] for i in keep]),
+                 feats=ring_feats[keep].reshape(len(keep), -1).astype(np.float16))
 
     # Standardise (per camera domain) and score
     domains = [(r.get("domain") or "").strip() for r in rows]
@@ -961,7 +1007,7 @@ def score_training_points(
         return "" if v is None or not np.isfinite(v) else f"{float(v):.{d}f}"
 
     table_path = os.path.join(out_dir, settings.CURATION_POINTS_FILE)
-    with open(table_path, "w", newline="") as f:
+    with atomic_write(table_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(POINT_COLUMNS)
         for i, r in enumerate(rows):
@@ -978,7 +1024,9 @@ def score_training_points(
     clean = use & (p_label >= settings.CURATION_CLEAN_P) & (
         ring_agree >= settings.CURATION_CLEAN_RING)
     summary = {
-        "n_points": n, "n_ok": int(ok.sum()), "n_mapped": int(use.sum()),
+        "n_points": n, "n_training_points": n_all,
+        "splits": list(splits) if splits else list(pf.SPLIT_NAMES),
+        "n_ok": int(ok.sum()), "n_mapped": int(use.sum()),
         "n_clean": int(clean.sum()),
         "n_suspect": int((use & (p_label < settings.CURATION_SUSPECT_P)).sum()),
         "n_mixed": int((use & (ring_agree < settings.CURATION_MIXED_RING)).sum()),
@@ -996,7 +1044,7 @@ def score_training_points(
                   "ring_agree": settings.CURATION_CLEAN_RING},
         **{k: v for k, v in summary.items() if k not in ("table", "tiles")},
     }
-    with open(os.path.join(out_dir, settings.CURATION_META_FILE), "w") as f:
+    with atomic_write(os.path.join(out_dir, settings.CURATION_META_FILE), "w") as f:
         json.dump(meta, f, indent=1)
     return summary
 
@@ -1056,7 +1104,7 @@ def reference_width(folder: str, clf: Any) -> Optional[float]:
         return None
     paths = [r["cam_filepath"] for r in read_table(ann)
              if r.get("cam_filepath") and not (r.get("domain") or "").strip()]
-    return pf._median_image_width(paths)
+    return pf.median_image_width(paths)
 
 
 def read_pool_points(
@@ -1186,7 +1234,7 @@ def mine_pool(
 
     def scale_of(p, g=None):
         if p not in widths:
-            widths.update(pf._image_widths([p]))
+            widths.update(pf.image_widths([p]))
         return pf.photo_scale(clf, g or gsd_mm, widths.get(p), ref_w)
 
     scale = pf.photo_scale(clf, gsd_mm)
@@ -1287,7 +1335,7 @@ def mine_pool(
 
     # Novelty against the training points (their own statistics)
     novelty = np.full(len(feats), np.nan, np.float32)
-    have, tf = _load_npz(pf._cache_file(folder, clf.backbone, clf.window, "points"))
+    have, tf = _load_npz(pf.feature_cache_path(folder, clf.backbone, clf.window, "points"))
     if tf is not None and len(tf):
         zt = _l2((tf.astype(np.float32) - clf.source_mean) / clf.source_std)
         sims, _ = _knn(_l2(zp), zt, settings.CURATION_KNN)
@@ -1305,10 +1353,11 @@ def mine_pool(
     clusters = remap[km.labels_]
     dist = np.linalg.norm(zr - km.cluster_centers_[km.labels_], axis=1)
 
-    np.savez(stem + ".npz", feats=feats.astype(np.float16), mean=mean, std=std)
+    with atomic_write(stem + ".npz", "wb") as f:
+        np.savez(f, feats=feats.astype(np.float16), mean=mean, std=std)
     cols = list(settings.TRAIN_ANN_COLUMNS) + [c for c in POOL_EXTRA_COLUMNS
                                                if c not in settings.TRAIN_ANN_COLUMNS]
-    with open(stem + ".csv", "w", newline="") as f:
+    with atomic_write(stem + ".csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for i, (p, x, y) in enumerate(pts):
@@ -1350,7 +1399,7 @@ def mine_pool(
         "n_given_labels": sum(1 for _pid, g in extra if g),
         "classes": list(clf.classes), "clusters": summaries,
     }
-    with open(stem + ".json", "w") as f:
+    with atomic_write(stem + ".json", "w") as f:
         json.dump(meta, f, indent=1)
     meta["csv"] = stem + ".csv"
     return meta

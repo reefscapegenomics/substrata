@@ -7,6 +7,10 @@ import numpy as np
 
 # Local Modules
 from substrata import geom, settings, annotations, sidecars
+from substrata.fileio import atomic_write_text as _atomic_write_text
+from substrata.frames import metres_per_unit as _metres_per_unit
+from substrata.frames import uniform_scale as _uniform_scale
+from substrata.logging import logger
 import substrata.annotations as annotations
 
 
@@ -166,6 +170,10 @@ class ProjectInitializer:
         (see :meth:`world_transform_is_stale`; ``substrata baseline --update``
         refreshes it).
 
+        ``path`` is the folder relative file names are taken from. Without it,
+        or when it does not exist (the project was moved), the YAML's own
+        folder is used; a relative ``path`` is taken from the YAML's folder.
+
         ``annotations`` names the project's default annotation set. Settings of
         an annotation set (``classes``, ``cropped_path``, ``crop_size``,
         ``classifier``, ``annotations_last_highest_id``) preferably live in that
@@ -173,9 +181,9 @@ class ProjectInitializer:
         which overrides these legacy project keys.
         """
         with open(filepath, "r") as f:
-            yaml_config = yaml.safe_load(f)
+            yaml_config = yaml.safe_load(f) or {}
         self.yaml_path = filepath
-        self.path = yaml_config.get("path")
+        self.path = _project_folder(yaml_config.get("path"), filepath)
         self.id = yaml_config.get("id")
 
         # Support both new "ply" key and legacy "pcd" key for backwards compatibility
@@ -335,8 +343,7 @@ class ProjectInitializer:
 
     def parent_scale_ratio(self, parent: "ProjectInitializer") -> float:
         """Scale of parent metres per local metre (QC of both scale factors)."""
-        m = self.to_parent_world_transform(parent)[:3, :3]
-        return float(np.cbrt(np.linalg.det(m)))
+        return _uniform_scale(self.to_parent_world_transform(parent))
 
     def world_transform_from_baseline(
         self, baseline: "ProjectInitializer"
@@ -394,7 +401,7 @@ class ProjectInitializer:
             Mapping of YAML key to value, e.g. for :func:`set_project_yaml_keys`.
         """
         T = np.asarray(self.baseline_transform, dtype=float)
-        s = float(np.cbrt(np.linalg.det(T[:3, :3])))
+        s = _uniform_scale(T)
         keys = {"world_transform": self.world_transform_from_baseline(baseline)}
         if baseline.scale_factor is not None:
             keys["scale_factor"] = float(baseline.scale_factor) * s
@@ -499,12 +506,29 @@ class ProjectInitializer:
             return init.parent_id, None
         return init.parent_id, np.asarray(init.parent_transform, dtype=float) @ T
 
+    # The project YAML keys that hold file paths (relative ones are taken from ``path``)
+    _YAML_PATH_KEYS = (
+        "ply", "cams_xml", "cams_meta_json", "markers", "annotations", "classifier",
+        "photos_path", "cropped_path", "thumbnails_path", "classes",
+    )
+
     def save_config_to_yaml(self, filepath: str | None = None) -> None:
-        """
-        Save the current configuration to a YAML file.
+        """Save the current configuration to a YAML file.
+
+        The file is patched, not rebuilt: only keys whose value changed are
+        rewritten (:func:`set_project_yaml_keys`); comments, key order, keys
+        the initializer does not model and paths written relative to ``path``
+        are kept, and keys the initializer has no value for are left as they
+        are. Saving to another file starts from this project's YAML (if any).
+        Paths inside ``path`` are written relative to it. Settings an
+        annotation set's sidecar gives (classifier, cropped_path, crop_size,
+        classes) stay in the sidecar and are removed from the project YAML; a
+        ``last_highest_id`` of the sidecar is not copied into
+        ``annotations_last_highest_id``. Written atomically.
 
         Args:
-            filepath (str, optional): Path where the YAML file should be saved.
+            filepath (str, optional): Path where the YAML file should be saved
+                (default: the YAML the project was loaded from).
         """
         config = {}
         # Annotation-set keys set by the sidecar stay in the sidecar
@@ -523,7 +547,10 @@ class ProjectInitializer:
             config["markers"] = self.markers_filepath
         if self.annotations_filepath is not None:
             config["annotations"] = self.annotations_filepath
-        if self.annotations_last_highest_id is not None:
+        if (
+            self.annotations_last_highest_id is not None
+            and "last_highest_id" not in sidecar_keys
+        ):
             config["annotations_last_highest_id"] = int(
                 self.annotations_last_highest_id
             )
@@ -581,10 +608,47 @@ class ProjectInitializer:
                 "offset": _as_flow_sequence(self.color_correction["offset"]),
             }
 
+
         if filepath is None:
             filepath = self.yaml_path
-        with open(filepath, "w") as f:
-            yaml.dump(config, f, default_flow_style=False)
+        source = filepath if os.path.isfile(filepath) else self.yaml_path
+        text = ""
+        if source and os.path.isfile(source):
+            with open(source) as f:
+                text = f.read()
+        old = (yaml.safe_load(text) if text.strip() else None) or {}
+        base = self.path  # (relative file names are read from here: init_with_yaml)
+
+        def resolve(value):
+            if not isinstance(value, str) or not base or os.path.isabs(value):
+                return value
+            return os.path.normpath(os.path.join(str(base), value))
+
+        changed = {}
+        for key, value in config.items():
+            if key == "path":
+                # (kept as it is, or left out, when it gives this folder anyway: a YAML without path:
+                # stays movable)
+                if base and os.path.normpath(_project_folder(old.get("path"), filepath, warn=False)) == \
+                        os.path.normpath(str(base)):
+                    continue
+            elif key in self._YAML_PATH_KEYS:
+                if key in old and resolve(old[key]) == os.path.normpath(str(value)):
+                    continue  # (the same file, maybe written relative: kept as it is)
+                value = _relative_to(value, base)
+            elif key in old and _same_yaml_value(old[key], value):
+                continue
+            elif key == "color_correction" and isinstance(old.get(key), dict) and all(
+                _same_yaml_value(old[key].get(k), v) for k, v in value.items()
+            ):
+                continue  # (the same fit: its fit_* quality keys, from `colors`, are kept)
+            changed[key] = value
+        # Annotation-set settings the sidecar gives move out of the project YAML (the
+        # sidecar's value is the one used; annotations_last_highest_id is left as it is)
+        for key in ("classes", "cropped_path", "crop_size", "classifier"):
+            if key in sidecar_keys and key in old:
+                changed[key] = None
+        _atomic_write_text(filepath, _set_yaml_keys_text(text, changed), newline="")
 
     def apply_annotation_sidecar(self) -> None:
         """Take annotation-set settings from the annotations CSV's sidecar YAML.
@@ -816,6 +880,7 @@ class ProjectInitializer:
             self.apply_world_transform()
 
         self.propagate_depth_model()
+        self.propagate_metres_per_unit()
 
         if (
             apply_color_correction
@@ -864,6 +929,22 @@ class ProjectInitializer:
                     key = "depth_scale_factor"
                 setattr(obj, key, value)
 
+    def propagate_metres_per_unit(self) -> None:
+        """Set ``metres_per_unit`` on the loaded cameras, markers and annotations.
+
+        The project's metres per original model unit
+        (:func:`substrata.frames.metres_per_unit` of ``world_transform`` and
+        ``scale_factor``): what ground resolutions (``pointfeatures``) and the
+        occlusion test's line-of-sight margin read, which the objects cannot
+        tell by themselves for a project that has a ``scale_factor`` but no
+        ``world_transform``. Called by :meth:`initialize` and the orient methods.
+        """
+        mpu = _metres_per_unit(self.world_transform, self.scale_factor)
+        for attr_name in ("cams", "markers", "annotations"):
+            obj = getattr(self, attr_name, None)
+            if obj is not None:
+                obj.metres_per_unit = mpu
+
     def apply_world_transform(self, skip_pcd=False):
         """
         Apply world_transform to loaded objects.
@@ -871,9 +952,9 @@ class ProjectInitializer:
         """
         transform_targets = [
             ("pcd", "Pointcloud", "apply_transform") if not skip_pcd else None,
-            ("cams", "Cameras", "transform_coords"),
-            ("markers", "Markers", "transform_coords"),
-            ("annotations", "Annotations", "transform_coords"),
+            ("cams", "Cameras", "apply_transform"),
+            ("markers", "Markers", "apply_transform"),
+            ("annotations", "Annotations", "apply_transform"),
         ]
 
         # Apply world_transform to all loaded objects and warn if they already have a
@@ -893,7 +974,7 @@ class ProjectInitializer:
         Compute project scale factor. Does not apply any transforms.
         """
         self.scalebars = annotations.Scalebars(settings.RGL_SCALEBARS, self.markers)
-        self.scale_factor = self.scalebars.calc_scalefactor()
+        self.scale_factor = self.scalebars.calc_scale_factor()
         return self.scale_factor
 
     def scale_and_orient(self, plot=True, recalculate=True, depth_markers=None):
@@ -945,6 +1026,7 @@ class ProjectInitializer:
 
         # Set depth attributes on pcd, cameras, markers and annotations
         self.propagate_depth_model()
+        self.propagate_metres_per_unit()
         # Set depth_markers attributes if depth_markers were used
         if depth_markers is not None:
             depth_markers.up_vector = self.up_vector
@@ -1025,7 +1107,7 @@ class ProjectInitializer:
             )
         else:
             transform = chunk_transform
-            scale = float(np.cbrt(np.linalg.det(chunk_transform[:3, :3])))
+            scale = _uniform_scale(chunk_transform)
             print("chunk_transform is not geocentric; applying it as-is")
         print(f"  Scale factor (from chunk_transform): {scale:.6f}")
 
@@ -1045,6 +1127,7 @@ class ProjectInitializer:
         self.depth_per_unit = float(np.linalg.norm(self.up_vector))
         self.apply_world_transform(skip_pcd=True)
         self.propagate_depth_model()
+        self.propagate_metres_per_unit()
 
         return self.world_transform
 
@@ -1142,6 +1225,32 @@ class ProjectInitializer:
             self.yaml_path = os.path.join(new_base_path, yaml_filename)
 
 
+def _relative_to(path: str, base: str | None) -> str:
+    """``path`` relative to ``base`` when it lies inside it, else as it is."""
+    if not base or not isinstance(path, str) or not os.path.isabs(path):
+        return path
+    base = os.path.abspath(str(base))
+    try:
+        inside = os.path.commonpath([base, os.path.abspath(path)]) == base
+    except ValueError:  # (another drive)
+        return path
+    return os.path.relpath(path, base) if inside else path
+
+
+def _project_folder(path: str | None, yaml_path: str, warn: bool = True) -> str:
+    """The folder a project YAML's relative file names are taken from: its ``path`` (relative: from the YAML's
+    folder) when that folder exists, else the YAML's own folder (with a warning when ``path`` was given)."""
+    here = os.path.dirname(os.path.abspath(yaml_path))
+    if path in (None, ""):
+        return here
+    folder = os.path.normpath(os.path.join(here, str(path)))  # (an absolute path stays as it is)
+    if os.path.isdir(folder):
+        return str(path) if os.path.isabs(str(path)) else folder
+    if warn:
+        logger.warning(f"{yaml_path}: path {path!r} does not exist; using the YAML's folder {here}")
+    return here
+
+
 def _rebase_path(path: str, old_base: str | None, new_base: str) -> str:
     """Move ``path`` from ``old_base`` to ``new_base`` (see reset_paths_to_local).
 
@@ -1178,15 +1287,23 @@ def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
 
     Each key's existing block (its line plus indented continuation lines) is
     removed and the new values are appended; a value of None only removes the
-    key. Unlike :meth:`ProjectInitializer.save_config_to_yaml` this keeps
+    key. Like :meth:`ProjectInitializer.save_config_to_yaml` this keeps
     comments, relative paths and keys the initializer does not model.
 
     Args:
-        yaml_path: The project YAML to update (written atomically).
+        yaml_path: The project YAML to update (written atomically, its
+            permission mode kept).
         values: Mapping of top-level key to value (arrays become flow lists).
     """
     with open(yaml_path) as f:
-        lines = f.read().splitlines(keepends=True)
+        text = f.read()
+    _atomic_write_text(yaml_path, _set_yaml_keys_text(text, values), newline="")
+
+
+def _set_yaml_keys_text(text: str, values: dict) -> str:
+    """``text`` (a YAML file's) with the top-level keys of ``values`` set (see
+    :func:`set_project_yaml_keys`)."""
+    lines = text.splitlines(keepends=True)
     out, skipping = [], False
     for line in lines:
         # Block-sequence items ("- ...") may start at column 0 and still belong
@@ -1200,6 +1317,7 @@ def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
             out.append(line)
     if out and not out[-1].endswith("\n"):
         out[-1] += "\n"
+
     def _yamlable(v):
         if isinstance(v, dict):
             return {k: _yamlable(x) for k, x in v.items()}
@@ -1211,10 +1329,20 @@ def set_project_yaml_keys(yaml_path: str, values: dict) -> None:
     text = "".join(out)
     if new:
         text += yaml.dump(new, default_flow_style=False, sort_keys=False)
-    tmp = f"{yaml_path}.tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, yaml_path)
+    return text
+
+
+def _same_yaml_value(old, new) -> bool:
+    """Whether a YAML value read back (``old``) equals the one to write (``new``)."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return old.keys() == new.keys() and all(_same_yaml_value(old[k], new[k]) for k in old)
+    if isinstance(new, (list, tuple, np.ndarray)) or isinstance(old, (list, tuple)):
+        try:
+            a, b = np.asarray(old, dtype=float), np.asarray(new, dtype=float)
+        except (TypeError, ValueError):
+            return list(old or []) == list(new)
+        return a.shape == b.shape and bool(np.array_equal(a, b))
+    return old == new
 
 
 def _parse_link_transform(value, key: str) -> np.ndarray | None:

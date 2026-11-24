@@ -35,18 +35,20 @@ python -m pip install -e .
 
 ## A first taste — command line
 
-Create a project folder from a Metashape `.psx`, then run a couple of high-level
-commands from inside it:
+Put the Metashape `.psx` in a folder named after the project id, then run a
+couple of high-level commands from inside it:
 
 ```bash
-# Initialize a project folder from a Metashape .psx (see the Projects page)
-substrata metashape-export --psx cur_sna_20m_20200303.psx
-
-cd cur_sna_20m_20200303
-substrata orient       # compute scale + orientation, write <id>.yaml
+cd cur_sna_20m_20200303          # holds cur_sna_20m_20200303.psx
+substrata metashape-export       # point cloud, cameras, markers, starter <id>.yaml
 substrata scalebars    # QC PDF of the scalebar fit
+substrata orient       # compute scale + orientation, write them to <id>.yaml
 substrata views        # composite-views PDF
 ```
+
+`metashape-export` writes into the current folder (or `-o DIR`), never into a new
+subfolder. {doc}`tutorials/plot_workflow` goes through these steps and the checks
+after each.
 
 Most commands auto-detect the project in the current directory, so you rarely
 need to pass file paths. See {doc}`command_line_usage` for every subcommand and
@@ -69,12 +71,21 @@ proj.annotations         # Annotations
 ```
 
 From here you can compute measurements, transfer annotations, or render QC
-reports. The tutorial notebooks walk through complete workflows end to end.
+reports. The tutorials below walk through complete workflows end to end.
 
 ## Next steps
 
 - {doc}`projects` — set up and configure your own project (the on-disk layout,
   the YAML project file, and the full schema).
+- {doc}`tutorials/plot_workflow` — from a Metashape project to a scaled,
+  oriented plot ready to measure, with the checks after each step.
+- {doc}`tutorials/annotate_and_classify` — point intercepts, labelling, training
+  a classifier, predicting and segmenting.
+- {doc}`tutorials/closeups` — close-up (macro) photos of colonies: poses,
+  annotations and one page per colony.
+- {doc}`tutorials/measurements_in_python` — TPI/TRI, roughness, plane angles,
+  vector dispersion, gap fraction and benthic fraction, and exactly what each
+  computes.
 - {doc}`command_line_usage` — every command-line subcommand and its options.
 - {doc}`notebooks/scaling_and_orientation` — scale and orient a point cloud from
   scalebar markers.

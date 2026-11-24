@@ -343,7 +343,7 @@ class TestTrainingHooks(unittest.TestCase):
         rows = self.rows
         self.store.append(
             [
-                # accepted at 0.25: now below --min_conf 0.5
+                # accepted at 0.25: now below --min-conf 0.5
                 {"key": cur.row_point_key(rows[2]), "action": "accept",
                  "orig_label": "B", "label_conf": 0.25},
                 # relabelled with a high confidence: kept, with that label_conf
@@ -574,7 +574,8 @@ class TestScoringAndPools(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_score_training_points(self):
-        summary = cur.score_training_points(self.d, self.clf, progress=False, folds=3)
+        summary = cur.score_training_points(self.d, self.clf, progress=False, folds=3,
+                                            splits=None)
         self.assertEqual(summary["n_points"], 48)
         rows = cur.read_table(summary["table"])
         self.assertEqual(list(rows[0]), cur.POINT_COLUMNS)
@@ -596,7 +597,8 @@ class TestScoringAndPools(unittest.TestCase):
         self.assertEqual(meta["n_points"], 48)
         # second run: everything cached (float16), same scores
         again = cur.read_table(
-            cur.score_training_points(self.d, self.clf, progress=False, folds=3)[
+            cur.score_training_points(self.d, self.clf, progress=False, folds=3,
+                                      splits=None)[
                 "table"
             ]
         )
@@ -605,6 +607,26 @@ class TestScoringAndPools(unittest.TestCase):
             [float(r["p_label"]) for r in rows],
             atol=2e-3,
         )
+
+    def test_score_only_the_train_split_by_default(self):
+        # held-out points are not listed for review (their labels would be tuned
+        # towards the model); the feature cache still keeps every point
+        summary = cur.score_training_points(self.d, self.clf, progress=False, folds=3)
+        rows = cur.read_table(summary["table"])
+        self.assertEqual(summary["splits"], ["train"])
+        self.assertEqual(summary["n_training_points"], 48)
+        self.assertTrue(rows and {r["split"] for r in rows} == {"train"})
+        self.assertEqual(len(rows), summary["n_points"])
+        every = pf.read_training_points(self.ann, None)
+        self.assertEqual(len(rows), sum(r["_split"] == 0 for r in every))
+        cache = np.load(pf.feature_cache_path(self.d, self.clf.backbone, self.clf.window,
+                                       "points"))
+        self.assertEqual(len(cache["keys"]), 48)
+        allsplits = cur.score_training_points(self.d, self.clf, progress=False,
+                                              folds=3, splits=None)
+        self.assertEqual(allsplits["n_points"], 48)
+        with self.assertRaises(ValueError):
+            cur.score_training_points(self.d, self.clf, progress=False, splits=["dev"])
 
     def test_score_with_a_class_the_classifier_never_saw(self):
         # e.g. all points of a rare class ended up in the validation split

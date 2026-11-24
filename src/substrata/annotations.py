@@ -1,9 +1,8 @@
 # Standard Library
 
 import csv
-import logging
+import io
 import os
-import random
 import re
 from collections import Counter
 from typing import (
@@ -12,6 +11,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Set,
@@ -29,19 +29,21 @@ import pandas as pd
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
-import matplotlib
-from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
 from substrata import (
     settings,
     measurements,
     cameras,
-    visualizations,
     geom,
     pointclouds,
     sidecars,
 )
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.fileio import atomic_write as _atomic_write
+from substrata.fileio import path_lock as _path_lock
+from substrata.frames import metres_per_unit as _metres_per_unit
+from substrata.frames import uniform_scale as _uniform_scale
 from substrata.logging import logger
 
 
@@ -72,6 +74,10 @@ class Annotations:
         ("pred_agree", ["pred_agree"], False),
         ("pred_top", ["pred_top"], False),
     ]
+    # private attributes _empty_like carries over to a subset
+    _SUBSET_PRIVATE = ("_crops_root", "_other_col_names")
+    # CSV header save() writes for a field of _FIELD_CONFIG, where not the field name
+    _SAVE_NAMES = {"depth_sensor_m": "depth"}
 
     def __init__(
         self,
@@ -85,6 +91,8 @@ class Annotations:
     ) -> None:
         self.data = {}
         self.measurements = {}
+        # rows of the loaded CSV that repeat an id (kept for save)
+        self.duplicate_rows: List[Dict[str, str]] = []
         self.world_transform = np.eye(4)
         self.filepath: Optional[str] = None  # CSV the annotations were loaded from
         self._crops_root: Optional[str] = None
@@ -93,7 +101,8 @@ class Annotations:
 
         if filepath is not None:
             self.get_annotations_from_file(
-                filepath, header=header, orig_coords_only=orig_coords_only
+                filepath, header=header, orig_coords_only=orig_coords_only,
+                ignore_header=ignore_header,
             )
         elif coords is not None:
             self.get_annotations_from_coords(coords)
@@ -110,12 +119,9 @@ class Annotations:
     def __contains__(self, key: str) -> bool:
         return key in self.data
 
-    def __iter__(self) -> "Annotations":
-        self._iter = iter(self.data.values())
-        return self
-
-    def __next__(self) -> "Annotation":
-        return next(self._iter)
+    def __iter__(self) -> Iterator["Annotation"]:
+        """Iterate over the annotations (a fresh iterator each time, so loops can nest)."""
+        return iter(self.data.values())
 
     def __len__(self) -> int:
         return len(self.data)
@@ -157,11 +163,6 @@ class Annotations:
     @crops_root.setter
     def crops_root(self, value: Optional[str]) -> None:
         self._crops_root = value
-
-    @property
-    def classifications(self) -> List[Optional[str]]:
-        """List of each annotation's classification (``None`` if unset)."""
-        return [annotation.classification for annotation in self.data.values()]
 
     @property
     def image_matches(self) -> Dict[str, Any]:
@@ -260,7 +261,19 @@ class Annotations:
         orig_coords_only: bool = False,
         ignore_header: bool = False,
     ) -> None:
-        """Read in annotations from a file and store in dict.
+        """Read in annotations from a CSV file and store them in ``data``.
+
+        The file is parsed with the ``csv`` module (quoted cells may hold
+        commas; a UTF-8 byte-order mark is ignored). Columns the class does not
+        model are kept per annotation in ``other_cols`` (``{header: value}``, in
+        file order) and written back by :meth:`save`.
+
+        Rows whose id is an annotation's id plus a postfix of
+        ``settings.ANN_ID_POST_FIXES`` (``_left`` / ``_right``, at the end of the
+        id) are stored as that annotation's ``extra_coords`` wherever they sit in
+        the file. A row repeating an id already read is kept aside in
+        ``duplicate_rows`` (written back by :meth:`save`), with a warning; it does
+        not change the annotation.
 
         Args:
             annotations_filepath: Path to the file.
@@ -268,7 +281,7 @@ class Annotations:
             orig_coords_only: Whether to only use original coordinates.
             ignore_header: If True, skip the first line and ignore the header argument.
         """
-        annotations_file = open(annotations_filepath, "r")
+        rows = _read_csv_table(annotations_filepath)
         self.filepath = annotations_filepath
         self.sidecar = sidecars.read_annotation_sidecar(annotations_filepath)
         if self.sidecar.get("cropped_path"):
@@ -276,59 +289,90 @@ class Annotations:
 
         # If ignore_header is True, skip first line and treat as no header
         if ignore_header:
-            next(annotations_file, None)  # Skip first line
+            rows = rows[1:]
             header = False
+        if header and rows:
+            self.col_order = self.__determine_col_order(rows[0])
+            names = [c.strip() for c in rows[0]]
+            first = 1
+        else:
+            self.col_order = dict(settings.ANN_DEFAULT_COL_ORDER)
+            names = []
+            first = 0
+        self._other_col_names = self.__other_column_names(names, rows[first:])
 
-        for line_no, line in enumerate(annotations_file):
-            if line_no == 0 and header:
-                self.col_order = self.__determine_col_order(line)
-                continue  # skip to next line
-            elif line_no == 0 and not header:
-                self.col_order = settings.ANN_DEFAULT_COL_ORDER
+        records = []  # (line_no, cells, id)
+        for line_no, cols in enumerate(rows):
+            if line_no < first or not any(c.strip() for c in cols):
+                continue
+            idx = self.col_order.get("id")
+            records.append((line_no, cols, cols[idx] if idx < len(cols) else ""))
+        plain_ids = {i for _, _, i in records if _strip_id_postfix(i) == i}
 
-            cols = line.rstrip("\r\n").split(",")
-            (
-                id,
-                orig_x,
-                orig_y,
-                orig_z,
-                label,
-                label_conf,
-                world_x,
-                world_y,
-                world_z,
-                cam_filepath,
-                cam_x,
-                cam_y,
-                other_cols,
-                depth_sensor_m,
-            ) = self.__get_annotation_fields(cols)
-            ann_id = self.__strip_post_fixes(id)
-            if ann_id not in self.data:
-                # New annotation
-                self.data[id] = Annotation([orig_x, orig_y, orig_z], id=id, parent=self)
-                self.data[id].line_no = line_no
-                self.data[id].label = self.data[id].classification = label
-                self.data[id].label_conf = label_conf
-                if world_x is not None and orig_coords_only is False:
-                    self.data[id].coords = np.asarray(
-                        [world_x, world_y, world_z], dtype=float
-                    )
-                # Load optional camera fields if present
-                self.data[id].cam_filepath = (
-                    cam_filepath if cam_filepath not in [None, ""] else None
-                )
-                self.data[id].cam_x = float(cam_x) if cam_x not in [None, ""] else None
-                self.data[id].cam_y = float(cam_y) if cam_y not in [None, ""] else None
-                self.data[id].depth_sensor_m = (
-                    float(depth_sensor_m) if depth_sensor_m not in [None, ""] else None
-                )
-                self.data[id].other_cols = other_cols
-                self.__set_prediction_fields(self.data[id], cols)
+        self.duplicate_rows = []
+        postfixed = []
+        for line_no, cols, id in records:
+            base = _strip_id_postfix(id)
+            if base != id and base in plain_ids:
+                postfixed.append((line_no, cols, base))
+            elif id in self.data:
+                self.__keep_duplicate(id, line_no, cols)
             else:
-                # Additional coordinates for existing annotation
-                self.data[ann_id].add_extra_coords(line.rstrip("\r\n"))
-        annotations_file.close()
+                self.__add_from_row(id, line_no, cols, orig_coords_only)
+        # Postfixed rows (e.g. ``sb1_left``) of an annotation in the file, in any order
+        for line_no, cols, base in postfixed:
+            ann = self.data[base]
+            row = self.__row_dict(cols)
+            if row["id"] in ann.extra_coords:
+                self.__keep_duplicate(row["id"], line_no, cols)
+            else:
+                ann.add_extra_coords(cols)
+                ann.extra_rows[row["id"]] = row
+
+    def __add_from_row(
+        self, id: str, line_no: int, cols: List[str], orig_coords_only: bool
+    ) -> None:
+        """Create the annotation of one CSV row."""
+        (
+            _id,
+            orig_x,
+            orig_y,
+            orig_z,
+            label,
+            label_conf,
+            world_x,
+            world_y,
+            world_z,
+            cam_filepath,
+            cam_x,
+            cam_y,
+            other_cols,
+            depth_sensor_m,
+        ) = self.__get_annotation_fields(cols)
+        ann = Annotation([orig_x, orig_y, orig_z], id=id, parent=self)
+        self.data[id] = ann
+        ann.line_no = line_no
+        ann.label = ann.classification = label
+        ann.label_conf = label_conf
+        if world_x not in (None, "") and orig_coords_only is False:
+            ann.coords = np.asarray([world_x, world_y, world_z], dtype=float)
+        # Load optional camera fields if present
+        ann.cam_filepath = cam_filepath if cam_filepath not in [None, ""] else None
+        ann.cam_x = float(cam_x) if cam_x not in [None, ""] else None
+        ann.cam_y = float(cam_y) if cam_y not in [None, ""] else None
+        ann.depth_sensor_m = (
+            float(depth_sensor_m) if depth_sensor_m not in [None, ""] else None
+        )
+        ann.other_cols = other_cols
+        self.__set_prediction_fields(ann, cols)
+
+    def __keep_duplicate(self, id: str, line_no: int, cols: List[str]) -> None:
+        """Keep a row whose id was already read (written back by :meth:`save`)."""
+        logger.warning(
+            f"{os.path.basename(str(self.filepath))}: id {id!r} repeated on line "
+            f"{line_no + 1}; the row is kept as is but not loaded as an annotation"
+        )
+        self.duplicate_rows.append(self.__row_dict(cols))
 
     def get_annotations_from_coords(
         self,
@@ -347,86 +391,6 @@ class Annotations:
             for i, coords in enumerate(annotations_coords):
                 if coords is not None:
                     self.data[i] = Annotation(coords, id=i, parent=self)
-
-    def get_annotations_from_google_worksheet(
-        self, worksheet: Any, header: bool = True
-    ) -> None:
-        """Use a Google worksheet to fill the annotations class.
-
-        Args:
-            worksheet: Google worksheet object.
-            header: Whether the worksheet has a header row.
-        """
-        worksheet_data = worksheet.get_all_values()
-        for row_number, row_cols in enumerate(worksheet_data, start=1):
-            if row_number == 1 and header:
-                self.col_order = self.__determine_col_order(",".join(row_cols))
-                continue  # skip to next line
-            elif row_number == 0 and not header:
-                self.col_order = settings.ANN_DEFAULT_COL_ORDER
-
-            (
-                id,
-                orig_x,
-                orig_y,
-                orig_z,
-                label,
-                label_conf,
-                world_x,
-                world_y,
-                world_z,
-                cam_filepath,
-                cam_x,
-                cam_y,
-                other_cols,
-            ) = self.__get_annotation_fields(row_cols)
-            if id not in self.data:
-                # New annotation
-                self.data[id] = Annotation([orig_x, orig_y, orig_z], id=id, parent=self)
-                self.data[id].line_no = row_number
-                self.data[id].label = self.data[id].classification = label
-                self.data[id].label_conf = label_conf
-                if world_x is not None:
-                    self.data[id].coords = np.asarray(
-                        [world_x, world_y, world_z], dtype=float
-                    )
-                # Load optional camera fields if present
-                self.data[id].cam_filepath = (
-                    cam_filepath if cam_filepath not in [None, ""] else None
-                )
-                self.data[id].cam_x = float(cam_x) if cam_x not in [None, ""] else None
-                self.data[id].cam_y = float(cam_y) if cam_y not in [None, ""] else None
-                self.data[id].other_cols = other_cols
-            else:
-                # Additional coordinates for existing annotation
-                self.data[id].add_extra_coords(",".join(row_cols))
-
-    def add_meta_data(self, data_filepath: str) -> None:
-        """Add metadata to annotations from a CSV file (requires header).
-
-        Args:
-            data_filepath: Path to the CSV file.
-        """
-        data_file = open(data_filepath, "r")
-        col_headers = None
-        for line_no, line in enumerate(data_file):
-            if line_no == 0:
-                self.col_order = self.__determine_col_order(line)
-                cols = line.rstrip("\r\n").split(",")
-                col_headers = [col.strip('"') for col in cols]
-                continue  # skip to next line
-
-            cols = line.rstrip("\r\n").split(",")
-            ann_id = cols[self.col_order["id"]]
-            if ann_id in self.data.keys():
-                self.data[ann_id].meta_data = {}
-                if col_headers is not None:
-                    for i in range(0, len(col_headers)):
-                        if i + 1 < len(cols):
-                            self.data[ann_id].meta_data[col_headers[i]] = cols[i + 1]
-            else:
-                print(f"No annotation with ID {ann_id} found.")
-        data_file.close()
 
     def get_new_id(
         self,
@@ -613,7 +577,7 @@ class Annotations:
             f"(label prefix {', '.join(prefixes) or 'any'}; {len(skipped)} "
             f"skipped) to {len(man_anns)} manual annotations"
         )
-        world_scale = float(np.cbrt(abs(np.linalg.det(self.world_transform[:3, :3]))))
+        world_scale = _uniform_scale(self.world_transform)
         cam_list = [c for c in cams if getattr(c, "sensor", None) is not None]
 
         # 1. Candidates by 3-D proximity
@@ -865,16 +829,6 @@ class Annotations:
 
         return results
 
-    def assign_image_match_classification_to_label(self) -> None:
-        """Iterate over all annotations and assign the classification to the label."""
-        for ann in self.data.values():
-            if ann.image_match is not None:
-                ann.label = ann.image_match.classification["label"]
-                ann.label_conf = -1
-            else:
-                ann.label = None
-                ann.label_conf = None
-
     def _ordered(
         self, ids: Optional[Iterable[str]] = None,
         priority_ids: Optional[Iterable[str]] = None,
@@ -1028,7 +982,7 @@ class Annotations:
                 if on_progress:
                     on_progress(done)
         bar.close()
-        counts = cameras._count_statuses(statuses)
+        counts = cameras.count_crop_statuses(statuses)
         if prune:
             counts["stale"] = n_stale
         return counts
@@ -1211,7 +1165,9 @@ class Annotations:
         if plot:
             from substrata import visualizations
 
-            visualizations.plot_depth_regression(depths, res.depths_pred)
+            visualizations.plot_depth_regression(
+                res.depths, res.depths_pred, errors=res
+            )
 
         # Print summary statistics
         print(
@@ -1303,14 +1259,10 @@ class Annotations:
             filepath=filepath, width=width, height=height
         )
 
-    # def get_pcd(self):
-    #     """Get a point cloud of all annotation coordinates."""
-    #     pcd = geometry.PointCloud()
-    #     pcd.points = utility.Vector3dVector(self.get_all_coords())
-    #     return pcd``
+    def apply_transform(self, transform: Union[np.ndarray, Any]) -> None:
+        """Apply a 4x4 transform to all annotation coordinates.
 
-    def transform_coords(self, transform: Union[np.ndarray, Any]) -> None:
-        """Apply a transformation to all annotation coordinates.
+        ``world_transform`` becomes ``transform @ world_transform``.
 
         Args:
             transform: A 4x4 transformation matrix or a Transform instance.
@@ -1324,35 +1276,27 @@ class Annotations:
             self.data[ann_id].transform_coords(transform)
         self.world_transform = np.dot(matrix, self.world_transform)
 
-    # Alias for compatibility
-    apply_transform = transform_coords
+    transform_coords = apply_transform  # deprecated alias (renamed 2026-11-25)
 
-    def get_original_coords(self, transform_matrix: np.ndarray) -> None:
-        """Revert transformed coordinates using the given transformation.
+    @_renamed_kwargs(transform_matrix="transform")
+    def reverse_transform(self, transform: np.ndarray) -> None:
+        """Set ``orig_coords`` from ``coords`` and the transform between them.
+
+        For annotations whose ``coords`` are in a frame ``transform``
+        maps the original (model) frame to: ``orig_coords = inv(T) @ coords``,
+        and ``world_transform`` becomes ``T`` (``coords = T @ orig_coords``
+        then holds, whatever ``world_transform`` was before).
 
         Args:
-            transform_matrix: The transformation matrix to invert.
+            transform: The 4x4 transform from the original frame to the
+                frame of ``coords``.
         """
+        T = np.asarray(transform, dtype=float)
         for ann_id in self.data:
-            self.data[ann_id].reverse_transform_coords(transform_matrix)
-        self.world_transform = np.dot(
-            np.array(transform_matrix), self.world_transform
-        )  # TODO: CHECK!
+            self.data[ann_id].reverse_transform_coords(T)
+        self.world_transform = T.copy()
 
-    def random_subset(self, length: int) -> "Annotations":
-        """Return a random subset of annotations.
-
-        Args:
-            length: Number of annotations to include.
-
-        Returns:
-            New container with the selected annotations.
-        """
-        annotations_subset = Annotations()
-        random_keys = random.sample(list(self.data.keys()), length)
-        for ann_id in random_keys:
-            annotations_subset.data[ann_id] = self.data[ann_id]
-        return annotations_subset
+    get_original_coords = reverse_transform  # deprecated alias (renamed 2026-11-25)
 
     def subset(self, length: int) -> "Annotations":
         """Return a subset of annotations.
@@ -1363,7 +1307,7 @@ class Annotations:
         Returns:
             New container with the selected annotations.
         """
-        annotations_subset = Annotations()
+        annotations_subset = self._empty_like()
         for ann_id in list(self.data.keys())[:length]:
             annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
@@ -1377,7 +1321,7 @@ class Annotations:
         Returns:
             New container with matching annotations.
         """
-        annotations_subset = Annotations()
+        annotations_subset = self._empty_like()
         for ann in self.data.values():
             if ann.id.startswith(prefix):
                 annotations_subset.data[ann.id] = ann
@@ -1398,40 +1342,10 @@ class Annotations:
             label_set = {label_string_or_list}
         else:
             label_set = set(label_string_or_list)
-        annotations_subset = Annotations()
+        annotations_subset = self._empty_like()
         for ann in self.data.values():
             if ann.label in label_set:
                 annotations_subset.data[ann.id] = ann
-        return annotations_subset
-
-    def subset_by_label_prefix(self, prefix: str) -> "Annotations":
-        """Return a subset of annotations where the label contains the given prefix.
-
-        Args:
-            prefix: Prefix to search for in annotation labels.
-
-        Returns:
-            New container with annotations whose label contains the prefix.
-        """
-        annotations_subset = Annotations()
-        for ann in self.data.values():
-            if ann.label is not None and prefix in ann.label:
-                annotations_subset.data[ann.id] = ann
-        return annotations_subset
-
-    def subset_by_range(self, start_idx: int, end_idx: int) -> "Annotations":
-        """Return a subset of annotations based on index range.
-
-        Args:
-            start_idx: Starting index.
-            end_idx: Ending index.
-
-        Returns:
-            New container with annotations in the range.
-        """
-        annotations_subset = Annotations()
-        for ann_id in list(self.data.keys())[start_idx:end_idx]:
-            annotations_subset.data[ann_id] = self.data[ann_id]
         return annotations_subset
 
     def subset_by_depth_range(
@@ -1442,7 +1356,7 @@ class Annotations:
         Depth comes from the depth regression (``up_vector``/``depth_offset``),
         not from ``z``. It is compared as a magnitude, so the range is in positive
         metres whether the project stores depth as positive or as negative height
-        (e.g. after ``orient --use_chunk_transform``). Both bounds are inclusive
+        (e.g. after ``orient --use-chunk-transform``). Both bounds are inclusive
         and may be given in either order.
 
         If the regression is not set, ``z`` of the transformed coordinates is
@@ -1503,22 +1417,32 @@ class Annotations:
         return annotations_subset
 
     def _empty_like(self) -> "Annotations":
-        """Return an empty Annotations container inheriting this instance's metadata."""
+        """An empty container with this one's metadata (``world_transform``,
+        ``filepath``, ``crops_root``, ``up_vector``, ``col_order``, sidecar, ...).
+
+        Arrays, dicts and lists are copied (one level), so changing the subset's
+        metadata leaves this container as it is; ``data``, ``measurements`` and
+        ``duplicate_rows`` start empty, private caches are not carried over.
+        """
         subset = Annotations()
+        skip = {"data", "measurements", "duplicate_rows", "_iter"}
         for attr, val in self.__dict__.items():
-            if attr == "data":
+            if attr in skip or (attr.startswith("_") and attr not in self._SUBSET_PRIVATE):
                 continue
+            if isinstance(val, np.ndarray):
+                val = val.copy()
+            elif isinstance(val, (dict, list)):
+                val = type(val)(val)
             try:
                 setattr(subset, attr, val)
-            except Exception:
+            except Exception:  # noqa: BLE001 - e.g. a read-only property
                 pass
-        subset.data = {}
         return subset
 
-    def get_radius_from_2D_surface_area(self) -> None:
+    def get_radius_from_2d_surface_area(self) -> None:
         """Set each annotation's ``radius`` from its 2D surface area measurement.
 
-        Calls ``Annotation.get_radius_from_2D_surface_area()`` for every annotation
+        Calls ``Annotation.get_radius_from_2d_surface_area()`` for every annotation
         that has ``SA_in_cm2`` set.  Annotations without it are skipped with a
         warning.  After this call, each annotation's ``self.radius`` is populated and
         can be used by ``get_point_cloud_by_radius`` and
@@ -1529,12 +1453,14 @@ class Annotations:
             if not ann.measurements.get("SA_in_cm2"):
                 missing_sa.append(ann_id)
                 continue
-            ann.get_radius_from_2D_surface_area()
+            ann.get_radius_from_2d_surface_area()
         if missing_sa:
             logger.warning(
                 "SA_in_cm2 not set for the following annotations (skipped): %s",
                 ", ".join(str(ann_id) for ann_id in missing_sa),
             )
+
+    get_radius_from_2D_surface_area = get_radius_from_2d_surface_area  # deprecated alias (renamed 2026-11-25)
 
     def get_min_radius(self) -> float:
         """Return the minimum ``radius`` across all annotations that have one set.
@@ -1584,11 +1510,15 @@ class Annotations:
         Args:
             source_pcd: Source point cloud.
             radius: Search radius in metres.  If ``None``, each annotation's
-                ``self.radius`` is used.  Call ``get_radius_from_2D_surface_area()``
+                ``self.radius`` is used.  Call ``get_radius_from_2d_surface_area()``
                 beforehand to set per-annotation radii automatically.
-            cylinder: If True, use a vertical cylinder search (XY distance only,
-                Z unconstrained) instead of a 3D sphere.  Recommended for TPI;
-                use a radius >= TPI ``radius_outer``.
+            cylinder: If True, a vertical cylinder (XY distance only, Z
+                unconstrained); False (default), a 3D sphere. TPI/TRI need the
+                cylinder (a sphere clips the annulus on a slope; use a radius >=
+                ``radius_outer``). Roughness, plane angles and vector dispersion
+                need the sphere: on a steep slope an unbounded cylinder takes in a
+                long strip of surface and whatever lies above or below it (Ra about
+                3x, plane elevation +38 deg on sa3_40m close-up targets at 0.15 m).
             radius_buffer: Additional metres added to each annotation's effective
                 radius.  ``self.radius`` on each annotation is unaffected.
         """
@@ -1602,12 +1532,13 @@ class Annotations:
                 radius_buffer=radius_buffer,
             )
 
+    @_renamed_kwargs(show_progress="progress")
     def load_undecimated_neighborhoods(
         self,
         ply_filepath: str,
         radius: Optional[float] = None,
         scale_factor: float = 1.0,
-        show_progress: bool = True,
+        progress: bool = True,
         cylinder: bool = False,
     ) -> None:
         """Load undecimated point cloud neighborhoods from a PLY file for all annotations.
@@ -1625,19 +1556,22 @@ class Annotations:
             ply_filepath: Path to the undecimated PLY file.
             radius: Real-world search radius in metres.  If ``None``, each
                 annotation's ``self.radius`` is used.  Call
-                ``get_radius_from_2D_surface_area()`` beforehand to populate
+                ``get_radius_from_2d_surface_area()`` beforehand to populate
                 per-annotation radii automatically.
             scale_factor: Scale factor that converts model-space units to real-world
                 metres (real_distance = model_distance * scale_factor). The radius
                 is divided by this value before searching so that the result
                 corresponds to the requested real-world radius. Defaults to 1.0
                 (no scaling).
-            show_progress: Whether to show progress bar during extraction.
-            cylinder: If True, use a top-down cylinder search (2D XY distance
-                only, ignoring Z). The Annotations world_transform is passed to
-                the streaming extractor so that the XY search is performed in
-                oriented world space. Returned neighborhoods are in original PLY
-                space and are then transformed to world space as normal.
+            progress: Whether to show progress bar during extraction.
+            cylinder: If True, use a vertical cylinder search (distance
+                across the world vertical only): for TPI/TRI. False (default), a
+                sphere: for roughness, plane angles and vector dispersion. The cylinder's radius is the
+                same PLY-unit radius (``radius / scale_factor``) as the sphere's;
+                the Annotations ``world_transform`` only sets its axis (the world
+                vertical, in the PLY frame), so it does not rescale the radius.
+                Returned neighborhoods are in original PLY space and are then
+                transformed to world space as normal.
 
         Raises:
             ValueError: If ``radius`` is ``None`` and any annotation's
@@ -1672,7 +1606,7 @@ class Annotations:
             ply_filepath,
             target_coords,
             radii,
-            show_progress=show_progress,
+            progress=progress,
             world_transform=self.world_transform,
             cylinder=cylinder,
         )
@@ -1708,11 +1642,9 @@ class Annotations:
             measurement_columns: Explicit list of columns to import. If None,
                 all numeric columns except id_column are imported.
         """
-        import csv
-
         unmatched = []
         matched = set()
-        with open(filepath, newline="") as f:
+        with io.StringIO(_read_csv_text(filepath), newline="") as f:
             reader = csv.DictReader(f)
             if id_column not in reader.fieldnames:
                 raise ValueError(
@@ -1771,7 +1703,7 @@ class Annotations:
 
         Delegates to ``Annotation.reduce_point_cloud_to_radius()`` for each
         annotation.  Annotations whose ``self.radius`` is not set are skipped with a
-        warning.  Call ``get_radius_from_2D_surface_area()`` beforehand to populate
+        warning.  Call ``get_radius_from_2d_surface_area()`` beforehand to populate
         radii automatically from surface-area measurements.
         """
         missing_radius = []
@@ -1909,162 +1841,186 @@ class Annotations:
                 self.data[id].measurements["benthic_fraction_image"] = result["image"]
 
     def save(self, filepath: str, orig_coords_only: bool = False) -> None:
-        """Save the annotations to a CSV file.
+        """Save the annotations to a CSV file (written atomically).
+
+        Columns: the modelled ones (id, coordinates, label, camera view, depth,
+        predictions), then every other column read from the file
+        (``other_cols``, in file order), then ``meta_data`` and scalar
+        ``measurements`` (sorted). A ``meta_data`` or measurement value replaces
+        an ``other_cols`` value of the same name. Rows of ``extra_coords``
+        (``<id>_left`` / ``<id>_right``) follow their annotation and repeated-id
+        rows (``duplicate_rows``) come last, so a load-save round trip keeps
+        every row and cell.
 
         Args:
             filepath: Output file path.
             orig_coords_only: If True, only output orig_coords and not world coords.
         """
-        output_lines = []
+        anns = list(self.data.values())
         # Header - core columns
-        col_headers = [
-            "id",
-            "orig_x",
-            "orig_y",
-            "orig_z",
-            "label",
-            "label_conf",
-        ]
+        col_headers = ["id", "orig_x", "orig_y", "orig_z", "label", "label_conf"]
         if not orig_coords_only:
             col_headers.extend(["world_x", "world_y", "world_z"])
         col_headers.extend(["cam_filepath", "cam_x", "cam_y", "depth"])
         # Consensus-prediction columns, only once predictions exist (or were loaded)
         loaded_preds = (getattr(self, "col_order", None) or {}).get("pred_label")
         with_preds = loaded_preds is not None or any(
-            getattr(ann, "pred_label", None) is not None for ann in self.data.values()
+            getattr(ann, "pred_label", None) is not None for ann in anns
         )
         if with_preds:
             col_headers.extend(list(PREDICTION_COLUMNS))
         # Header - specific to InterceptAnnotation instances
-        first_annotation = next(iter(self.data.values()), None)
-        if isinstance(first_annotation, InterceptAnnotation):
+        if anns and isinstance(anns[0], InterceptAnnotation):
             col_headers.extend(
-                [
-                    "search_radius",
-                    "is_extrapolated",
-                    "estimated_intercept_world_coords",
-                ]
+                ["search_radius", "is_extrapolated", "estimated_intercept_world_coords"]
             )
+        core = set(col_headers)
+        # Header - columns read from the file and not modelled, in file order
+        other_headers: Dict[str, None] = {}
+        for ann in anns:
+            other_headers.update(dict.fromkeys(_other_cols_dict(ann)))
+        for row in getattr(self, "duplicate_rows", None) or []:
+            other_headers.update(dict.fromkeys(row))
+        for ann in anns:
+            for row in (getattr(ann, "extra_rows", None) or {}).values():
+                other_headers.update(dict.fromkeys(row))
+        world = {"world_x", "world_y", "world_z"}
+        col_headers.extend(
+            h for h in other_headers if h not in core and not (h in world)
+        )
+        # Header - metadata and measurements (measurement images left out)
+        meta_headers = set()
+        measure_headers = set()
+        for ann in anns:
+            meta_headers.update(ann.meta_data.keys())
+            measure_headers.update(k for k in ann.measurements if "_image" not in k)
+        listed = set(col_headers)
+        col_headers.extend(sorted(h for h in meta_headers if h not in listed))
+        listed = set(col_headers)
+        col_headers.extend(sorted(h for h in measure_headers if h not in listed))
 
-        # Header - metadata and measurements
-        col_headers_meta = set()
-        for ann in self.data.values():
-            col_headers_meta.update(ann.meta_data.keys())
-        col_headers.extend(sorted(col_headers_meta))
-        col_headers_measure = set()
-        for ann in self.data.values():
-            # Exclude measurement keys with '_image' anywhere in the name
-            col_headers_measure.update(
-                key for key in ann.measurements.keys() if "_image" not in key
+        def blank(value: Any) -> Any:
+            return "" if value is None else value
+
+        output_rows = [col_headers]
+        for ann in anns:
+            row: Dict[str, Any] = dict(_other_cols_dict(ann))
+            row.update(
+                id=ann.id, label=blank(getattr(ann, "label", None)),
+                label_conf=blank(getattr(ann, "label_conf", None)),
             )
-        col_headers.extend(sorted(col_headers_measure))
-        output_lines.append(col_headers)
-
-        for ann in self.data.values():
-            row = []
-
-            # Core columns (id, orig_coords, label, world_coords)
-            row.append(ann.id)
-            row += [value for value in ann.orig_coords]
-            if hasattr(ann, "label"):
-                row.append(ann.label)
-            else:
-                row.append("")
-            if hasattr(ann, "label_conf"):
-                row.append(ann.label_conf)
-            else:
-                row.append("")
+            row.update(zip(("orig_x", "orig_y", "orig_z"), ann.orig_coords))
             if not orig_coords_only:
-                row += [value for value in ann.coords]
-
+                row.update(zip(("world_x", "world_y", "world_z"), ann.coords))
             # Camera columns (from image_match if available; otherwise any loaded values)
-            cam_filepath = None
-            cam_x = None
-            cam_y = None
-            if (
-                getattr(ann, "image_match", None) is not None
-                and getattr(ann.image_match, "cam", None) is not None
-            ):
-                cam_filepath = getattr(ann.image_match.cam, "filepath", None)
-                cam_x = getattr(ann.image_match, "x", None)
-                cam_y = getattr(ann.image_match, "y", None)
+            match = getattr(ann, "image_match", None)
+            if match is not None and getattr(match, "cam", None) is not None:
+                cam_view = (getattr(match.cam, "filepath", None),
+                            getattr(match, "x", None), getattr(match, "y", None))
             else:
-                cam_filepath = getattr(ann, "cam_filepath", None)
-                cam_x = getattr(ann, "cam_x", None)
-                cam_y = getattr(ann, "cam_y", None)
-            row.append(cam_filepath if cam_filepath is not None else "")
-            row.append(cam_x if cam_x is not None else "")
-            row.append(cam_y if cam_y is not None else "")
-            depth_sensor_m = getattr(ann, "depth_sensor_m", None)
-            row.append(depth_sensor_m if depth_sensor_m is not None else "")
+                cam_view = (getattr(ann, "cam_filepath", None),
+                            getattr(ann, "cam_x", None), getattr(ann, "cam_y", None))
+            row.update(zip(("cam_filepath", "cam_x", "cam_y"), map(blank, cam_view)))
+            row["depth"] = blank(getattr(ann, "depth_sensor_m", None))
             if with_preds:
                 for name in PREDICTION_COLUMNS:
-                    value = getattr(ann, name, None)
-                    row.append(value if value is not None else "")
-
-            # Columns specific to InterceptAnnotation instances
+                    row[name] = blank(getattr(ann, name, None))
             if isinstance(ann, InterceptAnnotation):
-                row.append(ann.search_radius)
-                row.append(ann.is_extrapolated)
-                row.append(ann.estimated_intercept_coords)
-            # Metadata
-            for name in sorted(col_headers_meta):
-                if name in ann.meta_data:
-                    row.append(ann.meta_data[name])
-                else:
-                    row.append("")
+                row["search_radius"] = ann.search_radius
+                row["is_extrapolated"] = ann.is_extrapolated
+                row["estimated_intercept_world_coords"] = ann.estimated_intercept_coords
+            row.update(ann.meta_data)
+            row.update(
+                (k, v) for k, v in ann.measurements.items() if "_image" not in k
+            )
+            output_rows.append([blank(row.get(h)) for h in col_headers])
+            # Rows of the annotation's extra coordinates (e.g. ``<id>_left``)
+            extra_rows = getattr(ann, "extra_rows", None) or {}
+            for full_id, coords in ann.extra_coords.items():
+                extra = dict(extra_rows.get(full_id, {}))
+                extra["id"] = full_id
+                orig = ann.orig_extra_coords.get(full_id, coords)
+                extra.update(zip(("orig_x", "orig_y", "orig_z"), orig))
+                if not orig_coords_only:
+                    extra.update(zip(("world_x", "world_y", "world_z"), coords))
+                output_rows.append([blank(extra.get(h)) for h in col_headers])
+        for dup in getattr(self, "duplicate_rows", None) or []:
+            output_rows.append([blank(dup.get(h)) for h in col_headers])
 
-            # Measurements (exclude keys with partial match "_image")
-            for name in sorted(col_headers_measure):
-                if "_image" in name:
-                    continue
-                if name in ann.measurements:
-                    row.append(ann.measurements[name])
-                else:
-                    row.append("")
-            output_lines.append(row)
-
-        with open(filepath, "w", newline="") as f:
-            csv.writer(f).writerows(output_lines)
+        with _path_lock(filepath):
+            write_csv_rows(filepath, output_rows)
         # Remember the file for in-memory annotations; a later save elsewhere
         # (e.g. a backup) must not move the crops_root of loaded annotations.
         if getattr(self, "filepath", None) is None:
             self.filepath = filepath
 
-    def __determine_col_order(self, line: str) -> Dict[str, Optional[int]]:
-        """Determine column order from either header or a line of data.
+    def __determine_col_order(self, cols: List[str]) -> Dict[str, Optional[int]]:
+        """Determine the column of each field from the header row.
 
         Args:
-            line: Header line or data line to parse.
+            cols: The header cells.
 
         Returns:
-            Dictionary mapping column names to indices.
-        """
+            Dictionary mapping field names to column indices (None if absent).
 
-        def get_col_index(
-            columns: List[str], names: List[str], mandatory: bool = True
-        ) -> Optional[int]:
-            # Strip quotation marks and whitespace from each column value
-            columns = [col.strip('"').strip() for col in columns]
+        Raises:
+            ValueError: If a mandatory column is missing.
+        """
+        columns = [col.strip().strip('"').strip() for col in cols]
+
+        def get_col_index(names: List[str], mandatory: bool = True) -> Optional[int]:
             for name in names:
                 if name in columns:
                     return columns.index(name)
             if mandatory:
                 raise ValueError(
-                    "Compulsory header columns missing in annotations file: {0} not in {1}".format(
-                        ", ".join(names), ", ".join(columns)
-                    )
+                    "Compulsory header columns missing in annotations file: "
+                    "{0} not in {1}".format(", ".join(names), ", ".join(columns))
                 )
-            else:
-                return None
+            return None
 
-        # Try to establish column indexes by assuming header
-        # Strip line endings (handle both Unix LF and Windows CRLF)
-        cols = line.rstrip("\r\n").split(",")
         return {
-            field_name: get_col_index(cols, possible_names, mandatory=mandatory)
+            field_name: get_col_index(possible_names, mandatory=mandatory)
             for field_name, possible_names, mandatory in self._FIELD_CONFIG
         }
+
+    def __other_column_names(
+        self, names: List[str], data_rows: List[List[str]]
+    ) -> Dict[int, str]:
+        """The header of each column the class does not model, by column index.
+
+        Names are made unique (``notes``, ``notes_2``; never one of the columns
+        :meth:`save` writes itself); a column without a header is ``col_<i>``.
+        """
+        primary = {i for i in self.col_order.values() if i is not None}
+        width = max([len(names)] + [len(r) for r in data_rows])
+        used = {self._SAVE_NAMES.get(f, f) for f, _, _ in self._FIELD_CONFIG}
+        out: Dict[int, str] = {}
+        for i in range(width):
+            if i in primary:
+                continue
+            name = names[i].strip() if i < len(names) and names[i].strip() else f"col_{i}"
+            key, n = name, 2
+            while key in used:
+                key, n = f"{name}_{n}", n + 1
+            used.add(key)
+            out[i] = key
+        return out
+
+    def __row_dict(self, cols: List[str]) -> Dict[str, str]:
+        """One CSV row as ``{header written by save: cell}``."""
+        row = {}
+        for field, _, _ in self._FIELD_CONFIG:
+            idx = self.col_order.get(field)
+            if idx is not None and idx < len(cols):
+                row[self._SAVE_NAMES.get(field, field)] = cols[idx]
+        row.update(self.__other_cells(cols))
+        return row
+
+    def __other_cells(self, cols: List[str]) -> Dict[str, str]:
+        """The cells of the columns the class does not model, ``{header: cell}``."""
+        names = getattr(self, "_other_col_names", None) or {}
+        return {names[i]: v for i, v in enumerate(cols) if i in names}
 
     def __get_annotation_fields(self, cols: List[str]) -> Tuple[
         Optional[str],
@@ -2079,8 +2035,8 @@ class Annotations:
         Optional[str],
         Optional[str],
         Optional[str],
-        Optional[float],
-        List[str],
+        Dict[str, str],
+        Optional[str],
     ]:
         """Get annotation values.
 
@@ -2089,26 +2045,17 @@ class Annotations:
 
         Returns:
             Tuple containing id, orig_x, orig_y, orig_z, label, label_conf,
-            world_x, world_y, world_z, cam_filepath, cam_x, cam_y, and other_fields.
+            world_x, world_y, world_z, cam_filepath, cam_x, cam_y, the other
+            columns (``{header: value}``) and depth.
         """
-
-        primary_field_indices = set(self.col_order.values())
 
         def get_value(key: str) -> Optional[str]:
             idx = self.col_order.get(key)
             return cols[idx] if idx is not None and idx < len(cols) else None
 
-        # Extract all known fields using the field configuration
-        field_values = {}
-        for field_name, _, _ in self._FIELD_CONFIG:
-            field_values[field_name] = get_value(field_name)
-
-        # Compute other_fields last, after all known fields are extracted
-        other_fields = [
-            value for idx, value in enumerate(cols) if idx not in primary_field_indices
-        ]
-
-        # Return in the expected order (matching the unpacking in get_annotations_from_file)
+        field_values = {
+            field_name: get_value(field_name) for field_name, _, _ in self._FIELD_CONFIG
+        }
         return (
             field_values["id"],
             field_values["orig_x"],
@@ -2122,7 +2069,7 @@ class Annotations:
             field_values["cam_filepath"],
             field_values["cam_x"],
             field_values["cam_y"],
-            other_fields,
+            self.__other_cells(cols),
             field_values["depth_sensor_m"],
         )
 
@@ -2144,20 +2091,6 @@ class Annotations:
         ann.pred_agree = float(pred_agree) if pred_agree is not None else None
         ann.pred_top = get_value("pred_top")
 
-    @staticmethod
-    def __strip_post_fixes(ann_id: str) -> str:
-        """Remove postfixes from annotation id.
-
-        Args:
-            ann_id: Annotation ID string.
-
-        Returns:
-            Annotation ID with postfixes removed.
-        """
-        for substring in settings.ANN_ID_POST_FIXES:
-            ann_id = ann_id.replace(substring, "")
-        return ann_id
-
 
 class Annotation:
     """Class that holds information about an annotation."""
@@ -2176,10 +2109,16 @@ class Annotation:
         self.classification = None
         self.radius: Optional[float] = None
         self.simple_pcd = None
+        self.label: Optional[str] = None
+        self.label_conf: Optional[str] = None
         self.meta_data = {}
         self.measurements = {}
+        # CSV columns the class does not model, {header: cell} (written back by save)
+        self.other_cols: Dict[str, str] = {}
         self.extra_coords = {}
         self.orig_extra_coords = {}
+        # the CSV cells of each extra_coords row, {full id: {header: cell}}
+        self.extra_rows: Dict[str, Dict[str, str]] = {}
         # Optional camera fields loaded/saved from CSV
         self.cam_filepath: Optional[str] = None
         self.cam_x: Optional[float] = None
@@ -2228,6 +2167,8 @@ class Annotation:
         """Show the annotation."""
         if self.simple_pcd is None:
             self.get_point_cloud_by_radius(self.parent.pcd, 0.2)
+        from substrata import visualizations  # lazy: figures only
+
         visualizations.show(self.simple_pcd, highlight_coords=self.coords)
 
     def show_position(self, pcd: Any, color=False, zoom=None) -> Any:
@@ -2254,48 +2195,29 @@ class Annotation:
     def show_measurement_image(self, key: str, width: float = 12) -> None:
         """Display a stored measurement image (e.g. ``tpi_image``).
 
-        Args:
-            key: Measurement key holding an (H, W, 3) image array.
-            width: Figure width in inches (height scales to aspect ratio).
+        See :func:`substrata.visualizations.show_measurement_image`.
         """
-        import matplotlib.pyplot as plt
+        from substrata import visualizations  # lazy: figures only
 
-        img = self.measurements.get(key)
-        if img is None:
-            logger.warning("No image found for '%s' on annotation %s", key, self.id)
-            return
-        h, w = img.shape[:2]
-        fig, ax = plt.subplots(figsize=(width, width * h / w))
-        ax.imshow(img)
-        ax.axis("off")
-        ax.set_title(f"{self.id} — {key}", fontsize=9)
-        plt.tight_layout()
-        plt.show()
+        visualizations.show_measurement_image(self, key, width=width)
 
     def show_measurement_images(self, width: float = 12) -> None:
         """Display all stored measurement images (keys ending in ``_image``).
 
-        Args:
-            width: Figure width in inches passed to each image.
+        See :func:`substrata.visualizations.show_measurement_images`.
         """
-        image_keys = [
-            k
-            for k, v in self.measurements.items()
-            if k.endswith("_image") and v is not None
-        ]
-        if not image_keys:
-            logger.warning("No measurement images found on annotation %s", self.id)
-            return
-        for key in image_keys:
-            self.show_measurement_image(key, width=width)
+        from substrata import visualizations  # lazy: figures only
+
+        visualizations.show_measurement_images(self, width=width)
 
     def add_extra_coords(self, line: Union[str, List[str]]) -> None:
         """Add extra coordinates to the annotation.
 
         Args:
-            line: A line with extra coordinate data.
+            line: The CSV row of the extra coordinates: its cells, or the line
+                (parsed with the ``csv`` module).
         """
-        cols = line.split(",")
+        cols = next(csv.reader([line])) if isinstance(line, str) else list(line)
         full_id = cols[self.parent.col_order["id"]]
         self.extra_coords[full_id] = np.array(
             [
@@ -2307,26 +2229,7 @@ class Annotation:
         )
         self.orig_extra_coords[full_id] = self.extra_coords[full_id]
 
-    def get_radius_from_extra_coords(self) -> float:
-        """Calculate the radius of the annotation using extra coordinates.
-
-        Returns:
-            Radius value.
-        """
-        coords = [value for value in self.extra_coords.values()]
-        distmat = np.sqrt(
-            np.sum(
-                (
-                    np.array(coords)[:, np.newaxis, :]
-                    - np.array(coords)[np.newaxis, :, :]
-                )
-                ** 2,
-                axis=-1,
-            )
-        )
-        return np.nanmax(distmat) / 2
-
-    def get_radius_from_2D_surface_area(self) -> float:
+    def get_radius_from_2d_surface_area(self) -> float:
         """Calculate the radius in meters using the 2D surface area in cm².
 
         Sets ``self.radius`` as a side effect so the value is available for
@@ -2340,6 +2243,8 @@ class Annotation:
         self.radius = radius_cm / 100
         return self.radius
 
+    get_radius_from_2D_surface_area = get_radius_from_2d_surface_area  # deprecated alias (renamed 2026-11-25)
+
     def get_point_cloud_by_radius(
         self,
         source_pcd: Any,
@@ -2352,10 +2257,11 @@ class Annotation:
         Args:
             source_pcd: Source point cloud.
             radius: Search radius in metres.  If ``None``, ``self.radius`` is used.
-                Call ``get_radius_from_2D_surface_area()`` beforehand to set it
+                Call ``get_radius_from_2d_surface_area()`` beforehand to set it
                 automatically from the surface-area measurement.
-            cylinder: If True, use a vertical cylinder search (XY distance only,
-                Z unconstrained) instead of a 3D sphere.
+            cylinder: If True, a vertical cylinder (XY distance only, Z
+                unconstrained): for TPI/TRI. False (default), a 3D sphere: for
+                roughness, plane angles and vector dispersion.
             radius_buffer: Additional metres added to the effective radius before
                 sampling.  Useful when a larger neighbourhood is needed for
                 downstream analysis (e.g. TPI annulus); ``self.radius`` is
@@ -2378,8 +2284,9 @@ class Annotation:
     def reduce_point_cloud_to_radius(self) -> None:
         """Filter simple_pcd to retain only points within ``self.radius``.
 
-        Applies a 3D sphere filter centred on ``self.orig_coords``.  Call
-        ``get_radius_from_2D_surface_area()`` beforehand to set ``self.radius``
+        Applies a 3D sphere filter centred on ``self.coords`` (the frame of the
+        cloud :meth:`get_point_cloud_by_radius` sampled ``simple_pcd`` from). Call
+        ``get_radius_from_2d_surface_area()`` beforehand to set ``self.radius``
         automatically, or assign it directly.
 
         Raises:
@@ -2389,7 +2296,8 @@ class Annotation:
             raise ValueError(f"Annotation {self.id}: self.radius is not set")
         if self.simple_pcd is None:
             return
-        distances_sq = np.sum((self.simple_pcd.points - self.orig_coords) ** 2, axis=1)
+        centre = np.asarray(self.coords, dtype=float)
+        distances_sq = np.sum((self.simple_pcd.points - centre) ** 2, axis=1)
         mask = distances_sq <= self.radius**2
         self.simple_pcd.points = self.simple_pcd.points[mask]
         if hasattr(self.simple_pcd, "colors") and self.simple_pcd.colors is not None:
@@ -2398,16 +2306,6 @@ class Annotation:
             self.simple_pcd.normals = self.simple_pcd.normals[mask]
         if hasattr(self.simple_pcd, "labels") and self.simple_pcd.labels is not None:
             self.simple_pcd.labels = self.simple_pcd.labels[mask]
-
-    def get_hom_coords(self) -> np.ndarray:
-        """Return the annotation coordinates in homogeneous format.
-
-        Returns:
-            Array with [x, y, z, 1].
-        """
-        return np.array(
-            [self.coords[0], self.coords[1], self.coords[2], 1], dtype=float
-        )
 
     def transform_coords(self, transform: np.ndarray) -> None:
         """Apply a transformation to the annotation coordinates.
@@ -2494,27 +2392,15 @@ class Annotation:
             )
             # Classify according to reprojection error if pcd is provided
             if pcd is not None:
-                image_match.get_reprojection_error(pcd, intercept_radius)
+                keep = cameras.keep_by_reprojection(
+                    image_match, pcd, intercept_radius,
+                    reprojection_threshold_uncertain, reprojection_threshold_discard,
+                )
                 if debug:
                     print(f"Reprojection error: {image_match.reprojection_error}")
-                if image_match.reprojection_error is None:
-                    continue  # do not store if no intercept found
-                elif (
-                    image_match.reprojection_error > reprojection_threshold_discard
-                ):
-                    continue  # do not store if error exceeds threshold
-                elif (
-                    image_match.reprojection_error
-                    >= reprojection_threshold_uncertain
-                ):
-                    image_match.potentially_obstructed = True
-                    image_matches.append(image_match)
-                else:
-                    image_match.potentially_obstructed = False
-                    image_matches.append(image_match)
-            else:
-                # If no pcd provided: add image_match regardless
-                image_matches.append(image_match)
+                if not keep:
+                    continue  # no intercept found, or the error exceeds the threshold
+            image_matches.append(image_match)
 
         if pcd is None and occluder is not None and image_matches:
             self._flag_occluded(image_matches, occluder, blocked_min, occlusion_check)
@@ -2547,6 +2433,20 @@ class Annotation:
         self.image_match = None
         return []
 
+    def _parent_metres_per_unit(self) -> Optional[float]:
+        """Metres per original model unit, from the parent :class:`Annotations`:
+        its ``metres_per_unit`` (set by the initializer), else
+        :func:`substrata.frames.metres_per_unit` of its ``world_transform`` (and
+        ``scale_factor``, if any). None without a parent."""
+        parent = self.parent
+        if parent is None:
+            return None
+        mpu = getattr(parent, "metres_per_unit", None)
+        if mpu:
+            return float(mpu)
+        return _metres_per_unit(getattr(parent, "world_transform", None),
+                                getattr(parent, "scale_factor", None))
+
     def _flag_occluded(
         self, image_matches: List[Any], occluder: Any, blocked_min: int,
         occlusion_check: int, wants: Optional[Callable[[Any], bool]] = None,
@@ -2558,7 +2458,7 @@ class Annotation:
         keep ``blockers`` None."""
         p = np.asarray(self.orig_coords, float)
         normal = occluder.normal_at(p) if image_matches else None
-        margin = occluder.line_of_sight_margin()
+        margin = occluder.line_of_sight_margin(scale_factor=self._parent_metres_per_unit())
         for k, m in enumerate(sorted(image_matches, key=lambda x: x.relevance)):
             if k >= occlusion_check or (wants is not None and not wants(m)):
                 m.blockers, m.potentially_obstructed = None, None
@@ -2595,8 +2495,8 @@ class Annotation:
             pcd=pcd,
             use_orig_coords=use_orig_coords,
             intercept_radius=intercept_radius,
-            reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
-            reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
+            reprojection_threshold_uncertain=reprojection_threshold_uncertain,
+            reprojection_threshold_discard=reprojection_threshold_discard,
         )
         if image_matches:
             return image_matches[0]
@@ -2741,15 +2641,20 @@ class Annotation:
         d = self.crops_dir(root)
         if d is None or not os.path.isdir(d):
             return []
-        by_stem = {}
+        # Crops sit in <crops dir>/<photo folder>/ (or, without a folder, in the
+        # crops dir itself): same-named photos of different folders do not mix
+        by_photo = {}
         for cam in (cams.data.values() if hasattr(cams, "data") else cams):
             fp = getattr(cam, "filepath", None) or ""
-            by_stem.setdefault(os.path.splitext(re.split(r"[\\/]", fp)[-1])[0], cam)
+            stem = os.path.splitext(re.split(r"[\\/]", fp)[-1])[0]
+            by_photo.setdefault((cameras.photo_folder_name(fp), stem), cam)
         out = []
         for folder, _dirs, files in os.walk(d):
+            rel = os.path.relpath(folder, d)
+            sub = None if rel == os.curdir else rel
             for f in files:
                 m = re.match(r"^(.*)_(-?\d+)_(-?\d+)\.jpg$", f)
-                cam = by_stem.get(m.group(1)) if m else None
+                cam = by_photo.get((sub, m.group(1))) if m else None
                 if cam is None:
                     continue
                 x, y, *_ = cam.get_pixel_coords(self.orig_coords, use_orig_coords=True)
@@ -2790,7 +2695,7 @@ class Annotation:
         if root is None:
             raise ValueError("No crops directory: pass root= or set crops_root.")
         matches = self._matches_for_crops(cams, max_cams, pcd, image_matches)
-        return cameras._count_statuses(
+        return cameras.count_crop_statuses(
             im.save_crop(root, crop_size, overwrite) for im in matches
         )
 
@@ -2885,7 +2790,7 @@ class Annotation:
             for im, res in zip(image_matches, results):
                 path = im.find_crop(root) if res else None
                 if path:
-                    cameras._update_crop_metadata(path, {
+                    cameras.update_crop_metadata(path, {
                         "pred_label": res["label"],
                         "pred_conf": float(res.get("confidence") or 0.0),
                         "pred_model": model or "",
@@ -3119,7 +3024,7 @@ class Scalebars:
             if hasattr(target_data, "data") and isinstance(target_data.data, dict):
                 # Assume keys are labels, values are Annotation objects
                 target_data_dict = {
-                    ann.label if hasattr(ann, "label") else key: [ann.coords]
+                    (getattr(ann, "label", None) or key): [ann.coords]
                     for key, ann in target_data.data.items()
                 }
                 self.store_target_coords(target_data_dict)
@@ -3181,7 +3086,7 @@ class Scalebars:
 
         For each label in ``target_data``, the coordinates are stored on any
         scalebar whose ``target1_label`` or ``target2_label`` matches, then
-        :meth:`calc_scalefactor` is called to refresh the summary statistics.
+        :meth:`calc_scale_factor` is called to refresh the summary statistics.
 
         Args:
             target_data: Mapping of target label to a sequence whose first
@@ -3195,7 +3100,7 @@ class Scalebars:
                     scalebar.target2_coords = np.asarray(target_coords[0], dtype=float)
         self.calc_scalefactor()
 
-    def calc_scalefactor(self, max_var: float = 0.005) -> Optional[float]:
+    def calc_scale_factor(self, max_var: float = 0.005) -> Optional[float]:
         """Compute the mean scale factor across all resolved scalebars.
 
         Averages the per-scalebar scale factors and stores the count, variance
@@ -3211,7 +3116,7 @@ class Scalebars:
         """
         scalefactors = []
         for scalebar in self.data:
-            scalefactor = scalebar.calc_scalefactor()
+            scalefactor = scalebar.calc_scale_factor()
             if scalefactor:
                 scalefactors.append(scalefactor)
 
@@ -3232,100 +3137,37 @@ class Scalebars:
         else:
             return None
 
+    calc_scalefactor = calc_scale_factor  # deprecated alias (renamed 2026-11-25)
+
     def _generate_scalebar_figs(self, pcd: Any) -> List[Any]:
-        """Generate matplotlib figures for each scalebar target."""
-        figs = []
-        for scalebar in self.data:
-            if (
-                scalebar.target1_coords is not None
-                and scalebar.target2_coords is not None
-            ):
-                radius = float(scalebar.length) * 5
-                target1 = pcd.subsample_pointcloud_by_radius(
-                    scalebar.target1_coords, radius
-                )
-                target2 = pcd.subsample_pointcloud_by_radius(
-                    scalebar.target2_coords, radius
-                )
-                fig1 = visualizations.plot_2d(
-                    target1,
-                    width=4,
-                    height=4,
-                    highlight_coords=scalebar.target1_coords,
-                    title=scalebar.target1_label + "\n" + str(scalebar.target1_coords),
-                )
-                fig2 = visualizations.plot_2d(
-                    target2,
-                    width=4,
-                    height=4,
-                    highlight_coords=scalebar.target2_coords,
-                    title=scalebar.target2_label + "\n" + str(scalebar.target2_coords),
-                )
-                figs.append(fig1)
-                figs.append(fig2)
-        return figs
+        """Figures of each scale bar's targets.
+
+        See :func:`substrata.visualizations.scalebar_figures`.
+        """
+        from substrata import visualizations  # lazy: figures only
+
+        return visualizations.scalebar_figures(self, pcd)
 
     def show(self, pcd: Any) -> List[Any]:
-        """Visualize the scale bar targets.
+        """Print the scale-bar summary and show the target figures.
 
-        Args:
-            pcd: The point cloud object.
+        See :func:`substrata.visualizations.show_scalebars`.
 
         Returns:
             List of matplotlib figure objects.
         """
-        if self.scalebars is not None:
-            print(
-                f"Number of scalebars: {self.scalebars}\n"
-                f"Scale factor: {self.scalefactor:.5f}\n"
-                f"Variance: {self.var:.10f}\n"
-                f"Std Error: {self.sterr:.10f}"
-            )
-            figs = self._generate_scalebar_figs(pcd)
-            # Show the figures interactively
-            for fig in figs:
-                fig.show()
-            return figs
-        return []
+        from substrata import visualizations  # lazy: figures only
+
+        return visualizations.show_scalebars(self, pcd)
 
     def save_pdf(self, pcd: Any, filepath: Optional[str] = None) -> None:
-        """Save the scalebar visualization as a PDF (does not display figures).
+        """Save the scalebar summary and figures as a PDF (does not display figures).
 
-        Args:
-            pcd: The point cloud object.
-            filepath: Optional path to save the PDF file.
-
-        Returns:
-            None
+        See :func:`substrata.visualizations.save_scalebars_pdf`.
         """
-        if self.scalebars is None:
-            return
+        from substrata import visualizations  # lazy: figures only
 
-        backend_original = matplotlib.get_backend()
-        # Use a non-interactive backend to prevent showing figures
-        matplotlib.use("Agg", force=True)
-        try:
-            if filepath is None:
-                base, ext = os.path.splitext(pcd.filepath)
-                filepath = f"{base}_scalebars.pdf"
-
-            pdf = PdfPages(filepath)
-            # Text summary
-            fig = visualizations.plot_text(
-                f"Number of scalebars: {self.scalebars}\n"
-                f"Scale factor: {self.scalefactor:.5f}\n"
-                f"Variance: {self.var:.10f}\n"
-                f"Std Error: {self.sterr:.10f}"
-            )
-            pdf.savefig(fig)
-            figs = self._generate_scalebar_figs(pcd)
-            # Scalebar visualizations
-            for fig in figs:
-                pdf.savefig(fig)
-            pdf.close()
-        finally:
-            # Restore the original backend
-            matplotlib.use(backend_original, force=True)
+        visualizations.save_scalebars_pdf(self, pcd, filepath)
 
 
 class Scalebar(object):
@@ -3338,7 +3180,7 @@ class Scalebar(object):
         self.target1_coords = None
         self.target2_coords = None
 
-    def calc_scalefactor(self) -> Optional[float]:
+    def calc_scale_factor(self) -> Optional[float]:
         """Compute this scalebar's scale factor from its two target coords.
 
         Measures the raw Euclidean distance between the two targets (stored on
@@ -3366,6 +3208,8 @@ class Scalebar(object):
             return self.scalefactor
         else:
             return None
+
+    calc_scalefactor = calc_scale_factor  # deprecated alias (renamed 2026-11-25)
 
 
 # --- Matching random points to manual annotations ----------------------------
@@ -3489,7 +3333,7 @@ def _resolve_reference_views(
         else:
             missing.append(k)
     if missing:
-        best_cam, best_x, best_y, _, cam_list = segmentation._match_points_to_cameras(
+        best_cam, best_x, best_y, _, cam_list = segmentation.match_points_to_cameras(
             np.array([anns[k].orig_coords for k in missing], dtype=float),
             cams,
             occlusion=False,
@@ -3607,8 +3451,9 @@ def _points_in_masks(
     return result
 
 
+@_renamed_kwargs(output_filepath="output_path")
 def save_annotation_matches_csv(
-    src_filepath: str, records: List[Dict[str, Any]], output_filepath: str
+    src_filepath: str, records: List[Dict[str, Any]], output_path: str
 ) -> None:
     """Copy an annotation CSV, appending the match columns.
 
@@ -3628,16 +3473,16 @@ def save_annotation_matches_csv(
     Args:
         src_filepath: The (random point) annotation CSV that was matched.
         records: Output of :meth:`Annotations.match_annotations`.
-        output_filepath: Where to write the matched CSV.
+        output_path: Where to write the matched CSV.
     """
     new_cols = list(settings.MATCH_CSV_COLUMNS)
     by_id = {
         str(rec["id"]): rec for rec in records if rec.get("considered", True)
     }
-    with open(src_filepath, newline="") as f:
-        rows = list(csv.reader(f))
-    if not rows:
-        raise ValueError(f"Empty annotation file: {src_filepath}")
+    try:
+        rows, newline, _low = read_csv_rows(src_filepath)
+    except ValueError:
+        raise ValueError(f"Empty annotation file: {src_filepath}") from None
     header = [c.strip().strip('"') for c in rows[0]]
     if "id" not in header:
         raise ValueError(f"No 'id' column in {src_filepath}")
@@ -3654,21 +3499,19 @@ def save_annotation_matches_csv(
     out_header += [c for c in new_cols if c not in out_names]
     out_names += [c for c in new_cols if c not in out_names]
     cols = [out_names.index(c) for c in new_cols]
-    with open(src_filepath, newline="") as f:
-        newline = "\r\n" if f.readline().endswith("\r\n") else "\n"
-    with open(output_filepath, "w", newline="") as f:
-        writer = csv.writer(f, lineterminator=newline)
-        writer.writerow(out_header)
-        for row in rows[1:]:
-            if not row:
-                continue
-            rec = by_id.get(row[id_col].strip())
-            row = list(row) + [""] * (len(rows[0]) - len(row))
-            row = [row[i] for i in keep] + [""] * (len(out_names) - len(keep))
-            if rec is not None:
-                for col, i in zip(new_cols, cols):
-                    row[i] = rec.get(col, "")
-            writer.writerow(row)
+    out_rows = [out_header]
+    for row in rows[1:]:
+        if not row:
+            continue
+        rec = by_id.get(row[id_col].strip())
+        row = list(row) + [""] * (len(rows[0]) - len(row))
+        row = [row[i] for i in keep] + [""] * (len(out_names) - len(keep))
+        if rec is not None:
+            for col, i in zip(new_cols, cols):
+                row[i] = rec.get(col, "")
+        out_rows.append(row)
+    with _path_lock(output_path):
+        write_csv_rows(output_path, out_rows, newline)
 
 
 def get_matched_annotation_ids(filepath: str) -> Set[str]:
@@ -3686,8 +3529,7 @@ def get_matched_annotation_ids(filepath: str) -> Set[str]:
     Returns:
         Set of ids (stripped strings); empty if the file has no match columns.
     """
-    with open(filepath, newline="") as f:
-        rows = list(csv.reader(f))
+    rows = _read_csv_table(filepath)
     if not rows:
         return set()
     header = [c.strip().strip('"') for c in rows[0]]
@@ -3738,7 +3580,7 @@ def join_manual_annotations(
             "'matched_to' in its sidecar"
         )
     manual: Dict[str, Tuple[str, str]] = {}
-    m_rows, _, m_head = _read_csv_rows(manual_filepath)
+    m_rows, _, m_head = read_csv_rows(manual_filepath)
     if "id" not in m_head:
         raise ValueError(f"No 'id' column in {manual_filepath}")
     mi = m_head.index("id")
@@ -3752,7 +3594,7 @@ def join_manual_annotations(
         if len(row) > mi:
             manual[row[mi].strip()] = (_cell(row, li), _cell(row, ci))
 
-    rows, _, head = _read_csv_rows(matched_filepath)
+    rows, _, head = read_csv_rows(matched_filepath)
     if "id" not in head:
         raise ValueError(f"No 'id' column in {matched_filepath}")
     idx = {c: head.index(c) if c in head else None for c in head}
@@ -3777,9 +3619,10 @@ def join_manual_annotations(
     return out
 
 
+@_renamed_kwargs(output_filepath="output_path")
 def save_joined_manual_annotations(
     matched_filepath: str,
-    output_filepath: str,
+    output_path: str,
     manual_filepath: Optional[str] = None,
 ) -> Dict[str, int]:
     """Write the matched CSV with the current manual labels joined in.
@@ -3791,7 +3634,7 @@ def save_joined_manual_annotations(
 
     Args:
         matched_filepath: Matched (random point) annotation CSV.
-        output_filepath: Where to write the joined CSV.
+        output_path: Where to write the joined CSV.
         manual_filepath: See :func:`join_manual_annotations`.
 
     Returns:
@@ -3800,34 +3643,67 @@ def save_joined_manual_annotations(
     joined = {
         j["id"]: j for j in join_manual_annotations(matched_filepath, manual_filepath)
     }
-    rows, newline, head = _read_csv_rows(matched_filepath)
+    rows, newline, head = read_csv_rows(matched_filepath)
     id_col = head.index("id")
     extra = ["manual_label", "manual_label_conf", "manual_status"]
     keep = [i for i, c in enumerate(head) if c not in extra]
     counts: Dict[str, int] = {}
-    with open(output_filepath, "w", newline="") as f:
-        writer = csv.writer(f, lineterminator=newline)
-        writer.writerow([rows[0][i] for i in keep] + extra)
-        for row in rows[1:]:
-            if not row:
-                continue
-            row = list(row) + [""] * (len(head) - len(row))
-            j = joined.get(row[id_col].strip(), {})
-            status = j.get("status", "")
-            counts[status] = counts.get(status, 0) + 1
-            writer.writerow(
-                [row[i] for i in keep]
-                + [j.get("manual_label", ""), j.get("manual_label_conf", ""), status]
-            )
+    out_rows = [[rows[0][i] for i in keep] + extra]
+    for row in rows[1:]:
+        if not row:
+            continue
+        row = list(row) + [""] * (len(head) - len(row))
+        j = joined.get(row[id_col].strip(), {})
+        status = j.get("status", "")
+        counts[status] = counts.get(status, 0) + 1
+        out_rows.append(
+            [row[i] for i in keep]
+            + [j.get("manual_label", ""), j.get("manual_label_conf", ""), status]
+        )
+    with _path_lock(output_path):
+        write_csv_rows(output_path, out_rows, newline)
     return counts
 
 
 # ---------------------------------------------------------------------------
-# In-place edits of an annotation CSV (one row at a time, e.g. from a viewer)
+# Reading and writing annotation CSVs. Every parser reads through
+# _read_csv_table (csv module: quoted cells, commas inside cells; a UTF-8 BOM is
+# dropped) and every rewrite goes through write_csv_rows (atomic, the file's
+# mode, BOM and line ending kept). In-place edits (one row at a time, e.g. from
+# a viewer) hold the file's lock (fileio.path_lock) from read to write.
 # ---------------------------------------------------------------------------
 
+def _other_cols_dict(ann: Any) -> Dict[str, Any]:
+    """An annotation's ``other_cols`` as ``{header: cell}`` (empty for older
+    objects that kept them as a bare list, whose headers are unknown)."""
+    other = getattr(ann, "other_cols", None)
+    return other if isinstance(other, dict) else {}
 
-def _read_csv_rows(path: str) -> Tuple[List[List[str]], str, List[str]]:
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+_ID_POSTFIX_RE = re.compile(
+    "(" + "|".join(re.escape(p) for p in settings.ANN_ID_POST_FIXES) + ")$"
+)
+
+
+def _strip_id_postfix(ann_id: str) -> str:
+    """An id without a trailing ``settings.ANN_ID_POST_FIXES`` postfix
+    (``sb1_left`` -> ``sb1``; ``a_left_b`` stays as it is)."""
+    return _ID_POSTFIX_RE.sub("", ann_id)
+
+
+def _read_csv_text(path: str) -> str:
+    """A CSV file's text (UTF-8, BOM dropped; line endings kept)."""
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        return fh.read()
+
+
+def _read_csv_table(path: str) -> List[List[str]]:
+    """A CSV file as rows of cells (header first, if any)."""
+    return list(csv.reader(io.StringIO(_read_csv_text(path), newline="")))
+
+
+def read_csv_rows(path: str) -> Tuple[List[List[str]], str, List[str]]:
     """Read a CSV as rows of strings.
 
     Args:
@@ -3837,19 +3713,38 @@ def _read_csv_rows(path: str) -> Tuple[List[List[str]], str, List[str]]:
         The rows (header first), the file's line ending and the lower-cased,
         stripped header names.
     """
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        text = fh.read()
-    rows = list(csv.reader(text.splitlines()))
+    text = _read_csv_text(path)
+    rows = list(csv.reader(io.StringIO(text, newline="")))
     eol = "\r\n" if "\r\n" in text[:4096] else "\n"
+    if not rows:
+        raise ValueError(f"Empty CSV file: {path}")
     return rows, eol, [h.strip().lower() for h in rows[0]]
 
 
-def _write_csv_rows(path: str, rows: List[List[str]], eol: str) -> None:
-    """Write rows to a temp file next to `path`, then swap it in."""
-    tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w", newline="") as fh:
+_read_csv_rows = read_csv_rows  # deprecated alias (renamed 2026-11-25)
+
+
+def _has_bom(path: str) -> bool:
+    """Whether an existing file starts with a UTF-8 byte-order mark."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(3) == _UTF8_BOM
+    except OSError:
+        return False
+
+
+def write_csv_rows(path: str, rows: List[List[Any]], eol: str = "\r\n") -> None:
+    """Write rows to ``path`` atomically (:func:`substrata.fileio.atomic_write`).
+
+    A byte-order mark of the file being replaced is kept (e.g. one saved by
+    Excel), so is its permission mode.
+    """
+    encoding = "utf-8-sig" if _has_bom(path) else "utf-8"
+    with _atomic_write(path, "w", newline="", encoding=encoding) as fh:
         csv.writer(fh, lineterminator=eol).writerows(rows)
-    os.replace(tmp, path)
+
+
+_write_csv_rows = write_csv_rows  # deprecated alias (renamed 2026-11-25)
 
 
 def annotation_csv_columns(path: str) -> List[str]:
@@ -3858,7 +3753,7 @@ def annotation_csv_columns(path: str) -> List[str]:
     Args:
         path: CSV file path.
     """
-    return _read_csv_rows(path)[2]
+    return read_csv_rows(path)[2]
 
 
 def update_annotation_csv_row(path: str, ann_id: str, values: Dict[str, Any]) -> None:
@@ -3889,28 +3784,29 @@ def update_annotation_csv_rows(path: str, updates: Dict[str, Dict[str, Any]]) ->
     Raises:
         KeyError: If an id has no row (nothing is written then).
     """
-    rows, eol, low = _read_csv_rows(path)
-    head = rows[0]
-    for c in dict.fromkeys(c for values in updates.values() for c in values):  # (new columns in the order given)
-        if c not in low:
-            head.append(c)
-            low.append(c)
-            for r in rows[1:]:
-                if r:
-                    r.extend([""] * (len(head) - len(r)))
-    idc = low.index("id")
-    hit = set()
-    for r in rows[1:]:
-        values = updates.get(r[idc].strip()) if len(r) > idc else None
-        if values is not None:
-            r.extend([""] * (len(head) - len(r)))
-            for c, v in values.items():
-                r[low.index(c)] = "" if v is None else str(v)
-            hit.add(r[idc].strip())
-    missing = [i for i in updates if i not in hit]
-    if missing:
-        raise KeyError(missing[0] if len(missing) == 1 else missing)
-    _write_csv_rows(path, rows, eol)
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        head = rows[0]
+        for c in dict.fromkeys(c for values in updates.values() for c in values):  # (new columns in the order given)
+            if c.lower() not in low:
+                head.append(c)
+                low.append(c.lower())
+                for r in rows[1:]:
+                    if r:
+                        r.extend([""] * (len(head) - len(r)))
+        idc = low.index("id")
+        hit = set()
+        for r in rows[1:]:
+            values = updates.get(r[idc].strip()) if len(r) > idc else None
+            if values is not None:
+                r.extend([""] * (len(head) - len(r)))
+                for c, v in values.items():
+                    r[low.index(c.lower())] = "" if v is None else str(v)
+                hit.add(r[idc].strip())
+        missing = [i for i in updates if i not in hit]
+        if missing:
+            raise KeyError(missing[0] if len(missing) == 1 else missing)
+        write_csv_rows(path, rows, eol)
 
 
 def main_camera_type(
@@ -3988,22 +3884,23 @@ def set_included_in_training(path: str, ids: Iterable[str], value: bool) -> int:
     Raises:
         KeyError: If an id has no row.
     """
-    rows, eol, low = _read_csv_rows(path)
-    _add_columns(rows, low, (settings.TRAIN_INCLUDE_COLUMN,))
-    idc, ic = low.index("id"), low.index(settings.TRAIN_INCLUDE_COLUMN)
-    want, n = set(ids), 0
-    seen = set()
-    for r in rows[1:]:
-        if r and len(r) > idc and r[idc].strip() in want:
-            r.extend([""] * (len(rows[0]) - len(r)))
-            r[ic] = "True" if value else "False"
-            seen.add(r[idc].strip())
-            n += 1
-    missing = want - seen
-    if missing:
-        raise KeyError(sorted(missing)[0])
-    _write_csv_rows(path, rows, eol)
-    return n
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        _add_columns(rows, low, (settings.TRAIN_INCLUDE_COLUMN,))
+        idc, ic = low.index("id"), low.index(settings.TRAIN_INCLUDE_COLUMN)
+        want, n = set(ids), 0
+        seen = set()
+        for r in rows[1:]:
+            if r and len(r) > idc and r[idc].strip() in want:
+                r.extend([""] * (len(rows[0]) - len(r)))
+                r[ic] = "True" if value else "False"
+                seen.add(r[idc].strip())
+                n += 1
+        missing = want - seen
+        if missing:
+            raise KeyError(sorted(missing)[0])
+        write_csv_rows(path, rows, eol)
+        return n
 
 
 def training_views(anns: Iterable["Annotation"]) -> Tuple[Dict[str, Tuple[str, float, float]], List[str]]:
@@ -4070,26 +3967,27 @@ def set_predictions(
     Returns:
         The number of rows written.
     """
-    rows, eol, low = _read_csv_rows(path)
-    _add_columns(rows, low, PREDICTION_COLUMNS)
-    idc = low.index("id")
-    ci = [low.index(c) for c in PREDICTION_COLUMNS]
-    n = 0
-    for r in rows[1:]:
-        if not r or len(r) <= idc or r[idc].strip() not in preds:
-            continue
-        r.extend([""] * (len(rows[0]) - len(r)))
-        p = preds[r[idc].strip()]
-        agree = p[4] if p is not None and len(p) > 4 else None
-        top = p[5] if p is not None and len(p) > 5 else None
-        vals = [""] * len(PREDICTION_COLUMNS) if p is None else [
-            p[0], f"{float(p[1]):.4f}", str(int(p[2])), p[3] or "",
-            "" if agree is None else f"{float(agree):.2f}", top or ""]
-        for i, v in zip(ci, vals):
-            r[i] = v
-        n += 1
-    _write_csv_rows(path, rows, eol)
-    return n
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        _add_columns(rows, low, PREDICTION_COLUMNS)
+        idc = low.index("id")
+        ci = [low.index(c) for c in PREDICTION_COLUMNS]
+        n = 0
+        for r in rows[1:]:
+            if not r or len(r) <= idc or r[idc].strip() not in preds:
+                continue
+            r.extend([""] * (len(rows[0]) - len(r)))
+            p = preds[r[idc].strip()]
+            agree = p[4] if p is not None and len(p) > 4 else None
+            top = p[5] if p is not None and len(p) > 5 else None
+            vals = [""] * len(PREDICTION_COLUMNS) if p is None else [
+                p[0], f"{float(p[1]):.4f}", str(int(p[2])), p[3] or "",
+                "" if agree is None else f"{float(agree):.2f}", top or ""]
+            for i, v in zip(ci, vals):
+                r[i] = v
+            n += 1
+        write_csv_rows(path, rows, eol)
+        return n
 
 
 def set_training_views(
@@ -4112,30 +4010,31 @@ def set_training_views(
     Returns:
         The number of rows whose view was written.
     """
-    rows, eol, low = _read_csv_rows(path)
-    head = rows[0]
-    inc = settings.TRAIN_INCLUDE_COLUMN
-    changed = _add_columns(rows, low, ("cam_filepath", "cam_x", "cam_y", inc))
-    ci = {c: low.index(c) for c in ("id", "cam_filepath", "cam_x", "cam_y", inc)}
-    n = 0
-    for r in rows[1:]:
-        if not r or len(r) <= ci["id"]:
-            continue
-        v = views.get(r[ci["id"]].strip())
-        if v is None:
-            continue
-        r.extend([""] * (len(head) - len(r)))
-        if r[ci["cam_filepath"]].strip() and not overwrite:
-            continue
-        fp, x, y = v
-        r[ci["cam_filepath"]] = str(fp)
-        r[ci["cam_x"]] = f"{float(x):.2f}"
-        r[ci["cam_y"]] = f"{float(y):.2f}"
-        r[ci[inc]] = "True"
-        n += 1
-    if n or changed:
-        _write_csv_rows(path, rows, eol)
-    return n
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        head = rows[0]
+        inc = settings.TRAIN_INCLUDE_COLUMN
+        changed = _add_columns(rows, low, ("cam_filepath", "cam_x", "cam_y", inc))
+        ci = {c: low.index(c) for c in ("id", "cam_filepath", "cam_x", "cam_y", inc)}
+        n = 0
+        for r in rows[1:]:
+            if not r or len(r) <= ci["id"]:
+                continue
+            v = views.get(r[ci["id"]].strip())
+            if v is None:
+                continue
+            r.extend([""] * (len(head) - len(r)))
+            if r[ci["cam_filepath"]].strip() and not overwrite:
+                continue
+            fp, x, y = v
+            r[ci["cam_filepath"]] = str(fp)
+            r[ci["cam_x"]] = f"{float(x):.2f}"
+            r[ci["cam_y"]] = f"{float(y):.2f}"
+            r[ci[inc]] = "True"
+            n += 1
+        if n or changed:
+            write_csv_rows(path, rows, eol)
+        return n
 
 
 def append_annotation_csv_row(path: str, values: Dict[str, Any]) -> None:
@@ -4146,9 +4045,11 @@ def append_annotation_csv_row(path: str, values: Dict[str, Any]) -> None:
         values: Column name (lower case) -> value; columns the file does not
             have are left out, columns not given are left blank.
     """
-    rows, eol, low = _read_csv_rows(path)
-    rows.append(["" if values.get(c) is None else str(values[c]) for c in low])
-    _write_csv_rows(path, rows, eol)
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        given = {str(k).strip().lower(): v for k, v in values.items()}
+        rows.append(["" if given.get(c) is None else str(given[c]) for c in low])
+        write_csv_rows(path, rows, eol)
 
 
 def delete_annotation_csv_row(path: str, ann_id: str) -> None:
@@ -4161,14 +4062,15 @@ def delete_annotation_csv_row(path: str, ann_id: str) -> None:
     Raises:
         KeyError: If no row has this id.
     """
-    rows, eol, low = _read_csv_rows(path)
-    idc = low.index("id")
-    keep = [rows[0]] + [
-        r for r in rows[1:] if not (len(r) > idc and r[idc].strip() == ann_id)
-    ]
-    if len(keep) == len(rows):
-        raise KeyError(ann_id)
-    _write_csv_rows(path, keep, eol)
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        idc = low.index("id")
+        keep = [rows[0]] + [
+            r for r in rows[1:] if not (len(r) > idc and r[idc].strip() == ann_id)
+        ]
+        if len(keep) == len(rows):
+            raise KeyError(ann_id)
+        write_csv_rows(path, keep, eol)
 
 
 def replace_annotation_csv_values(
@@ -4187,22 +4089,24 @@ def replace_annotation_csv_values(
     Returns:
         The number of cells changed (the file is only rewritten if > 0).
     """
-    rows, eol, low = _read_csv_rows(path)
-    if column.lower() not in low:
-        return 0
-    i = low.index(column.lower())
-    n = 0
-    for r in rows[1:]:
-        if len(r) > i and r[i] in mapping and mapping[r[i]] != r[i]:
-            r[i] = mapping[r[i]]
-            n += 1
-    if n:
-        _write_csv_rows(path, rows, eol)
-    return n
+    with _path_lock(path):
+        rows, eol, low = read_csv_rows(path)
+        if column.lower() not in low:
+            return 0
+        i = low.index(column.lower())
+        n = 0
+        for r in rows[1:]:
+            if len(r) > i and r[i] in mapping and mapping[r[i]] != r[i]:
+                r[i] = mapping[r[i]]
+                n += 1
+        if n:
+            write_csv_rows(path, rows, eol)
+        return n
 
 
 def backup_annotation_csv(path: str) -> str:
-    """Copy an annotation CSV to ``<folder>/backup/<name>_<YYYYmmdd_HHMMSS>.bak``.
+    """Copy an annotation CSV to ``<folder>/backup/<name>_<YYYYmmdd_HHMMSS>.bak``
+    (``..._2.bak`` etc. for further backups within the same second).
 
     Args:
         path: Annotation CSV.
@@ -4214,12 +4118,18 @@ def backup_annotation_csv(path: str) -> str:
 
     d = os.path.join(os.path.dirname(os.path.abspath(path)), "backup")
     os.makedirs(d, exist_ok=True)
-    out = os.path.join(
-        d, f"{os.path.basename(path)}_{datetime.now():%Y%m%d_%H%M%S}.bak"
-    )
-    with open(path, "rb") as src, open(out, "wb") as dst:
-        dst.write(src.read())
-    return out
+    stem = f"{os.path.basename(path)}_{datetime.now():%Y%m%d_%H%M%S}"
+    with open(path, "rb") as src:
+        data = src.read()
+    n = 1
+    while True:  # (a second backup within the same second gets _2, _3, ...: none is overwritten)
+        out = os.path.join(d, f"{stem}.bak" if n == 1 else f"{stem}_{n}.bak")
+        try:
+            with open(out, "xb") as dst:
+                dst.write(data)
+            return out
+        except FileExistsError:
+            n += 1
 
 
 def depth_in_m(

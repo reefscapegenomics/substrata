@@ -2,7 +2,8 @@
 
 The three functions share one projection core (cameras.py) and the stacked camera
 arrays are cached on :class:`Cameras`. These tests compare them with frozen copies
-of the three implementations as they were before (``_ref_*`` below, kept verbatim but for the lens:
+of the three implementations as they were before (``_ref_*`` below, kept verbatim but for the relevance, in
+consistent units since November 2026 (``cameras._relevance``), and the lens:
 since 0.2 the pixels follow Metashape's frame camera model, here in ``_ref_pixels``, written out on its
 own; tests/test_lens_metashape.py checks the model against Metashape itself):
 same pixels, depths, relevances, in-view flags and types, on distorted and
@@ -55,13 +56,16 @@ def _ref_get_pixel_coords(self, coords, use_orig_coords=False, required_to_be_in
     in_view = (
         proj_point[2] > 0
         and r2 * self.sensor.fx**2 < 1.01 * self.sensor.width**2
-        and 0 <= x_img <= self.sensor.width
-        and 0 <= y_img <= self.sensor.height
+        and 0 <= x_img < self.sensor.width
+        and 0 <= y_img < self.sensor.height
     )
     if in_view or not required_to_be_in_view:
         dist_sq = np.sum((cam_coords - coords) ** 2)
-        rm = np.abs((np.abs(proj_point[2]) + dist_sq) / (self.sensor.fx * self.sensor.fy)) * (
+        rm = dist_sq / (self.sensor.fx * self.sensor.fy) * (
             10 + np.abs(x_img - 0.5 * self.sensor.width) + np.abs(y_img - 0.5 * self.sensor.height))
+        if in_view:  # (rounded, at most the last pixel: 0 <= x < width)
+            return (min(int(round(x_img)), int(self.sensor.width) - 1),
+                    min(int(round(y_img)), int(self.sensor.height) - 1), float(proj_point[2]), rm)
         return (int(round(x_img)), int(round(y_img)), float(proj_point[2]), rm)
     return None, None, None, None
 
@@ -86,13 +90,13 @@ def _ref_project_points(self, coords, use_orig_coords=False):
     r2 = x_norm**2 + y_norm**2
     x_img, y_img = _ref_pixels(x_norm, y_norm, s)
     in_view = ((depth > 0) & (r2 * s.fx**2 < 1.01 * s.width**2)
-               & (x_img >= 0) & (x_img <= s.width) & (y_img >= 0) & (y_img <= s.height))
+               & (x_img >= 0) & (x_img < s.width) & (y_img >= 0) & (y_img < s.height))
     cam_center = np.asarray(cam_coords, dtype=float).ravel()[:3]
     dist_sq = np.sum((cam_center - pts) ** 2, axis=1)
-    relevance = np.abs((np.abs(depth) + dist_sq) / (s.fx * s.fy)) * (
+    relevance = dist_sq / (s.fx * s.fy) * (
         10 + np.abs(x_img - 0.5 * s.width) + np.abs(y_img - 0.5 * s.height))
-    x_px = np.rint(x_img)
-    y_px = np.rint(y_img)
+    x_px = np.where(in_view, np.minimum(np.rint(x_img), s.width - 1), np.rint(x_img))
+    y_px = np.where(in_view, np.minimum(np.rint(y_img), s.height - 1), np.rint(y_img))
     if single:
         return (float(x_px[0]), float(y_px[0]), float(depth[0]),
                 float(relevance[0]), bool(in_view[0]))
@@ -141,16 +145,17 @@ def _ref_pixel_hits(cams, coords, use_orig_coords=True, enabled_only=True, cache
         from types import SimpleNamespace
         xi, yi = _ref_pixels(xn, yn, SimpleNamespace(**{k: v for k, v in st.items() if isinstance(v, np.ndarray)}))
         ok = ((proj[:, 2] > 0) & (r2 * st["fx"] ** 2 < 1.01 * st["width"] ** 2)
-              & (xi >= 0) & (xi <= st["width"]) & (yi >= 0) & (yi <= st["height"]))
+              & (xi >= 0) & (xi < st["width"]) & (yi >= 0) & (yi < st["height"]))
     idx = np.flatnonzero(ok)
     if enabled_only:
         idx = np.array([i for i in idx.tolist() if getattr(st["cams"][i], "enabled", True) is not False], int)
     if not len(idx):
         return []
     dist_sq = ((st["centres"][idx] - p[:3]) ** 2).sum(1)
-    rm = (np.abs((np.abs(proj[idx, 2]) + dist_sq) / (st["fx"][idx] * st["fy"][idx]))
+    rm = (dist_sq / (st["fx"][idx] * st["fy"][idx])
           * (10 + np.abs(xi[idx] - 0.5 * st["width"][idx]) + np.abs(yi[idx] - 0.5 * st["height"][idx])))
-    return [(st["cams"][i], int(round(xi[i])), int(round(yi[i])), float(proj[i, 2]), r)
+    return [(st["cams"][i], min(int(round(xi[i])), int(st["width"][i]) - 1),
+             min(int(round(yi[i])), int(st["height"][i]) - 1), float(proj[i, 2]), r)
             for i, r in zip(idx.tolist(), rm.tolist())]
 
 
@@ -206,7 +211,7 @@ def _cameras(n=120, seed=0, parent=True):
             cams_obj.data[c.cam_id] = c
         cams.append(c)
     if parent:
-        cams_obj.transform_coords(_world())
+        cams_obj.apply_transform(_world())
     return cams
 
 
@@ -228,11 +233,11 @@ def _edge_case_points():
     camera, at depth 0, beyond the field-of-view radius."""
     f = 1024.0
     return np.array([
-        [2000 / f, 0.0, 1.0],          # x = 4000 exactly (right border: in view)
-        [-2000 / f, 0.0, 1.0],         # x = 0 exactly (left border)
-        [0.0, 1500 / f, 1.0],          # y = 3000 exactly (bottom border)
-        [0.0, -1500 / f, 1.0],         # y = 0 exactly (top border)
-        [2000 / f, 1500 / f, 1.0],     # the corner
+        [2000 / f, 0.0, 1.0],          # x = 4000 exactly (right border: out of view, 0 <= x < width)
+        [-2000 / f, 0.0, 1.0],         # x = 0 exactly (left border: in view)
+        [0.0, 1500 / f, 1.0],          # y = 3000 exactly (bottom border: out of view)
+        [0.0, -1500 / f, 1.0],         # y = 0 exactly (top border: in view)
+        [2000 / f, 1500 / f, 1.0],     # the far corner (out of view)
         [2001 / f, 0.0, 1.0],          # one pixel past the right border
         [0.0, -1501 / f, 1.0],         # one pixel above the top
         [0.5 / f, 0.5 / f, 1.0],       # 2000.5, 1500.5 (half pixels: rounded to even)
@@ -315,13 +320,13 @@ class TestProjectionEquivalence(unittest.TestCase):
                     self.assertTrue(all(_same(u, v) for u, v in zip(old1, new1)), (old1, new1))
         # the edge cases, explicitly
         x, y, d, _r, iv = _edge_case_camera().project_points(_edge_case_points())
-        self.assertEqual(iv.tolist()[:9], [True] * 5 + [False, False, True, True])
+        self.assertEqual(iv.tolist()[:9], [False, True, False, True, False, False, False, True, True])
         self.assertEqual((x[7], y[7], x[8], y[8]), (2000.0, 1500.0, 2002.0, 1498.0))
         self.assertFalse(iv[9] or iv[10] or iv[11])
 
     def test_pixel_hits(self):
         for parent in (True, False):
-            cm._projection_changed()
+            cm.invalidate_projection_cache()
             cams = _cameras(150, parent=parent) + [_edge_case_camera()]
             pts = np.vstack([_points(n=40), _edge_case_points()])
             seen = 0
@@ -358,7 +363,7 @@ class TestProjectionEquivalence(unittest.TestCase):
         self.assertNotIn(hit, [h[0] for h in cm.pixel_hits(cams, p)])
         self.assertTrue(_same_hits(_ref_pixel_hits(cams, p), cm.pixel_hits(cams, p)))
         # a world transform restacks the world frame
-        parent.transform_coords(_world())
+        parent.apply_transform(_world())
         for orig in (True, False):
             self.assertTrue(_same_hits(_ref_pixel_hits(cams, p, orig), cm.pixel_hits(cams, p, orig), not orig))
         # replacing a camera in the container restacks
@@ -377,7 +382,7 @@ class TestProjectionEquivalence(unittest.TestCase):
         no_sensor, placeholder = hits[0], hits[1]
         no_sensor.sensor = None
         placeholder.missing_pose_from_meta = True  # (its pose: the identity, at the origin, as loaded)
-        cm._projection_changed()
+        cm.invalidate_projection_cache()
         for c in (no_sensor, placeholder):
             self.assertFalse(cm.can_project(c))
             self.assertEqual(c.get_pixel_coords(p, use_orig_coords=True), (None, None, None, None))

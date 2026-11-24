@@ -45,6 +45,8 @@ from tqdm import tqdm
 
 # Local Modules
 from substrata import settings
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.frames import metres_per_unit, uniform_scale
 from substrata.logging import logger
 
 Image.MAX_IMAGE_PIXELS = None
@@ -63,7 +65,8 @@ __all__ = [
     "calibrate_point_classifier", "list_images", "DenseMap", "load_resampled",
     "dense_probabilities", "iter_dense_maps", "photo_scale", "save_dense_masks",
     "unique_stems", "training_offsets", "resolve_arch", "is_dinov3",
-    "backbone_patch_size", "dinov3_weights", "width_scale",
+    "backbone_patch_size", "dinov3_weights", "width_scale", "training_scales",
+    "photo_ids", "metres_per_unit",
 ]
 
 POINT_MODEL_FORMAT = "substrata-point-classifier"
@@ -540,12 +543,16 @@ def extract_point_features(
 
 
 def world_scale(world_transform: Any) -> Optional[float]:
-    """Linear scale of a 4x4 world transform (world units per original unit)."""
+    """Linear scale of a 4x4 world transform (world units per original unit):
+    :func:`substrata.frames.uniform_scale`, None for a missing or singular
+    transform."""
     if world_transform is None:
         return None
-    lin = np.asarray(world_transform, dtype=float)[:3, :3]
-    s = float(np.cbrt(abs(np.linalg.det(lin))))
+    s = uniform_scale(world_transform)
     return s if s > 0 else None
+
+
+# (metres_per_unit, re-exported here: defined in substrata.frames)
 
 
 def ground_resolution_mm(depth: float, fx: float, scale: float) -> Optional[float]:
@@ -577,7 +584,8 @@ def image_match_gsd_mm(match: Any) -> Optional[float]:
     # metres per model unit: set on cameras loaded without their project's
     # world_transform (e.g. by substrata-explore), else of their world_transform
     scale = (getattr(parent, "metres_per_unit", None)
-             or world_scale(getattr(parent, "world_transform", None)))
+             or metres_per_unit(getattr(parent, "world_transform", None),
+                                getattr(parent, "scale_factor", None)))
     if not fx or scale is None:
         return None
     depth = getattr(match, "depth", None)
@@ -692,9 +700,8 @@ def _load_project_cameras(yaml_path: str) -> Optional[Tuple[Dict[str, Any], floa
         xml = getattr(init, "cams_xml_filepath", None)
         if not (meta and xml and os.path.isfile(meta) and os.path.isfile(xml)):
             return None
-        scale = world_scale(getattr(init, "world_transform", None))
-        if scale is None:
-            scale = float(getattr(init, "scale_factor", None) or 0) or None
+        scale = metres_per_unit(getattr(init, "world_transform", None),
+                                getattr(init, "scale_factor", None))
         if scale is None:
             return None
         print(f"Ground resolution: loading cameras of {os.path.basename(yaml_path)}")
@@ -792,7 +799,7 @@ class PointFeatureClassifier:
         ref = (self.meta or {}).get("ref_width")
         if paths is not None and ref and not known.all():
             todo = np.nonzero(~known)[0]
-            widths = _image_widths([paths[i] for i in todo])
+            widths = image_widths([paths[i] for i in todo])
             for i in todo:
                 w = widths.get(paths[i])
                 if w:
@@ -984,40 +991,60 @@ def is_point_classifier_path(path: str) -> bool:
 def fit_point_probe(
     z: np.ndarray, y: Sequence[str], cs: Sequence[float] = settings.POINT_PROBE_CS,
     cv: int = settings.POINT_PROBE_CV, seed: int = 0,
+    groups: Optional[Sequence[Any]] = None,
 ) -> Tuple[List[str], np.ndarray, np.ndarray, float]:
     """Fit a class-balanced logistic-regression probe on standardised features.
 
     The regularisation ``C`` is chosen by stratified cross-validation on
-    macro-F1. A per-feature standardisation of ``z`` is folded into the
-    returned weights, so the probe is a single linear layer.
+    macro-F1. With ``groups`` (e.g. the photo of each point) the folds are
+    grouped (``StratifiedGroupKFold``): the points of one photo are never split
+    between a fold's fit and its scoring, which would favour a weakly
+    regularised probe that memorises photos. A per-feature standardisation of
+    ``z`` is folded into the returned weights, so the probe is a single linear
+    layer.
 
     Returns:
         ``(classes, weights (K, C), bias (K,), chosen C)``.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import f1_score
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
     y = np.asarray(y)
     m = z.mean(0)
     s = z.std(0) + 1e-6
     zs = (z - m) / s
     folds = min(cv, int(min(Counter(y.tolist()).values())))
+    if groups is not None:
+        groups = np.asarray(groups)
+        folds = min(folds, len(set(groups.tolist())))
     if folds >= 2 and len(cs) > 1:
         # The C search by hand (as LogisticRegressionCV with scoring="f1_macro"
         # would): that combination fails for two classes in some scikit-learn
         # versions (1.9: make_scorer() got multiple values for 'pos_label').
-        splits = list(StratifiedKFold(folds, shuffle=True, random_state=seed).split(zs, y))
+        if groups is not None:
+            kfold = StratifiedGroupKFold(folds, shuffle=True, random_state=seed)
+            splits = list(kfold.split(zs, y, groups))
+        else:
+            kfold = StratifiedKFold(folds, shuffle=True, random_state=seed)
+            splits = list(kfold.split(zs, y))
+        # a fold whose fit part holds a single class cannot score a C
+        splits = [(tr, te) for tr, te in splits if len(set(y[tr].tolist())) > 1]
 
         def cv_f1(c: float) -> float:
             scores = []
             for tr, te in splits:
-                fit = LogisticRegression(C=c, class_weight="balanced", max_iter=5000).fit(zs[tr], y[tr])
+                fit = LogisticRegression(
+                    C=c, class_weight="balanced", max_iter=5000).fit(zs[tr], y[tr])
                 scores.append(f1_score(y[te], fit.predict(zs[te]), average="macro"))
-            return float(np.mean(scores))
+            return float(np.mean(scores)) if scores else float("nan")
 
         f1s = [cv_f1(float(c)) for c in cs]
-        c = float(list(cs)[int(np.argmax(f1s))])  # (ties: the first, as LogisticRegressionCV)
+        if np.isfinite(f1s).any():
+            # (ties: the first, as LogisticRegressionCV)
+            c = float(list(cs)[int(np.nanargmax(f1s))])
+        else:
+            c = float(sorted(cs)[len(cs) // 2])
     else:
         c = float(sorted(cs)[len(cs) // 2])
     lr = LogisticRegression(C=c, class_weight="balanced", max_iter=5000).fit(zs, y)
@@ -1081,7 +1108,7 @@ def row_key(r: Dict[str, Any]) -> str:
             f"{r['_x']:.1f}|{r['_y']:.1f}")
 
 
-def _median_image_width(paths: Sequence[str], max_n: int = 200) -> Optional[float]:
+def median_image_width(paths: Sequence[str], max_n: int = 200) -> Optional[float]:
     widths = []
     for p in list(dict.fromkeys(paths))[:max_n]:
         try:
@@ -1092,7 +1119,10 @@ def _median_image_width(paths: Sequence[str], max_n: int = 200) -> Optional[floa
     return float(np.median(widths)) if widths else None
 
 
-def _image_widths(paths: Sequence[str]) -> Dict[str, Optional[int]]:
+_median_image_width = median_image_width  # deprecated alias (renamed 2026-11-25)
+
+
+def image_widths(paths: Sequence[str]) -> Dict[str, Optional[int]]:
     """Width (px) of each distinct photo, None when unreadable."""
     out: Dict[str, Optional[int]] = {}
     for p in dict.fromkeys(paths):
@@ -1104,13 +1134,16 @@ def _image_widths(paths: Sequence[str]) -> Dict[str, Optional[int]]:
     return out
 
 
+_image_widths = image_widths  # deprecated alias (renamed 2026-11-25)
+
+
 def auto_scale_factor(
     paths: Sequence[str], window: int = settings.POINT_WINDOW_PX,
     width: Optional[float] = None,
 ) -> float:
     """Scale at which the window spans ``POINT_CONTEXT_FRACTION`` of the median
     image width (``width`` if given; at most 1: never upsample)."""
-    w = width or _median_image_width(paths)
+    w = width or median_image_width(paths)
     if not w:
         return 1.0
     return float(min(1.0, window / (w * settings.POINT_CONTEXT_FRACTION)))
@@ -1206,7 +1239,7 @@ def plan_training_scales(
     domain = np.array([bool((r.get("domain") or "").strip()) for r in rows], bool)
     main = [i for i in range(len(rows)) if not domain[i]] or list(range(len(rows)))
     paths = [rows[i]["cam_filepath"] for i in main]
-    ref_w = _median_image_width(paths)
+    ref_w = median_image_width(paths)
     auto = auto_scale_factor(paths, window, ref_w)
     if feature_scale:
         s = float(feature_scale)
@@ -1251,12 +1284,43 @@ def _width_scaled_domains(
     if not plan.ref_width or not sel.any():
         return plan
     idx = np.nonzero(sel)[0]
-    widths = _image_widths([rows[i]["cam_filepath"] for i in idx])
+    widths = image_widths([rows[i]["cam_filepath"] for i in idx])
     for i in idx:
         w = widths.get(rows[i]["cam_filepath"])
         if w:
             plan.scales[i] = width_scale(plan.scale_factor, plan.ref_width, w)
     return plan
+
+
+def training_scales(
+    clf: "PointFeatureClassifier", rows: Sequence[Dict[str, Any]], output_dir: str,
+) -> np.ndarray:
+    """Per-row scales at which :func:`train_point_classifier` resampled ``rows``.
+
+    The same rules as :func:`plan_training_scales` with the classifier's own
+    resolution: the (filled) ground resolution / ``target_mm_px``, else
+    ``scale_factor``; points of other camera domains without a ground
+    resolution at their photo's width scale (:func:`_width_scaled_domains`).
+    Used to re-read the training points (``train --validate`` / ``--test``,
+    ``substrata curate``) at exactly the training scales (feature cache hits).
+    """
+    n = len(rows)
+    domain = np.array([bool((r.get("domain") or "").strip()) for r in rows], bool)
+    sf = float(clf.scale_factor)
+    if clf.target_mm_px:
+        raw = resolve_training_gsd(rows, os.path.join(
+            output_dir, settings.POINT_FEATURES_DIR, "gsd_cache.json"))
+        g = _fill_gsd(rows, raw)
+        ok = np.isfinite(g) & (g > 0)
+        scales = np.full(n, sf)
+        scales[ok] = g[ok] / float(clf.target_mm_px)
+        sel = domain & ~np.isfinite(raw)
+    else:
+        scales = np.full(n, sf)
+        sel = domain
+    plan = ScalePlan(scales, clf.target_mm_px, sf, "",
+                     (clf.meta or {}).get("ref_width"))
+    return _width_scaled_domains(rows, plan, sel).scales
 
 
 def width_scale(scale_factor: float, ref_width: float, width: float) -> float:
@@ -1269,9 +1333,12 @@ def width_scale(scale_factor: float, ref_width: float, width: float) -> float:
     return float(min(1.0, scale_factor * ref_width / width))
 
 
-def _cache_file(output_dir: str, backbone: str, window: int, kind: str) -> str:
+def feature_cache_path(output_dir: str, backbone: str, window: int, kind: str) -> str:
     return os.path.join(output_dir, settings.POINT_FEATURES_DIR,
                         f"{kind}_{backbone}_w{window}.npz")
+
+
+_cache_file = feature_cache_path  # deprecated alias (renamed 2026-11-25)
 
 
 def cached_features(
@@ -1286,7 +1353,9 @@ def cached_features(
     Keys include the scale (and window offset), so a changed resolution
     re-extracts. The cache is
     rewritten with exactly the current keys (stale entries dropped); points on
-    unreadable photos are not cached and are retried next time.
+    unreadable photos are not cached and are retried next time. Features are
+    stored as float16; newly extracted ones are rounded the same way before
+    they are returned, so a first run and a cached rerun give the same values.
 
     Returns:
         ``(features (n, C) float32, ok (n,) bool)``.
@@ -1327,7 +1396,8 @@ def cached_features(
             feats[i] = old[have[k]]
             ok[i] = True
     if missing:
-        feats[missing] = new
+        # as stored (float16), so the result does not depend on the cache
+        feats[missing] = np.asarray(new, np.float32).astype(np.float16)
         ok[missing] = new_ok
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     keep = np.nonzero(ok)[0]
@@ -1354,7 +1424,7 @@ def training_offsets(
     return out
 
 
-def _train_offsets(
+def enabled_training_offsets(
     keys: Sequence[str], window: int, enabled: Optional[bool] = None,
 ) -> Optional[np.ndarray]:
     """Training window offsets when enabled (``settings.POINT_TRAIN_OFFSETS``,
@@ -1364,6 +1434,9 @@ def _train_offsets(
     return training_offsets(keys, window) if enabled else None
 
 
+_train_offsets = enabled_training_offsets  # deprecated alias (renamed 2026-11-25)
+
+
 def random_patches(
     paths: Sequence[str], n_images: int = settings.POINT_CALIB_IMAGES,
     per_image: int = settings.POINT_CALIB_PER_IMAGE,
@@ -1371,11 +1444,14 @@ def random_patches(
 ) -> List[Tuple[str, float, float]]:
     """Random positions in a random sample of photos (deterministic for a seed).
 
-    Photos are picked by a hash of their file name and each photo's positions
+    Photos are picked by a hash of their name (:func:`photo_ids`: the file
+    name, the full path where file names repeat) and each photo's positions
     are seeded by it, so adding or removing a few photos (e.g. curation) only
     changes the patches of those photos, and the patch cache stays valid."""
+    ids = photo_ids(paths)
+
     def h(p):
-        return hashlib.md5(f"{seed}|{os.path.basename(p)}".encode()).hexdigest()
+        return hashlib.md5(f"{seed}|{ids[p]}".encode()).hexdigest()
 
     uniq = sorted(set(paths), key=h)
     pick = sorted(uniq[:n_images])
@@ -1393,6 +1469,15 @@ def random_patches(
     return out
 
 
+def photo_ids(paths: Sequence[str]) -> Dict[str, str]:
+    """A name per distinct photo path: its file name, or its full path when
+    another photo has the same file name (keys of patch caches and seeds)."""
+    uniq = list(dict.fromkeys(paths))
+    n = Counter(os.path.basename(p) for p in uniq)
+    return {p: os.path.basename(p) if n[os.path.basename(p)] == 1 else p
+            for p in uniq}
+
+
 def feature_statistics(feats: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Per-feature mean and spread used for standardisation."""
     return feats.mean(0).astype(np.float32), (feats.std(0) + 1e-6).astype(np.float32)
@@ -1408,12 +1493,13 @@ def _calibration_features(
     for r, s in zip(rows, scales):
         photo_scale[r["cam_filepath"]].append(s)
     patches = random_patches(list(photo_scale))
-    keys = [f"{os.path.basename(p)}|{x:.1f}|{y:.1f}" for p, x, y in patches]
+    ids = photo_ids(list(photo_scale))
+    keys = [f"{ids[p]}|{x:.1f}|{y:.1f}" for p, x, y in patches]
     sc = [float(np.median(photo_scale[p])) for p, _x, _y in patches]
     feats, ok = cached_features(
         keys, [p for p, _x, _y in patches], [x for _p, x, _y in patches],
         [y for _p, _x, y in patches], sc,
-        _cache_file(output_dir, backbone, window, "calibration"), model_loader,
+        feature_cache_path(output_dir, backbone, window, "calibration"), model_loader,
         window, batch_size, n_jobs, desc="Calibration patches",
     )
     return feats[ok]
@@ -1474,14 +1560,19 @@ def train_point_classifier(
     feature_mm_px: Optional[float] = None, feature_scale: Optional[float] = None,
     window: int = settings.POINT_WINDOW_PX,
     batch_size: int = settings.POINT_BATCH_SIZE, n_jobs: int = -1,
-    hub_repo: Optional[str] = None,
+    hub_repo: Optional[str] = None, split_by: Optional[str] = None,
 ) -> Tuple[PointFeatureClassifier, Dict[str, Any]]:
     """Train and save a point-feature classifier from a training annotations CSV.
 
     Steps: read rows (label map, split) -> choose the resolution
     (:func:`plan_training_scales`) -> point features (cached, incremental) ->
     calibration statistics from random patches of the training photos ->
-    probe on the train split -> evaluate validation and test.
+    probe on the train split (its C cross-validated with folds grouped by
+    photo) -> evaluate validation and test.
+
+    ``split_by`` is only recorded (``meta["split_by"]``): the split itself is
+    the CSV's ``split_key`` (see
+    :func:`substrata.classification.collate_training_annotations`).
 
     Returns:
         ``(classifier, info)`` with ``info`` holding ``rows``, ``plan``,
@@ -1527,9 +1618,9 @@ def train_point_classifier(
     feats, ok = cached_features(
         keys, [r["cam_filepath"] for r in rows],
         [r["_x"] for r in rows], [r["_y"] for r in rows], plan.scales,
-        _cache_file(output_dir, backbone, window, "points"), loader, window,
+        feature_cache_path(output_dir, backbone, window, "points"), loader, window,
         batch_size, n_jobs, desc="Point features",
-        offsets=_train_offsets(keys, window),
+        offsets=enabled_training_offsets(keys, window),
     )
     domains = [(r.get("domain") or "").strip() for r in rows]
     main = [i for i, d in enumerate(domains) if not d] or list(range(len(rows)))
@@ -1553,7 +1644,8 @@ def train_point_classifier(
     if len(set(y[train])) < 2:
         raise ValueError("Training needs at least two classes in the train split.")
     print(f"Fitting the probe on {int(train.sum())} training points ...")
-    classes, w, b, c = fit_point_probe(z[train], y[train])
+    photos = np.array([r["cam_filepath"] for r in rows])
+    classes, w, b, c = fit_point_probe(z[train], y[train], groups=photos[train])
     clf = PointFeatureClassifier(
         backbone=backbone, classes=classes, weights=w, bias=b,
         source_mean=mean, source_std=std, window=window,
@@ -1561,6 +1653,8 @@ def train_point_classifier(
         label_map=dict(label_map), hub_repo=hub_repo, domains=domain_stats,
         meta={
             "resolution": plan.description, "probe_C": c,
+            "probe_cv": "folds grouped by photo",
+            "split_by": split_by,
             "n_train": int(train.sum()), "n_calibration_patches": int(len(calib)),
             "train_offsets": bool(settings.POINT_TRAIN_OFFSETS),
             "ref_width": plan.ref_width,
@@ -1597,19 +1691,15 @@ def evaluate_point_classifier(
                     for r in rows])
     if not sel.any():
         raise ValueError(f"No {split_name} points in {ann_path}.")
-    gsd = None
-    if clf.target_mm_px:
-        gsd = _fill_gsd(rows, resolve_training_gsd(rows, os.path.join(
-            output_dir, settings.POINT_FEATURES_DIR, "gsd_cache.json")))
-    scales = clf.scales_for(gsd, len(rows))
+    scales = training_scales(clf, rows, output_dir)
     keys = [row_key(r) for r in rows]
     feats, ok = cached_features(
         keys, [r["cam_filepath"] for r in rows],
         [r["_x"] for r in rows], [r["_y"] for r in rows], scales,
-        _cache_file(output_dir, clf.backbone, clf.window, "points"),
+        feature_cache_path(output_dir, clf.backbone, clf.window, "points"),
         clf.backbone_model, clf.window, batch_size, n_jobs,
         desc="Point features",
-        offsets=_train_offsets(keys, clf.window, clf.meta.get("train_offsets")),
+        offsets=enabled_training_offsets(keys, clf.window, clf.meta.get("train_offsets")),
     )
     use = sel & ok
     domains = [(r.get("domain") or "").strip() for r, u in zip(rows, use) if u]
@@ -1631,7 +1721,7 @@ def report_point_evaluation(
           f"macro-F1: {result['macro_f1']:.4f}\n")
     print(result["report"])
     if pdf_path:
-        classification._write_stats_pdf(
+        classification.write_classifier_stats_pdf(
             pdf_path, split_name, result["n"], result["accuracy"],
             f"Balanced accuracy: {result['balanced_accuracy']:.4f}\n"
             f"Macro-F1: {result['macro_f1']:.4f}\n\n{result['report']}",
@@ -1686,6 +1776,11 @@ def calibrate_point_classifier(
         gsd_mm: Ground resolution (mm/px) of these photos; required for
             classifiers with a physical target resolution.
         n_images, per_image: Sampling of random patches.
+
+    The patches are resampled exactly as prediction resamples these photos
+    (:meth:`PointFeatureClassifier.scales_for` with the photo paths): by the
+    ground resolution, else by their width relative to the training photos.
+    The scale of each photo is stored in ``meta["calibration"]["scales"]``.
     """
     if clf.target_mm_px and not gsd_mm:
         raise ValueError(
@@ -1695,17 +1790,25 @@ def calibrate_point_classifier(
     patches = random_patches(images, n_images, per_image, seed=seed)
     if not patches:
         raise ValueError("No readable calibration photos.")
-    scale = gsd_mm / clf.target_mm_px if clf.target_mm_px else clf.scale_factor
+    paths = [p for p, _x, _y in patches]
+    gsd = [float(gsd_mm)] * len(paths) if gsd_mm else None
+    scales = clf.scales_for(gsd, len(paths), paths)
     feats, ok = extract_point_features(
-        [p for p, _x, _y in patches], [x for _p, x, _y in patches],
-        [y for _p, _x, y in patches], np.full(len(patches), scale),
+        paths, [x for _p, x, _y in patches], [y for _p, _x, y in patches], scales,
         clf.backbone_model(), clf.window, batch_size=batch_size, n_jobs=n_jobs,
         desc="Calibration patches",
     )
-    mean, std = feature_statistics(feats[ok])
-    info = {"n_patches": int(ok.sum()),
-            "n_images": len({p for p, _x, _y in patches}),
-            "gsd_mm": gsd_mm, "scale": float(scale)}
+    if not np.asarray(ok).any():
+        raise ValueError("No calibration patch could be read.")
+    mean, std = feature_statistics(np.asarray(feats)[ok])
+    per_photo = {p: round(float(sc), 6) for p, sc in zip(paths, scales)}
+    info = {"n_patches": int(np.asarray(ok).sum()),
+            "n_images": len(per_photo),
+            "gsd_mm": gsd_mm, "scale": float(np.median(scales)),
+            "scales": per_photo,
+            "scale_rule": ("ground resolution / target" if gsd else
+                           "photo width (as prediction without a ground "
+                           "resolution)")}
     return clf.with_calibration(mean, std, info)
 
 
@@ -1914,8 +2017,9 @@ def photo_scale(
     return float(clf.scale_factor)
 
 
+@_renamed_kwargs(out_dir="output_dir")
 def save_dense_masks(
-    dm: DenseMap, out_dir: str, stem: str,
+    dm: DenseMap, output_dir: str, stem: str,
     colors: Dict[str, Tuple[int, int, int]], save_probs: bool = False,
 ) -> Dict[str, str]:
     """Write a photo's masks at feature-cell resolution.
@@ -1926,9 +2030,9 @@ def save_dense_masks(
     uint8 0-255, ``classes``). Upsample by ``dm.cell_px`` to native pixels.
 
     Returns:
-        The written file names (relative to ``out_dir``).
+        The written file names (relative to ``output_dir``).
     """
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     labels = dm.labels()
     lab = Image.frombytes("P", (labels.shape[1], labels.shape[0]), labels.tobytes())
     palette = []
@@ -1936,13 +2040,13 @@ def save_dense_masks(
         palette += list(colors.get(c, (128, 128, 128)))
     lab.putpalette(palette + [0] * (768 - len(palette)))
     files = {"labels": f"{stem}_labels.png", "conf": f"{stem}_conf.png"}
-    lab.save(os.path.join(out_dir, files["labels"]))
+    lab.save(os.path.join(output_dir, files["labels"]))
     conf = np.clip(np.rint(dm.confidence() * 255), 0, 255).astype(np.uint8)
-    Image.fromarray(conf).save(os.path.join(out_dir, files["conf"]))
+    Image.fromarray(conf).save(os.path.join(output_dir, files["conf"]))
     if save_probs:
         files["probs"] = f"{stem}_probs.npz"
         q = np.clip(np.rint(dm.probs * 255), 0, 255).astype(np.uint8)
-        np.savez_compressed(os.path.join(out_dir, files["probs"]), probs=q,
+        np.savez_compressed(os.path.join(output_dir, files["probs"]), probs=q,
                             classes=np.array(dm.classes))
     return files
 

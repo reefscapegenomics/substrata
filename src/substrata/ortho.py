@@ -12,6 +12,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+
 if TYPE_CHECKING:
     from substrata.annotations import Annotation, Annotations
     from substrata.pointclouds import PointCloud, SimplePointCloud
@@ -72,6 +74,32 @@ def _as_per_point(value, n: int) -> list:
     return seq if len(seq) == n else [value] * n
 
 
+def _cloud_units(pcd, units: Optional[str]) -> str:
+    """Length unit of a cloud's coordinates, for labels.
+
+    *units* if given; else ``"m"`` when the cloud carries a ``scale_factor``
+    (a :class:`~substrata.pointclouds.PointCloud` scaled to metres by
+    ``apply_orientation_transforms`` / the project initializer), otherwise
+    ``"units"`` (model units: an unscaled cloud is not in metres).
+    """
+    if units is not None:
+        return str(units)
+    return "m" if getattr(pcd, "scale_factor", None) is not None else "units"
+
+
+def _display_rotation(display_rotation: int, rotation: Optional[int]) -> int:
+    """The display rotation in degrees, accepting the old ``rotation`` keyword."""
+    if rotation is not None:
+        warnings.warn(
+            "the `rotation` argument (degrees) is now `display_rotation`; "
+            "`.rotation` is the 3x3 view rotation matrix",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return rotation
+    return display_rotation
+
+
 class OrthoMap:
     """Pre-rendered 2D orthographic projection of a point cloud.
 
@@ -80,11 +108,21 @@ class OrthoMap:
     overlay dynamic highlights (annotations, coordinate lists, etc.)
     without re-rasterizing.
 
+    Pixel convention: pixel column ``i`` covers projected x in
+    ``[origin_x + i * resolution, origin_x + (i + 1) * resolution)`` and row 0
+    is the top (highest projected y). :meth:`project` returns continuous image
+    coordinates in which pixel ``(i, j)`` spans ``[i, i + 1) x [j, j + 1)``, so
+    ``floor(project(p))`` is the pixel the rasteriser put ``p`` in and its
+    centre is at ``(i + 0.5, j + 0.5)``.
+
     Attributes:
         image: Pre-rendered ortho image as a numpy array (H, W, 3, uint8).
         rotation: 3x3 rotation matrix from world to view coordinates.
+        display_rotation: In-plane rotation of the shown image (degrees).
         origin: 2D offset ``(min_x, min_y)`` in rotated space.
-        resolution: Metres per pixel.
+        resolution: Cloud units (metres for a scaled cloud) per pixel; the same
+            along x and y.
+        units: Length unit of the coordinates (``"m"`` or ``"units"``).
         width: Image width in pixels.
         height: Image height in pixels.
     """
@@ -95,9 +133,11 @@ class OrthoMap:
         up_vector: Optional[Union[List[float], np.ndarray]] = None,
         pixel_width: Optional[int] = None,
         pixel_height: Optional[int] = None,
-        rotation: int = 0,
+        display_rotation: int = 0,
         color_mode: str = "mean",
         mask_bbox=None,
+        units: Optional[str] = None,
+        rotation: Optional[int] = None,
     ) -> None:
         """Initialize an OrthoMap from a point cloud.
 
@@ -115,6 +155,8 @@ class OrthoMap:
                 as maximum values and the aspect ratio is preserved.
             pixel_height: Desired image height in pixels.  See
                 *pixel_width* for interaction rules.
+            display_rotation: In-plane rotation (degrees) of the image
+                returned by :meth:`show`.
             color_mode: How the points falling in one pixel are combined.
                 ``"mean"`` (default) averages their colours;
                 ``"brightest"`` takes the colour of the most luminous
@@ -128,6 +170,9 @@ class OrthoMap:
                 :func:`substrata.measurements.find_optimal_box_position`.
                 Points outside it are dropped and the image covers exactly
                 the box.
+            units: Length unit for labels (default: ``"m"`` for a cloud with
+                a ``scale_factor``, else ``"units"``).
+            rotation: Old name of *display_rotation* (deprecated).
         """
         if color_mode not in ("mean", "brightest"):
             raise ValueError(
@@ -139,8 +184,9 @@ class OrthoMap:
         up = np.asarray(up_vector, dtype=np.float64)
         up = up / np.linalg.norm(up)
         self._up_vector = up
+        self.units = _cloud_units(pcd, units)
 
-        self._rotation = rotation
+        self.display_rotation = _display_rotation(display_rotation, rotation)
         self.rotation: np.ndarray = self._rotation_to_z(up)
         points = np.asarray(pcd.points)
         rotated = (self.rotation @ points.T).T
@@ -178,8 +224,8 @@ class OrthoMap:
         self.z_profile = self._depth_profile(ys, zs, min_y, max_y)
 
         logger.info(
-            "OrthoMap created: %d x %d px  (%.6f m/px, %d points)",
-            self.width, self.height, self.resolution, len(xs),
+            "OrthoMap created: %d x %d px  (%.6f %s/px, %d points)",
+            self.width, self.height, self.resolution, self.units, len(xs),
         )
 
     # ------------------------------------------------------------------
@@ -190,7 +236,7 @@ class OrthoMap:
         """Return a concise summary of the ortho map."""
         return (
             f"OrthoMap({self.width}x{self.height} px, "
-            f"res={self.resolution:.6f} m/px, "
+            f"res={self.resolution:.6f} {self.units}/px, "
             f"up={self._up_vector.tolist()})"
         )
 
@@ -202,10 +248,12 @@ class OrthoMap:
         self,
         coords: Union[np.ndarray, List[float]],
     ) -> np.ndarray:
-        """Map 3D world coordinate(s) to 2D pixel positions.
+        """Map 3D world coordinate(s) to continuous image coordinates.
 
-        Pixel coordinates follow standard image convention: *x* increases
-        to the right, *y* increases downward.
+        *x* increases to the right, *y* downward; pixel ``(i, j)`` spans
+        ``[i, i + 1) x [j, j + 1)`` (its centre is ``(i + 0.5, j + 0.5)``), so
+        ``floor`` of the result is the pixel the rasteriser assigns the point
+        to (the class docstring). The image covers ``[0, width] x [0, height]``.
 
         Args:
             coords: A single 3D coordinate ``(3,)`` or an array of
@@ -222,8 +270,7 @@ class OrthoMap:
             coords = coords[np.newaxis, :]
         rotated = (self.rotation @ coords.T).T
         px = (rotated[:, 0] - self.origin[0]) / self.resolution
-        py = (self.height - 1
-              - (rotated[:, 1] - self.origin[1]) / self.resolution)
+        py = self.height - (rotated[:, 1] - self.origin[1]) / self.resolution
         result = np.column_stack([px, py])
         return result[0] if single else result
 
@@ -416,6 +463,7 @@ class OrthoMap:
         filled = empty & valid
         img[filled] = np.clip(np.round(acc[filled]), 0, 255).astype(np.uint8)
 
+    @_renamed_kwargs(point_size_metres="point_size_m")
     def show(
         self,
         highlights: Optional[
@@ -429,7 +477,7 @@ class OrthoMap:
         width: Optional[int] = None,
         height: Optional[int] = None,
         point_size: int = 5,
-        point_size_metres: Optional[float] = None,
+        point_size_m: Optional[float] = None,
         point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
@@ -463,8 +511,8 @@ class OrthoMap:
             width: Display width in pixels.
             height: Display height in pixels.
             point_size: Radius of highlight markers in display pixels.
-                Ignored when *point_size_metres* is set.
-            point_size_metres: Diameter of highlight markers in metres.
+                Ignored when *point_size_m* is set.
+            point_size_m: Diameter of highlight markers in metres.
                 When provided, the marker is scaled so that it spans
                 exactly this distance in the orthographic projection,
                 regardless of display resolution.  Takes precedence over
@@ -507,7 +555,7 @@ class OrthoMap:
                 *center* is a coordinate (used for zoom-to-annotation).
             axes: Frame the map with X/Y axes in metres (rendered with
                 matplotlib; the result is still returned as a PIL Image).
-                Not available together with an in-plane ``rotation``.
+                Not available together with a ``display_rotation``.
             isobaths: Add a depth axis on the right, parallel to Y, with a
                 tick where the plot's mean depth (along Y) crosses each
                 isobath. ``True`` uses multiples of *isobath_interval*
@@ -527,8 +575,10 @@ class OrthoMap:
         """
         if isobaths is not None and isobaths is not False:
             axes = True
-        if axes and self._rotation:
-            raise ValueError("axes/isobaths are not supported with rotation")
+        if axes and self.display_rotation:
+            raise ValueError(
+                "axes/isobaths are not supported with a display_rotation"
+            )
         if background_color is not None:
             arr = self.image.copy()
             bg_mask = np.all(arr == 255, axis=-1)
@@ -591,7 +641,7 @@ class OrthoMap:
                 self._draw_highlights(
                     img, coords_3d,
                     point_size, fill_colors, outline_colors,
-                    point_shape, point_size_metres, point_outline_width,
+                    point_shape, point_size_m, point_outline_width,
                 )
 
         display_size = img.size
@@ -600,8 +650,8 @@ class OrthoMap:
             box = self._crop_box(img, crop)
             img = img.crop(box)
 
-        if self._rotation:
-            img = img.rotate(-self._rotation, expand=True)
+        if self.display_rotation:
+            img = img.rotate(-self.display_rotation, expand=True)
 
         if axes:
             img = self._render_axes(
@@ -721,8 +771,8 @@ class OrthoMap:
         )
         ax.imshow(np.asarray(img), extent=extent, origin="upper",
                   interpolation="nearest")
-        ax.set_xlabel("X (m)")
-        ax.set_ylabel("Y (m)")
+        ax.set_xlabel(f"X ({self.units})")
+        ax.set_ylabel(f"Y ({self.units})")
 
         if isobaths is not None and isobaths is not False:
             depths, ys = self.isobath_positions(isobaths, isobath_interval)
@@ -749,7 +799,7 @@ class OrthoMap:
                 tick.tick2line.set_markersize(0)
                 tick.label2.set_color("0.5")
                 tick.label2.set_fontstyle("italic")
-            ax2.set_ylabel("Depth (m)")
+            ax2.set_ylabel(f"Depth ({self.units})")
 
         buf = BytesIO()
         fig.savefig(buf, format="png", dpi=dpi)
@@ -796,7 +846,12 @@ class OrthoMap:
         pixel_width: Optional[int],
         pixel_height: Optional[int],
     ) -> Tuple[int, int, float]:
-        """Determine image size and resolution.
+        """Determine image size and resolution (square pixels).
+
+        A first size comes from the requested width/height (or a heuristic),
+        then the resolution is the coarser of ``extent_x / w`` and
+        ``extent_y / h`` and the size is recomputed from it, so the image covers
+        the full extent along both axes without exceeding the requested size.
 
         Args:
             extent_x: Spatial extent along the horizontal view axis.
@@ -830,7 +885,9 @@ class OrthoMap:
             ))
             h = int(max(256, target / max(w, 1)))
 
-        resolution = extent_x / max(w, 1)
+        resolution = max(extent_x / max(w, 1), extent_y / max(h, 1))
+        w = max(1, int(np.ceil(extent_x / resolution - 1e-9)))
+        h = max(1, int(np.ceil(extent_y / resolution - 1e-9)))
         return w, h, resolution
 
     @staticmethod
@@ -931,7 +988,7 @@ class OrthoMap:
         fill_colors,
         outline_colors,
         shape: str = "circle",
-        radius_metres: Optional[float] = None,
+        radius_m: Optional[float] = None,
         outline_width: int = 1,
     ) -> None:
         """Draw highlight markers onto *img* (modified in place).
@@ -940,25 +997,25 @@ class OrthoMap:
             img: PIL Image to draw onto.
             coords_3d: World coordinates ``(N, 3)``.
             radius: Marker radius in display pixels.  Ignored when
-                *radius_metres* is set.
+                *radius_m* is set.
             fill_colors: A single RGB fill colour (or ``None`` for hollow)
                 applied to every marker, or a length-N sequence of
                 per-marker fill colours.
             outline_colors: Outline colour(s), single or per-marker; same
                 broadcasting rules as *fill_colors*.
             shape: ``"circle"`` or ``"square"``.
-            radius_metres: Marker diameter in metres.  When provided,
+            radius_m: Marker diameter in metres.  When provided,
                 overrides *radius* and scales the marker to span this
                 distance in world space.
             outline_width: Border thickness in display pixels.  The border
                 is drawn inward from the marker bounding box, so the outer
-                diameter stays at *radius* (or *radius_metres*) no matter
+                diameter stays at *radius* (or *radius_m*) no matter
                 how thick the border is.
         """
         scale_x = img.width / self.width
         scale_y = img.height / self.height
-        if radius_metres is not None:
-            radius = radius_metres * scale_x / (2 * self.resolution)
+        if radius_m is not None:
+            radius = radius_m * scale_x / (2 * self.resolution)
         pixels = self.project(coords_3d)
         if pixels.ndim == 1:
             pixels = pixels[np.newaxis, :]
@@ -968,8 +1025,9 @@ class OrthoMap:
         draw = ImageDraw.Draw(img)
         bbox_fn = draw.ellipse if shape == "circle" else draw.rectangle
         for (px, py), fill, outline in zip(pixels, fills, outlines):
-            dx = px * scale_x
-            dy = py * scale_y
+            # continuous image coordinates -> PIL's (integers = pixel centres)
+            dx = px * scale_x - 0.5
+            dy = py * scale_y - 0.5
             bbox_fn(
                 [dx - radius, dy - radius, dx + radius, dy + radius],
                 fill=fill,
@@ -1220,13 +1278,15 @@ class OrthoMapGroup(OrthoMap):
         up_vector: Optional[Union[List[float], np.ndarray]] = None,
         pixel_width: Optional[int] = None,
         pixel_height: Optional[int] = None,
-        rotation: int = 0,
+        display_rotation: int = 0,
         arrange: Optional[str] = "stack",
         order: Optional[List[int]] = None,
         vertical_spacing: float = 1.0,
         align: str = "centroid",
         names: Optional[List[str]] = None,
         orient: str = "topdown",
+        units: Optional[str] = None,
+        rotation: Optional[int] = None,
     ) -> None:
         """Initialize a composite ortho map from several plots.
 
@@ -1238,7 +1298,7 @@ class OrthoMapGroup(OrthoMap):
             pixel_width: Optional target width in pixels.
             pixel_height: Optional target height in pixels.  Recommended over
                 *pixel_width* for a tall vertical stack.
-            rotation: In-plane rotation in degrees applied on ``show``.
+            display_rotation: In-plane rotation in degrees applied on ``show``.
             arrange: ``"stack"`` for a depth-ordered vertical layout
                 (default) or ``None`` to composite clouds at their true world
                 coordinates (legacy co-registered behaviour).
@@ -1258,6 +1318,9 @@ class OrthoMapGroup(OrthoMap):
                 *up_vector*; ``"slope"`` views each plot face-on to its own
                 best-fit plane (down-slope pointing down).  See the class
                 docstring.
+            units: Length unit for labels (default from the first cloud, as
+                :class:`OrthoMap`).
+            rotation: Old name of *display_rotation* (deprecated).
         """
         pcds = list(pcds)
         if not pcds:
@@ -1270,7 +1333,10 @@ class OrthoMapGroup(OrthoMap):
         up = np.asarray(up_vector, dtype=np.float64)
         up = up / np.linalg.norm(up)
         self._up_vector = up
-        self._rotation = rotation
+        self.units = _cloud_units(
+            next((p for p in pcds if p is not None), None), units
+        )
+        self.display_rotation = _display_rotation(display_rotation, rotation)
         # The composite is assembled directly in the layout plane, so the
         # inherited ``project`` uses an identity view rotation; each plot's own
         # view rotation is applied per plot (below and in ``_to_layout``).
@@ -1378,7 +1444,7 @@ class OrthoMapGroup(OrthoMap):
         """Return a concise summary of the composite ortho map."""
         return (
             f"OrthoMapGroup({self.width}x{self.height} px, "
-            f"res={self.resolution:.6f} m/px, "
+            f"res={self.resolution:.6f} {self.units}/px, "
             f"up={self._up_vector.tolist()}, arrange={self._arrange!r}, "
             f"orient={self._orient!r})"
         )
@@ -1471,7 +1537,7 @@ class OrthoMapGroup(OrthoMap):
             pts = pts[:: len(pts) // 50000 + 1]
 
         # PCA best-fit plane normal (smallest-eigenvalue eigenvector), oriented
-        # towards up — equivalent to measurements.get_best_fit_plane_PCA.
+        # towards up — equivalent to measurements.get_best_fit_plane_pca.
         cov = np.cov((pts - pts.mean(axis=0)).T)
         evals, evecs = np.linalg.eigh(cov)
         normal = evecs[:, int(np.argmin(evals))]
@@ -1498,6 +1564,7 @@ class OrthoMapGroup(OrthoMap):
     # Rendering
     # ------------------------------------------------------------------
 
+    @_renamed_kwargs(point_size_metres="point_size_m")
     def show(
         self,
         annotations_list=None,
@@ -1506,7 +1573,7 @@ class OrthoMapGroup(OrthoMap):
         label_color: Tuple[int, int, int] = (0, 0, 0),
         font_size: Optional[int] = None,
         point_size: Optional[int] = None,
-        point_size_metres: Optional[float] = None,
+        point_size_m: Optional[float] = None,
         label_rotation: int = 90,
         legend: bool = False,
         label_colors: Optional[dict] = None,
@@ -1532,8 +1599,8 @@ class OrthoMapGroup(OrthoMap):
             font_size: Label font size in pixels.  Defaults to ~1.25% of the
                 composite height.
             point_size: Marker radius in pixels.  Defaults to ~0.25% of the
-                composite height.  Ignored when *point_size_metres* is given.
-            point_size_metres: Marker diameter in metres (consistent physical
+                composite height.  Ignored when *point_size_m* is given.
+            point_size_m: Marker diameter in metres (consistent physical
                 size across plots).  Overrides *point_size*.
             label_rotation: Rotation of the tile labels in degrees — ``90``
                 (default) draws them vertically in a narrow left gutter, ``0``
@@ -1553,8 +1620,8 @@ class OrthoMapGroup(OrthoMap):
         Returns:
             PIL ``Image`` of the composite map.
         """
-        if point_size_metres is not None:
-            kwargs["point_size_metres"] = point_size_metres
+        if point_size_m is not None:
+            kwargs["point_size_m"] = point_size_m
         else:
             if point_size is None:
                 point_size = max(3, round(self.height * 0.0025))
@@ -1872,7 +1939,10 @@ class OrthoGrid:
     ``cell_size`` metres and reduces each cell to a scalar or label:
 
     - ``value_by="z"``   — height (DEM); ``agg`` in mean/median/max/min.
-    - ``value_by="count"`` / ``"density"`` — points per cell / per m².
+    - ``value_by="count"`` / ``"density"`` — points per cell / per m² **of
+      the given cloud**: for a decimated or subsampled cloud this is the
+      sample's density (e.g. ~50 M points spread over the plot), not the
+      density of the original reconstruction.
     - ``value_by="label"`` — majority annotation label per cell.
     - ``value_by="custom"`` — run a :mod:`substrata.measurements` function
       (``measurement``) on each cell's own points and take one output scalar
@@ -1884,8 +1954,13 @@ class OrthoGrid:
     only cells whose centre lies inside it, while cells are still rendered
     everywhere.
 
+    Lengths are in the cloud's units: metres for a scaled cloud (one with a
+    ``scale_factor``, as the project initializer gives), else model units
+    (``units``).
+
     Attributes:
-        cell_size: Cell side length in metres.
+        cell_size: Cell side length (metres for a scaled cloud).
+        units: Length unit of the coordinates (``"m"`` or ``"units"``).
         x0, y0: Lattice origin (min corner) in the projected frame.
         nx, ny: Grid dimensions in cells.
         counts: ``(ny, nx)`` int array of points (or annotations) per cell.
@@ -1927,6 +2002,7 @@ class OrthoGrid:
         min_points: int = 10,
         value_label: Optional[str] = None,
         mask_bbox=None,
+        units: Optional[str] = None,
     ) -> None:
         """Build the grid and reduce every cell.
 
@@ -1980,6 +2056,8 @@ class OrthoGrid:
                 exactly the box (aligned to its min corner unless *bbox* or
                 *intercepts* set the alignment) and the background is cropped
                 to it.
+            units: Length unit for labels (default: ``"m"`` when *pcd* has a
+                ``scale_factor``, else ``"units"``; see :class:`OrthoMap`).
         """
         if bbox is not None and intercepts is not None:
             raise ValueError("Provide either bbox or intercepts, not both")
@@ -1997,6 +2075,15 @@ class OrthoGrid:
                 )
             if neighborhood_scale < 1.0:
                 raise ValueError("neighborhood_scale must be >= 1.0")
+            if (getattr(measurement, "__name__", "") == "calc_tpi_and_tri"
+                    and neighborhood_scale < 2.0):
+                # TPI compares the cell (inner radius: half the cell side) with an
+                # annulus out to the window's inscribed circle (half the window
+                # side): with a window of one cell that annulus is empty.
+                raise ValueError(
+                    "calc_tpi_and_tri needs neighborhood_scale >= 2 (the annulus "
+                    "runs from half the cell side to half the window side)"
+                )
             if min_points < 1:
                 raise ValueError("min_points must be >= 1")
             if metric is None:
@@ -2020,6 +2107,7 @@ class OrthoGrid:
         self.neighborhood_scale = float(neighborhood_scale)
         self.min_points = int(min_points)
         self.value_label = value_label
+        self.units = _cloud_units(pcd, units)
         self.info: dict = {}
         self.mask_bbox = None
         if mask_bbox is not None:
@@ -2334,16 +2422,21 @@ class OrthoGrid:
             self._world_points[idx], colors, normals
         )
         ann = Annotation(coords=np.asarray(center_world, dtype=float))
-        # Half the cell diagonal — a sensible inner radius for location-anchored
-        # measurements (e.g. TPI); unused by neighbourhood-only measurements.
-        ann.radius = self.cell_size * np.sqrt(2.0) / 2.0
+        # Inner radius for location-anchored measurements: half the cell side
+        # (unused by neighbourhood-only measurements).
+        ann.radius = self.cell_size / 2.0
         ann.simple_pcd = simple
+        kwargs = {}
+        if getattr(self.measurement, "__name__", "") == "calc_tpi_and_tri":
+            # The annulus ends at the window's inscribed circle, so it lies
+            # entirely inside the points read for this cell.
+            kwargs["radius_outer"] = self.cell_size * self.neighborhood_scale / 2.0
         # A marginal cell can still trip expected numeric warnings inside the
         # measurement (degenerate covariance, complex eigvecs); keep them out of
         # the per-cell output. Genuine errors still raise and are handled above.
         with warnings.catch_warnings(), np.errstate(all="ignore"):
             warnings.simplefilter("ignore")
-            ann.measure(self.measurement, generate_image=False)
+            ann.measure(self.measurement, generate_image=False, **kwargs)
         val = ann.measurements.get(self.metric)
         return float(val) if val is not None else np.nan
 
@@ -2508,14 +2601,26 @@ class OrthoGrid:
     # Lookup
     # ------------------------------------------------------------------
 
-    def value_at(self, x: float, y: float) -> Optional[dict]:
-        """Return the cell record at world ``(x, y)``, or ``None`` if outside.
+    def value_at(
+        self, x: float, y: float, z: Optional[float] = None
+    ) -> Optional[dict]:
+        """Return the cell record at a position, or ``None`` if outside.
+
+        ``value_at(x, y)`` takes coordinates in the grid's projected frame (the
+        frame of ``x0``/``y0``, ``bbox`` and ``cell_bbox``; world XY for the
+        default top-down ``up_vector``). ``value_at(x, y, z)`` takes a world
+        point and projects it along the up vector first (needed for a tilted
+        ``up_vector``, where the projected position depends on z).
 
         Returns a dict ``{ix, iy, cell_bbox, n_points, value, label,
         in_report}``. ``value`` is the reduced scalar (``None`` in label mode);
         ``label`` is the cell's majority label when annotations were supplied.
+        ``cell_bbox`` is in the projected frame.
         """
-        pt = self.rotation @ np.array([float(x), float(y), 0.0])
+        if z is None:
+            pt = np.array([float(x), float(y)])
+        else:
+            pt = self.rotation @ np.array([float(x), float(y), float(z)])
         ix = int(np.floor((pt[0] - self.x0) / self.cell_size))
         iy = int(np.floor((pt[1] - self.y0) / self.cell_size))
         if not (0 <= ix < self.nx and 0 <= iy < self.ny):
@@ -2549,10 +2654,11 @@ class OrthoGrid:
     def _value_label(self) -> str:
         if self.value_by == "custom":
             return self.value_label or self.metric or "value"
+        u = self.units
         return {
-            "z": "z (m)",
+            "z": f"z ({u})",
             "count": "count",
-            "density": "points / m²",
+            "density": f"points / {u}²",
         }.get(self.value_by, self.value_by)
 
     @property
@@ -2584,6 +2690,7 @@ class OrthoGrid:
                   alpha=0.4, zorder=0, vmin=0.0, vmax=1.0)
         return ext
 
+    @_renamed_kwargs(point_size_metres="point_size_m")
     def show(
         self,
         cmap: Optional[str] = None,
@@ -2599,7 +2706,7 @@ class OrthoGrid:
         color_by: Optional[str] = "auto",
         fill_by_group: bool = False,
         point_size: float = 5,
-        point_size_metres: Optional[float] = None,
+        point_size_m: Optional[float] = None,
         point_color: Optional[Tuple[int, int, int]] = (255, 0, 0),
         point_outline: Optional[Tuple[int, int, int]] = (0, 0, 0),
         point_shape: str = "circle",
@@ -2644,8 +2751,8 @@ class OrthoGrid:
             fill_by_group: Draw markers filled/hollow by the even/odd index of
                 their ``group``.
             point_size: Marker radius in display points (ignored when
-                *point_size_metres* is set).
-            point_size_metres: Marker diameter in metres — drawn to scale in the
+                *point_size_m* is set).
+            point_size_m: Marker diameter in metres — drawn to scale in the
                 map's coordinates (takes precedence over *point_size*).
             point_color: RGB fill for markers (``None`` for hollow), unless
                 *color_by* assigns per-point colours.
@@ -2707,7 +2814,7 @@ class OrthoGrid:
             self._draw_highlights(
                 ax_left, mpatches, highlights,
                 color_by=color_by, fill_by_group=fill_by_group,
-                point_size=point_size, point_size_metres=point_size_metres,
+                point_size=point_size, point_size_m=point_size_m,
                 point_color=point_color, point_outline=point_outline,
                 point_shape=point_shape, point_open=point_open,
                 point_outline_width=point_outline_width,
@@ -2730,7 +2837,7 @@ class OrthoGrid:
 
     def _draw_highlights(
         self, ax, mpatches, highlights, color_by="auto", fill_by_group=False,
-        point_size=5, point_size_metres=None,
+        point_size=5, point_size_m=None,
         point_color=(255, 0, 0), point_outline=(0, 0, 0),
         point_shape="circle", point_open=False, point_outline_width=1.0,
         label_colors=None,
@@ -2739,7 +2846,7 @@ class OrthoGrid:
 
         Reuses ``OrthoMap._extract_highlights`` / ``_resolve_marker_style`` for
         coords and per-point colours, projects them into the grid frame via
-        ``self.rotation``, and draws with matplotlib. ``point_size_metres`` draws
+        ``self.rotation``, and draws with matplotlib. ``point_size_m`` draws
         markers to scale in map coordinates; otherwise ``point_size`` is a
         display-point radius. ``point_open`` draws every marker as an open
         outline with a transparent interior, and ``point_outline_width`` is the
@@ -2776,12 +2883,12 @@ class OrthoGrid:
         fills = [_mpl(c) for c in fills]
         outlines = [_mpl(c) for c in outlines]
 
-        if point_size_metres is not None:
-            r = point_size_metres / 2.0
+        if point_size_m is not None:
+            r = point_size_m / 2.0
             for (px, py), fc, ec in zip(xy, fills, outlines):
                 if point_shape == "square":
                     patch = mpatches.Rectangle(
-                        (px - r, py - r), point_size_metres, point_size_metres,
+                        (px - r, py - r), point_size_m, point_size_m,
                         facecolor=fc, edgecolor=ec,
                         linewidth=point_outline_width, zorder=4,
                     )
@@ -2891,13 +2998,33 @@ class OrthoGrid:
         ax_right.set_xlabel(self._value_label())
         ax_right.set_ylabel("Cell count")
 
+    def label_counts(self, report_only: bool = True) -> dict:
+        """Number of occupied cells per label (label mode).
+
+        Cells without a label count as ``"No data"``. Keys are in the order of
+        first occurrence (rows from the bottom, then columns). These are the
+        counts the label bar charts (``show``, ``animations``) draw.
+
+        Args:
+            report_only: Count only the cells inside the reporting area
+                (``report_mask``; default), else every occupied cell.
+
+        Returns:
+            dict: ``{label: n_cells}``.
+        """
+        mask = self.present & self.report_mask if report_only else self.present
+        counts: dict = {}
+        for lbl in self.cell_labels[mask]:
+            cat = lbl if lbl is not None else "No data"
+            counts[cat] = counts.get(cat, 0) + 1
+        return counts
+
     def _show_label(self, ax_left, ax_right, label_colors, plt, mpatches) -> None:
         """Label-filled cells + per-label count bar chart."""
         label_colors, labels_present = self._resolve_label_colors(label_colors)
 
         no_data = (0.7, 0.7, 0.7)
         rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
-        counts_by_cat: dict = {}
         for j in range(self.ny):
             for i in range(self.nx):
                 if not self.present[j, i]:
@@ -2906,9 +3033,7 @@ class OrthoGrid:
                 col = label_colors.get(lbl, no_data) if lbl is not None else no_data
                 rgba[j, i, :3] = col[:3]
                 rgba[j, i, 3] = 0.6
-                if self.report_mask[j, i]:
-                    cat = lbl if lbl is not None else "No data"
-                    counts_by_cat[cat] = counts_by_cat.get(cat, 0) + 1
+        counts_by_cat = self.label_counts()
         ax_left.imshow(rgba, extent=self.extent, origin="lower", zorder=1)
 
         handles = [

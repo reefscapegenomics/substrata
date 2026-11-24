@@ -134,6 +134,15 @@ class TestRevealOrder(unittest.TestCase):
         rt = anim._reveal_t_spiral(5, 3)
         self.assertLess(rt[1, 2], rt[0, 0])   # centre before a corner
 
+    def test_label_counts_are_the_reported_cells(self):
+        grid = _label_grid()
+        counts = grid.label_counts()
+        self.assertEqual(counts.get("coral"), 2)
+        self.assertEqual(sum(counts.values()),
+                         int((grid.present & grid.report_mask).sum()))
+        self.assertGreaterEqual(sum(grid.label_counts(report_only=False).values()),
+                                sum(counts.values()))
+
     def test_categories_dominant_first_equal_slices(self):
         grid = _label_grid()   # coral x2 (dominant), algae x1, sand x1
         rt, k = anim._reveal_t_categories(grid, grid.present, grid.report_mask)

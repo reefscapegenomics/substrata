@@ -3,9 +3,9 @@
 ``data/metashape_lens.json`` holds Agisoft Metashape 2.2's own ``Calibration.project`` (camera-frame point ->
 pixel) and ``Calibration.unproject`` (pixel -> normalised direction) for real Samoa calibrations (the AUV camera,
 the two diver cameras of sa3_20m and sa4_60m, a video camera) and synthetic ones that set every term (K1-K4, P1-P4,
-B1, B2), made with Metashape's Python API (see its ``source``). substrata's projection (``cameras._distort``, as
+B1, B2), made with Metashape's Python API (see its ``source``). substrata's projection (``cameras.camera_points_to_pixels``, as
 ``get_pixel_coords``, ``project_points`` and ``pixel_hits`` use it) must give the same pixels, its inverse
-(``_undistort``, ``Camera.pixel_to_ray``) the same directions, and the cams.xml reader every term.
+(``pixels_to_normalized``, ``Camera.pixel_to_ray``) the same directions, and the cams.xml reader every term.
 
 Until 0.2 substrata put P1 and P2 the other way round (OpenCV's order) and left out K4 and B2: up to ~20-100 px
 near the image edges on the Samoa sensors (546 px on sa3_20m's PGRAM02).
@@ -61,12 +61,12 @@ class TestLensMetashape(unittest.TestCase):
             cal, ref = entry["calibration"], np.array(entry["project"])
             with self.subTest(sensor=cal["name"]):
                 s = _sensor(cal)
-                u, v, _ = cm._distort(ref[:, 0], ref[:, 1], ref[:, 2], s)
+                u, v, _ = cm.camera_points_to_pixels(ref[:, 0], ref[:, 1], ref[:, 2], s)
                 err = np.hypot(u - ref[:, 3], v - ref[:, 4])
                 self.assertLess(err.max(), 1e-6, f"{cal['name']}: up to {err.max():.3g} px from Metashape")
 
     def test_inverse_matches_metashape(self):
-        """_undistort: the exact inverse of the projection (back through it: the pixel again, to 1e-6 px), the
+        """pixels_to_normalized: the exact inverse of the projection (back through it: the pixel again, to 1e-6 px), the
         same direction as Metashape's unproject wherever that is exact itself (Metashape's unproject is an
         approximation: on sa3_20m's PGRAM02 its direction projects up to ~9 px from the pixel), and NaN only
         where there is no direction (the far corners of the strongly distorted video frames, where Metashape's
@@ -75,13 +75,13 @@ class TestLensMetashape(unittest.TestCase):
             cal, ref = entry["calibration"], np.array(entry["unproject"])
             with self.subTest(sensor=cal["name"]):
                 s = _sensor(cal)
-                x, y = cm._undistort(ref[:, 0], ref[:, 1], s)
-                ms_u, ms_v, _ = cm._distort(ref[:, 2], ref[:, 3], np.ones(len(ref)), s)
+                x, y = cm.pixels_to_normalized(ref[:, 0], ref[:, 1], s)
+                ms_u, ms_v, _ = cm.camera_points_to_pixels(ref[:, 2], ref[:, 3], np.ones(len(ref)), s)
                 ms_exact = np.hypot(ms_u - ref[:, 0], ms_v - ref[:, 1]) < 1e-6
                 found = np.isfinite(x)
                 self.assertTrue((found | ~ms_exact).all(), "no direction where Metashape has one")
                 self.assertGreater(found.mean(), 0.9)
-                u, v, _ = cm._distort(x[found], y[found], np.ones(found.sum()), s)  # (back: the pixel again)
+                u, v, _ = cm.camera_points_to_pixels(x[found], y[found], np.ones(found.sum()), s)  # (back: the pixel again)
                 self.assertLess(np.hypot(u - ref[found, 0], v - ref[found, 1]).max(), 1e-6)
                 both = found & ms_exact
                 self.assertGreater(both.sum(), 0)
@@ -98,13 +98,13 @@ class TestLensMetashape(unittest.TestCase):
                 s = _sensor(cal)
                 inside = ((ref[:, 3] > 0) & (ref[:, 3] < cal["width"]) & (ref[:, 4] > 0)
                           & (ref[:, 4] < cal["height"]))
-                _u, _v, ok = cm._distort(ref[:, 0], ref[:, 1], ref[:, 2], s)
+                _u, _v, ok = cm.camera_points_to_pixels(ref[:, 0], ref[:, 1], ref[:, 2], s)
                 self.assertTrue(ok[inside].all())
         pgram02 = _sensor(next(e["calibration"] for e in _fixture() if "sa3_20m PGRAM02" in e["calibration"]["name"]))
         self.assertAlmostEqual(np.sqrt(pgram02.r2_max), 0.878, places=3)
         # beyond the fold: a point ~50 degrees off the axis lands at (4784, 5236), inside the image; the
         # earlier bound (1.005 image widths: r < 1.338) took it as in view
-        u, v, ok = cm._distort(np.array([0.0]), np.array([1.206]), np.ones(1), pgram02)
+        u, v, ok = cm.camera_points_to_pixels(np.array([0.0]), np.array([1.206]), np.ones(1), pgram02)
         self.assertTrue(0 < u[0] < pgram02.width and 0 < v[0] < pgram02.height)
         self.assertLess(1.206 ** 2 * pgram02.fx ** 2, 1.01 * pgram02.width ** 2)
         self.assertFalse(ok[0])
@@ -148,7 +148,7 @@ class TestLensMetashape(unittest.TestCase):
         axes (x' gains P1 (r2 + 2 x^2), y' gains 2 P1 x y = 0 there); OpenCV's order would move the point on
         the y axis along y."""
         s = _sensor(dict(name="p1", width=2000, height=2000, f=1000.0, p1=1e-3))
-        u, v, _ = cm._distort(np.array([0.5, 0.0]), np.array([0.0, 0.5]), np.ones(2), s)
+        u, v, _ = cm.camera_points_to_pixels(np.array([0.5, 0.0]), np.array([0.0, 0.5]), np.ones(2), s)
         self.assertAlmostEqual(u[0], 1500 + 1000 * 1e-3 * 0.75)  # (r2 + 2 x^2 = 0.75 at x = 0.5)
         self.assertAlmostEqual(v[0], 1000.0)
         self.assertAlmostEqual(u[1], 1000 + 1000 * 1e-3 * 0.25)  # (r2 = 0.25 at y = 0.5)

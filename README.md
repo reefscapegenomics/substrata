@@ -74,7 +74,7 @@ and images.
 | **Cameras** | Read Agisoft Metashape camera poses and sensors, find the images that see a given 3-D point (and vice versa), and sync between cameras and/or sensors. |
 | **Annotations** | Manage labeled features (e.g. individual coral colonies) or generate random and stratified point annotations. Project 3-D points into images and ray-cast 2-D image annotations back onto the point cloud to transfer annotations between overlapping reconstructions. |
 | **Classification** | Train image-patch classifiers on labeled annotations for automated classification, segment coral colonies in images, and segment point clouds into benthic categories. |
-| **Measurements** | Terrain and ecological metrics: e.g. topographic position index (TPI), terrain ruggedness index (TRI), rugosity, fractal dimension, surface area, gap fraction, benthic cover, and depth regression. |
+| **Measurements** | Terrain and ecological metrics: e.g. topographic position index (TPI), terrain ruggedness index (TRI), roughness (Ra/Rq), surface orientation and vector dispersion, gap fraction, benthic cover, and depth regression. Each metric's definition is documented in the [measurements tutorial](https://substrata.readthedocs.io/en/latest/tutorials/measurements_in_python.html). |
 | **Visualization** | Orthographic plot maps, multi-plot figures (e.g. depth transects), composite views, and PDF QC reports. |
 
 ## ⚡ Installation
@@ -145,13 +145,22 @@ proj.annotations         # Annotations
 
 ## 📚 Tutorials
 
-These Jupyter notebooks walk through several workflows and are rendered in the
+Step-by-step guides for the main workflows, from the command line and in Python:
+
+| Guide | Description |
+| --- | --- |
+| [From Metashape to a measured plot](https://substrata.readthedocs.io/en/latest/tutorials/plot_workflow.html) | Export, scale, orient, colour-correct and stratify a plot |
+| [Annotate and classify](https://substrata.readthedocs.io/en/latest/tutorials/annotate_and_classify.html) | Point intercepts, crops, labelling, training and prediction |
+| [Close-up photos](https://substrata.readthedocs.io/en/latest/tutorials/closeups.html) | Pose macro photos of colonies from the GoPro video and turn them into annotations |
+| [Measurements in Python](https://substrata.readthedocs.io/en/latest/tutorials/measurements_in_python.html) | TPI, TRI, roughness, orientation, gap fraction and benthic fraction: what exactly is computed |
+
+These Jupyter notebooks walk through further workflows and are rendered in the
 [documentation](https://substrata.readthedocs.io/en/latest/). They are still
 being written and cover only some features, so some sections are brief or
 incomplete. The [API reference](https://substrata.readthedocs.io/en/latest/api.html)
 documents all public functions.
 
-| Tutorial | Description |
+| Notebook | Description |
 | --- | --- |
 | [Scaling and orientation](https://substrata.readthedocs.io/en/latest/notebooks/scaling_and_orientation.html) | Scale and orient a point cloud from scalebar markers |
 | [Transferring annotations](https://substrata.readthedocs.io/en/latest/notebooks/transferring_annotations.html) | Transfer annotations between overlapping reconstructions |

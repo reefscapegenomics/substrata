@@ -42,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from . import settings
+from .compat import renamed_kwargs as _renamed_kwargs
 
 MODES = ("segment", "predict")
 OUTPUT_DIR = "predictions"  # in the set's .annos folder (not a set itself: substrata-explore reads .annos/*.csv)
@@ -135,6 +136,7 @@ def predict_from_group(
     pcd=None,
     occluder=None,
     world_transform: Optional[np.ndarray] = None,
+    scale_factor: Optional[float] = None,
     crop_size=None,
     clear_of_edge=None,
     ids: Optional[Iterable[str]] = None,
@@ -154,6 +156,8 @@ def predict_from_group(
             predict mode's when there is no ``occluder``.
         occluder: predict mode: the stratified occlusion test (``stratified.ply_occluder``).
         world_transform: The frame of ``pcd`` (default ``pcd.world_transform``; segment mode).
+        scale_factor: The project's ``scale_factor`` (segment mode: metres per model unit when
+            ``world_transform`` is the identity; see :func:`substrata.pointfeatures.metres_per_unit`).
         crop_size: The classifier's crop size (crop classifiers).
         clear_of_edge: predict mode: crop size ``(w, h)`` a view's crop must fit (default
             ``settings.CROP_SIZE_DEFAULT``).
@@ -190,7 +194,8 @@ def predict_from_group(
             qc, list(group_cams), classifier, world_transform=world_transform, pcd=pcd,
             occlusion=pcd is not None, views=views or settings.SEG_POINT_VIEWS,
             crop_size=None if crop_size is None else int(np.atleast_1d(crop_size)[0]),
-            batch_size=batch_size, include_disabled=True, verbose=verbose,
+            batch_size=batch_size, include_disabled=True, scale_factor=scale_factor,
+            verbose=verbose,
         )
         classes = res["classes"]
         for i, a in enumerate(points):
@@ -249,14 +254,15 @@ def output_path(csv_path: str, group: str, mode: str, tag: Optional[str] = None)
     return os.path.join(os.path.dirname(os.path.abspath(csv_path)), OUTPUT_DIR, name)
 
 
-def write_results(out_csv: str, anns, results: Dict[str, Dict[str, Any]], *, group: str, mode: str,
+@_renamed_kwargs(out_csv="output_path")
+def write_results(output_path: str, anns, results: Dict[str, Dict[str, Any]], *, group: str, mode: str,
                   model: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Write :func:`predict_from_group`'s results (one row per point of the set, in its order; :data:`COLUMNS`)
-    and ``<out_csv>.json`` (``meta`` plus counts). Returns the counts."""
-    os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
+    and ``<output_path>.json`` (``meta`` plus counts). Returns the counts."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fmt = lambda v, f="{:.4f}": "" if v is None else f.format(v)  # noqa: E731
     n = dict(points=0, with_view_available=0, predicted=0, no_view=0)
-    tmp = out_csv + ".tmp"
+    tmp = output_path + ".tmp"
     with open(tmp, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(COLUMNS)
@@ -273,11 +279,14 @@ def write_results(out_csv: str, anns, results: Dict[str, Dict[str, Any]], *, gro
                         r["n"], fmt(r["agree"], "{:.2f}"), r["top"] or "", r["available"],
                         v[0] if v else "", fmt(v[1] if v else None, "{:.2f}"), fmt(v[2] if v else None, "{:.2f}"),
                         group, mode, model or ""])
-    os.replace(tmp, out_csv)
-    from . import __version__
+    os.replace(tmp, output_path)
+    try:
+        from . import __version__
+    except ImportError:  # (the module loaded on its own, e.g. by the tests)
+        __version__ = None
 
     info = dict(meta or {}, camera_group=group, view_mode=mode, pred_model=model, counts=n,
                 substrata=__version__, created=datetime.now().isoformat(timespec="seconds"))
-    with open(out_csv + ".json", "w") as fh:
+    with open(output_path + ".json", "w") as fh:
         json.dump(info, fh, indent=1, default=str)
     return n

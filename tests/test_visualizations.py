@@ -205,3 +205,37 @@ class TestVisualizeTpiInputs(unittest.TestCase):
         vals = np.asarray(self.pc.points)[:, 2]
         img = v.visualize_tpi(self.pc, vals, vals)
         self.assertEqual(img.ndim, 3)
+
+
+@unittest.skipUnless(v is not None, "requires the open3d/substrata environment")
+class TestCropImg(unittest.TestCase):
+    """get_crop_img (imagecrops, re-exported here) cuts classifier_crop_box."""
+
+    def setUp(self):
+        import tempfile
+
+        from PIL import Image
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = f"{self.tmp.name}/p.png"
+        arr = np.zeros((40, 60, 3), np.uint8)
+        arr[..., 0] = np.arange(60)[None, :]  # red = x
+        arr[..., 1] = np.arange(40)[:, None]  # green = y
+        Image.fromarray(arr).save(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_same_box_as_classifier(self):
+        from substrata.classification import classifier_crop_box
+
+        for x, y, w, h in ((30.7, 20.2, 9, 7), (2.0, 3.0, 10, 10), (59.0, 39.0, 8, 8)):
+            left, top, right, bottom = classifier_crop_box(x, y, w, h, 60, 40)
+            pil = np.asarray(v.get_crop_img(self.path, x, y, w, h))
+            self.assertEqual(pil.shape[:2], (bottom - top, right - left))
+            self.assertEqual(int(pil[0, 0, 0]), left)
+            self.assertEqual(int(pil[0, 0, 1]), top)
+
+    def test_outside_raises(self):
+        with self.assertRaises(ValueError):
+            v.get_crop_img(self.path, -50, -50, 10, 10)

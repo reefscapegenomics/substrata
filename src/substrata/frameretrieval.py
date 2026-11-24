@@ -128,16 +128,16 @@ def calibration_difference(a, b, *, nx: int = 41, ny: int = 23, inner: float = 0
     same pixel (deg). ``inner``: the central share of the image for ``px_max_inner`` (the corners of a wide lens
     are dark and may not be imaged at all). Returns ``px_median``, ``px_max_inner``, ``deg_median``,
     ``deg_max``, ``n_unimaged`` (grid pixels either lens model cannot image)."""
-    from .cameras import _lens, _undistort
+    from .cameras import lens_distortion, pixels_to_normalized
 
     if (a.width, a.height) != (b.width, b.height):
         raise ValueError("the sensors' resolutions differ")
     u, v = np.meshgrid(np.linspace(0, a.width, nx), np.linspace(0, a.height, ny))
     u, v = u.ravel(), v.ravel()
-    xa, ya = _undistort(u, v, a)
-    xd, yd = _lens(xa, ya, b)
+    xa, ya = pixels_to_normalized(u, v, a)
+    xd, yd = lens_distortion(xa, ya, b)
     px = np.hypot(b.fx * xd + b.b2 * yd + b.cx - u, b.fy * yd + b.cy - v)
-    xb, yb = _undistort(u, v, b)
+    xb, yb = pixels_to_normalized(u, v, b)
     ra = np.stack([xa, ya, np.ones_like(xa)], 1)
     rb = np.stack([xb, yb, np.ones_like(xb)], 1)
     ra /= np.linalg.norm(ra, axis=1)[:, None]
@@ -149,22 +149,50 @@ def calibration_difference(a, b, *, nx: int = 41, ny: int = 23, inner: float = 0
                 deg_median=float(np.median(deg[ok])), deg_max=float(np.max(deg[ok])), n_unimaged=int((~ok).sum()))
 
 
+def _check_resolution(sensor, sid, cams: List[Any], sensors: Optional[Dict[Any, Any]] = None) -> None:
+    """ValueError if the cameras of ``sid`` have another resolution than ``sensor``: that of a sensor they
+    (or ``sensors``) already have, else that of the first of their photos that can be read."""
+    want = (int(sensor.width), int(sensor.height))
+    mine = [c for c in cams if getattr(c, "sensor_id", None) == sid]
+    known = [s for s in [*(getattr(c, "sensor", None) for c in mine), (sensors or {}).get(sid)] if s is not None]
+    got = next(((int(s.width), int(s.height)) for s in known if hasattr(s, "width")), None)
+    if got is None:
+        from PIL import Image
+
+        for c in mine[:5]:
+            try:
+                with Image.open(c.filepath) as im:  # (the header only)
+                    got = tuple(im.size)
+                break
+            except (OSError, AttributeError, TypeError):
+                continue
+    if got is not None and got != want:
+        raise ValueError(f"the calibration is for {want[0]}x{want[1]} px images, sensor {sid}'s are "
+                         f"{got[0]}x{got[1]} px")
+
+
 def give_sensor(cams: Iterable[Any], sensor, sensor_id: Optional[int] = None) -> int:
     """Give ``sensor`` to the cameras of ``sensor_id`` (default ``sensor.sensor_id``) among ``cams`` (a
     :class:`substrata.cameras.Cameras` also gets it in its ``sensors``). They still see nothing until they
-    have a pose. Returns how many cameras got it."""
-    from .cameras import _projection_changed
+    have a pose. Returns how many cameras got it.
+
+    Raises:
+        ValueError: If the cameras' resolution (their current sensor's, else their first readable photo's)
+            is not the calibration's: a calibration only fits images of its own size.
+    """
+    from .cameras import invalidate_projection_cache
 
     sid = sensor.sensor_id if sensor_id is None else sensor_id
+    data = list(cams.data.values() if hasattr(cams, "data") else cams)
+    _check_resolution(sensor, sid, data, getattr(cams, "sensors", None))
     if hasattr(cams, "sensors") and isinstance(getattr(cams, "sensors"), dict):
         cams.sensors[sid] = sensor
-    data = cams.data.values() if hasattr(cams, "data") else cams
     n = 0
     for c in data:
         if getattr(c, "sensor_id", None) == sid:
             c.sensor = sensor
             n += 1
-    _projection_changed()
+    invalidate_projection_cache()
     return n
 
 

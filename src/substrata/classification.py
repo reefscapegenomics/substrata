@@ -4,6 +4,7 @@ import csv
 import re
 import hashlib
 import json
+import math
 import os
 from collections import Counter
 
@@ -13,35 +14,11 @@ from tqdm.auto import tqdm
 
 # Local Modules
 from substrata import settings
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.fileio import atomic_write as _atomic_write
+from substrata.imagecrops import classifier_crop_box  # noqa: F401 (re-exported)
+from substrata.imagecrops import get_crop_img as _get_crop_img
 from substrata.logging import logger
-
-
-def _center_crop(
-    img: Image.Image, crop_size: Union[int, Tuple[int, int]]
-) -> Image.Image:
-    """
-    Center-crop a PIL image to a given square size (int) or (width, height) tuple.
-
-    Args:
-        img: PIL image to crop.
-        crop_size: Either an int (square) or a (width, height) tuple.
-
-    Returns:
-        Cropped PIL image.
-    """
-    w, h = img.size
-    if isinstance(crop_size, int):
-        cw = ch = min(crop_size, w, h)
-    else:
-        req_w, req_h = crop_size
-        cw = min(req_w, w)
-        ch = min(req_h, h)
-
-    left = max(0, (w - cw) // 2)
-    top = max(0, (h - ch) // 2)
-    right = left + cw
-    bottom = top + ch
-    return img.crop((left, top, right, bottom))
 
 
 def get_image_classifier(checkpoint: str, device: Optional[str] = None) -> Any:
@@ -122,14 +99,14 @@ def classifier_crop_size(learn: Any) -> Optional[int]:
 
 
 def _ensure_learner(classifier: Union[str, Any]):
-    """
-    Ensure we have a FastAI learner object. If a string path is provided, load it.
+    """A loaded classifier: load it with ``get_image_classifier`` if given a path.
 
     Args:
-        classifier: Either a path to a .pkl learner or an already loaded learner.
+        classifier: A path to a classifier (fastai crop classifier ``.pkl`` or point
+            classifier ``.pt``) or an already loaded one.
 
     Returns:
-        A FastAI Learner instance.
+        The loaded classifier (fastai Learner or ``PointFeatureClassifier``).
     """
     if isinstance(classifier, str):
         return get_image_classifier(classifier)
@@ -143,7 +120,7 @@ def _crop_from_stored_crop(
 
     Stored crops (:meth:`~substrata.cameras.ImageMatch.save_crop`) are centred
     on the match and never resized, so cutting ``crop_size`` from their centre
-    (with the same box arithmetic as ``visualizations.get_crop_img``) yields the
+    (with the same box arithmetic as ``imagecrops.get_crop_img``) yields the
     same pixels as cropping the source photo, but decodes a far smaller JPEG.
 
     Returns:
@@ -162,8 +139,10 @@ def _crop_from_stored_crop(
     try:
         with Image.open(path) as stored:
             stored_w, stored_h = stored.size
-            left = int(x - crop_w / 2) - int(x - stored_w / 2)
-            top = int(y - crop_h / 2) - int(y - stored_h / 2)
+            # the crop's box in photo pixels, relative to the stored crop's
+            c_left, c_top, _r, _b = classifier_crop_box(x, y, crop_w, crop_h)
+            s_left, s_top, _r, _b = classifier_crop_box(x, y, stored_w, stored_h)
+            left, top = c_left - s_left, c_top - s_top
             if (
                 left < 0
                 or top < 0
@@ -199,16 +178,15 @@ def _crop_for_match(
         return None
     try:
         if crop_size is not None:
-            from substrata.visualizations import get_crop_img  # lazy heavy import
-
             if isinstance(crop_size, int):
                 crop_w = crop_h = crop_size
             else:
                 crop_w, crop_h = crop_size
-            return get_crop_img(
+            return _get_crop_img(
                 fp, image_match.x, image_match.y, crop_w, crop_h
             ).convert("RGB")
-        return Image.open(fp).convert("RGB")
+        with Image.open(fp) as im:
+            return im.convert("RGB")
     except (OSError, ValueError):
         return None
 
@@ -225,7 +203,7 @@ def _learner_device(learn) -> str:
             return "unknown"
 
 
-def _result_from_probs(prob_list, vocab) -> Dict[str, Any]:
+def result_from_probs(prob_list, vocab) -> Dict[str, Any]:
     """Build the standard classification result dict from a probability vector."""
     pred_idx = int(max(range(len(prob_list)), key=lambda i: prob_list[i]))
     if vocab is not None and len(vocab) == len(prob_list):
@@ -240,6 +218,9 @@ def _result_from_probs(prob_list, vocab) -> Dict[str, Any]:
         "label": label, "confidence": confidence,
         "probs": probs_map, "pred_idx": pred_idx,
     }
+
+
+_result_from_probs = result_from_probs  # deprecated alias (renamed 2026-11-25)
 
 
 def _classify_matches_point_features(
@@ -314,7 +295,8 @@ def classify_image_matches_batch(
 
     Args:
         image_matches: ImageMatch instances to classify.
-        classifier: Loaded fastai learner or path to a ``.pkl`` (loaded once).
+        classifier: A loaded classifier or a path to one (``.pkl`` crop classifier or
+            ``.pt`` point classifier; loaded once).
         crop_size: Crop size (int or ``(w, h)``); ``None`` uses the full image.
         batch_size: Inference batch size.
         n_jobs: Threads for parallel crop loading (-1 = all cores).
@@ -387,7 +369,7 @@ def classify_image_matches_batch(
         dl = learn.dls.test_dl(crops, bs=batch_size)
         probs, _ = learn.get_preds(dl=dl)
         for pos, prob in zip(idx_map, probs.tolist()):
-            res = _result_from_probs(prob, vocab)
+            res = result_from_probs(prob, vocab)
             results[pos] = res
             setattr(image_matches[pos], "classification", res)
     except Exception as e:  # noqa: BLE001 - fall back to the per-image path.
@@ -418,7 +400,7 @@ def classify_image_match(
 
     Args:
         image_match: An instance of `cameras.ImageMatch`.
-        classifier: Loaded FastAI learner or path to a .pkl learner.
+        classifier: A loaded classifier or a path to one (``.pkl`` or ``.pt``).
         crop_size: Optional int (square) or (width, height) tuple for center crop.
         show: If True, display the image crop and classification result
             (Jupyter notebook).
@@ -524,6 +506,9 @@ def aggregate_predictions(
     - ``"weighted"``: the mean of the class-probability vectors, each crop
       weighted by ``relevance_min / relevance``. ``relevance`` (lower is better)
       scores how close the camera is and how central the point is in the image.
+      A crop without a usable relevance (missing, zero, negative or not
+      finite) is weighted as the least relevant crop that has one (all crops
+      weigh the same when none has one), so it can never take all the weight.
       Crops flagged ``potentially_obstructed`` are left out unless every crop
       is. Averaging probabilities keeps a single overconfident crop from
       outvoting several consistent ones.
@@ -558,9 +543,16 @@ def aggregate_predictions(
 
     clear = [p for p in pairs if not getattr(p[0], "potentially_obstructed", False)]
     used = clear or pairs
-    relevances = [
-        max(float(getattr(im, "relevance", 1.0) or 0.0), 1e-12) for im, _ in used
-    ]
+    relevances = []
+    for im, _ in used:
+        try:
+            rel = float(getattr(im, "relevance", None))
+        except (TypeError, ValueError):
+            rel = float("nan")
+        relevances.append(rel if math.isfinite(rel) and rel > 0 else None)
+    known = [r for r in relevances if r is not None]
+    worst = max(known) if known else 1.0
+    relevances = [worst if r is None else r for r in relevances]
     min_relevance = min(relevances)
     totals: Dict[str, float] = {}
     weight_sum = 0.0
@@ -773,12 +765,13 @@ def _is_bold(
     A node is bolded when it is a *tip* (no visible subcategories and not a
     bare root-level category) whose aggregated count reaches ``min_count``,
     or - unless ``tips_only`` - a *heavy parent* (has visible children and its
-    own direct count exceeds ``min_count``).
+    own direct count reaches ``min_count``). Both use ``>=``, as ``--min-count``
+    documents (parents used ``>`` before 2026-11).
     """
     is_tip = not has_visible_kids and not is_root
     is_tip_bold = is_tip and total_count >= min_count
     is_heavy_parent = (
-        has_visible_kids and direct_count > min_count and not tips_only
+        has_visible_kids and direct_count >= min_count and not tips_only
     )
     return is_tip_bold or is_heavy_parent
 
@@ -1103,7 +1096,7 @@ def write_label_map(
     ``count`` column is an informational hint for hand-editing.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="") as f:
+    with _atomic_write(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(_LABEL_MAP_COLUMNS)
         for label in sorted(labels):
@@ -1292,9 +1285,9 @@ def confidence_passes(
 ) -> bool:
     """Return whether a ``label_conf`` value clears the ``min_conf`` threshold.
 
-    An empty (or non-numeric) ``label_conf`` is *included by default*; with
-    ``strict`` it is instead treated as ``0`` and so excluded whenever
-    ``min_conf`` is above zero.
+    An empty, non-numeric or non-finite (``nan``, ``inf``) ``label_conf`` is
+    *included by default*; with ``strict`` it is instead treated as ``0`` and
+    so excluded whenever ``min_conf`` is above zero.
 
     Args:
         raw: The raw ``label_conf`` cell (may be empty/None).
@@ -1306,13 +1299,14 @@ def confidence_passes(
         True if the annotation should be kept.
     """
     raw = (raw or "").strip()
-    if raw == "":
-        return min_conf <= 0 if strict else True
     try:
-        return float(raw) >= min_conf
+        value = float(raw)
     except ValueError:
-        # A non-numeric confidence behaves like an empty value.
+        value = float("nan")
+    if not math.isfinite(value):
+        # An empty, non-numeric or non-finite confidence: no value.
         return min_conf <= 0 if strict else True
+    return value >= min_conf
 
 
 def collate_training_annotations(
@@ -1320,7 +1314,7 @@ def collate_training_annotations(
     output_path: str, model_path: str, prompt: bool = True,
     min_conf: Optional[float] = None, conf_strict: bool = False,
     curation: Any = None, curation_stats: Optional[Counter] = None,
-    skipped: Optional[Counter] = None,
+    skipped: Optional[Counter] = None, split_by: str = settings.TRAIN_SPLIT_BY,
 ) -> Tuple[int, int, int]:
     """Write a consolidated training annotations CSV.
 
@@ -1354,10 +1348,19 @@ def collate_training_annotations(
         skipped: Optional Counter; ``not_in_training`` counts the rows left
             out by ``settings.TRAIN_INCLUDE_COLUMN``
             (:func:`included_in_training`).
+        split_by: How points are grouped into the train/validation/test split
+            (the ``split_key`` column, see :func:`row_split_key`): ``"photo"``
+            (default; all points of a photo share a split, so neighbouring
+            points of one photo never sit on both sides), ``"plot"`` (all
+            points of an annotation file's plot) or ``"point"`` (each point on
+            its own: the behaviour before 2026-11, to reproduce older runs).
 
     Returns:
         Tuple ``(n_written, n_dropped_missing_cam, n_dropped_low_conf)``.
     """
+    if split_by not in settings.TRAIN_SPLIT_BY_CHOICES:
+        raise ValueError(f"split_by must be one of "
+                         f"{settings.TRAIN_SPLIT_BY_CHOICES}, not {split_by!r}")
     # First pass: collect kept rows and the unique camera directories per file.
     kept: List[Dict[str, str]] = []
     dir_mapping: Dict[str, str] = {}
@@ -1412,7 +1415,7 @@ def collate_training_annotations(
 
     n_written = 0
     n_dropped = 0
-    with open(output_path, "w", newline="") as out:
+    with _atomic_write(output_path, "w", newline="") as out:
         writer = csv.writer(out)
         writer.writerow(settings.TRAIN_ANN_COLUMNS)
         for row in kept:
@@ -1444,12 +1447,39 @@ def collate_training_annotations(
                 cam_x,
                 cam_y,
                 row.get("depth", ""),
-                row.get("split_key", ""),
+                row_split_key(row, split_by, new_fp),
                 row.get("cam_gsd_mm", ""),
                 row.get("domain", ""),
             ])
             n_written += 1
     return n_written, n_dropped, n_dropped_conf
+
+
+def row_split_key(
+    row: Dict[str, Any], split_by: str = settings.TRAIN_SPLIT_BY,
+    cam_filepath: Optional[str] = None,
+) -> str:
+    """The ``split_key`` of a collated training row (see :func:`split_for_id`).
+
+    ``"photo"``: the row's own ``split_key`` (CoralNet points and pool points
+    already carry their image), else the photo's file stem. ``"plot"``: the
+    plot (model) name of the row's annotation file (``_model_name``), else its
+    photo. ``"point"``: the row's own ``split_key`` or empty (the point id
+    decides, as before 2026-11).
+
+    Args:
+        row: Annotation row (``split_key``, ``cam_filepath``, ``_model_name``).
+        split_by: ``"photo"``, ``"plot"`` or ``"point"``.
+        cam_filepath: The (remapped) photo path; default the row's.
+    """
+    own = (row.get("split_key") or "").strip()
+    if split_by == "point":
+        return own
+    photo = os.path.splitext(os.path.basename(
+        (cam_filepath or row.get("cam_filepath") or "").strip()))[0]
+    if split_by == "plot":
+        return (row.get("_model_name") or "").strip() or own or photo
+    return own or photo
 
 
 # ---------------------------------------------------------------------------
@@ -1515,8 +1545,9 @@ def link_image_dir(
     return best, image_index[best], best_n
 
 
+@_renamed_kwargs(out_path="output_path")
 def convert_coralnet_csv(
-    csv_path: str, image_index: Dict[str, Dict[str, str]], out_path: str,
+    csv_path: str, image_index: Dict[str, Dict[str, str]], output_path: str,
     include_column: bool = False,
 ) -> Dict[str, Any]:
     """Convert a CoralNet point export into a training annotations CSV.
@@ -1528,7 +1559,7 @@ def convert_coralnet_csv(
     Args:
         csv_path: CoralNet annotations export.
         image_index: Output of :func:`index_image_dir`.
-        out_path: Destination CSV (``settings.TRAIN_ANN_COLUMNS``).
+        output_path: Destination CSV (``settings.TRAIN_ANN_COLUMNS``).
         include_column: Also write ``settings.TRAIN_INCLUDE_COLUMN`` (True for
             every row), as an annotation set to edit from then on.
 
@@ -1564,7 +1595,7 @@ def convert_coralnet_csv(
         columns.append(settings.TRAIN_INCLUDE_COLUMN)
         blank[settings.TRAIN_INCLUDE_COLUMN] = "True"
     n_written = 0
-    with open(out_path, "w", newline="") as f:
+    with _atomic_write(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         for i, row in enumerate(rows):
@@ -1630,9 +1661,10 @@ def plan_crops(
 ) -> Dict[str, Dict[str, Any]]:
     """Compute the expected crop file for every annotation.
 
-    Each annotation's split is drawn from its ``id``, unless the CSV has an
-    optional ``split_key`` column: rows sharing a ``split_key`` (e.g. the same
-    image) then all land in the same split, avoiding train/validation leakage.
+    Each annotation's split is drawn from its ``split_key`` (written by
+    :func:`collate_training_annotations`; by default the photo), so rows
+    sharing a ``split_key`` all land in the same split, avoiding
+    train/validation leakage; rows without one are split by their ``id``.
 
     Args:
         annotations_path: Consolidated training annotations CSV.
@@ -1730,8 +1762,9 @@ def filter_readable_images(files: List[Any]) -> Tuple[List[Any], List[Any]]:
     return good, bad
 
 
+@_renamed_kwargs(out_path="output_path")
 def generate_crop(
-    cam_filepath: str, cam_x: float, cam_y: float, crop_size: int, out_path: str
+    cam_filepath: str, cam_x: float, cam_y: float, crop_size: int, output_path: str
 ) -> bool:
     """Write a single square crop centred on ``(cam_x, cam_y)``.
 
@@ -1740,7 +1773,7 @@ def generate_crop(
         cam_x: Crop centre x (pixels).
         cam_y: Crop centre y (pixels).
         crop_size: Square crop width/height (pixels).
-        out_path: Destination JPEG path.
+        output_path: Destination JPEG path.
 
     Returns:
         True on success, False if the source image is missing/unreadable or
@@ -1748,10 +1781,9 @@ def generate_crop(
 
     Note:
         Delegates the actual centred crop to
-        :func:`substrata.visualizations.get_crop_img` (the shared pixel-centred
+        :func:`substrata.imagecrops.get_crop_img` (the shared pixel-centred
         crop helper) rather than reimplementing the box maths here.
     """
-    from substrata.visualizations import get_crop_img  # lazy heavy import
 
     if not os.path.isfile(cam_filepath):
         logger.warning("Source image not found, skipping crop: %s", cam_filepath)
@@ -1763,16 +1795,16 @@ def generate_crop(
     except OSError:
         return False
     try:
-        crop = get_crop_img(cam_filepath, cam_x, cam_y, crop_size, crop_size)
+        crop = _get_crop_img(cam_filepath, cam_x, cam_y, crop_size, crop_size)
         crop = crop.convert("RGB")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        crop.save(out_path, "JPEG", quality=settings.TRAIN_CROP_JPEG_QUALITY)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        crop.save(output_path, "JPEG", quality=settings.TRAIN_CROP_JPEG_QUALITY)
     except (OSError, ValueError) as e:
         logger.warning("Could not crop %s: %s", cam_filepath, e)
         # Remove any partial/empty output so it is not treated as a valid crop.
-        if os.path.exists(out_path):
+        if os.path.exists(output_path):
             try:
-                os.remove(out_path)
+                os.remove(output_path)
             except OSError:
                 pass
         return False
@@ -1812,7 +1844,7 @@ def stored_crop_size(output_dir: str, existing: Set[str]) -> Optional[int]:
 def _write_crop_size(output_dir: str, crop_size: int) -> None:
     """Record the crop size of the crop folders (see :func:`stored_crop_size`)."""
     os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, settings.TRAIN_CROPS_INFO_FILE), "w") as f:
+    with _atomic_write(os.path.join(output_dir, settings.TRAIN_CROPS_INFO_FILE), "w") as f:
         json.dump({"crop_size": int(crop_size)}, f)
         f.write("\n")
 
@@ -2089,97 +2121,20 @@ def final_metrics_from_learner(learn: Any) -> Dict[str, Any]:
     return out
 
 
+@_renamed_kwargs(pdf_path="output_path")
 def write_training_summary_pdf(
-    pdf_path: str, info: List[Tuple[str, Any]], counts_by_split: Dict[str, Counter],
+    output_path: str, info: List[Tuple[str, Any]], counts_by_split: Dict[str, Counter],
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Render a training-run summary to a multi-page PDF.
 
-    Page 1 is a text summary of the run settings, the per-split crop totals and
-    (if given) the final metrics. The remaining pages show a horizontal stacked
-    bar chart of per-training-class crop counts (train/validation/test),
-    paginated ``settings.TRAIN_SUMMARY_CLASSES_PER_PAGE`` classes at a time and
-    sorted by total count.
-
-    Args:
-        pdf_path: Destination PDF path.
-        info: Ordered ``(label, value)`` rows of run settings to print.
-        counts_by_split: ``split_dir -> Counter(class -> count)`` (see
-            :func:`count_crops_by_class`).
-        crop_dirs: Folder names for the three splits (train/val/test order).
-        metrics: Optional ``{metric_name: value}`` from the final epoch.
+    See :func:`substrata.visualizations.save_training_summary_pdf`.
     """
-    import matplotlib
+    from substrata import visualizations  # lazy: figures only
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    import numpy as np
-
-    train_name, valid_name, test_name = crop_dirs
-    classes = sorted(
-        set().union(*[set(c) for c in counts_by_split.values()])
-        if counts_by_split else set(),
-        key=lambda c: (
-            -sum(counts_by_split.get(s, {}).get(c, 0) for s in crop_dirs), c
-        ),
-    )
-
-    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
-    with PdfPages(pdf_path) as pdf:
-        # Page 1: settings + totals + final metrics.
-        fig = plt.figure(figsize=(8.5, 11))
-        ax = fig.add_subplot(111)
-        ax.axis("off")
-        fig.suptitle("Training summary", fontsize=12, y=0.98)
-        lines = [f"{k}: {v}" for k, v in info]
-        lines.append("")
-        lines.append("Crops per split:")
-        for split in crop_dirs:
-            tot = sum(counts_by_split.get(split, {}).values())
-            lines.append(f"  {split}: {tot}")
-        grand_total = sum(
-            sum(counts_by_split.get(s, {}).values()) for s in crop_dirs
-        )
-        lines.append(f"  total: {grand_total}")
-        if metrics:
-            lines.append("")
-            lines.append("Final-epoch metrics:")
-            for k, v in metrics.items():
-                lines.append(f"  {k}: {v}")
-        ax.text(
-            0.02, 0.96, "\n".join(lines), transform=ax.transAxes, va="top",
-            ha="left", family="monospace", fontsize=8,
-        )
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # Remaining pages: per-class stacked bar chart of crop counts.
-        per_page = settings.TRAIN_SUMMARY_CLASSES_PER_PAGE
-        for start in range(0, len(classes), per_page):
-            page = classes[start:start + per_page]
-            tr = np.array([counts_by_split.get(train_name, {}).get(c, 0) for c in page])
-            va = np.array([counts_by_split.get(valid_name, {}).get(c, 0) for c in page])
-            te = np.array([counts_by_split.get(test_name, {}).get(c, 0) for c in page])
-            y = np.arange(len(page))
-            fig, ax = plt.subplots(figsize=(8.5, max(3, len(page) * 0.25 + 1)))
-            ax.barh(y, tr, color="#4c72b0", label=train_name)
-            ax.barh(y, va, left=tr, color="#dd8452", label=valid_name)
-            ax.barh(y, te, left=tr + va, color="#55a868", label=test_name)
-            ax.set_yticks(y)
-            ax.set_yticklabels(page, fontsize=6)
-            ax.invert_yaxis()  # largest class on top
-            ax.set_xlabel("Crops")
-            ax.set_title("Crops per training class")
-            ax.legend(fontsize=7, loc="lower right")
-            totals = tr + va + te
-            for i, t in enumerate(totals):
-                ax.text(t, i, f" {int(t)}", va="center", fontsize=6)
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-    logger.info("Wrote training summary PDF: %s", pdf_path)
+    visualizations.save_training_summary_pdf(
+        output_path, info, counts_by_split, crop_dirs=crop_dirs, metrics=metrics)
 
 
 def _load_encoder_weights(model: Any, path: str) -> Any:
@@ -2249,6 +2204,7 @@ def train_classifier(
     crop_dirs: Tuple[str, str, str] = settings.TRAIN_CROP_DIRS,
     pretrained_weights: Optional[str] = None,
     crop_size: Optional[int] = None,
+    seed: Optional[int] = settings.TRAIN_SEED,
 ) -> Any:
     """Train a fastai image classifier on the generated crops.
 
@@ -2274,6 +2230,9 @@ def train_classifier(
         crop_size: Crop size (px) of the training crops, stored on the
             exported learner so prediction and segmentation crop the same
             (see :func:`classifier_crop_size`).
+        seed: Random seed of Python, NumPy and PyTorch (fastai ``set_seed``,
+            with deterministic cuDNN) so a rerun trains the same model; None
+            leaves the generators unseeded.
 
     Returns:
         The trained fastai Learner.
@@ -2282,8 +2241,11 @@ def train_classifier(
     from fastai.vision.all import (
         DataBlock, ImageBlock, CategoryBlock, GrandparentSplitter,
         get_image_files, parent_label, vision_learner, accuracy, error_rate,
-        Resize,
+        Resize, set_seed,
     )
+
+    if seed is not None:
+        set_seed(int(seed), reproducible=True)
 
     train_name, valid_name, _test_name = crop_dirs
 
@@ -2338,156 +2300,30 @@ def train_classifier(
 def _write_example_pages(pdf, plt, np, labels, examples):
     """Append example-classification pages to an open ``PdfPages``.
 
-    One row per category (in ``labels`` order, matching the confusion matrix),
-    with up to ``settings.TRAIN_EXAMPLES_PER_CLASS`` example crops as columns.
-    Each crop's title is the predicted label; misclassified crops get a red
-    title and a red border. Rows are paginated
-    ``settings.TRAIN_EXAMPLE_ROWS_PER_PAGE`` categories at a time.
+    See :func:`substrata.visualizations._classifier_example_pages`.
     """
-    per_class = settings.TRAIN_EXAMPLES_PER_CLASS
-    rows_per_page = settings.TRAIN_EXAMPLE_ROWS_PER_PAGE
+    from substrata import visualizations  # lazy: figures only
 
-    # Keep confusion-matrix order; skip labels with no example crops.
-    cats = [lab for lab in labels if examples.get(lab)]
-    if not cats:
-        return
-
-    for start in range(0, len(cats), rows_per_page):
-        page_cats = cats[start:start + rows_per_page]
-        fig, axes = plt.subplots(
-            len(page_cats), per_class,
-            figsize=(per_class * 1.1 + 1.0, len(page_cats) * 1.25),
-            squeeze=False,
-        )
-        fig.suptitle(
-            "Example classifications (title = prediction; red = misclassified)",
-            fontsize=11, y=0.99,
-        )
-        for r, cat in enumerate(page_cats):
-            samples = examples.get(cat, [])[:per_class]
-            for c in range(per_class):
-                ax = axes[r][c]
-                ax.set_xticks([])
-                ax.set_yticks([])
-                if c == 0:
-                    ax.set_ylabel(
-                        cat, rotation=0, ha="right", va="center", fontsize=7,
-                    )
-                if c >= len(samples):
-                    ax.axis("off")
-                    continue
-                fp, pred = samples[c]
-                try:
-                    im = np.asarray(Image.open(fp).convert("RGB"))
-                    ax.imshow(im)
-                except OSError:
-                    ax.text(
-                        0.5, 0.5, "(unreadable)", ha="center", va="center",
-                        transform=ax.transAxes, fontsize=5,
-                    )
-                wrong = pred != cat
-                ax.set_title(
-                    pred, fontsize=5, color="red" if wrong else "black",
-                )
-                for spine in ax.spines.values():
-                    spine.set_visible(True)
-                    spine.set_edgecolor("red" if wrong else "0.6")
-                    spine.set_linewidth(2.0 if wrong else 0.5)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
-        pdf.savefig(fig)
-        plt.close(fig)
+    visualizations._classifier_example_pages(pdf, labels, examples)
 
 
-def _write_stats_pdf(
-    pdf_path: str, split_folder: str, n: int, acc: float, report: str,
+@_renamed_kwargs(pdf_path="output_path")
+def write_classifier_stats_pdf(
+    output_path: str, split_folder: str, n: int, acc: float, report: str,
     cm: Any, labels: List[str],
     examples: Optional[Dict[str, List[Tuple[str, str]]]] = None,
 ) -> None:
     """Render the evaluation stats to a multi-page PDF.
 
-    Page 1 is a text summary (accuracy + per-class precision/recall/F1); page 2
-    is the confusion-matrix heatmap, row-normalised so per-class structure stays
-    visible despite large differences in class size; the remaining pages show
-    example classified crops per category (see :func:`_write_example_pages`).
+    See :func:`substrata.visualizations.save_classifier_stats_pdf`.
     """
-    import matplotlib
+    from substrata import visualizations  # lazy: figures only
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    import numpy as np
+    visualizations.save_classifier_stats_pdf(
+        output_path, split_folder, n, acc, report, cm, labels, examples=examples)
 
-    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
-    with PdfPages(pdf_path) as pdf:
-        # Page 1: text summary.
-        fig = plt.figure(figsize=(8.5, 11))
-        ax = fig.add_subplot(111)
-        ax.axis("off")
-        fig.suptitle(f"Classifier stats - {split_folder}", fontsize=12, y=0.98)
-        text = (
-            f"Crops evaluated: {n}\n"
-            f"Overall accuracy: {acc:.4f}\n\n"
-            f"{report}"
-        )
-        ax.text(
-            0.02, 0.96, text, transform=ax.transAxes, va="top", ha="left",
-            family="monospace", fontsize=8,
-        )
-        pdf.savefig(fig)
-        plt.close(fig)
 
-        # Page 2: confusion matrix heatmap. Colour by row-normalised values
-        # (fraction of each true class) so the diagonal and per-class errors
-        # stay visible regardless of how many images back each class; a few
-        # huge classes would otherwise saturate a raw-count colour scale and
-        # wash out every other cell.
-        cm = np.asarray(cm)
-        row_sums = cm.sum(axis=1, keepdims=True)
-        cm_norm = np.divide(
-            cm, row_sums, out=np.zeros(cm.shape, dtype=float),
-            where=row_sums != 0,
-        )
-
-        fig, ax = plt.subplots(figsize=(max(6, len(labels) * 0.5),
-                                        max(5, len(labels) * 0.5)))
-        im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
-        ax.set_xticks(range(len(labels)))
-        ax.set_yticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=6)
-        # Keep absolute counts in view via the y-axis (n = images per class).
-        ax.set_yticklabels(
-            [f"{lab} (n={int(row_sums[i])})" for i, lab in enumerate(labels)],
-            fontsize=6,
-        )
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("True")
-        ax.set_title(
-            "Confusion matrix (row-normalised; n = images per true class)"
-        )
-        fig.colorbar(
-            im, ax=ax, fraction=0.046, pad=0.04, label="Fraction of true class"
-        )
-
-        # Annotate raw counts only when there are few enough classes to read.
-        if len(labels) <= settings.TRAIN_CM_ANNOTATE_MAX:
-            for i in range(len(labels)):
-                for j in range(len(labels)):
-                    count = int(cm[i, j])
-                    if count == 0:
-                        continue
-                    ax.text(
-                        j, i, str(count), ha="center", va="center", fontsize=6,
-                        color="white" if cm_norm[i, j] > 0.5 else "black",
-                    )
-
-        fig.tight_layout()
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # Remaining pages: example classified crops per category.
-        if examples:
-            _write_example_pages(pdf, plt, np, labels, examples)
-    logger.info("Wrote classifier stats PDF: %s", pdf_path)
+_write_stats_pdf = write_classifier_stats_pdf  # deprecated alias (renamed 2026-11-25)
 
 
 def report_classifier_stats(
@@ -2503,7 +2339,7 @@ def report_classifier_stats(
     raw label is excluded (absent from ``label_map``) are skipped.
 
     Args:
-        classifier: A loaded fastai Learner or a path to a ``.pkl`` learner.
+        classifier: A loaded classifier or a path to one (``.pkl`` or ``.pt``).
         crops_dir: Base directory holding the crop folders.
         split_folder: Which split to evaluate (e.g. ``validation_crops`` or
             ``test_crops``).
@@ -2578,7 +2414,7 @@ def report_classifier_stats(
     print(cm)
 
     if pdf_path is not None:
-        _write_stats_pdf(
+        write_classifier_stats_pdf(
             pdf_path, split_folder, len(files), acc, report, cm, labels,
             examples=examples,
         )

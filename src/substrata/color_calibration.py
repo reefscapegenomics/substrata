@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import logging
-import os
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Third-Party Libraries
-import matplotlib
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
 from substrata import settings
@@ -103,6 +101,49 @@ def plane_signed_distances(
     """Signed distance from each point to a plane (n must be unit length)."""
     n = plane_normal / (np.linalg.norm(plane_normal) + 1e-15)
     return (points - plane_point.reshape(1, 3)) @ n
+
+
+def correction_residuals(
+    measured_rgb_255: np.ndarray,
+    reference_rgb_255: np.ndarray,
+    correction: Dict[str, np.ndarray],
+    mask: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Residuals of an affine colour correction against the reference patches.
+
+    ``corrected = measured @ matrix.T + offset`` (unclipped, sRGB 0-255).
+
+    Args:
+        measured_rgb_255: (N, 3) measured patch colours (NaN where missing).
+        reference_rgb_255: (N, 3) reference colours.
+        correction: Dict with ``"matrix"`` (3x3) and ``"offset"`` (3,).
+        mask: (N,) bool, the patches the fit used (default: those with a
+            finite measurement).
+
+    Returns:
+        dict: ``rmse`` (RMS residual after correction over the masked patches
+        and channels; the fit RMSE), ``rmse_all`` (over all finite patches),
+        ``rmse_before`` (measured vs reference, masked), the per-channel
+        ``rmse_per_channel`` and ``rmse_before_per_channel`` (3-element
+        arrays, masked) and ``n_patches_fit``.
+    """
+    measured = np.asarray(measured_rgb_255, dtype=float)
+    ref = np.asarray(reference_rgb_255, dtype=float)
+    if mask is None:
+        mask = np.isfinite(measured).all(axis=1)
+    mask = np.asarray(mask, dtype=bool)
+    matrix = np.asarray(correction["matrix"], dtype=float)
+    offset = np.asarray(correction["offset"], dtype=float)
+    after = measured @ matrix.T + offset - ref
+    before = measured - ref
+    return {
+        "rmse": float(np.sqrt(np.mean(after[mask] ** 2))),
+        "rmse_all": float(np.sqrt(np.nanmean(after ** 2))),
+        "rmse_before": float(np.sqrt(np.mean(before[mask] ** 2))),
+        "rmse_per_channel": np.sqrt(np.mean(after[mask] ** 2, axis=0)),
+        "rmse_before_per_channel": np.sqrt(np.mean(before[mask] ** 2, axis=0)),
+        "n_patches_fit": int(mask.sum()),
+    }
 
 
 def fit_plane_from_corners(
@@ -204,8 +245,13 @@ class ColorCalibration:
         Args:
             pcd: PointCloud with colors.
             patch_definitions: Sequence of (name, chart_u, chart_v, ref_r, ref_g, ref_b).
-            radius: Search radius in point cloud units.
-            plane_epsilon: Max distance to fitted plane through corners; None skips filter.
+            radius: Search radius in point cloud units (metres in a project's
+                world frame); None uses
+                ``settings.DEFAULT_COLOR_CALIBRATION_RADIUS``.
+            plane_epsilon: Max distance to the plane through the corners (point
+                cloud units); None uses
+                ``settings.DEFAULT_COLOR_CALIBRATION_PLANE_EPSILON``, 0 skips
+                the filter.
             marker_u_min, marker_v_min, marker_u_max, marker_v_max: Override
                 the marker-quad bounds in chart UV (defaults from settings).
             min_points: Minimum point count (after radius + plane filter)
@@ -381,7 +427,11 @@ class ColorCalibrations:
         self.num_cards: Optional[int] = None
         self.median_rgb_255_per_patch: Optional[np.ndarray] = None
         self.outlier_mask: Optional[np.ndarray] = None
+        self.patch_fit_mask: Optional[np.ndarray] = None
         self.color_correction: Optional[Dict[str, np.ndarray]] = None
+        self.fit_stats: Optional[Dict[str, Any]] = None
+        #: :func:`correction_residuals` of the last fit (drawn by ``show``)
+        self.fit_residuals: Optional[Dict[str, Any]] = None
         self._last_marker_u_min: Optional[float] = None
         self._last_marker_v_min: Optional[float] = None
         self._last_marker_u_max: Optional[float] = None
@@ -390,7 +440,7 @@ class ColorCalibrations:
         if target_data is not None:
             if hasattr(target_data, "data") and isinstance(target_data.data, dict):
                 target_data_dict = {
-                    ann.label if hasattr(ann, "label") else key: [ann.coords]
+                    (getattr(ann, "label", None) or key): [ann.coords]
                     for key, ann in target_data.data.items()
                 }
                 self.store_target_coords(target_data_dict)
@@ -437,10 +487,20 @@ class ColorCalibrations:
 
         Comparison uses sRGB 0-255 for measured vs reference to match reference table.
 
+        A card's value of a patch is flagged as an outlier (``outlier_mask``)
+        when it lies more than ``settings.COLOR_CALIBRATION_OUTLIER_Z`` robust
+        SDs (1.4826 x MAD across cards) from the cross-card median in any
+        channel. The per-patch median used for the fit
+        (``median_rgb_255_per_patch``) is then taken over the unflagged cards
+        only; a patch whose every card is flagged keeps the median of all cards
+        but is left out of the fit (``patch_fit_mask``).
+
         Args:
             pcd: PointCloud with RGB colors.
-            radius: Search radius (point cloud units).
-            plane_epsilon: Max distance to corner plane; None uses settings default.
+            radius: Search radius (point cloud units: metres in a project's
+                world frame); None uses the settings default.
+            plane_epsilon: Max distance to corner plane; None uses the settings
+                default, 0 skips the filter.
             marker_u_min, marker_v_min, marker_u_max, marker_v_max: Override
                 the marker-quad bounds in chart UV (defaults from settings).
             min_points: Minimum point count (after radius + plane filter)
@@ -504,6 +564,7 @@ class ColorCalibrations:
         self.num_cards = len(valid_cards)
         if self.num_cards == 0:
             self.median_rgb_255_per_patch = None
+            self.patch_fit_mask = None
             self.outlier_mask = None
             return
 
@@ -515,7 +576,9 @@ class ColorCalibrations:
                 if m is not None:
                     stack[row, j, :] = m * 255.0
 
-        self.median_rgb_255_per_patch = np.nanmedian(stack, axis=0)
+        all_median = np.nanmedian(stack, axis=0)
+        self.median_rgb_255_per_patch = all_median
+        self.patch_fit_mask = np.isfinite(all_median).all(axis=1)
 
         z = float(settings.COLOR_CALIBRATION_OUTLIER_Z)
         out = np.zeros((len(self.data), n), dtype=bool)
@@ -525,7 +588,7 @@ class ColorCalibrations:
 
         for j in range(n):
             col = stack[:, j, :]
-            med = self.median_rgb_255_per_patch[j]
+            med = all_median[j]
             abs_dev = np.abs(col - med.reshape(1, 3))
             patch_mad = np.nanmedian(abs_dev, axis=0)
             scale = 1.4826 * (patch_mad + 1e-6)
@@ -536,15 +599,31 @@ class ColorCalibrations:
                     out[ci, j] = True
 
         self.outlier_mask = out
+        # the per-patch median of the cards not flagged for that patch
+        flagged = out[np.asarray(valid_cards, dtype=int)]  # (cards, patches)
+        clean = stack.copy()
+        clean[flagged] = np.nan
+        has_clean = np.isfinite(clean).all(axis=2).any(axis=0)
+        with warnings.catch_warnings():  # (all-NaN patches: handled below)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            clean_median = np.nanmedian(clean, axis=0)
+        self.median_rgb_255_per_patch = np.where(
+            has_clean[:, None], clean_median, all_median)
+        self.patch_fit_mask = has_clean & np.isfinite(all_median).all(axis=1)
 
     def compute_color_correction(self) -> Dict[str, np.ndarray]:
         """Compute a global affine colour correction from measured vs. reference patches.
 
         Solves ``corrected = M @ measured + b`` via ordinary least-squares over
-        the 24 ColorChecker patches.  Patches where *every* card is flagged as
-        an outlier are excluded from the fit.
+        the 24 ColorChecker patches, in sRGB 0-255 (gamma-encoded values, not
+        linear light). Each patch's measured value is the median over the
+        cards not flagged as outliers for it; patches where *every* card is
+        flagged are excluded from the fit (``patch_fit_mask``).
 
-        ``sample_point_cloud()`` must have been called first.
+        ``sample_point_cloud()`` must have been called first. The fit's
+        statistics are kept in ``fit_stats`` (``rmse``: RMS residual over the
+        fitted patches and channels, ``rmse_all``: over all patches, in RGB
+        units; ``n_patches_fit``, ``n_patches``, ``space``).
 
         Returns:
             Dict with ``"matrix"`` (3x3 ndarray) and ``"offset"`` (length-3
@@ -567,17 +646,14 @@ class ColorCalibrations:
                 f"Reference has {ref.shape[0]} patches but measured has {n_patches}."
             )
 
-        mask = np.ones(n_patches, dtype=bool)
-        if (
-            self.outlier_mask is not None
-            and self.num_cards
-            and self.num_cards > 1
-            and self._aggregation_card_indices
-        ):
-            rows = np.array(self._aggregation_card_indices, dtype=int)
-            sub = self.outlier_mask[rows, :n_patches]
-            all_outlier = np.all(sub, axis=0)
-            mask &= ~all_outlier
+        mask = np.isfinite(measured).all(axis=1)
+        fit_mask = getattr(self, "patch_fit_mask", None)
+        if fit_mask is not None and len(fit_mask) == n_patches:
+            mask &= np.asarray(fit_mask, dtype=bool)
+        if mask.sum() < 4:
+            logger.warning(
+                "Only %d usable patches: the affine colour fit (12 parameters) "
+                "is underdetermined.", int(mask.sum()))
 
         measured_fit = measured[mask]
         ref_fit = ref[mask]
@@ -588,18 +664,24 @@ class ColorCalibrations:
         matrix = params[:3, :].T
         offset = params[3, :]
 
-        corrected = measured @ matrix.T + offset
-        residuals = corrected - ref
-        rmse = float(np.sqrt(np.mean(residuals ** 2)))
+        self.color_correction = {
+            "matrix": matrix,
+            "offset": offset,
+        }
+        self.fit_residuals = correction_residuals(
+            measured, ref, self.color_correction, mask
+        )
+        rmse = self.fit_residuals["rmse"]
+        rmse_all = self.fit_residuals["rmse_all"]
 
         logger.info(
             "Colour correction fitted on %d/%d patches  (RMSE = %.2f RGB units)",
             int(mask.sum()), n_patches, rmse,
         )
-
-        self.color_correction = {
-            "matrix": matrix,
-            "offset": offset,
+        self.fit_stats = {
+            "rmse": rmse, "rmse_all": rmse_all,
+            "n_patches_fit": int(mask.sum()), "n_patches": int(n_patches),
+            "space": "sRGB 0-255",
         }
         return self.color_correction
 
@@ -610,62 +692,6 @@ class ColorCalibrations:
             lines.append(f"  cards_with_full_samples={self.num_cards},")
         lines.append(")")
         return "\n".join(lines)
-
-    def _qc_summary_text(self) -> str:
-        """Human-readable summary for the PDF cover page."""
-        lines = ["Color calibration QC", ""]
-        lines.append(f"Charts defined: {len(self.data)}")
-        lines.append(f"Charts with full patch samples: {self.num_cards}")
-        if self._last_marker_u_min is not None:
-            lines.append(
-                f"marker_quad UV: u=[{self._last_marker_u_min:.4f}, "
-                f"{self._last_marker_u_max:.4f}], "
-                f"v=[{self._last_marker_v_min:.4f}, {self._last_marker_v_max:.4f}]"
-            )
-        if self.outlier_mask is not None:
-            lines.append(
-                f"Outlier flags (card x patch): {int(np.sum(self.outlier_mask))}"
-            )
-        lines.append("")
-        lines.append("Measured RGB vs reference (sRGB 8-bit); outliers use MAD across cards.")
-        return "\n".join(lines)
-
-    def _generate_qc_figs(self) -> List[Any]:
-        """Build matplotlib figures for QC (one grid per card + summary)."""
-        from substrata import visualizations
-
-        figs: List[Any] = []
-        title_extra = ""
-        if self._last_marker_u_min is not None:
-            title_extra = (
-                f"marker UV: u=[{self._last_marker_u_min:.4f}, "
-                f"{self._last_marker_u_max:.4f}], "
-                f"v=[{self._last_marker_v_min:.4f}, {self._last_marker_v_max:.4f}]"
-            )
-        figs.append(visualizations.plot_text(self._qc_summary_text(), width=10, height=6))
-        aggregating = set(self._aggregation_card_indices or ())
-        for i, card in enumerate(self.data):
-            if i in self._excluded_card_indices:
-                continue
-            if not card.patch_results:
-                continue
-            om = (
-                self.outlier_mask[i]
-                if self.outlier_mask is not None
-                else np.zeros(len(card.patch_results), dtype=bool)
-            )
-            status = "" if i in aggregating else "  [EXCLUDED: missing patches]"
-            fig = visualizations.plot_colorchecker_qc_grid(
-                card.patch_results,
-                title=(
-                    f"Card {i + 1}: "
-                    f"{card.name or card.tl_label + ' … ' + card.br_label}"
-                    f"{status}\n{title_extra}"
-                ),
-                outlier_mask=om,
-            )
-            figs.append(fig)
-        return figs
 
     def show(
         self,
@@ -723,108 +749,10 @@ class ColorCalibrations:
             else:
                 self.color_correction = None
 
-        sample_r = float(settings.DEFAULT_COLOR_CALIBRATION_RADIUS)
-        aggregating = set(self._aggregation_card_indices or ())
-
-        figs: List[Any] = []
-        for i, card in enumerate(self.data):
-            if i in self._excluded_card_indices:
-                continue
-            if not card.has_all_corners() or not card.patch_results:
-                continue
-
-            corners = np.array([
-                card.tl_coords, card.tr_coords,
-                card.bl_coords, card.br_coords,
-            ])
-            centre = corners.mean(axis=0)
-            diag = np.max(np.linalg.norm(corners - centre, axis=1))
-            fetch_radius = diag * (1.0 + margin_frac)
-
-            sub = pcd.subsample_pointcloud_by_radius(centre, fetch_radius)
-            pts = np.asarray(sub.points)
-            cols = np.asarray(getattr(sub, "colors", np.ones_like(pts)))
-            if pts.shape[0] == 0:
-                continue
-
-            normal, origin = fit_plane_from_corners(
-                card.tl_coords, card.tr_coords, card.bl_coords,
-            )
-            signed_dist = (pts - origin) @ normal
-            slab_mask = np.abs(signed_dist) <= plane_thickness
-            pts = pts[slab_mask]
-            cols = cols[slab_mask]
-            if pts.shape[0] == 0:
-                continue
-
-            patch_centers = np.array([
-                pr["world_xyz"] for pr in card.patch_results
-            ])
-            patch_names = [pr["name"] for pr in card.patch_results]
-            status = "" if i in aggregating else "  [EXCLUDED: missing patches]"
-            card_title = (
-                f"Card {i + 1}: "
-                f"{card.name or card.tl_label + ' … ' + card.br_label}"
-                f"{status}"
-            )
-
-            om = (
-                self.outlier_mask[i]
-                if self.outlier_mask is not None
-                else np.zeros(len(card.patch_results), dtype=bool)
-            )
-            fig = visualizations.plot_colorchecker_card_summary(
-                pcd_points=pts,
-                pcd_colors=cols,
-                tl=card.tl_coords,
-                tr=card.tr_coords,
-                bl=card.bl_coords,
-                br=card.br_coords,
-                patch_centers_3d=patch_centers,
-                patch_names=patch_names,
-                patch_results=card.patch_results,
-                outlier_mask=om,
-                radius=sample_r,
-                title=card_title,
-                point_size=point_size,
-                margin_frac=margin_frac,
-                width=width,
-                height=height,
-            )
-            figs.append(fig)
-
-        if self.color_correction is not None and self.median_rgb_255_per_patch is not None:
-            ref = np.array(
-                [[r, g, b] for (_, _, _, r, g, b) in self.patch_definitions],
-                dtype=float,
-            )
-            names = [name for (name, *_rest) in self.patch_definitions]
-            global_om = None
-            if (
-                self.outlier_mask is not None
-                and self.num_cards
-                and self.num_cards > 1
-                and self._aggregation_card_indices
-            ):
-                rows = np.array(self._aggregation_card_indices, dtype=int)
-                global_om = np.all(
-                    self.outlier_mask[rows, :ref.shape[0]], axis=0,
-                )
-            figs.append(visualizations.plot_color_correction_summary(
-                measured_rgb_255=self.median_rgb_255_per_patch,
-                reference_rgb_255=ref,
-                correction=self.color_correction,
-                patch_names=names,
-                outlier_mask=global_om,
-                title="Colour Correction Summary",
-            ))
-            figs.append(visualizations.plot_color_before_after(
-                pcd=pcd,
-                correction=self.color_correction,
-                title="Point Cloud Before / After Colour Correction",
-            ))
-
-        return figs
+        return visualizations.color_calibration_figures(
+            self, pcd, margin_frac=margin_frac, point_size=point_size,
+            plane_thickness=plane_thickness, width=width, height=height,
+        )
 
     def save_pdf(
         self, pcd: Optional[Any] = None, filepath: Optional[str] = None,
@@ -838,16 +766,6 @@ class ColorCalibrations:
         if self.num_cards is None:
             self.sample_point_cloud(pcd)
 
-        backend_original = matplotlib.get_backend()
-        matplotlib.use("Agg", force=True)
-        try:
-            if filepath is None:
-                base, _ext = os.path.splitext(pcd.filepath)
-                filepath = f"{base}_color_calibration.pdf"
+        from substrata import visualizations  # lazy: figures only
 
-            pdf = PdfPages(filepath)
-            for fig in self.show(pcd):
-                pdf.savefig(fig)
-            pdf.close()
-        finally:
-            matplotlib.use(backend_original, force=True)
+        visualizations.save_color_calibration_pdf(self, pcd, filepath)

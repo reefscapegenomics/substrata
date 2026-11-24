@@ -118,7 +118,7 @@ class TestBuildImageIndex(unittest.TestCase):
             _touch(os.path.join(tmp, "training_crops", "IMG_0003.JPG"))
             _touch(os.path.join(tmp, "a", "notes.txt"))
 
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
 
             # Case-differing duplicates collide into one entry.
             self.assertIn("img_0001.jpg", index)
@@ -146,7 +146,7 @@ class TestResolveImagePaths(unittest.TestCase):
             stored = {
                 f"cam_000{i}": rf"D:\old\dive1\IMG_000{i}.JPG" for i in (1, 2, 3)
             }
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
 
             calls = []
 
@@ -173,7 +173,7 @@ class TestResolveImagePaths(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             good = _touch(os.path.join(tmp, "here", "IMG_0001.JPG"))
             _touch(os.path.join(tmp, "elsewhere", "IMG_0001.JPG"))
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
 
             plan = cp.resolve_image_paths({"cam_0001": good}, index)
 
@@ -185,7 +185,7 @@ class TestResolveImagePaths(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _touch(os.path.join(tmp, "a", "IMG_0001.JPG"))
             _touch(os.path.join(tmp, "b", "IMG_0001.JPG"))
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
 
             stored = {"cam_0001": r"D:\old\dive1\IMG_0001.JPG"}
             snapshot = dict(stored)
@@ -208,7 +208,7 @@ class TestResolveImagePaths(unittest.TestCase):
                              ("dive4", "D")):
             for i in (1, 2):
                 stored[f"{prefix}{i}"] = f"/old/{dive}/{prefix}_{i}.JPG"
-        return cp, stored, cp.build_image_index(tmp, quiet=True)
+        return cp, stored, cp.build_image_index(tmp, verbose=False)
 
     def test_missing_folder_is_asked_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,7 +274,7 @@ class TestResolveImagePaths(unittest.TestCase):
     def test_missing_callback_required_when_non_interactive(self) -> None:
         cp = _load_pathrepair()
         with tempfile.TemporaryDirectory() as tmp:
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
             with self.assertRaises(RuntimeError):
                 cp.resolve_image_paths({"cam_0001": "/gone/IMG_0001.JPG"}, index)
 
@@ -317,7 +317,7 @@ class TestCollisions(unittest.TestCase):
                 "cam_0001": r"D:\old\dive1\IMG_0001.JPG",
                 "cam_0002": r"D:\old\dive2\IMG_0001.JPG",
             }
-            index = cp.build_image_index(tmp, quiet=True)
+            index = cp.build_image_index(tmp, verbose=False)
 
             plan = cp.resolve_image_paths(stored, index)
 
@@ -411,7 +411,7 @@ class TestSavePaths(unittest.TestCase):
             cams = Cameras(cams_meta_filepath=meta_path, cams_xml_filepath=None)
             cams.data["cam_a"].set_filepath(real)
 
-            missing = cams.missing_image_paths(use_orig=True)
+            missing = cams.missing_image_paths(use_orig_filepath=True)
             self.assertNotIn("cam_a", missing)
             self.assertIn("cam_b", missing)
 
@@ -748,7 +748,7 @@ class TestAnnotationCsvs(unittest.TestCase):
             _touch(os.path.join(tmp, "x", "IMG_0001.JPG"))
             stored = {"/old/d1/IMG_0001.JPG": "/old/d1/IMG_0001.JPG"}
             plan = pr.resolve_image_paths(
-                stored, pr.build_image_index(tmp, quiet=True),
+                stored, pr.build_image_index(tmp, verbose=False),
                 on_duplicate=None, on_missing=None,
                 dir_map={"/old/d1": new},
             )

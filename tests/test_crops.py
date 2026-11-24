@@ -28,7 +28,7 @@ _SUB = _SRC / "substrata"
 
 
 _MODULES = (
-    "settings", "logging", "geom", "pathrepair", "visualizations",
+    "settings", "logging", "geom", "pathrepair", "imagecrops", "visualizations",
     "measurements", "pointclouds", "cameras", "classification", "annotations",
 )
 _KEYS = ["substrata"] + [f"substrata.{name}" for name in _MODULES]
@@ -174,7 +174,7 @@ class TestCropPaths(_TmpDirTest):
 
     def test_windows_style_photo_path(self):
         cam = cam_mod.Camera(cam_id=1, path=r"D:\photos\site.closeup\IMG_9.jpg")
-        self.assertEqual(cam_mod._photo_folder_name(cam.filepath), "site.closeup")
+        self.assertEqual(cam_mod.photo_folder_name(cam.filepath), "site.closeup")
 
     def test_find_crop_falls_back_to_legacy_layout(self):
         im = _make_match(self.photo)
@@ -261,7 +261,7 @@ class TestCropMetadata(_TmpDirTest):
         path = im.find_crop(self.root)
         with Image.open(path) as before:
             pixels = np.asarray(before).copy()
-        cam_mod._update_crop_metadata(path, {"pred_label": "S", "pred_conf": 0.9})
+        cam_mod.update_crop_metadata(path, {"pred_label": "S", "pred_conf": 0.9})
         meta = cam_mod.read_crop_metadata(path)
         self.assertEqual(meta["pred_label"], "S")
         self.assertTrue(meta["potentially_obstructed"])
@@ -421,7 +421,7 @@ class TestAnnotationsFile(unittest.TestCase):
         self.assertEqual((first.pred_label, first.pred_conf, first.pred_n),
                          ("S", 0.75, 3))
         self.assertIsNone(second.pred_label)
-        self.assertEqual(first.other_cols, [])
+        self.assertEqual(first.other_cols, {})
 
 
 if __name__ == "__main__":

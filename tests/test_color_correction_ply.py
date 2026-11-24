@@ -65,25 +65,25 @@ class TestColorCorrectedPly(unittest.TestCase):
     def test_decimate_marks_corrected_output(self):
         out = os.path.join(self.tmp.name, "cc.ply")
         self.assertFalse(pc.ply_is_color_corrected(self.src))
-        pc.decimate_ply_file(self.src, out, 10, show_progress=False,
+        pc.decimate_ply_file(self.src, out, 10, progress=False,
                              color_correction=CC)
         self.assertTrue(pc.ply_is_color_corrected(out))
         self.assertEqual(_read_rgb(out)[0], (100, 100, 60))
 
     def test_marker_kept_and_double_correction_refused(self):
         out = os.path.join(self.tmp.name, "cc.ply")
-        pc.decimate_ply_file(self.src, out, 10, show_progress=False,
+        pc.decimate_ply_file(self.src, out, 10, progress=False,
                              color_correction=CC)
         again = os.path.join(self.tmp.name, "cc_dec.ply")
-        pc.decimate_ply_file(out, again, 2, show_progress=False)
+        pc.decimate_ply_file(out, again, 2, progress=False)
         self.assertTrue(pc.ply_is_color_corrected(again))
         with self.assertRaises(ValueError):
-            pc.decimate_ply_file(out, again, 10, show_progress=False,
+            pc.decimate_ply_file(out, again, 10, progress=False,
                                  color_correction=CC)
 
     def test_plain_decimate_is_not_marked(self):
         out = os.path.join(self.tmp.name, "dec.ply")
-        pc.decimate_ply_file(self.src, out, 2, show_progress=False)
+        pc.decimate_ply_file(self.src, out, 2, progress=False)
         self.assertFalse(pc.ply_is_color_corrected(out))
 
 
@@ -125,7 +125,7 @@ class TestYamlColorCorrection(unittest.TestCase):
         pc.decimate_ply_file(
             os.path.join(self.proj, "cur_sna.ply"),
             os.path.join(self.proj, "cur_sna_cc.ply"),
-            10, show_progress=False, color_correction=CC,
+            10, progress=False, color_correction=CC,
         )
         # Plain PLY: the YAML correction is applied on load
         self.assertEqual(tuple(self._colors("cur_sna.ply")[0]), (100, 100, 60))

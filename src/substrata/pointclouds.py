@@ -14,9 +14,17 @@ import struct
 
 # Local Modules
 from substrata import geom, settings
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.fileio import atomic_write as _atomic_write
 from substrata.geom import Transform
+from substrata.stratified import (
+    PLY_TYPES,
+    STRATIFIED_COMMENT,
+    available_memory,
+    ply_rgb,
+    read_ply_header,
+)
 import substrata.annotations as annotations
-from matplotlib.backends.backend_pdf import PdfPages
 
 if TYPE_CHECKING:  # hint-only imports
     from substrata.annotations import (
@@ -50,17 +58,10 @@ _FALLBACK_AVAILABLE_BYTES = 8 * 1024**3
 
 
 def _available_memory_bytes() -> int:
-    """Best-effort estimate of RAM available to this process, in bytes."""
-    try:  # Optional dep — psutil gives the most accurate "available" figure.
-        import psutil  # type: ignore
-
-        return int(psutil.virtual_memory().available)
-    except Exception:
-        pass
-    try:  # POSIX fallback (Linux/macOS): pages currently free.
-        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
-    except (ValueError, OSError, AttributeError):
-        return _FALLBACK_AVAILABLE_BYTES
+    """RAM available to this process, in bytes (``stratified.available_memory``:
+    MemAvailable / psutil within cgroup limits), or a conservative floor when
+    it cannot be determined."""
+    return available_memory() or _FALLBACK_AVAILABLE_BYTES
 
 
 def _o3d_bytes_per_vertex(has_rgb: bool, has_normals: bool) -> int:
@@ -93,43 +94,10 @@ def _memory_safe_vertex_cap(
     return max(1, int((_available_memory_bytes() * fraction) // peak_bpv))
 
 
-# PLY scalar sizes (bytes) and struct codes
-ply_type_sizes = {
-    "char": 1,
-    "uchar": 1,
-    "int8": 1,
-    "uint8": 1,
-    "short": 2,
-    "ushort": 2,
-    "int16": 2,
-    "uint16": 2,
-    "int": 4,
-    "uint": 4,
-    "int32": 4,
-    "uint32": 4,
-    "float": 4,
-    "float32": 4,
-    "double": 8,
-    "float64": 8,
-}
-ply_type_struct = {
-    "char": "b",
-    "uchar": "B",
-    "int8": "b",
-    "uint8": "B",
-    "short": "h",
-    "ushort": "H",
-    "int16": "h",
-    "uint16": "H",
-    "int": "i",
-    "uint": "I",
-    "int32": "i",
-    "uint32": "I",
-    "float": "f",
-    "float32": "f",
-    "double": "d",
-    "float64": "d",
-}
+# PLY scalar sizes (bytes) and struct codes, from the one PLY type map
+# (``stratified.PLY_TYPES``: PLY type -> numpy type code)
+ply_type_sizes = {t: np.dtype(c).itemsize for t, c in PLY_TYPES.items()}
+ply_type_struct = {t: np.dtype(c).char for t, c in PLY_TYPES.items()}
 
 
 class PointCloud:
@@ -271,11 +239,12 @@ class PointCloud:
         """Check if the world_transform is the identity matrix."""
         return np.allclose(self.world_transform, np.eye(4))
 
+    @_renamed_kwargs(show_progress="progress")
     def read_point_cloud(
         self,
         filepath: str,
         max_points: Optional[int] = None,
-        show_progress: bool = True,
+        progress: bool = True,
     ) -> None:
         """Read a pointcloud directly from a file.
 
@@ -366,13 +335,13 @@ class PointCloud:
 
         if effective_max is not None and is_ply:
             self.o3d_pcd = _stream_load_ply_into_o3d_pcd(
-                filepath, int(effective_max), show_progress=show_progress
+                filepath, int(effective_max), progress=progress
             )
         elif is_ply:
             # Try Open3D first; fall back to the streaming parser when Open3D
             # rejects the file (e.g. Metashape exports with `double` xyz or
             # extra vertex properties trigger "number of vertex <= 0").
-            pcd = o3d.io.read_point_cloud(filepath, print_progress=show_progress)
+            pcd = o3d.io.read_point_cloud(filepath, print_progress=progress)
             if len(pcd.points) == 0:
                 logger.warning(
                     "Open3D returned 0 points for %s; falling back to "
@@ -383,27 +352,13 @@ class PointCloud:
                     with open(filepath, "rb") as fin:
                         _, _, n_vertices, *_ = _parse_ply_header(fin)
                 pcd = _stream_load_ply_into_o3d_pcd(
-                    filepath, n_vertices, show_progress=show_progress
+                    filepath, n_vertices, progress=progress
                 )
             self.o3d_pcd = pcd
         else:
             self.o3d_pcd = o3d.io.read_point_cloud(filepath, print_progress=True)
         base_name = os.path.splitext(os.path.basename(filepath))[0]
         self.name = re.sub(r"_dec.*$", "", base_name)
-
-    def populate_point_cloud(
-        self, points: np.ndarray, normals: np.ndarray, colors: np.ndarray
-    ) -> None:
-        """Populate the point cloud with points, normals, and colors.
-
-        Args:
-            points: Point coordinates as numpy array.
-            normals: Point normals as numpy array.
-            colors: Point colors as numpy array.
-        """
-        self.o3d_pcd.points = points
-        self.o3d_pcd.normals = normals
-        self.o3d_pcd.colors = colors
 
     def build_kd_tree(self) -> None:
         """Build kd tree for the point cloud."""
@@ -418,15 +373,27 @@ class PointCloud:
         pcd_xy.points = o3d.utility.Vector3dVector(xy_points)
         self.o3d_pcd_tree_xy = o3d.geometry.KDTreeFlann(pcd_xy)
 
+    @_renamed_kwargs(transform_matrix="transform")
     def apply_transform(
-        self, transform_matrix: npt.NDArray[np.floating], plot=False, plot_title=None
+        self, transform: npt.NDArray[np.floating], plot=False, plot_title=None
     ) -> None:
-        """Apply a 4x4 homogeneous transform to the point cloud."""
-        tm = np.asarray(transform_matrix, dtype=float)
-        if tm.shape != (4, 4):
-            raise ValueError("`transform_matrix` must have shape (4, 4)")
+        """Apply a 4x4 homogeneous transform to the point cloud.
 
+        Points get the full transform. Normals are transformed as surface
+        normals (``transform_normals``: inverse-transpose of the 3x3 part, then
+        renormalised to unit length), so they stay unit and perpendicular to the
+        surface under scaling, including non-uniform scaling.
+        """
+        tm = np.asarray(transform, dtype=float)
+        if tm.shape != (4, 4):
+            raise ValueError("`transform` must have shape (4, 4)")
+
+        normals = np.array(self.o3d_pcd.normals) if self.o3d_pcd.has_normals() else None
         self.o3d_pcd.transform(tm)
+        if normals is not None:
+            self.o3d_pcd.normals = o3d.utility.Vector3dVector(
+                transform_normals(normals, tm)
+            )
         logger.info("Applied transform:\n%s", tm)
 
         self.transforms.append(tm)
@@ -436,11 +403,12 @@ class PointCloud:
 
             fig = plot(self, title=plot_title)
 
+    @_renamed_kwargs(transform_matrices="transforms")
     def apply_transforms(
-        self, transform_matrices: Iterable[npt.NDArray[np.floating]]
+        self, transforms: Iterable[npt.NDArray[np.floating]]
     ) -> None:
         """Apply several 4x4 transforms in sequence."""
-        for idx, tm in enumerate(transform_matrices):
+        for idx, tm in enumerate(transforms):
             self.apply_transform(tm)
 
     def apply_color_correction(
@@ -618,43 +586,17 @@ class PointCloud:
         title: str | None = None,
         ortho_resolution: float | None = None,
     ) -> str:
-        """Save the composite views to a single-page PDF.
+        """Save the composite views to a single-page PDF; returns the filepath.
 
-        Uses a non-interactive backend and closes figures after saving,
-        similar to ``Scalebars.save_pdf``.
-
-        Returns the output filepath.
+        See :func:`substrata.visualizations.save_views_pdf`.
         """
-        import matplotlib
+        from substrata import visualizations  # lazy: figures only
 
-        backend_original = matplotlib.get_backend()
-        matplotlib.use("Agg", force=True)
-        try:
-            if filepath is None:
-                base, _ = os.path.splitext(self.filepath or "pointcloud")
-                filepath = f"{base}_views.pdf"
-
-            from substrata.visualizations import plot_views as _plot_views
-
-            fig = _plot_views(
-                self,
-                point_size=point_size,
-                width=width,
-                height=height,
-                max_output_points=max_output_points,
-                title=title,
-                ortho_resolution=ortho_resolution,
-            )
-            pdf = PdfPages(filepath)
-            pdf.savefig(fig)
-            pdf.close()
-            # Ensure figure is closed to free memory
-            import matplotlib.pyplot as plt
-
-            plt.close(fig)
-            return filepath
-        finally:
-            matplotlib.use(backend_original, force=True)
+        return visualizations.save_views_pdf(
+            self, filepath, point_size=point_size, width=width, height=height,
+            max_output_points=max_output_points, title=title,
+            ortho_resolution=ortho_resolution,
+        )
 
     def crop(
         self,
@@ -856,59 +798,67 @@ class PointCloud:
             if hasattr(self, attr):
                 delattr(self, attr)
 
-    def reduce_pcd_to_points_in_mesh(self, mesh) -> None:
-        """Reduce the number of points by sampling points from a target mesh.
-
-        Args:
-            mesh: Target mesh to sample points from.
-        """
-        n_points = len(self.o3d_pcd.points)
-        reduced_pcd = mesh.sample_points_uniformly(n_points)
-        reduced_pcd = mesh.sample_points_poisson_disk(n_points, pcl=reduced_pcd)
-        self.o3d_pcd = reduced_pcd
-
     def subsample_pointcloud_by_radius(
-        self, coords: np.ndarray, radius: float, cylinder: bool = False
+        self,
+        coords: np.ndarray,
+        radius: float,
+        cylinder: bool = False,
+        exclude_query_point: bool = True,
     ) -> "SimplePointCloud":
-        """Subsample the pointcloud by a given radius.
+        """The points of the cloud within a radius of a coordinate.
 
         Args:
-            coords: Coordinates to search around.
-            radius: Search radius.
+            coords: Coordinates to search around (the annotation point).
+            radius: Search radius (cloud units).
             cylinder: If True, search within a vertical cylinder (XY distance
                 only, Z unconstrained) instead of a 3D sphere.  Use this when
                 downstream analysis depends on horizontal distance — e.g. TPI,
                 which compares elevations across a horizontal neighbourhood.
+            exclude_query_point: Leave out the query point itself when it is a
+                cloud point (one record at exactly ``coords``, e.g. an intercept),
+                so the neighbourhood is its surroundings. Any other point is kept,
+                including the nearest one when ``coords`` is not a cloud point.
 
         Returns:
-            SimplePointCloud with subsampled points.
-
-        Raises:
-            RuntimeError: If the pointcloud has <=1 points.
+            SimplePointCloud with the points (and their colours / normals when
+            the cloud has them; labels "empty").
         """
-        if cylinder:
+        coords = np.asarray(coords, dtype=float).reshape(3)
+        points = np.asarray(self.points)
+        if len(points) == 0:
+            idx = np.zeros(0, dtype=int)
+        elif cylinder:
             if not hasattr(self, "o3d_pcd_tree_xy"):
                 self.build_kd_tree_xy()
             coords_xy = np.array([coords[0], coords[1], 0.0])
-            [k, idx, _] = self.o3d_pcd_tree_xy.search_radius_vector_3d(
+            _k, idx, _ = self.o3d_pcd_tree_xy.search_radius_vector_3d(
                 coords_xy, radius
             )
         else:
             if not hasattr(self, "o3d_pcd_tree"):
                 self.build_kd_tree()
-            [k, idx, _] = self.o3d_pcd_tree.search_radius_vector_3d(coords, radius)
+            _k, idx, _ = self.o3d_pcd_tree.search_radius_vector_3d(coords, radius)
+        idx = np.asarray(idx, dtype=int)
+        if exclude_query_point and len(idx):
+            same = np.flatnonzero((points[idx] == coords).all(axis=1))
+            if len(same):
+                idx = np.delete(idx, same[0])
 
-        if len(self.points) <= 1:
-            logger.error(
-                "Pointcloud for annotation id {} has <=1 points".format(self.id)
+        if len(idx) <= 1:
+            logger.warning(
+                "Neighbourhood of %s (radius %g) has %d point(s)",
+                np.round(coords, 4).tolist(), radius, len(idx),
             )
 
-        # Return a new pointcloud with the subsampled points
+        def _take(values):
+            values = np.asarray(values)
+            return values[idx] if len(values) == len(points) and len(points) else None
+
         return SimplePointCloud(
-            np.asarray(self.points)[idx[1:], :],
-            np.asarray(self.colors)[idx[1:], :],
-            np.asarray(self.normals)[idx[1:], :],
-            np.asarray(np.repeat("empty", len(np.asarray(self.points)[idx[1:], :]))),
+            points[idx],
+            _take(self.colors),
+            _take(self.normals),
+            np.repeat("empty", len(idx)),
         )
 
     def get_cam_dist(
@@ -1041,7 +991,7 @@ class PointCloud:
         coords recorded, so they line up with cameras/pcd (e.g. get_image_matches checks the transforms), and
         the depth regression carried over so depth_in_m works on them."""
         if not self.world_transform_is_identity:
-            intercept_points.get_original_coords(self.world_transform)
+            intercept_points.reverse_transform(self.world_transform)
         for attr in ("up_vector", "depth_offset"):
             if getattr(self, attr, None) is not None:
                 setattr(intercept_points, attr, getattr(self, attr))
@@ -1187,12 +1137,15 @@ class PointCloud:
         Returns:
             InterceptAnnotation object if found, None otherwise.
         """
+        if len(self.points) == 0:
+            return None  # nothing to find (always_return would never stop)
+        if not search_radius > 0:
+            raise ValueError("search_radius must be positive")
         # Ensure the point cloud has a KDTree for XY coordinates.
-        used_search_radius = search_radius
         if not hasattr(self, "o3d_pcd_tree_xy"):
             self.build_kd_tree_xy()
 
-        # Prepare the query point with z=0.``
+        # Prepare the query point with z=0.
         query_xy = np.array([xy_coord[0], xy_coord[1], 0.0])
 
         # Search for neighbors adjusting search_radius if necessary.
@@ -1258,23 +1211,36 @@ class PointCloud:
         max_search_radius: float = settings.MAX_SEARCH_RADIUS_FOR_INTERCEPT_SEARCH,
         always_return: bool = False,
     ) -> "InterceptAnnotation | None":
-        """Find the first point that intersects with a line segment.
+        """Find the first cloud point along a line segment.
 
-        The search is performed by discretizing the line segment and querying the nearest
-        neighbor at each step, with an intercept being returned if the distance is less
-        than the search radius.
+        Search geometry (r = ``search_radius``): the segment runs from
+        ``origin_coord`` to ``target_coord`` (or ``max_dist_from_origin`` along
+        ``vector``). The candidates are the cloud points within r of the segment
+        (a capsule: a cylinder of radius r around it, with hemispherical ends);
+        t is a candidate's distance along the segment. The first surface met is
+        at the smallest t, t_first, and the hit is the candidate nearest the
+        line among those with t <= t_first + r: on the first surface, at most r
+        behind its first contact, and as close to the line of sight as the
+        cloud allows (the earliest candidate alone sits on the capsule's rim,
+        up to r off the line). The search is exact: the segment is walked in
+        steps of r with radius queries of r * sqrt(5) / 2, which together cover
+        the capsule, and stops once no later query can hold a point with
+        t <= t_first + r.
 
-        If always_return is True, the function will keep expanding the search until
-        a closest neighbor is found.
+        If nothing is within ``search_radius`` and ``always_return`` is True, the
+        radius is widened in steps of ``search_radius`` (up to
+        ``max_search_radius``) and the cloud point nearest any of the segment's
+        sample points (spaced ``search_radius``) within that radius is returned
+        (its radius is the one used).
 
         Args:
             origin_coord: Starting coordinate for the line segment.
             search_radius: Search radius for finding intercept points.
             target_coord: End coordinate for the line segment (mutually exclusive with vector).
             vector: Direction vector for the line segment (mutually exclusive with target_coord).
-            max_dist_from_origin: Maximum distance from origin for intercept search.
+            max_dist_from_origin: Segment length when ``vector`` is given.
             max_search_radius: Maximum search radius when always_return is True.
-            always_return: Whether to always return a result, expanding search if necessary.
+            always_return: Whether to widen the search when nothing is found.
 
         Returns:
             InterceptAnnotation object if found, None otherwise.
@@ -1288,89 +1254,85 @@ class PointCloud:
             target_coord is not None and vector is not None
         ):
             raise ValueError("Specify either a target_coord or vector.")
+        if not search_radius > 0:
+            raise ValueError("search_radius must be positive")
+        if len(self.points) == 0:
+            return None
 
         # Ensure the pointcloud has a KDTree
         if not hasattr(self, "o3d_pcd_tree"):
             self.build_kd_tree()
 
-        # Calculate endpoint for intercept search
+        origin = np.asarray(origin_coord, dtype=float)
         if target_coord is None:
-            unit_vector = vector / np.linalg.norm(vector)
-            target_coord = origin_coord + (unit_vector * max_dist_from_origin)
+            unit_vector = np.asarray(vector, dtype=float)
+            unit_vector = unit_vector / np.linalg.norm(unit_vector)
+            target = origin + unit_vector * max_dist_from_origin
+        else:
+            target = np.asarray(target_coord, dtype=float)
+        seg = target - origin
+        length = float(np.linalg.norm(seg))
+        u = seg / length if length > 0 else np.array([0.0, 0.0, 1.0])
 
-        # Discretize the line segment between start_coord and target_coord
-        # using intercept_radius as step distance
-        sample_points = geom.sample_points_along_line(
-            origin_coord, target_coord, search_radius
-        )
-        sample_point_neighbors = []
-        search_radius_sq = search_radius**2
+        points = self.points
+        r = float(search_radius)
+        query_r = r * np.sqrt(1.25)  # covers the capsule between samples
+        sample_t = np.append(np.arange(0.0, length, r), length)
+        first_t = np.inf
+        found_i, found_t, found_d2 = [], [], []
+        for t_s in sample_t:
+            if t_s - query_r > first_t + r:
+                break  # later queries only hold points further along
+            _k, idx, _ = self.o3d_pcd_tree.search_radius_vector_3d(
+                origin + u * t_s, query_r
+            )
+            if not len(idx):
+                continue
+            idx = np.asarray(idx, dtype=int)
+            q = points[idx] - origin
+            t = q @ u
+            closest = np.clip(t, 0.0, length)  # nearest point on the segment
+            d2 = ((q - np.outer(closest, u)) ** 2).sum(axis=1)
+            ok = d2 <= r * r
+            if ok.any():
+                found_i.append(idx[ok])
+                found_t.append(t[ok])
+                found_d2.append(d2[ok])
+                first_t = min(first_t, float(t[ok].min()))
+        if found_i:
+            idx, t, d2 = (np.concatenate(a) for a in (found_i, found_t, found_d2))
+            d2 = np.where(t <= first_t + r, d2, np.inf)
+            j = int(np.argmin(d2))
+            return annotations.InterceptAnnotation(points[idx[j]], search_radius)
 
-        # For each step, query the nearest neighbor to sample_point
-        for sample_point in sample_points:
-            # k=1 as we only need the nearest neighbor's distance
-            k, idxs, dists = self.o3d_pcd_tree.search_knn_vector_3d(sample_point, 1)
-            sample_point_neighbors.append([k, idxs, dists])
-            if k > 0 and dists[0] <= search_radius_sq:
-                return annotations.InterceptAnnotation(
-                    self.points[idxs[0]], search_radius
-                )
-
-        # If no intercept is found and always_return evaluate an ever increasing
-        # search_radius until an intercept is found.
+        # If no intercept is found and always_return, widen the search radius
+        # around the sample points until a nearest neighbour is within it.
         if always_return:
+            nearest = []
+            for t_s in sample_t:
+                k, idxs, dists = self.o3d_pcd_tree.search_knn_vector_3d(
+                    origin + u * t_s, 1
+                )
+                if k > 0:
+                    nearest.append((dists[0], idxs[0]))
             used_search_radius = search_radius
-
             while used_search_radius <= max_search_radius:
                 used_search_radius += search_radius
-                search_radius_sq = used_search_radius**2
-
-                for k, idxs, dists in sample_point_neighbors:
-                    if k > 0 and dists[0] <= search_radius_sq:
-                        return annotations.InterceptAnnotation(
-                            self.points[idxs[0]], used_search_radius
-                        )
+                within = [(d, i) for d, i in nearest if d <= used_search_radius**2]
+                if within:
+                    return annotations.InterceptAnnotation(
+                        points[within[0][1]], used_search_radius
+                    )
 
         return None  # No intercept found
 
-    def principal_axis(self, plane: str = "xy") -> "geom.Vector":
-        """Return the first PCA eigen-vector projected into the chosen plane.
-
-        Args:
-            plane: One of {"xy", "xz", "yz"} specifying the plane in which the
-                   vector is projected.
-
-        Returns:
-            geom.Vector: Unit-length 4-vector lying in the requested plane.
-
-        Raises:
-            ValueError: If *plane* is not "xy", "xz", or "yz".
-        """
-        from substrata import measurements  # late import to avoid cycle
-
-        eig_vals, eig_vecs = measurements.conduct_PCA(self)
-
-        v = eig_vecs[0]  # dominant 3-D eigen-vector
-
-        plane = plane.lower()
-        if plane == "xy":
-            v_proj = [v[0], v[1], 0.0]
-        elif plane == "xz":
-            v_proj = [v[0], 0.0, v[2]]
-        elif plane == "yz":
-            v_proj = [0.0, v[1], v[2]]
-        else:
-            raise ValueError("plane must be 'xy', 'xz', or 'yz'")
-
-        return geom.Vector(v_proj)
-
-    def principal_axis_xy_2D(self) -> "geom.Vector":
+    def principal_axis_xy(self) -> "geom.Vector":
         """Return the dominant PCA eigen-vector in XY-space.
 
         The method:
 
         1.  Runs a 2-D PCA on the cloud's X/Y coordinates
-            (`measurements.conduct_xy_PCA`, which should return
+            (`measurements.conduct_xy_pca`, which should return
             ``eigenvalues, eigenvectors`` like the 3-D version).
         2.  Takes the first eigen-vector *(v_x, v_y)*, normalises it, and
             returns it as a `geom.Vector` lying in the XY-plane
@@ -1384,12 +1346,14 @@ class PointCloud:
         """
         from substrata import measurements  # late import to avoid cycle
 
-        eig_vals, eig_vecs = measurements.conduct_xy_PCA(self)
+        eig_vals, eig_vecs = measurements.conduct_xy_pca(self)
         vx, vy = eig_vecs[:, 0]  # principal 2-D axis
         vec = np.array([vx, vy, 0.0])
         vec /= np.linalg.norm(vec)
 
         return geom.Vector(vec)
+
+    principal_axis_xy_2D = principal_axis_xy  # deprecated alias (renamed 2026-11-25)
 
     def apply_along_slope_transform(
         self,
@@ -1414,7 +1378,7 @@ class PointCloud:
             )
             print("Inlier method: RANSAC")
         elif method == "pca":
-            a, b, c, d, inliers = measurements.get_best_fit_plane_PCA(
+            a, b, c, d, inliers = measurements.get_best_fit_plane_pca(
                 self, inlier_range=inlier_range, align_normals=True
             )
             print("Inlier method: PCA (deterministic)")
@@ -1432,7 +1396,7 @@ class PointCloud:
             if n[2] < 0:
                 n = -n
         else:
-            eig_vals, eig_vecs = measurements.conduct_PCA(SimplePointCloud(Pi))
+            eig_vals, eig_vecs = measurements.conduct_pca(SimplePointCloud(Pi))
             n = eig_vecs[:, np.argmin(eig_vals)]
             n = n / np.linalg.norm(n)
             if n[2] < 0:
@@ -1446,7 +1410,8 @@ class PointCloud:
         if visualize:
             d_original = -np.dot(n, Pi.mean(axis=0))
             visualizations.visualize_elevation_angle(
-                self, [n[0], n[1], n[2], d_original], point_size=1
+                self, [n[0], n[1], n[2], d_original], point_size=1,
+                elev_deg=elev_deg,
             )
 
         # Rotate about inlier centroid
@@ -1465,7 +1430,7 @@ class PointCloud:
         if visualize:
             P2 = np.asarray(self.points)
             Pi2 = P2[inliers]
-            eig_vals2, eig_vecs2 = measurements.conduct_PCA(SimplePointCloud(Pi2))
+            eig_vals2, eig_vecs2 = measurements.conduct_pca(SimplePointCloud(Pi2))
             n2 = eig_vecs2[:, np.argmin(eig_vals2)]
             n2 = n2 / np.linalg.norm(n2)
             if n2[2] < 0:
@@ -1693,6 +1658,29 @@ class PointCloud:
         return T, metrics
 
 
+@_renamed_kwargs(transform_matrix="transform")
+def transform_normals(normals: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Transform surface normals by a 4x4 (or 3x3) transform.
+
+    Normals transform with the inverse-transpose of the linear (3x3) part,
+    ``n' = (A^-1)^T n``, which keeps them perpendicular to the transformed
+    surface also under non-uniform scaling; the result is renormalised to unit
+    length (a uniform scale s would otherwise give length 1/s). Zero normals
+    stay zero.
+
+    Args:
+        normals: (N, 3) normals (row vectors).
+        transform: 4x4 homogeneous or 3x3 linear transform.
+
+    Returns:
+        (N, 3) unit normals.
+    """
+    a = np.asarray(transform, dtype=float)[:3, :3]
+    out = np.asarray(normals, dtype=float) @ np.linalg.inv(a)  # rows: (A^-T n)^T
+    norm = np.linalg.norm(out, axis=1, keepdims=True)
+    return np.divide(out, norm, out=np.zeros_like(out), where=norm > 0)
+
+
 class SimplePointCloud:
     """Simple point cloud class for storing points, colors and normals."""
 
@@ -1719,40 +1707,50 @@ class SimplePointCloud:
         if labels is not None:
             self.labels = np.asarray(labels)
 
-    def transform(self, transform_matrix: np.ndarray) -> None:
+    @_renamed_kwargs(transform_matrix="transform")
+    def transform(self, transform: np.ndarray) -> None:
         """Apply a 4x4 homogeneous transform to the point cloud in-place.
 
-        Points are fully transformed (rotation + translation). Normals are
-        rotated only (upper-left 3x3), preserving their directional meaning.
+        Points are fully transformed. Normals are transformed as surface
+        normals (``transform_normals``: inverse-transpose of the upper-left 3x3,
+        renormalised), so they stay unit and perpendicular to the surface.
         Colors and labels are unaffected.
 
         Args:
-            transform_matrix: 4x4 homogeneous transformation matrix.
+            transform: 4x4 homogeneous transformation matrix.
         """
-        if hasattr(transform_matrix, "mat"):
-            transform_matrix = transform_matrix.mat
-        elif hasattr(transform_matrix, "matrix"):
-            transform_matrix = transform_matrix.matrix
-        m = np.asarray(transform_matrix, dtype=float)
+        if hasattr(transform, "mat"):
+            transform = transform.mat
+        elif hasattr(transform, "matrix"):
+            transform = transform.matrix
+        m = np.asarray(transform, dtype=float)
         if m.shape != (4, 4):
-            raise ValueError("transform_matrix must be 4x4.")
+            raise ValueError("transform must be 4x4.")
         # Vectorized point transform: (N,3) -> homogeneous (N,4) -> (N,3)
         ones = np.ones((len(self.points), 1), dtype=float)
         self.points = (np.hstack([self.points, ones]) @ m.T)[:, :3]
-        if hasattr(self, "normals"):
-            self.normals = self.normals @ m[:3, :3].T
+        if getattr(self, "normals", None) is not None and len(self.normals):
+            self.normals = transform_normals(self.normals, m)
 
-    def geto3d_pcd(self) -> o3d.geometry.PointCloud:
-        """Convert to Open3D PointCloud object.
+    def to_o3d(self) -> o3d.geometry.PointCloud:
+        """Convert to an Open3D PointCloud (colours and normals when present).
 
         Returns:
             Open3D PointCloud object with current points, colors, and normals.
         """
+        n = len(self.points)
         o3d_pcd = o3d.geometry.PointCloud()
-        o3d_pcd.points = o3d.utility.Vector3dVector(self.points)
-        o3d_pcd.colors = o3d.utility.Vector3dVector(self.colors)
-        o3d_pcd.normals = o3d.utility.Vector3dVector(self.normals)
+        o3d_pcd.points = o3d.utility.Vector3dVector(
+            np.asarray(self.points, dtype=float).reshape(-1, 3))
+        for attr in ("colors", "normals"):
+            v = getattr(self, attr, None)
+            if v is not None and len(v) == n and n:
+                setattr(o3d_pcd, attr, o3d.utility.Vector3dVector(
+                    np.asarray(v, dtype=float).reshape(-1, 3)))
         return o3d_pcd
+
+    # name used by measurements.get_best_fit_plane_ransac and visualizations
+    get_o3d_pcd = to_o3d
 
     def show(self):
         """Show the point cloud using plotly for interactive 3D visualization."""
@@ -1762,74 +1760,60 @@ class SimplePointCloud:
 
 
 def _parse_ply_header(fin):
-    # returns (fmt, endian, n_vertices, vertex_props, record_size)
-    header_lines = []
-    fmt = None
-    endian = None
-    vertex_count = None
-    vertex_props = []
-    in_vertex_block = False
+    """Parse a binary vertex-only PLY header from an open binary file.
 
-    while True:
-        line = fin.readline()
-        if not line:
-            raise ValueError("Unexpected EOF while reading PLY header.")
-        header_lines.append(line)
-        s = line.decode("ascii", errors="strict").strip()
+    Thin wrapper around :func:`substrata.stratified.read_ply_header` (the one
+    header parser; see it for the rules). Leaves ``fin`` at the first vertex
+    record.
 
-        if s.startswith("format "):
-            fmt = s.split()[1]
-            if fmt == "binary_little_endian":
-                endian = "<"
-            elif fmt == "binary_big_endian":
-                endian = ">"
-            else:
-                raise ValueError("Only binary PLY is supported (little/big endian).")
-
-        elif s.startswith("element "):
-            parts = s.split()
-            elem_name, elem_count = parts[1], int(parts[2])
-            if elem_name == "vertex":
-                vertex_count = elem_count
-                in_vertex_block = True
-            else:
-                in_vertex_block = False
-
-        elif s.startswith("property "):
-            if in_vertex_block:
-                parts = s.split()
-                if parts[1] == "list":
-                    raise NotImplementedError(
-                        "List properties on vertices are unsupported."
-                    )
-                ptype, pname = parts[1], parts[2]
-                if ptype not in ply_type_sizes:
-                    raise ValueError(f"Unsupported PLY type: {ptype}")
-                vertex_props.append((ptype, pname))
-
-        elif s == "end_header":
-            break
-
-    if fmt is None or endian is None or vertex_count is None or not vertex_props:
-        raise ValueError("Invalid or unsupported PLY header.")
-    record_size = sum(ply_type_sizes[t] for t, _ in vertex_props)
-    return fmt, endian, vertex_count, vertex_props, record_size, header_lines
+    Returns:
+        ``(fmt, endian, n_vertices, vertex_props, record_size, header_lines)``.
+    """
+    h = read_ply_header(fin)
+    return h.fmt, h.endian, h.n_vertices, h.props, h.record_size, h.lines
 
 
 def _make_output_header(
     fmt: str, vertex_props, vertex_count_out: int, comments=()
 ) -> bytes:
-    lines = []
-    lines.append(b"ply\n")
-    lines.append(f"format {fmt} 1.0\n".encode("ascii"))
-    lines.append(b"comment decimated with reservoir sampling\n")
+    """A minimal binary PLY header: format, comments, the vertex element.
+
+    Args:
+        fmt: ``binary_little_endian`` or ``binary_big_endian``.
+        vertex_props: Vertex properties as (ply type, name).
+        vertex_count_out: Number of vertex records that follow.
+        comments: Comment texts (str, or bytes kept verbatim) without the
+            ``comment`` keyword.
+    """
+    lines = [b"ply\n", f"format {fmt} 1.0\n".encode("ascii")]
     for c in comments:
-        lines.append(f"comment {c}\n".encode("ascii"))
+        c = c if isinstance(c, bytes) else c.encode("latin-1")
+        lines.append(b"comment " + c.rstrip(b"\r\n") + b"\n")
     lines.append(f"element vertex {vertex_count_out}\n".encode("ascii"))
     for t, name in vertex_props:
         lines.append(f"property {t} {name}\n".encode("ascii"))
     lines.append(b"end_header\n")
     return b"".join(lines)
+
+
+def _source_comments(header_lines) -> List[bytes]:
+    """The ``comment`` texts of a source header, to carry into a derived PLY.
+
+    Leaves out the stratified marker (a derived file is not stratified) and the
+    colour-corrected marker (added back by the caller when it applies).
+    """
+    skip = {
+        STRATIFIED_COMMENT.strip()[len(b"comment "):],
+        settings.PLY_COLOR_CORRECTED_COMMENT.encode("latin-1"),
+    }
+    out = []
+    for line in header_lines:
+        text = line.strip()
+        if text.startswith(b"comment "):
+            c = text[len(b"comment "):].strip()
+            if c and c not in skip:
+                out.append(c)
+    return out
 
 
 def _header_is_color_corrected(header_lines) -> bool:
@@ -2010,24 +1994,11 @@ def _apply_color_correction_vertex_chunk(
     return bytes(buf)
 
 
-def _reservoir_slots(n_vertices: int, k: int, rng=None):
-    # yields slot index to write into (0..k-1) or None for discard
-
-    rng = np.random.default_rng() if rng is None else rng
-    for i in range(n_vertices):
-        if i < k:
-            yield i
-        else:
-            j = int(rng.integers(0, i + 1))
-            yield j if j < k else None
-
-
 def ply_head(input_path: str, n: int = 5, print_output: bool = True):
-    """Peek the first N vertex records of a PLY file.
+    """Peek the first N vertex records of a binary PLY file.
 
-    Supports both binary little/big-endian and ASCII PLYs. Parses the header
-    to determine vertex property layout and then reads and prints the first
-    ``n`` vertices. Returns a list of dicts for programmatic use.
+    The header is parsed with :func:`substrata.stratified.read_ply_header`
+    (binary little/big-endian, vertex-only; ASCII PLYs raise ``ValueError``).
 
     Args:
         input_path: Path to the PLY file.
@@ -2037,116 +2008,29 @@ def ply_head(input_path: str, n: int = 5, print_output: bool = True):
     Returns:
         list[dict]: Parsed vertex records (up to N), each as {prop_name: value}.
     """
-    records = []
+    h = read_ply_header(input_path)
+    rows = int(min(h.n_vertices, n))
     with open(input_path, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, header_lines = _parse_ply_header(fin)
-
-        # Compute header size to seek to vertex data
-        header_size = sum(len(l) for l in header_lines)
-        prop_types = [t for t, _ in vprops]
-        prop_names = [name for _, name in vprops]
-
-        # Helper: decide a concise subset of keys to show if printing
-        def subset_keys(names):
-            preferred = (
-                "x",
-                "y",
-                "z",
-                "nx",
-                "ny",
-                "nz",
-                "red",
-                "green",
-                "blue",
-                "confidence",
-            )
-            keys = [k for k in preferred if k in names]
-            return keys if keys else list(names[:6])
-
-        if fmt.startswith("binary_"):
-            # Build struct fmt string for one vertex
-            try:
-                row_fmt = endian + "".join(ply_type_struct[t] for t in prop_types)
-            except KeyError as e:
-                raise ValueError(f"Unsupported PLY type in header: {e}") from e
-
-            fin.seek(header_size)
-            if print_output:
-                print("columns:", ", ".join(prop_names))
-            max_rows = min(int(n_vertices), int(n))
-            for i in range(max_rows):
-                row = fin.read(rec_size)
-                if len(row) < rec_size:
-                    break
-                vals = struct.unpack(row_fmt, row)
-                rec = dict(zip(prop_names, vals))
-                records.append(rec)
-                if print_output:
-                    keys = subset_keys(prop_names)
-                    view = ", ".join(f"{k}={rec[k]!r}" for k in keys if k in rec)
-                    print(f"{i} {view}")
-        elif fmt == "ascii":
-            # Read ASCII vertex lines after header
-            fin.seek(header_size)
-            # Map PLY scalar types to Python casts
-            float_types = {
-                "float",
-                "double",
-                "float32",
-                "float64",
-            }
-            int_types = {
-                "char",
-                "uchar",
-                "short",
-                "ushort",
-                "int",
-                "uint",
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-            }
-
-            casts = []
-            for t in prop_types:
-                if t in float_types:
-                    casts.append(float)
-                elif t in int_types:
-                    casts.append(int)
-                else:
-                    # Fallback: keep as string
-                    casts.append(lambda x: x)
-
-            if print_output:
-                print("columns:", ", ".join(prop_names))
-            max_rows = min(int(n_vertices), int(n))
-            for i in range(max_rows):
-                line = fin.readline()
-                if not line:
-                    break
-                parts = line.decode("ascii", "ignore").strip().split()
-                if len(parts) < len(prop_names):
-                    break
-                vals = [cast(parts[idx]) for idx, cast in enumerate(casts)]
-                rec = dict(zip(prop_names, vals))
-                records.append(rec)
-                if print_output:
-                    keys = subset_keys(prop_names)
-                    view = ", ".join(f"{k}={rec[k]!r}" for k in keys if k in rec)
-                    print(f"{i} {view}")
-        else:
-            raise ValueError(f"Unsupported PLY format: {fmt}")
-
+        fin.seek(h.header_len)
+        recs = np.frombuffer(fin.read(rows * h.record_size), dtype=h.dtype)
+    names = list(h.dtype.names)
+    preferred = ("x", "y", "z", "nx", "ny", "nz", "red", "green", "blue", "confidence")
+    keys = [k for k in preferred if k in names] or names[:6]
+    records = []
+    if print_output:
+        print("columns:", ", ".join(names))
+    for i, rec in enumerate(recs):
+        row = {k: rec[k].item() for k in names}
+        records.append(row)
+        if print_output:
+            print(f"{i} " + ", ".join(f"{k}={row[k]!r}" for k in keys))
     return records
 
 
 def _stream_load_ply_into_o3d_pcd(
     filepath: str,
     target_points: int,
-    show_progress: bool = True,
+    progress: bool = True,
 ) -> o3d.geometry.PointCloud:
     """Stream-sample a PLY and build an o3d.PointCloud, freeing transients.
 
@@ -2166,13 +2050,13 @@ def _stream_load_ply_into_o3d_pcd(
     Args:
         filepath: Path to the binary PLY file.
         target_points: Maximum number of points to stream-sample.
-        show_progress: Whether to display the tqdm progress bar.
+        progress: Whether to display the tqdm progress bar.
 
     Returns:
         A populated ``o3d.geometry.PointCloud``.
     """
     points, colors, normals = _stream_sample_ply_to_arrays(
-        filepath, int(target_points), show_progress=show_progress
+        filepath, int(target_points), progress=progress
     )
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
@@ -2186,163 +2070,150 @@ def _stream_load_ply_into_o3d_pcd(
     return pcd
 
 
+def _chunk_sample(
+    rng: np.random.Generator, n_chunk: int, need: int, remaining: int
+) -> np.ndarray:
+    """Which records of the next chunk a uniform streaming sample takes.
+
+    Sequential sampling without replacement: of the ``remaining`` records still
+    to be read (this chunk first), ``need`` are still to be chosen, so the number
+    taken from this chunk of ``n_chunk`` records is hypergeometric (binomial with
+    the same mean beyond numpy's 10^9 hypergeometric limit, clipped to what is
+    feasible), and they are a uniform random subset of the chunk. Over the whole
+    file this takes exactly the target count, every record with the same
+    probability (target / total).
+
+    Returns:
+        Sorted record indices within the chunk.
+    """
+    if need <= 0:
+        return np.zeros(0, dtype=np.int64)
+    rest = remaining - n_chunk
+    if rest <= 0:
+        m = need
+    elif n_chunk < 10**9 and rest < 10**9:
+        m = int(rng.hypergeometric(n_chunk, rest, need))
+    else:
+        m = int(rng.binomial(need, n_chunk / remaining))
+    m = int(np.clip(m, max(0, need - rest), min(n_chunk, need)))
+    return np.sort(rng.choice(n_chunk, size=m, replace=False))
+
+
 def _stream_sample_ply_to_arrays(
     input_path: str,
     target_points: int,
-    show_progress: bool = True,
+    progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
+    seed: Optional[int] = 0,
 ):
-    """
-    Stream a binary PLY and return sampled (points, colors?, normals?) arrays.
+    """Stream a binary PLY and return a uniform random sample as arrays.
 
-    Faster version: reads big byte chunks, parses with NumPy structured dtype,
-    and Bernoulli-samples in vectorized fashion. No per-vertex Python loop.
-    """
-    import struct
-    from tqdm.auto import tqdm
+    Reads the vertex records in chunks and takes exactly
+    ``min(target_points, N)`` of them, uniformly at random without replacement
+    (``_chunk_sample``), in file order. Colours are decoded as
+    :func:`substrata.stratified.ply_rgb` (uchar as is, 16-bit by their top
+    byte, float in [0, 1]) and returned in [0, 1].
 
+    Args:
+        input_path: Path to the binary PLY.
+        target_points: Number of points to sample.
+        progress: Whether to show a progress bar.
+        chunk_bytes: Read buffer size (rounded down to whole records).
+        seed: Random seed (default 0: the same file, target and chunk size
+            always give the same sample); None for a fresh random sample.
+
+    Returns:
+        ``(points, colors or None, normals or None)``, float64 (k, 3) arrays.
+    """
     with open(input_path, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
-
-        # Build structured dtype for this vertex layout
-        np_dtypes = {
-            "char": "i1",
-            "uchar": "u1",
-            "int8": "i1",
-            "uint8": "u1",
-            "short": "i2",
-            "ushort": "u2",
-            "int16": "i2",
-            "uint16": "u2",
-            "int": "i4",
-            "uint": "u4",
-            "int32": "i4",
-            "uint32": "u4",
-            "float": "f4",
-            "float32": "f4",
-            "double": "f8",
-            "float64": "f8",
-        }
-        fields = []
-        for t, name in vprops:
-            if t not in np_dtypes:
-                raise ValueError(f"Unsupported PLY type: {t}")
-            fields.append((name, endian + np_dtypes[t]))
-        dt = np.dtype(fields)
-
-        # Offsets for xyz / rgb / normals
-        has_rgb = all(n in dt.names for n in ("red", "green", "blue"))
-        has_nrm = all(n in dt.names for n in ("nx", "ny", "nz"))
-        if not all(n in dt.names for n in ("x", "y", "z")):
+        h = read_ply_header(fin)
+        dt, n_vertices, rec_size = h.dtype, h.n_vertices, h.record_size
+        if not h.has("x", "y", "z"):
             raise ValueError("PLY must contain x,y,z vertex properties.")
+        has_rgb = h.has("red", "green", "blue")
+        has_nrm = h.has("nx", "ny", "nz")
 
         k = max(0, min(int(target_points), n_vertices))
         if k == 0:
             return np.zeros((0, 3), dtype=float), None, None
 
-        # Pre-allocate outputs
         points = np.empty((k, 3), dtype=float)
         colors = np.empty((k, 3), dtype=float) if has_rgb else None
         normals = np.empty((k, 3), dtype=float) if has_nrm else None
 
-        # Chunked read loop
-        bytes_total = n_vertices * rec_size
         chunk_recs = max(1, chunk_bytes // rec_size)
-
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
         taken = 0
-        seen = 0
         remaining = n_vertices
-
-        # Read vertex section in chunks
         with tqdm(
-            total=n_vertices, unit="vtx", desc="Read/Sample", disable=not show_progress
+            total=n_vertices, unit="vtx", desc="Read/Sample", disable=not progress
         ) as pbar:
             while remaining > 0 and taken < k:
-                # Read a whole-number of records
                 to_read = int(min(remaining, chunk_recs))
                 buf = fin.read(to_read * rec_size)
                 if len(buf) != to_read * rec_size:
                     raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
-
-                arr = np.frombuffer(buf, dtype=dt, count=to_read)
-
-                # Dynamic accept probability to hit the target without overshoot
-                need = k - taken
-                p = min(1.0, need / remaining)
-
-                # Bernoulli sample in bulk
-                mask = rng.random(to_read) < p
-                sel = arr[mask]
-                if sel.size > need:
-                    idx = rng.choice(sel.size, size=need, replace=False)
-                    sel = sel[idx]
-
-                # Copy into outputs
-                if sel.size:
-                    points[taken : taken + sel.size, 0] = sel["x"]
-                    points[taken : taken + sel.size, 1] = sel["y"]
-                    points[taken : taken + sel.size, 2] = sel["z"]
+                sel_idx = _chunk_sample(rng, to_read, k - taken, remaining)
+                if len(sel_idx):
+                    sel = np.frombuffer(buf, dtype=dt, count=to_read)[sel_idx]
+                    end = taken + len(sel)
+                    points[taken:end, 0] = sel["x"]
+                    points[taken:end, 1] = sel["y"]
+                    points[taken:end, 2] = sel["z"]
                     if has_rgb:
-                        # scale 0..255 → 0..1
-                        colors[taken : taken + sel.size, 0] = sel["red"] / 255.0
-                        colors[taken : taken + sel.size, 1] = sel["green"] / 255.0
-                        colors[taken : taken + sel.size, 2] = sel["blue"] / 255.0
+                        colors[taken:end] = ply_rgb(sel) / 255.0
                     if has_nrm:
-                        normals[taken : taken + sel.size, 0] = sel["nx"]
-                        normals[taken : taken + sel.size, 1] = sel["ny"]
-                        normals[taken : taken + sel.size, 2] = sel["nz"]
-                    taken += sel.size
-
-                seen += to_read
-                remaining = n_vertices - seen
+                        normals[taken:end, 0] = sel["nx"]
+                        normals[taken:end, 1] = sel["ny"]
+                        normals[taken:end, 2] = sel["nz"]
+                    taken = end
+                remaining -= to_read
                 pbar.update(to_read)
-
-        # If, due to rounding, we got slightly fewer than k, we can top-up by reading a few more
-        # chunks or just accept the slightly smaller sample; typically difference is tiny.
-        if taken < k:
-            points = points[:taken]
-            if colors is not None:
-                colors = colors[:taken]
-            if normals is not None:
-                normals = normals[:taken]
 
     return points, colors, normals
 
 
+@_renamed_kwargs(show_progress="progress")
 def stream_extract_neighborhoods_ply(
     input_path: str,
     target_coords: List[np.ndarray],
     radius: Union[float, List[float]],
-    show_progress: bool = True,
+    progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
     world_transform: Optional[np.ndarray] = None,
     cylinder: bool = False,
 ) -> List["SimplePointCloud"]:
-    """
-    Stream a binary PLY and extract neighborhoods around target coordinates.
+    """Stream a binary PLY and extract neighbourhoods around target coordinates.
 
-    Scans the PLY file once and collects all points within radius of each target
-    coordinate. Returns a list of SimplePointCloud objects, one per target coordinate.
+    Scans the PLY file once (every record; a stratified PLY's
+    ``StratifiedPly.query_box`` reads only the clusters near a point) and
+    collects all points within the radius of each target coordinate.
+
+    Everything is in the PLY's own (raw) frame: ``target_coords``, ``radius``
+    and the returned points. ``world_transform`` (a similarity: rotation,
+    uniform scale, translation, e.g. the project's world transform) only
+    defines which way is up for the cylinder search; distances are not
+    rescaled by it.
 
     Args:
         input_path: Path to the binary PLY file.
-        target_coords: List of target coordinates (each as 3-element array).
-        radius: Search radius (float) or list of radii (one per target_coord).
-        show_progress: Whether to show progress bar.
+        target_coords: Target coordinates in the PLY frame (each 3 values).
+        radius: Search radius in PLY units (float) or one per target
+            (metres / scale_factor for a radius in metres).
+        progress: Whether to show progress bar.
         chunk_bytes: Chunk size for reading.
-        world_transform: Optional 4x4 homogeneous transform. When cylinder=True,
-            both PLY points and target_coords are projected through this matrix
-            before the distance test, so the search is performed in world space.
-        cylinder: If True, use a top-down cylinder search (2D XY distance only,
-            ignoring Z). Useful for capturing a full depth column above/below
-            each annotation. If world_transform is provided the search is done
-            in the transformed (oriented) space; otherwise the original PLY
-            axes are used. Returned SimplePointCloud objects always contain the
-            original (untransformed) PLY coordinates.
+        world_transform: Optional 4x4 PLY-to-world transform. With
+            ``cylinder=True`` the cylinder axis is the world vertical (its
+            direction in the PLY frame, ``A^-1 e_z``); without it the PLY's own
+            z axis. Ignored for spheres (a sphere is the same in both frames).
+        cylinder: If True, use a vertical cylinder of the given radius (the
+            distance perpendicular to the up axis only), capturing the full
+            depth column above/below each target.
 
     Returns:
-        List of SimplePointCloud objects, one per target coordinate.
+        List of SimplePointCloud objects, one per target coordinate, with
+        the original (untransformed) PLY coordinates, colours in [0, 1] (as
+        :func:`substrata.stratified.ply_rgb`) and normals when present.
     """
     # Normalize radius to a list
     if isinstance(radius, (int, float)):
@@ -2354,143 +2225,71 @@ def stream_extract_neighborhoods_ply(
             )
         radii = [float(r) for r in radius]
 
-    target_coords = [np.asarray(coord, dtype=float) for coord in target_coords]
-    if not all(coord.shape == (3,) for coord in target_coords):
+    targets = np.array([np.asarray(c, dtype=float) for c in target_coords])
+    if len(targets) and targets.shape[1:] != (3,):
         raise ValueError("All target_coords must be 3-element arrays")
+    targets = targets.reshape(-1, 3)
+    radii_sq = np.square(radii)
 
-    # Pre-transform target_coords to search space for cylinder mode
+    up = np.array([0.0, 0.0, 1.0])
     if cylinder and world_transform is not None:
-        m = np.asarray(world_transform, dtype=float)
-        tc_arr = np.array(target_coords, dtype=float)
-        ones = np.ones((len(tc_arr), 1), dtype=float)
-        target_coords_search = (np.hstack([tc_arr, ones]) @ m.T)[:, :3]
-    else:
-        target_coords_search = np.array(target_coords, dtype=float)
+        a = np.asarray(world_transform, dtype=float)[:3, :3]
+        up = np.linalg.solve(a, up)  # world vertical in the PLY frame
+        up /= np.linalg.norm(up)
 
     with open(input_path, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, _ = _parse_ply_header(fin)
-
-        # Build structured dtype for this vertex layout
-        np_dtypes = {
-            "char": "i1",
-            "uchar": "u1",
-            "int8": "i1",
-            "uint8": "u1",
-            "short": "i2",
-            "ushort": "u2",
-            "int16": "i2",
-            "uint16": "u2",
-            "int": "i4",
-            "uint": "u4",
-            "int32": "i4",
-            "uint32": "u4",
-            "float": "f4",
-            "float32": "f4",
-            "double": "f8",
-            "float64": "f8",
-        }
-        fields = []
-        for t, name in vprops:
-            if t not in np_dtypes:
-                raise ValueError(f"Unsupported PLY type: {t}")
-            fields.append((name, endian + np_dtypes[t]))
-        dt = np.dtype(fields)
-
-        # Check for xyz / rgb / normals
-        has_rgb = all(n in dt.names for n in ("red", "green", "blue"))
-        has_nrm = all(n in dt.names for n in ("nx", "ny", "nz"))
-        if not all(n in dt.names for n in ("x", "y", "z")):
+        h = read_ply_header(fin)
+        dt, n_vertices, rec_size = h.dtype, h.n_vertices, h.record_size
+        if not h.has("x", "y", "z"):
             raise ValueError("PLY must contain x,y,z vertex properties.")
+        has_rgb = h.has("red", "green", "blue")
+        has_nrm = h.has("nx", "ny", "nz")
 
-        # Determine scale factor for RGB: uchar/uint8 stored as 0-255, float as 0-1
-        if has_rgb:
-            rgb_prop_type = next(t for t, n in vprops if n == "red")
-            rgb_scale = (
-                255.0 if rgb_prop_type in ("uchar", "uint8", "char", "int8") else 1.0
-            )
+        neighborhoods = [[] for _ in range(len(targets))]
+        neighborhoods_colors = [[] for _ in range(len(targets))]
+        neighborhoods_normals = [[] for _ in range(len(targets))]
 
-        # Pre-allocate lists for each neighborhood
-        neighborhoods = [[] for _ in target_coords]
-        neighborhoods_colors = [[] for _ in target_coords] if has_rgb else None
-        neighborhoods_normals = [[] for _ in target_coords] if has_nrm else None
-
-        # Chunked read loop
         chunk_recs = max(1, chunk_bytes // rec_size)
         remaining = n_vertices
-
-        # Pre-compute squared radii for distance comparison
-        radii_sq = [r**2 for r in radii]
-
-        # Read vertex section in chunks
         with tqdm(
             total=n_vertices,
             unit=" pts",
             unit_scale=True,
             desc="Extract neighborhoods",
-            disable=not show_progress,
+            disable=not progress,
         ) as pbar:
             while remaining > 0:
-                # Read a whole-number of records
                 to_read = int(min(remaining, chunk_recs))
                 buf = fin.read(to_read * rec_size)
                 if len(buf) != to_read * rec_size:
                     raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
-
                 arr = np.frombuffer(buf, dtype=dt, count=to_read)
+                coords = np.column_stack([arr["x"], arr["y"], arr["z"]]).astype(float)
 
-                # Extract coordinates for this chunk
-                coords = np.column_stack([arr["x"], arr["y"], arr["z"]])
-
-                # Optionally transform coords to search space (cylinder mode)
-                if cylinder and world_transform is not None:
-                    m = np.asarray(world_transform, dtype=float)
-                    ones = np.ones((len(coords), 1), dtype=float)
-                    coords_search = (np.hstack([coords, ones]) @ m.T)[:, :3]
-                else:
-                    coords_search = coords
-
-                # For each target coordinate, find points within radius
-                for idx, (target_coord_s, radius_sq_val) in enumerate(
-                    zip(target_coords_search, radii_sq)
-                ):
-                    # Compute squared distances (vectorized); cylinder uses XY only
-                    if cylinder:
-                        diff = coords_search[:, :2] - target_coord_s[:2]
-                        distances_sq = np.sum(diff**2, axis=1)
+                for idx, (target, r2) in enumerate(zip(targets, radii_sq)):
+                    d = coords - target
+                    if cylinder:  # distance from the vertical axis through target
+                        along = d @ up
+                        dist_sq = (d * d).sum(axis=1) - along * along
                     else:
-                        distances_sq = np.sum(
-                            (coords_search - target_coord_s) ** 2, axis=1
-                        )
-                    mask = distances_sq <= radius_sq_val
-
-                    if np.any(mask):
-                        # Always store original (untransformed) PLY coords
-                        neighborhoods[idx].append(coords[mask])
-
-                        if has_rgb:
-                            rgb = np.column_stack(
-                                [
-                                    arr["red"][mask] / rgb_scale,
-                                    arr["green"][mask] / rgb_scale,
-                                    arr["blue"][mask] / rgb_scale,
-                                ]
-                            )
-                            neighborhoods_colors[idx].append(rgb)
-
-                        if has_nrm:
-                            normals_chunk = np.column_stack(
-                                [arr["nx"][mask], arr["ny"][mask], arr["nz"][mask]]
-                            )
-                            neighborhoods_normals[idx].append(normals_chunk)
+                        dist_sq = (d * d).sum(axis=1)
+                    mask = dist_sq <= r2
+                    if not np.any(mask):
+                        continue
+                    neighborhoods[idx].append(coords[mask])
+                    if has_rgb:
+                        neighborhoods_colors[idx].append(ply_rgb(arr[mask]) / 255.0)
+                    if has_nrm:
+                        neighborhoods_normals[idx].append(np.column_stack(
+                            [arr["nx"][mask], arr["ny"][mask], arr["nz"][mask]]
+                        ).astype(float))
 
                 remaining -= to_read
                 pbar.update(to_read)
 
-    # Concatenate all chunks for each neighborhood and create SimplePointCloud objects
     result = []
-    for idx in range(len(target_coords)):
-        if len(neighborhoods[idx]) == 0:
-            # Empty neighborhood
+    for idx in range(len(targets)):
+        if not neighborhoods[idx]:
             points = np.zeros((0, 3), dtype=float)
             colors = np.zeros((0, 3), dtype=float) if has_rgb else None
             normals = np.zeros((0, 3), dtype=float) if has_nrm else None
@@ -2498,33 +2297,46 @@ def stream_extract_neighborhoods_ply(
             points = np.vstack(neighborhoods[idx])
             colors = np.vstack(neighborhoods_colors[idx]) if has_rgb else None
             normals = np.vstack(neighborhoods_normals[idx]) if has_nrm else None
-
         result.append(SimplePointCloud(points, colors, normals, None))
-
     return result
 
 
+@_renamed_kwargs(show_progress="progress")
 def decimate_ply_file(
     input_path: str,
     output_path: str,
     target_points: int,
-    show_progress: bool = True,
+    progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
     color_correction: Optional[Dict[str, np.ndarray]] = None,
+    seed: Optional[int] = 0,
 ) -> None:
     """Decimate a binary PLY by uniform random subsampling with a streaming read.
+
+    Takes exactly ``min(target_points, N)`` vertex records, uniformly at random
+    without replacement (``_chunk_sample``), keeps them in file order and copies
+    them verbatim (apart from an optional colour correction). One pass over the
+    input; the selected records are held in memory until the output is written.
+
+    The output header keeps the source's comments (except the stratified
+    marker) and records the sampling, e.g.
+    ``comment substrata decimate: 50000000 of 579428108 vertices, uniform random
+    without replacement, seed 0``.
 
     Args:
         input_path: Path to the source binary PLY.
         output_path: Path to write the decimated PLY.
         target_points: Desired vertex count (clamped to ``[0, N]``).
-        show_progress: Whether to show tqdm progress bars.
+        progress: Whether to show tqdm progress bars.
         chunk_bytes: Target read buffer size for streaming; each read uses the
             largest multiple of the vertex record size not exceeding this (so chunks
             always contain whole vertices).
         color_correction: Optional dict with ``matrix`` (3×3) and ``offset`` (3,)
             in 0–255 RGB space (same as :meth:`PointCloud.apply_color_correction`).
             When set, RGB is adjusted per vertex as data is written (no second load).
+        seed: Random seed. The default 0 makes the output reproducible (same
+            input, target, seed and ``chunk_bytes`` give the same file); None
+            draws a fresh sample (recorded as ``seed none``).
     """
     matrix: Optional[np.ndarray] = None
     offset_cc: Optional[np.ndarray] = None
@@ -2542,14 +2354,17 @@ def decimate_ply_file(
                 f"{input_path} already has the colour correction applied; "
                 "refusing to apply it twice."
             )
+        k = max(0, min(int(target_points), n_vertices))
+        comments: List[Union[str, bytes]] = list(_source_comments(header_lines))
+        if k < n_vertices:
+            comments.append(
+                f"substrata decimate: {k} of {n_vertices} vertices, uniform random "
+                f"without replacement, seed {'none' if seed is None else seed}"
+            )
         # Mark baked-in colour correction (and keep an existing mark), so
         # loading the output does not apply the YAML correction again
-        comments = (
-            (settings.PLY_COLOR_CORRECTED_COMMENT,)
-            if color_correction is not None
-            or _header_is_color_corrected(header_lines)
-            else ()
-        )
+        if color_correction is not None or _header_is_color_corrected(header_lines):
+            comments.append(settings.PLY_COLOR_CORRECTED_COMMENT)
 
         # Reads must be multiples of rec_size (e.g. 64 MiB is not divisible by 28).
         aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
@@ -2563,37 +2378,31 @@ def decimate_ply_file(
                     "cannot apply color_correction during decimation."
                 )
 
-        k = max(0, min(int(target_points), n_vertices))
+        def _correct(blob: bytes) -> bytes:
+            if color_correction is None:
+                return blob
+            return _apply_color_correction_vertex_chunk(
+                blob, rec_size, endian, rgb_layout, matrix, offset_cc
+            )
+
         if k == 0:
-            # Write empty PLY file
-            out_header = _make_output_header(fmt, vprops, 0, comments)
-            with open(output_path, "wb") as fout:
-                fout.write(out_header)
+            with _atomic_write(output_path, "wb") as fout:
+                fout.write(_make_output_header(fmt, vprops, 0, comments))
             return
 
         if k >= n_vertices:
             # fast stream copy - no decimation needed
-            out_header = _make_output_header(fmt, vprops, n_vertices, comments)
-            with open(output_path, "wb") as fout:
-                fout.write(out_header)
+            with _atomic_write(output_path, "wb") as fout:
+                fout.write(_make_output_header(fmt, vprops, n_vertices, comments))
                 bytes_left = n_vertices * rec_size
                 with tqdm(
-                    total=n_vertices, unit="vtx", disable=not show_progress
+                    total=n_vertices, unit="vtx", disable=not progress
                 ) as pbar:
                     while bytes_left:
                         chunk = fin.read(min(aligned_chunk_bytes, bytes_left))
                         if not chunk:
                             break
-                        if color_correction is not None:
-                            chunk = _apply_color_correction_vertex_chunk(
-                                chunk,
-                                rec_size,
-                                endian,
-                                rgb_layout,
-                                matrix,
-                                offset_cc,
-                            )
-                        fout.write(chunk)
+                        fout.write(_correct(chunk))
                         bytes_left -= len(chunk)
                         pbar.update(len(chunk) // rec_size)
             if color_correction is not None:
@@ -2602,74 +2411,46 @@ def decimate_ply_file(
                 )
             return
 
-        # Two-pass approach: first pass to collect samples, second pass to write with correct header
-        rng = np.random.default_rng()
+        # One pass: select the records chunk by chunk and keep them in memory,
+        # then write the header (count known up front: exactly k) and the records.
+        rng = np.random.default_rng(seed)
         taken = 0
-        seen = 0
         remaining = n_vertices
         rec_dtype = np.dtype(f"V{rec_size}")  # "opaque" record view
         chunk_recs = max(1, chunk_bytes // rec_size)
-
-        # Collect all selected vertex data first
         selected_vertices = []
-
         with tqdm(
             total=n_vertices,
             unit="vtx",
             desc="Read/Sample",
-            disable=not show_progress,
+            disable=not progress,
         ) as pbar:
             while remaining > 0 and taken < k:
                 to_read = int(min(remaining, chunk_recs))
                 buf = fin.read(to_read * rec_size)
                 if len(buf) != to_read * rec_size:
                     raise ValueError("Corrupt PLY: unexpected EOF in vertex data.")
-
-                # Vectorized selection
-                need = k - taken
-                p = min(1.0, need / remaining)
-                mask = rng.random(to_read) < p
-
-                # Assemble selected records as bytes in one go
-                arr = np.frombuffer(buf, dtype=rec_dtype, count=to_read)
-                sel = arr[mask]
-                if sel.size > need:
-                    sel = sel[rng.choice(sel.size, size=need, replace=False)]
-                if sel.size:
-                    blob = sel.tobytes()
-                    if color_correction is not None:
-                        blob = _apply_color_correction_vertex_chunk(
-                            blob,
-                            rec_size,
-                            endian,
-                            rgb_layout,
-                            matrix,
-                            offset_cc,
-                        )
-                    selected_vertices.append(blob)
-                    taken += sel.size
-
-                seen += to_read
-                remaining = n_vertices - seen
+                sel_idx = _chunk_sample(rng, to_read, k - taken, remaining)
+                if len(sel_idx):
+                    arr = np.frombuffer(buf, dtype=rec_dtype, count=to_read)
+                    selected_vertices.append(_correct(arr[sel_idx].tobytes()))
+                    taken += len(sel_idx)
+                remaining -= to_read
                 pbar.update(to_read)
 
-        # Now write the file with the correct vertex count
-        actual_count = taken
-        out_header = _make_output_header(fmt, vprops, actual_count, comments)
-        with open(output_path, "wb") as fout:
-            fout.write(out_header)
+        with _atomic_write(output_path, "wb") as fout:
+            fout.write(_make_output_header(fmt, vprops, taken, comments))
             for vertex_data in selected_vertices:
                 fout.write(vertex_data)
         if color_correction is not None:
-            logger.info(
-                "Applied streaming colour correction to %d vertices", actual_count
-            )
+            logger.info("Applied streaming colour correction to %d vertices", taken)
 
 
+@_renamed_kwargs(show_progress="progress")
 def repair_ply_for_open3d(
     input_path: str,
     output_path: Optional[str] = None,
-    show_progress: bool = True,
+    progress: bool = True,
     chunk_bytes: int = 64 * 1024 * 1024,
     verify: bool = True,
 ) -> str:
@@ -2694,7 +2475,7 @@ def repair_ply_for_open3d(
         input_path: Path to the source binary PLY file.
         output_path: Destination PLY path. Defaults to
             ``<input_basename>_o3d.ply`` next to the source.
-        show_progress: Whether to display a tqdm progress bar.
+        progress: Whether to display a tqdm progress bar.
         chunk_bytes: Target read buffer size; each read uses the largest
             multiple of the input vertex record size not exceeding this so
             chunks always contain whole vertices.
@@ -2725,14 +2506,14 @@ def repair_ply_for_open3d(
         # Reads must be multiples of rec_size to keep whole vertex records.
         aligned_chunk_bytes = max(rec_size, (chunk_bytes // rec_size) * rec_size)
 
-        with open(output_path, "wb") as fout:
+        with _atomic_write(output_path, "wb") as fout:
             fout.write(out_header)
             bytes_left = n_vertices * rec_size
             with tqdm(
                 total=n_vertices,
                 unit="vtx",
                 desc="Repair PLY",
-                disable=not show_progress,
+                disable=not progress,
             ) as pbar:
                 while bytes_left:
                     chunk = fin.read(min(aligned_chunk_bytes, bytes_left))
@@ -2795,12 +2576,13 @@ def get_decimated_pcd(
     Args:
         pcd: Source point cloud.
         target_points: Desired number of points in the output (clamped to [0, N]).
-        rng: Optional NumPy Generator for reproducibility.
+        rng: Optional NumPy Generator (default: seeded with 0, so repeated calls
+            give the same sample).
 
     Returns:
         PointCloud: A new decorated point cloud containing the sampled points.
     """
-    rng = np.random.default_rng() if rng is None else rng
+    rng = np.random.default_rng(0) if rng is None else rng  # deterministic by default
 
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors)

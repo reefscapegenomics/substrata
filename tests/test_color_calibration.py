@@ -217,5 +217,25 @@ class TestAffineColorCorrection(unittest.TestCase):
         self.assertEqual(corr["offset"].shape, (3,))
 
 
+class TestTargetsWithoutLabels(unittest.TestCase):
+    """Markers loaded without labels (label None) are found by their id."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cc = _load_color_calibration()
+
+    def test_unlabelled_markers_use_their_key(self):
+        from types import SimpleNamespace
+
+        markers = SimpleNamespace(data={
+            name: SimpleNamespace(label=None, coords=np.array([i, 0.0, 0.0]))
+            for i, name in enumerate(["t1", "t2", "t3", "t4"])
+        })
+        cals = self.cc.ColorCalibrations([["t1", "t2", "t3", "t4"]], target_data=markers)
+        card = cals.data[0]
+        self.assertEqual(card.tl_coords.tolist(), [0.0, 0.0, 0.0])
+        self.assertEqual(card.br_coords.tolist(), [3.0, 0.0, 0.0])
+
+
 if __name__ == "__main__":
     unittest.main()

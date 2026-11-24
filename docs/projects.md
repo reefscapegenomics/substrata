@@ -133,14 +133,20 @@ raw chunk-local coordinates. Scale and orientation are left for `substrata
 orient` (or the Python workflow below) to compute afterward.
 
 ```bash
-# Write cur_sna_20m_20200303/ into the current directory, then compute scale + orientation
-substrata metashape-export --psx cur_sna_20m_20200303.psx
+# In the project folder, next to cur_sna_20m_20200303.psx; then compute scale + orientation
 cd cur_sna_20m_20200303
+substrata metashape-export
 substrata orient
+
+# Or from anywhere: an explicit .psx, and the folder to write into
+substrata metashape-export --psx /data/raw/cur_sna_20m_20200303.psx -o /data/projects/cur_sna_20m_20200303
 ```
 
-See {doc}`command_line_usage` for the full set of options (choosing a chunk,
-output directory, and locating the Metashape executable).
+The files are written into the current folder (or `-o DIR`), never into a new
+subfolder; the project id is the folder name, or the `.psx` name with `--psx`. See
+{doc}`command_line_usage` for the full set of options (choosing a chunk, output
+directory, and locating the Metashape executable), and
+{doc}`tutorials/plot_workflow` for the steps that follow.
 
 ### Exporting the files manually
 
@@ -201,15 +207,18 @@ A few things worth knowing:
 - **`scale_and_orient()` needs markers and cameras.** Scale is computed from
   scalebar targets in the markers file (using the built-in RGL scalebar target
   definitions in {mod}`substrata.settings`), and the up vector is regressed from
-  per-camera measured depths (`depth_sensor_m`). If your scalebars don't follow
+  per-camera measured depths (`depth_sensor_m`, the cameras' reference z in
+  Metashape). If your scalebars don't follow
   the RGL target layout, compute scale manually instead — see the
   {doc}`notebooks/scaling_and_orientation` tutorial — and set
   `proj.scale_factor` / `proj.world_transform` yourself before saving.
 - **You can determine the up vector from annotation depths instead of cameras**
   by passing `depth_markers=` to `scale_and_orient()`.
-- **Pass an explicit path to `save_config_to_yaml()`** when you opened the
-  project by directory. In that case there is no existing YAML path to default
-  to, so the filepath argument is required.
+- **Pass an explicit path to `save_config_to_yaml()`** when the project has no
+  YAML yet. Otherwise it defaults to the YAML the project was loaded from.
+- **The YAML is patched, not rebuilt.** Only keys whose value changed are
+  rewritten; comments, key order, keys substrata does not know and relative paths
+  are kept. The file is written atomically.
 - **What gets saved is the cumulative `world_transform`.** On reload, only the
   4×4 `world_transform` is re-applied; the `scale_factor`, `up_vector`,
   `depth_offset`, and `depth_per_unit` are stored as read-only metadata.
@@ -226,11 +235,11 @@ project file is plain YAML.
 ### Minimum project file
 
 The only thing substrata strictly needs to do useful work is a point cloud.
-Relative filenames are resolved against `path`, so the smallest practical file
-is:
+Relative filenames are resolved against `path`, or against the YAML's own folder
+when there is no `path`, so the smallest practical file, saved in the project
+folder, is:
 
 ```yaml
-path: "/data/cur_sna_20m_20200303/"
 ply: "cur_sna_20m_20200303_dec50M.ply"
 ```
 
@@ -238,9 +247,11 @@ With this, `proj.initialize()` loads the point cloud and nothing else. Add the
 key for each component you want loaded — cameras need **both** `cams_xml` and
 `cams_meta_json`; markers and annotations each need their own key.
 
-> **Tip:** filenames may be either relative (resolved against `path`) or
-> absolute. If you use relative filenames you must set `path`. If you give
-> absolute paths for every file, `path` is optional.
+> **Tip:** filenames may be either relative or absolute. Relative ones are
+> resolved against `path` (itself relative to the YAML's folder if it is
+> relative). When `path` is missing, or names a folder that does not exist (the
+> project was moved), the YAML's own folder is used instead, with a warning in
+> the second case.
 
 ### Reload a fully configured project
 
@@ -269,7 +280,7 @@ the corresponding object unloaded (or fall back to the default shown).
 
 | Key | Type | Purpose / default |
 | --- | --- | --- |
-| `path` | str | Base directory; relative filenames are resolved against it. |
+| `path` | str | Base directory; relative filenames are resolved against it. Default, and fallback when it does not exist: the YAML's folder. |
 | `id` | str | Project id (used to name outputs). Defaults to the directory name when opened by `path`. |
 | `ply` | str | Point-cloud PLY file. Legacy alias: `pcd`. |
 | `cams_xml` | str | Metashape camera poses (`chunk.exportCameras(...)`). Loaded only together with `cams_meta_json`. |
@@ -278,7 +289,7 @@ the corresponding object unloaded (or fall back to the default shown).
 | `annotations` | str | The default annotation set (a point CSV, normally in `<id>.annos/`). Not set by a folder convention. |
 | `annotations_last_highest_id` | int | Highest annotation id issued so far (for assigning new ids). |
 | `classes` | str | Class-definition CSV. Default: `classes.csv` next to the annotations CSV, in `<id>.annos/`, or in the project folder. |
-| `classifier` | str | Trained crop-classifier file. |
+| `classifier` | str | Trained classifier: a point classifier (`.pt`) or a crop classifier (`.pkl`). |
 | `photos_path` | str | Directory of source photos. |
 | `cropped_path` | str | Directory of cropped image chips. |
 | `crop_size` | int | Crop size in pixels. |
@@ -290,8 +301,11 @@ the corresponding object unloaded (or fall back to the default shown).
 | `world_transform` | 4×4 list | Cumulative transform applied on `initialize()`. Defaults to the identity matrix. |
 | `parent_id`, `parent_transform` | str, 4×4 list | Optional larger plot this one sits in, and this plot's orig → parent orig transform. `world_transform` stays its own. |
 | `baseline_id`, `baseline_transform` | str, 4×4 list | Optional baseline timepoint whose frame this plot inherits, and this plot's orig → baseline orig transform. `world_transform` (and the scale/depth keys) are then a cached baseline `world_transform @ baseline_transform`; see `substrata baseline`. |
-| `color_correction` | mapping | `matrix` (3×3 or 3×4) and `offset` (length-3) arrays applied to point-cloud colours on load. |
+| `color_correction` | mapping | `matrix` (3×3 or 3×4) and `offset` (length-3) arrays applied to point-cloud colours on load; `substrata colors` also records the fit (`fit_rmse`, `fit_patches`, `fit_space`). |
 | `firefish_water_level`, `firefish_depth_sensor_offset` | float, `[x, y, z]` | Firefish depth-sensor settings (kept as a record only). |
+
+A folder of photos without a 3-D model (an *image set*) has a YAML with
+`type: images` instead; see `substrata sample-points` in {doc}`command_line_usage`.
 
 The per-set keys `annotations_last_highest_id`, `classes`, `classifier`,
 `cropped_path` and `crop_size` are legacy keys here. They now belong in the sidecar
@@ -335,10 +349,13 @@ world_transform:
 
 ## Moving a project between machines
 
-Project files store paths, which won't match after copying a project to a
-different machine or directory. To rebase every registered path onto a new base
-directory, pass `local=True` (rebases onto the current working directory) or call
-`proj.reset_paths_to_local("/new/base/dir")` and re-save. Files inside the old
+A YAML with relative file names (as `save_config_to_yaml` writes them for files
+inside `path`) loads after a move as it is: when `path` no longer exists, the
+YAML's own folder is used. Absolute paths, and the photo paths in
+`<id>.meta.json`, do not follow; `substrata path-repair` checks and repairs all of
+them (see {doc}`command_line_usage`). In Python, to rebase every registered path
+onto a new base directory, pass `local=True` (rebases onto the current working
+directory) or call `proj.reset_paths_to_local("/new/base/dir")` and re-save. Files inside the old
 `path` keep their place relative to it (e.g. `<id>.annos/x.csv`). A file outside it,
 such as a shared `../classes.csv`, keeps its relative place when it exists there
 under the new base; otherwise it is looked for in the new base by name:
@@ -349,6 +366,8 @@ proj = ProjectInitializer(yaml="cur_sna_20m_20200303.yaml", local=True)
 
 ## Next steps
 
+- {doc}`tutorials/plot_workflow` — from a Metashape project to a scaled,
+  oriented plot, from the command line.
 - {doc}`notebooks/scaling_and_orientation` — compute scale and orientation step
   by step, including custom (non-RGL) scalebar layouts.
 - {doc}`notebooks/transferring_annotations` — move annotations between

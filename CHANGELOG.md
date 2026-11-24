@@ -5,6 +5,148 @@ checks it at start-up.
 
 ## 0.2.0.dev2 (unreleased)
 
+### 24–25 November 2026: package review
+
+A review of the whole package (calculations checked on synthetic data with known answers; every fix below has a test
+that failed before it, mostly in `tests/test_review_*.py`).
+
+**Calculations fixed**
+- **Gap fraction** (`calc_gap_fraction`): the "fill" gap fraction flooded the canopy as sky when a seed fell on a covered
+  pixel (an opaque 0–45° canopy gave 0.25 instead of 0.75), and with `color_output=True` (the default) benthic points of
+  a colour close to the grey sky counted as sky. Both fractions now come from a binary raster (`hemispherical_cover`,
+  `gap_fractions`), independent of the display options. The docstring now says what is measured (sky / disk area in an
+  equidistant projection; it depends on point density).
+- **Neighbourhood of an annotation** (`Annotation.reduce_point_cloud_to_radius`): filtered the world-frame cloud around
+  the original-frame coordinates, so with a world transform it kept no points.
+- **TPI / TRI**: return NaN (with a warning) when less than 75 % of the annulus holds points
+  (`annulus_coverage`, `settings.TPI_MIN_ANNULUS_COVERAGE`; `min_annulus_coverage=None` turns it off). A one-sided
+  annulus near the edge of the cloud gave a slope-biased TPI (0.084 m on a smooth plane). `OrthoGrid` per-cell TPI: the
+  annulus now runs from half the cell side to half the window side (it was empty); it needs `neighborhood_scale >= 2`.
+  On real colonies (10 close-up targets of sa3_40m, cylinder neighbourhoods as documented) TPI/TRI, Ra/Rq, plane
+  angles and dispersion are unchanged by the review (≤ 1e-4); all 166 close-up targets of sa3_40m and sa4_20m have
+  ≥ 83 % annulus coverage. A spherical neighbourhood on a steep slope now gives NaN (the sphere clips the annulus).
+- **Plane fits without normals** (roughness, plane angles, RANSAC): crashed, or gave an arbitrary sign (153° instead of
+  27°); the normal now faces +Z. `conduct_PCA` uses `eigh` (complex results on near-degenerate clouds).
+- **Depth regression**: positive depths gave an up vector pointing down (the flip meant to catch this never ran); they are
+  now negated with a warning (`normalize_depth_sign`).
+- **Vector dispersion** accepts open3d clouds; its figure shows the directional deviation (0–180°) like the metric.
+- **`geom`**: `Transform @ Transform` composed in the reverse order; `Vector.dot` included w; two constructors changed
+  their inputs.
+- **Point clouds**: colours of 16-bit or float PLYs were wrong in capped/streamed loads and neighbourhood extraction;
+  `subsample_pointcloud_by_radius` dropped the true nearest neighbour; normals were scaled by scaled transforms
+  (now inverse-transpose, renormalised); `stream_extract_neighborhoods_ply` used the wrong radius in cylinder mode;
+  `get_intercept` could miss points and return a hit up to one step behind the surface (now an exact capsule search);
+  `get_z_intercept` hung on an empty cloud.
+- **Reproducibility**: `decimate` (and `metashape-export`'s decimation) is seeded (`--seed`, default 0, recorded in
+  the header) and keeps exactly the requested number of points; the figures' decimation is seeded too. New `dec*` files
+  differ from existing ones, so results computed on them (orientation, intercepts) can shift slightly.
+- **Orthos**: a narrow, tall plot was cut off (pixel size from x only); markers were half a pixel off.
+- **Training**: the train / validation / test split was drawn per point, so points of one photo fell in several splits
+  and the reported metrics were optimistic. It is now per photo (`train --split-by photo|plot|point`; `point` = the old
+  behaviour), recorded in the summary and the model. The probe's C is cross-validated grouped by photo.
+- **Resampling scales**: `calibrate`, `train --validate/--test`, `curate` scores and `segment`'s dense views now resample
+  photos of other cameras exactly as `predict` does (they used another scale). Recalibrate calibrated models used on
+  wider cameras. Ground resolution falls back to `scale_factor` when there is no world transform.
+- **`colors`**: the cloud and markers are in the same (world) frame with metre radii (`-n` and `--markers` mixed
+  frames); outlier cards are dropped from the per-patch medians (the old rule almost never fired); the fit RMSE is
+  stored.
+- `curate` reviews the train split only (`--all-splits`), so the test set is not edited using the model's errors.
+- `firefish --target-depth` accepts 20 or -20 (the documented example crashed); `masks` reuses masks only from the same
+  classifier file; same-named photos no longer share feature caches or crops (`stale_crops` deleted valid crops of
+  same-named photos in other folders).
+
+**Data safety**
+- **Annotation CSVs** keep every column, row, quoted cell and BOM through load and save: a comma in a label or path broke
+  reloading, a BOM header did not load, and `save()` dropped columns it did not know (e.g. `include_cam_in_training`).
+  Duplicate ids warn and are kept. Concurrent edits are locked (`fileio.path_lock`).
+- One atomic writer (`substrata.fileio`) that keeps the file's permissions (the old ones left 0600 files), now used for
+  annotation CSVs, meta.json / cams.xml, crops, camsync / curate / train / masks outputs, the stratified index and PLY
+  outputs; `save_config_to_yaml` patches the project YAML in place (comments, unknown keys, relative paths and the
+  colour fit's quality keys kept).
+- `segment`'s recoloured PLY keeps 16-bit colours.
+
+**Changed**
+- Pixels: a point is in view for 0 ≤ u < width; photos are read in their stored grid (EXIF orientation ignored, as the
+  projection does); matched keypoints are mapped to full-size pixels with the half-pixel offset (camsync / video poses
+  shift by about half a reduced pixel). EXIF `DateTimeOriginal` is read from the Exif IFD, with sub-seconds.
+- CLI options are spelled with hyphens (`--output-pdf`, `--min-conf`, `--use-chunk-transform`, …); the underscore
+  spellings still work.
+- `Camera.get_image_matches` returns `[]` instead of None; camera subsets no longer re-parent the original's cameras;
+  nested loops over `Cameras` / `Annotations` work.
+- One definition of the world transform's scale (`frames.uniform_scale`, `frames.metres_per_unit`), set on the
+  project's cameras, markers and annotations (`ProjectInitializer.propagate_metres_per_unit`); the occlusion test's
+  minimum margin is in metres.
+- New helpers: `StratifiedPly.prefix_for_budget`, `OrthoMap(display_rotation=, units=)`.
+- FireFish's offset search starts from the earliest camera and record times (it used the first in file order).
+- View ranking (`cameras._relevance`): the squared distance to the camera over `fx * fy` (the area a pixel covers
+  there) times the centre penalty. It added the depth (a length) to the squared distance, so the ranking depended on
+  the chunk's units. On sa3_40m, 97 % of 400 points keep their best view (99.5 % within their camera type). Training
+  views already stored in annotation CSVs are kept; views chosen anew (crops, predict, substrata-explore) can differ.
+- **TPI / TRI are weighted by area** (`calc_tpi_and_tri(raster_cell_size=0.01)`, `settings.TPI_RASTER_CELL_SIZE`): the
+  annulus points of each 1 cm XY cell are replaced by their mean, so densely photographed parts no longer weigh more.
+  On 83 close-up targets of sa3_40m the points per cell varied 5x within an annulus; TPI_abs changed by 0.02 m
+  (median, on values of about 0.19 m; up to 0.32 m), and 5 mm, 1 cm and 2 cm cells agreed within 2 mm.
+  `raster_cell_size=None` gives the earlier per-point values. A warning is logged when fewer than half of the cells
+  hold points (cells finer than the cloud).
+
+**Measurements separate from figures**
+- Every QC figure shows exactly the reported value: figures take the measurement's result (`elev_deg=`, `plane=`,
+  `errors=`, `residuals=`, `result=`) and otherwise call the measurement function, never a copy of it. Roughness and
+  dispersion figures no longer refit on a decimated cloud; depth-regression, camera-residual, benthic-fraction and
+  colour-summary numbers come from the measurement.
+- Metric functions only compute; their display images are built by figure functions in `visualizations`
+  (`tpi_figure`, `benthic_fraction_figure`, `render_gap_fraction`). Signatures and return values unchanged.
+- New pure helpers: `distances_to_plane`, `plane_orientation`, `annulus_plane`, `tpi_point_values`,
+  `vector_dispersion_from_normals`, `normal_deviation_deg`, `regression_errors`, `pcd_correspondence` (the align QC
+  statistics, previously computed only inside a plotting function), `camera_residuals`, `benthic_fraction_from_results`,
+  `color_calibration.correction_residuals`, `OrthoGrid.label_counts`.
+- Figure and report code that lived in compute modules (depth residuals, scalebars, colour cards, camsync and
+  training reports, align QC, curation sheets) is in `visualizations`; the old methods delegate to it.
+- `substrata.imagecrops`: the crop arithmetic used by training and prediction (it lived in `visualizations`).
+- `substrata.visualizations` is a package of themed submodules (`clouds`, `colorcards`, `photos`, `depth`,
+  `terrain`, `gapfraction`, `benthic`, `sampling`, `reports`, `runreports`, `alignment`) behind the same front
+  module; `from substrata import visualizations` and every `visualizations.<name>` work as before. Each submodule
+  names the measurement functions its numbers come from.
+- Compute modules import figure libraries only when drawing: `import substrata.measurements` takes 0.07 s instead of
+  1.2 s (substrata-explore imports it).
+- Fixed: `intercepts --slope` drew `slope_pca.png` from a refit on the already aligned cloud (about 0°), not the stored
+  `slope_elevation_deg`; the classifier stats PDF crashed with NumPy ≥ 2.3.
+
+**Consistent names** (old names stay as deprecated aliases; old keywords still work and raise a `DeprecationWarning`
+once, `substrata.compat.renamed_kwargs`)
+- One name per concept: `output_path` / `output_dir` for what a function writes, `progress` for progress bars, unit
+  suffixes `_m`, `_mm`, `_px`, `_deg`, `_s` (e.g. `point_size_m`, `offset_s`), `transform` for a 4×4 argument.
+- Lower case: `conduct_pca`, `conduct_xy_pca`, `get_best_fit_plane_pca`, `get_radius_from_2d_surface_area`,
+  `principal_axis_xy`, `calc_scale_factor`, `get_time_diff_s`.
+- `Cameras` / `Annotations`: `.apply_transform` / `.reverse_transform` (were `transform_coords` /
+  `get_original_coords`; single cameras and annotations keep `transform_coords`).
+- Helpers used across modules (or by substrata-explore) have public names (e.g. `photo_folder_name`,
+  `lens_distortion`, `pixels_to_normalized`, `PLY_TYPES`); the underscore names remain.
+
+**Removed** (unused: checked in substrata, substrata-explore, the tests, docs and notebooks)
+- About 5,000 lines (the package is 600 lines smaller despite the new helpers; the tests grew from 13,400 to 17,300
+  lines): the SIFT / heat-map experiments in `segmentation`, 16 unused figure functions, 30 functions in `measurements` (old grid,
+  transect and intercept code, `measurements.slerp` (duplicate of `geom.slerp`), `get_fractal_dimension`, …), the
+  `Video` / `Frame` classes and other unused `Camera(s)` / `Annotations` methods, unused `geom` constructors and
+  `PointCloud` helpers. `measurements` has an `__all__`.
+
+### 24 November 2026
+
+- **`substrata images --layout pages`** (`annotationpages.py`): one A4 page per annotation - the best overview photo
+  zoomed on the point (most relevant unobstructed view of the main camera type, as `crops` chooses it; `--zoom`,
+  at least 0.5 m or 2.5x the close-up's frame), the close-up's full frame (box = the crop below) and the close-up at
+  100% (1 photo pixel = 1 dot at 300 dpi); point marked, scale bars from camera distance, header with plot,
+  annotation, label, depth and `--info` columns. `--layout auto` (default) makes pages when the stored views are
+  close-ups (a `cams2annos` camera-targets set, or stored photos of a non-main camera type), else the grid as
+  before; `--closeup GROUP` names the close-up cameras for any set (points without one get overview-only pages).
+  A stored close-up is shown also when its camera is disabled (a pose camsync estimated), with a note to check it.
+  The overview prefers views with the point clear of the photo edge (`settings.PAGES_CLEAR_OF_EDGE_PX`).
+  `--labels` / `--ids` select annotations in both layouts; `--occlusion` / `--camera-type` as for `crops`.
+- **Display contrast** (`imageadjust.py`, `substrata images --contrast`): `auto_contrast(img, method,
+  reference=)` with `stretch` (default: one luminance stretch, colours kept), `stretch-rgb`, `clahe`, `none`;
+  statistics from a reference image so crops of one photo match its full frame; new methods via
+  `@register_contrast_method`.
+
 ### 20 November 2026
 
 - **`substrata track-video` camera poses** (`videopose.py`; `--no-poses` to leave out): each stop's camera position

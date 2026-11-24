@@ -53,7 +53,7 @@ class TestSubsetByDepthRange(unittest.TestCase):
         anns = a.Annotations(coords=coords)
         t = np.eye(4)
         t[2, 2] = -2.0  # z = 0, -2, -4, ..., -14 after the transform
-        anns.transform_coords(t)
+        anns.apply_transform(t)
         with self.assertLogs(a.logger, level="WARNING") as cm:
             subset = anns.subset_by_depth_range(8, 12)
         self.assertEqual(sorted(subset.data), ["p4", "p5", "p6"])

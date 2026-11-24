@@ -844,6 +844,15 @@ def _sparse_pc():
 
 
 class TestOrthoGridCustom(unittest.TestCase):
+    def test_tpi_needs_a_window_wider_than_the_cell(self):
+        # The per-cell TPI annulus runs from half the cell side to half the
+        # window side: with a one-cell window it would be empty (all NaN).
+        def calc_tpi_and_tri(*a, **k):  # noqa: D401 - stub
+            return None
+        with self.assertRaises(ValueError):
+            _CountingGrid(pcd=_ramp_pc(), value_by="custom",
+                          measurement=calc_tpi_and_tri, cell_size=1.0)
+
     def _dummy(self, metric=None):
         # A callable whose __name__ maps to a default metric ("Ra").
         def calc_roughness(*a, **k):  # noqa: D401 - stub
@@ -1139,17 +1148,17 @@ class TestOrthoGridHighlights(unittest.TestCase):
         uniq = {tuple(np.round(c, 3)) for c in fc}
         self.assertGreaterEqual(len(uniq), 2)
 
-    def test_point_size_metres_uses_patches(self):
+    def test_point_size_m_uses_patches(self):
         import matplotlib.patches as mpatches
         fig = self._grid().show(
-            show_pcd=False, highlights=self._anns(), point_size_metres=0.5,
+            show_pcd=False, highlights=self._anns(), point_size_m=0.5,
         )
         circles = [p for p in fig.axes[0].patches
                    if isinstance(p, mpatches.Circle)]
         self.assertEqual(len(circles), 2)
         fig2 = self._grid().show(
             show_pcd=False, highlights=self._anns(),
-            point_size_metres=0.5, point_shape="square",
+            point_size_m=0.5, point_shape="square",
         )
         rects = [p for p in fig2.axes[0].patches
                  if isinstance(p, mpatches.Rectangle)]
@@ -1186,7 +1195,7 @@ class TestOrthoGridHighlights(unittest.TestCase):
     def test_point_open_patches_are_hollow(self):
         import matplotlib.patches as mpatches
         fig = self._grid().show(
-            show_pcd=False, highlights=self._anns(), point_size_metres=0.5,
+            show_pcd=False, highlights=self._anns(), point_size_m=0.5,
             point_open=True, point_outline_width=3.0,
         )
         circles = [p for p in fig.axes[0].patches

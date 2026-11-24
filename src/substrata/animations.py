@@ -33,8 +33,9 @@ def _reveal_t(nx: int, ny: int) -> np.ndarray:
         ny: Number of grid rows.
 
     Returns:
-        ``(ny, nx)`` float array in ``[0, 1)``: a cell becomes visible once the
-        animation progress ``p`` reaches its value.
+        ``(ny, nx)`` float array in ``(0, 1]`` (``1/N`` for the first cell, 1
+        for the last): a cell becomes visible once the animation progress
+        ``p`` reaches its value.
     """
     i = np.arange(nx)[None, :]          # column index -> (1, nx)
     j = np.arange(ny)[:, None]          # row index, 0 = bottom -> (ny, 1)
@@ -110,7 +111,6 @@ def _reveal_t_categories(grid, present, report, force_nodata_last: bool = True):
     """
     ny, nx = grid.ny, grid.nx
     cells: dict = {}
-    report_counts: dict = {}
     for j in range(ny):
         for i in range(nx):
             if not present[j, i]:
@@ -118,8 +118,7 @@ def _reveal_t_categories(grid, present, report, force_nodata_last: bool = True):
             lbl = grid.cell_labels[j, i]
             cat = lbl if lbl is not None else "No data"
             cells.setdefault(cat, []).append((j, i))
-            if report[j, i]:
-                report_counts[cat] = report_counts.get(cat, 0) + 1
+    report_counts = grid.label_counts()  # (present / report are the grid's)
 
     def dominance(cat):
         # Most reported cells first; break ties on total occupancy, then name.
@@ -448,7 +447,6 @@ def _setup_label(grid, ax_left, ax_right, label_colors, mpatches, plt,
 
     target_rgb = np.zeros((ny, nx, 3), dtype=float)
     cell_cat = np.empty((ny, nx), dtype=object)
-    final_counts: dict = {}
     for j in range(ny):
         for i in range(nx):
             if not present[j, i]:
@@ -456,10 +454,8 @@ def _setup_label(grid, ax_left, ax_right, label_colors, mpatches, plt,
             lbl = grid.cell_labels[j, i]
             col = label_colors.get(lbl, no_data) if lbl is not None else no_data
             target_rgb[j, i] = col[:3]
-            cat = lbl if lbl is not None else "No data"
-            cell_cat[j, i] = cat
-            if report[j, i]:
-                final_counts[cat] = final_counts.get(cat, 0) + 1
+            cell_cat[j, i] = lbl if lbl is not None else "No data"
+    final_counts = grid.label_counts()  # the counts OrthoGrid.show() draws
 
     categories = sorted(k for k in final_counts if k != "No data")
     if "No data" in final_counts:

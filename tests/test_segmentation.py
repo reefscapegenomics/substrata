@@ -192,6 +192,63 @@ class TestSaveLoad(unittest.TestCase):
         np.testing.assert_array_equal(s.propagate(pts), s2.propagate(pts))
 
 
+class TestRecolorPlyFile(unittest.TestCase):
+    """recolor_ply_file reads the header with stratified.read_ply_header and
+    keeps 16-bit colours on their full range."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, path, ctype, rgb):
+        np_t = {"uchar": "<u1", "ushort": "<u2"}[ctype]
+        dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                       ("red", np_t), ("green", np_t), ("blue", np_t)])
+        rec = np.zeros(len(rgb), dt)
+        rec["x"] = 100.0 + np.arange(len(rgb)) * 100.0  # far from the query points
+        for i, c in enumerate(("red", "green", "blue")):
+            rec[c] = rgb[:, i]
+        head = ("ply\nformat binary_little_endian 1.0\n"
+                f"element vertex {len(rgb)}\n"
+                "property float x\nproperty float y\nproperty float z\n"
+                + "".join(f"property {ctype} {c}\n" for c in ("red", "green", "blue"))
+                + "end_header\n")
+        with open(path, "wb") as f:
+            f.write(head.encode("ascii") + rec.tobytes())
+
+    def _read(self, path):
+        from substrata.stratified import read_ply_header
+
+        with open(path, "rb") as f:
+            h = read_ply_header(f)
+            return np.frombuffer(f.read(), dtype=h.dtype, count=h.n_vertices)
+
+    def test_unlabelled_points_keep_their_colour(self):
+        s = _make_seg(colors={"A": (255, 0, 0), "B": (0, 255, 0)})
+        for ctype, top in (("uchar", 255), ("ushort", 65535)):
+            rgb = np.array([[top, top, top], [0, 0, 0]])
+            src = os.path.join(self.tmp.name, f"in_{ctype}.ply")
+            dst = os.path.join(self.tmp.name, f"out_{ctype}.ply")
+            self._write(src, ctype, rgb)
+            seg.recolor_ply_file(src, dst, s, max_radius=1.0, verbose=False)
+            out = self._read(dst)
+            for c in ("red", "green", "blue"):
+                np.testing.assert_array_equal(out[c], rgb[:, 0], err_msg=ctype)
+
+    def test_rejects_ply_without_colours(self):
+        src = os.path.join(self.tmp.name, "nocol.ply")
+        with open(src, "wb") as f:
+            f.write(b"ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+                    b"property float x\nproperty float y\nproperty float z\n"
+                    b"end_header\n" + np.zeros(3, "<f4").tobytes())
+        out = os.path.join(self.tmp.name, "o.ply")
+        with self.assertRaises(ValueError):
+            seg.recolor_ply_file(src, out, _make_seg(), verbose=False)
+        self.assertFalse(os.path.exists(out))
+
+
 class _FakeDL:
     def __init__(self, crops):
         self.n = len(crops)
@@ -338,7 +395,7 @@ class TestMatchMultiView(unittest.TestCase):
         self.assertEqual(cam.tolist(), [[1, 2], [0, 2]])
         self.assertEqual(rel.tolist(), [[1.0, 2.0], [1.0, 2.0]])
         self.assertEqual(x[0].tolist(), [11.0, 12.0])
-        best, *_ = seg._match_points_to_cameras(qc, cams, verbose=False)
+        best, *_ = seg.match_points_to_cameras(qc, cams, verbose=False)
         self.assertEqual(best.tolist(), [1, 0])
         # More views than cameras: the rest stay empty.
         cam5, *_r = seg._match_points_to_cameras_multi(

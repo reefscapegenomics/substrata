@@ -209,7 +209,10 @@ class Correspondences:
         from . import videotrack as vt
 
         m = self.m
-        im = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
+        from . import imagesync as isy
+        from .fileio import imread
+
+        im = imread(frame_path, cv2.IMREAD_GRAYSCALE)
         if im is None:
             return None
         h0, w0 = im.shape
@@ -234,10 +237,10 @@ class Correspondences:
             if mk is None or mk.sum() < MIN_PHOTO_MATCHES:
                 continue
             sel = mk.ravel().astype(bool)
-            Af = vt.unturn(A[sel], k, fw, fh) * (w0 / fw)
+            Af = isy.to_sensor_px(vt.unturn(A[sel], k, fw, fh), w0 / fw)
             ph, pw = (pg.shape[1], pg.shape[0]) if m.turn[i] % 2 else pg.shape
             cam = m.photos[i]
-            Bf = vt.unturn(B[sel], m.turn[i], pw, ph) * (cam.sensor.width / pw)
+            Bf = isy.to_sensor_px(vt.unturn(B[sel], m.turn[i], pw, ph), cam.sensor.width / pw)
             idx = self.lookup(i, Bf)
             ok = idx >= 0
             UV.append(Af[ok])
@@ -407,10 +410,14 @@ def pose_record(fp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def save_json(path: str, obj) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".tmp", "w") as f:
+    """Write ``obj`` as JSON to ``path`` atomically (:func:`substrata.fileio.atomic_write`), making its folder."""
+    from .fileio import atomic_write
+
+    folder = os.path.dirname(path)
+    if folder:  # (a bare file name: the current folder)
+        os.makedirs(folder, exist_ok=True)
+    with atomic_write(path, "w") as f:
         json.dump(obj, f, indent=1)
-    os.replace(path + ".tmp", path)
 
 
 def load_json(path: str):

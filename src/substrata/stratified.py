@@ -25,11 +25,13 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import BinaryIO, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
 
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.fileio import atomic_write
 from substrata.logging import logger
 
 __all__ = [
@@ -57,7 +59,7 @@ STRATIFIED_INDEX_VERSION = 1
 STRATIFIED_COMMENT = b"comment substrata stratified v1\n"
 _GRID_CELLS = 1 << 24
 
-_PLY_TYPES = {
+PLY_TYPES = {
     "char": "i1",
     "int8": "i1",
     "uchar": "u1",
@@ -77,8 +79,11 @@ _PLY_TYPES = {
 }
 
 
+_PLY_TYPES = PLY_TYPES  # deprecated alias (renamed 2026-11-25)
+
+
 # ---------------------------------------------------------------------------
-# Binary PLY access (vertex-only clouds, as pointclouds._parse_ply_header)
+# Binary PLY access (vertex-only clouds; also used by pointclouds)
 # ---------------------------------------------------------------------------
 
 
@@ -108,7 +113,7 @@ class PlyHeader:
     def dtype(self) -> np.dtype:
         """Structured dtype of one vertex record."""
         return np.dtype(
-            [(name, self.endian + _PLY_TYPES[t]) for t, name in self.props]
+            [(name, self.endian + PLY_TYPES[t]) for t, name in self.props]
         )
 
     @property
@@ -121,57 +126,76 @@ class PlyHeader:
         return all(n in self.dtype.names for n in names)
 
 
-def read_ply_header(path: str) -> PlyHeader:
+def read_ply_header(path: Union[str, BinaryIO]) -> PlyHeader:
     """Parse the header of a binary, vertex-only PLY.
 
+    This is the one PLY header parser of substrata (``pointclouds`` uses it
+    too). Rules: binary little- or big-endian only; exactly one non-empty
+    element, ``vertex``, with scalar properties of the standard PLY types;
+    other elements may be declared but only with count 0 (a non-empty element
+    before the vertices would shift their offset, one after them would be
+    silently dropped by vertex-only readers). Header lines are decoded as
+    latin-1, so a non-ASCII comment does not break parsing.
+
     Args:
-        path: PLY file path.
+        path: PLY file path, or a binary file object positioned at the start
+            of the file (it is left positioned at the first vertex record).
 
     Returns:
         The parsed header.
 
     Raises:
-        ValueError: For ASCII PLYs, non-empty non-vertex elements, list
-            properties on vertices or a malformed header.
+        ValueError: For ASCII PLYs, non-empty non-vertex elements, list or
+            unknown-type properties on vertices or a malformed header.
     """
+    if hasattr(path, "readline"):
+        return _parse_ply_header(path, getattr(path, "name", "<stream>"))
+    with open(path, "rb") as f:
+        return _parse_ply_header(f, path)
+
+
+def _parse_ply_header(f, path: str) -> PlyHeader:
+    """``read_ply_header`` on an open binary file at offset 0."""
     lines: List[bytes] = []
     fmt = endian = None
     n_vertices = None
     props: List[Tuple[str, str]] = []
     in_vertex = False
-    with open(path, "rb") as f:
-        if f.readline().strip() != b"ply":
-            raise ValueError(f"{path}: not a PLY file")
-        lines.append(b"ply\n")
-        while True:
-            line = f.readline()
-            if not line:
-                raise ValueError(f"{path}: unexpected EOF in header")
-            lines.append(line)
-            s = line.decode("ascii").strip()
-            if s.startswith("format "):
-                fmt = s.split()[1]
-                if fmt == "binary_little_endian":
-                    endian = "<"
-                elif fmt == "binary_big_endian":
-                    endian = ">"
-                else:
-                    raise ValueError(f"{path}: only binary PLY is supported")
-            elif s.startswith("element "):
-                _, name, count = s.split()[:3]
-                in_vertex = name == "vertex"
-                if in_vertex:
-                    n_vertices = int(count)
-                elif int(count) != 0:
-                    raise ValueError(f"{path}: non-empty element '{name}' unsupported")
-            elif s.startswith("property ") and in_vertex:
-                parts = s.split()
-                if parts[1] == "list":
-                    raise ValueError(f"{path}: list properties on vertices unsupported")
-                props.append((parts[1], parts[2]))
-            elif s == "end_header":
-                break
-        header_len = f.tell()
+    start = f.tell()
+    if f.readline().strip() != b"ply":
+        raise ValueError(f"{path}: not a PLY file")
+    lines.append(b"ply\n")
+    while True:
+        line = f.readline()
+        if not line:
+            raise ValueError(f"{path}: unexpected EOF in header")
+        lines.append(line)
+        s = line.decode("latin-1").strip()
+        if s.startswith("format "):
+            fmt = s.split()[1]
+            if fmt == "binary_little_endian":
+                endian = "<"
+            elif fmt == "binary_big_endian":
+                endian = ">"
+            else:
+                raise ValueError(f"{path}: only binary PLY is supported")
+        elif s.startswith("element "):
+            _, name, count = s.split()[:3]
+            in_vertex = name == "vertex"
+            if in_vertex:
+                n_vertices = int(count)
+            elif int(count) != 0:
+                raise ValueError(f"{path}: non-empty element '{name}' unsupported")
+        elif s.startswith("property ") and in_vertex:
+            parts = s.split()
+            if parts[1] == "list":
+                raise ValueError(f"{path}: list properties on vertices unsupported")
+            if parts[1] not in PLY_TYPES:
+                raise ValueError(f"{path}: unsupported PLY type '{parts[1]}'")
+            props.append((parts[1], parts[2]))
+        elif s == "end_header":
+            break
+    header_len = f.tell() - start
     if fmt is None or n_vertices is None or not props:
         raise ValueError(f"{path}: invalid PLY header")
     return PlyHeader(path, fmt, endian, n_vertices, props, header_len, lines)
@@ -294,8 +318,12 @@ class StratifiedIndex:
         return np.cumsum(self.counts.sum(1))
 
     def save(self, path: str) -> None:
-        """Write the index as an .npz file."""
-        np.savez(path, version=STRATIFIED_INDEX_VERSION, **asdict(self))
+        """Write the index as an .npz file (atomically; ``.npz`` is added to a
+        path without it, as ``np.savez`` does)."""
+        if not path.endswith(".npz"):
+            path += ".npz"
+        with atomic_write(path, "wb") as f:
+            np.savez(f, version=STRATIFIED_INDEX_VERSION, **asdict(self))
 
     @classmethod
     def load(cls, path: str) -> "StratifiedIndex":
@@ -418,8 +446,36 @@ class StratifiedPly:
         """(N, 3) uint8 colours of records (``ply_rgb``)."""
         return ply_rgb(records)
 
+    def prefix_for_budget(self, n: int) -> int:
+        """The largest round-end prefix size <= n (the first round end if none).
+
+        Only a prefix that ends at a round end is a uniform subsample of the
+        whole cloud (``round_ends``); use this to turn a point budget into a
+        ``read_prefix`` size.
+
+        Args:
+            n: Point budget.
+        """
+        ends = self.index.round_ends
+        k = int(np.searchsorted(ends, int(n), side="right"))
+        return int(ends[max(k - 1, 0)])
+
     def read_prefix(self, n: int) -> np.ndarray:
-        """First n records: a uniform random subsample of the cloud."""
+        """First n records.
+
+        A uniform random subsample of the cloud only when n is a round end
+        (``index.round_ends``; ``prefix_for_budget`` gives one): a prefix that
+        ends mid-round adds the next round for the first clusters only, so one
+        region is denser than the rest. Such a prefix is logged (debug).
+        """
+        n = int(n)
+        if n < self.n and n not in set(self.index.round_ends.tolist()):
+            logger.debug(
+                f"{self.path}: prefix of {n:,} records is not a round end, so not "
+                f"a uniform subsample (round ends: "
+                f"{', '.join(f'{int(e):,}' for e in self.index.round_ends)}); "
+                "use prefix_for_budget"
+            )
         return np.array(self.records[:n])
 
     def read_slices(
@@ -1416,10 +1472,22 @@ class Occluder:
             count += int((dist2 < r[c] ** 2).sum())
         return count
 
-    def line_of_sight_margin(self) -> float:
-        """Stretch around a point ignored by :meth:`blockers` (its own surface): a few
-        subsample spacings, at least 0.01 model units."""
-        return max(4 * float(np.median(self.spacing)), 0.01)
+    @_renamed_kwargs(min_metres="min_m")
+    def line_of_sight_margin(
+        self, scale_factor: Optional[float] = None, min_m: float = 0.01,
+    ) -> float:
+        """Stretch around a point ignored by :meth:`blockers` (its own surface), in
+        model (original PLY) units: four median subsample spacings, but at least
+        `min_m`.
+
+        Args:
+            scale_factor: Metres per model unit (the project's ``scale_factor``);
+                the floor is then ``min_m / scale_factor`` model units.
+                None (scale unknown): the floor is ``min_m`` model units.
+            min_m: The floor, in metres (in model units without a scale).
+        """
+        floor = min_m / scale_factor if scale_factor else min_m
+        return max(4 * float(np.median(self.spacing)), floor)
 
 
 def ply_occluder(ply_path: Optional[str]) -> Optional[Occluder]:

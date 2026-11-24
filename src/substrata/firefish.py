@@ -2,19 +2,16 @@
 import logging
 import os
 from datetime import datetime, timezone
-import sys
 
 # Third-Party Libraries
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.preprocessing import RobustScaler
 from tqdm import tqdm
 from joblib import Parallel, delayed
-from matplotlib.backends.backend_pdf import PdfPages
 
 # Local Modules
-from substrata import settings, visualizations, measurements, cameras
+from substrata import settings, measurements, cameras
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +67,8 @@ class FireFish:
         self, cams, offset=0, time_range=None, show_overlap_range=False
     ):
         """Plot the camera distances against the FireFish altitudes"""
+        import matplotlib.pyplot as plt  # lazy: figures only
+
         # cams_with_datetime = [cam for cam in cams if cam.has_coords_datetime_camdist()]
         cams_with_datetime = [
             cam for cam in cams if cam.has_coords_datetime()
@@ -113,20 +112,27 @@ class FireFish:
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
         return fig
 
-    def get_offset_of_first_photo_from_firefish_start(self, cams):
-        """Determine the offset between the first photo and the first FireFish measurement"""
-        cams_with_datetime = [
-            cam for cam in cams if cam.has_coords_datetime()
-        ]  # TO FIX
-        first_camera_time = cams_with_datetime[0].datetime
-        first_firefish_time = self.data.iloc[0]["unixtime"]
-        return get_time_diff_in_secs(first_firefish_time, first_camera_time)
-
     def filter_by_depth_range(self, min_depth, max_depth):
-        """Filter the DataFrame for values within a certain range."""
+        """The longest stretch of records with ``min_depth < depth < max_depth``.
+
+        Depths are negative (metres below the surface). Records more than 60 s
+        apart start a new stretch.
+
+        Raises:
+            ValueError: no record lies in the depth band.
+        """
         filtered_data = self.data[
             (self.data["depth"] > min_depth) & (self.data["depth"] < max_depth)
         ]
+        if filtered_data.empty:
+            depths = self.data["depth"]
+            span = (f"{depths.min():.1f} to {depths.max():.1f} m" if len(depths)
+                    else "no records")
+            raise ValueError(
+                f"No FireFish records between {min_depth:g} and {max_depth:g} m "
+                f"depth (the log spans {span}); check --target-depth "
+                "(depth below the surface, e.g. 20 for 20 m) and "
+                "--depth-outlier-threshold.")
 
         # Identify fragments by detecting gaps (threshold 60 secs)
         filtered_data = filtered_data.copy()
@@ -137,16 +143,11 @@ class FireFish:
             lambda x: x.max() - x.min()
         )
         longest_fragment_id = fragment_durations.idxmax()
-        print(longest_fragment_id)
 
         # Filter only the longest fragment
         return filtered_data[filtered_data["fragment_id"] == longest_fragment_id].drop(
             columns="fragment_id"
         )
-
-    def get_last_firefish_time(self):
-        """Get the last time in the FireFish data"""
-        return int(self.data.iloc[-1]["unixtime"])
 
     def determine_camera_time_offset_based_on_lowest_depth_regression_error(
         self,
@@ -181,9 +182,12 @@ class FireFish:
             cams_with_datetime = [
                 cam for cam in cams if cam.has_coords_datetime()
             ]  # TO FIX
-            first_camera_time = cams_with_datetime[0].datetime
-            first_firefish_time = filtered_data.iloc[0]["unixtime"]
-            starting_offset = get_time_diff_in_secs(
+            # (the earliest times, whatever order the cameras and records are in)
+            first_camera_time = min(
+                (cam.datetime for cam in cams_with_datetime), key=get_unix_time
+            )
+            first_firefish_time = filtered_data["unixtime"].min()
+            starting_offset = get_time_diff_s(
                 first_firefish_time, first_camera_time
             )
             cameras_time_delta = cams.get_time_delta_between_first_and_last_photo()
@@ -192,7 +196,7 @@ class FireFish:
 
         # Calculate error statistics for offset range
         error_stats = []
-        sensor_offset_units = cameras._sensor_offset_units(
+        sensor_offset_units = cameras.sensor_offset_units(
             depth_sensor_offset, scale_factor
         )
 
@@ -239,8 +243,9 @@ class FireFish:
             "Lowest MAE: {0} at offset: {1}".format(lowest_mae, lowest_mae_offset)
         )
 
-        # Plot the matches
-        fig = self.__plot_matches(offsets, maes, maes)
+        # Plot the error and the number of matched cameras per offset
+        nums = [stat["num_matches"] for stat in error_stats]
+        fig = self.__plot_matches(offsets, maes, nums)
         return lowest_mae_offset, fig
 
     def get_camera_depths_from_firefish(self, cams, offset):
@@ -320,6 +325,8 @@ class FireFish:
         from a tide gauge) converts the FireFish depths to depth below mean sea
         level before anything else (see ``apply_water_level``).
         """
+        from matplotlib.backends.backend_pdf import PdfPages  # lazy: figures only
+
         self.apply_water_level(water_level)
         # Create PDF output file
         if not pdf_output_filepath:
@@ -388,17 +395,23 @@ class FireFish:
         return up_vector, depth_offset, depth_per_unit
 
     @staticmethod
-    def __plot_matches(x_values, series1, series2):
-        """Plot the matches between cameras and FireFish data"""
+    def __plot_matches(offsets, maes, num_matches):
+        """Plot the depth-regression MAE and the number of matched cameras
+        against the camera time offset."""
+        import matplotlib.pyplot as plt  # lazy: figures only
+
         fig, ax1 = plt.subplots()
 
         color = "tab:blue"
-        ax1.plot(x_values, series1, color=color)
+        ax1.plot(offsets, maes, color=color)
+        ax1.set_xlabel("Camera time offset (s)")
+        ax1.set_ylabel("Depth regression MAE (m)", color=color)
         ax1.tick_params(axis="y", labelcolor=color)
 
         ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
         color = "tab:red"
-        ax2.plot(x_values, series2, color=color)
+        ax2.plot(offsets, num_matches, color=color)
+        ax2.set_ylabel("Cameras matched", color=color)
         ax2.tick_params(axis="y", labelcolor=color)
 
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
@@ -425,7 +438,7 @@ def get_unix_time(unknown_datetime):
     return unknown_datetime
 
 
-def get_time_diff_in_secs(datetime1, datetime2):
+def get_time_diff_s(datetime1, datetime2):
     """Calculates the time difference in seconds between two datetime values.
 
     Args:
@@ -440,3 +453,6 @@ def get_time_diff_in_secs(datetime1, datetime2):
     datetime1_unix = get_unix_time(datetime1)
     datetime2_unix = get_unix_time(datetime2)
     return int(datetime1_unix - datetime2_unix)
+
+
+get_time_diff_in_secs = get_time_diff_s  # deprecated alias (renamed 2026-11-25)

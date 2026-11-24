@@ -4,6 +4,8 @@ from typing import Tuple
 import numpy as np
 import numpy.typing as npt
 
+from substrata.frames import uniform_scale as _uniform_scale
+
 FloatArray = npt.NDArray[np.float64]
 
 
@@ -79,9 +81,10 @@ class Transform:
 
     @classmethod
     def from_depth_offset(cls, dz: float) -> "Transform":
-        """Translate the scene by **−dz** along Z.
+        """Translate the scene by **+dz** along Z.
 
-        A positive ``dz`` moves geometry *toward* the viewer if +Z is up.
+        A positive ``dz`` moves geometry up (towards +Z): with depths negative
+        below the surface, ``z + dz`` is the depth after the offset.
         """
         return cls.from_translation((0.0, 0.0, float(dz)))
 
@@ -117,10 +120,13 @@ class Transform:
             axis: Length-3 vector describing the rotation axis.
             angle_rad: Rotation angle in radians.
         """
-        axis = np.asarray(axis, dtype=float)
+        axis = np.array(axis, dtype=float)  # a copy: the caller's array is kept
         if axis.shape != (3,):
             raise ValueError("`axis` must be a length-3 vector.")
-        axis /= np.linalg.norm(axis)
+        norm = np.linalg.norm(axis)
+        if norm == 0:
+            raise ValueError("`axis` must be non-zero.")
+        axis = axis / norm
         x, y, z = axis
         c, s = np.cos(angle_rad), np.sin(angle_rad)
         C = 1 - c
@@ -150,71 +156,7 @@ class Transform:
         )
         return cls(r)
 
-    @classmethod
-    def from_centroid(cls, pcd: "npt.ArrayLike | object") -> "Transform":
-        """Return a translation that moves *pcd*’s centroid to the origin.
-
-        Args:
-            pcd:  • Open3D/Decorated point cloud with a ``points`` attribute, or
-                  • Any `(N, 3)` array-like of XYZ coordinates.
-
-        Returns:
-            Transform: 4 × 4 matrix that translates by **−centroid**.
-        """
-        # Get the raw (N, 3) array of points
-        points = np.asarray(pcd.points) if hasattr(pcd, "points") else np.asarray(pcd)
-        if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError("`pcd` must provide an (N, 3) point array.")
-
-        centroid = points.mean(axis=0)
-        t = np.eye(4, dtype=float)
-        t[:3, 3] = -centroid
-        return cls(t)
-
-    @classmethod
-    def from_xy_origin(cls, xy: "npt.ArrayLike | Tuple[float, float]") -> "Transform":
-        """Create a transform that shifts the X-Y origin to *xy*.
-
-        Args:
-            xy: Two-element sequence (x, y) or any array-like convertible to that.
-
-        Returns:
-            Transform: 4 × 4 matrix translating by (−x, −y, 0).
-
-        """
-        x, y = np.asarray(xy, dtype=float).flatten()[:2]
-        t = np.eye(4, dtype=float)
-        t[0, 3] = -x
-        t[1, 3] = -y
-        return cls(t)
-
     # ------------------------------------------------------------------ up-vector helper
-
-    @classmethod
-    def from_up_vector_legacy(cls, up: "Vector | npt.ArrayLike") -> "Transform":
-        """Build a rotation that mimics the legacy get_up_vector_transform (intrinsic Z–Y–X)."""
-        # Use the same angle definitions as the legacy helper:
-        # theta_xz = atan2(-vx, -vz), psi_yz = atan2(-vy, -vz)
-        v = up.xyz if isinstance(up, Vector) else Vector(up).xyz
-        theta_xz = np.arctan2(-v[0], -v[2])
-        psi_yz = np.arctan2(-v[1], -v[2])
-
-        cb, sb = np.cos(theta_xz), np.sin(theta_xz)
-        cg, sg = np.cos(psi_yz), np.sin(psi_yz)
-
-        # Intrinsic Z–Y–X with α=0 reduces to this 3×3 (matches legacy formula)
-        R = np.array(
-            [
-                [cb, sb * sg, sb * cg],
-                [0.0, cg, -sg],
-                [-sb, cb * sg, cb * cg],
-            ],
-            dtype=float,
-        )
-
-        T = np.eye(4, dtype=float)
-        T[:3, :3] = R
-        return cls(T)
 
     @classmethod
     def from_up_vector(cls, up: "Vector | npt.ArrayLike") -> "Transform":
@@ -242,7 +184,8 @@ class Transform:
     @classmethod
     def align_x_to_vector(cls, v: "Vector | npt.ArrayLike") -> "Transform":
         """Rotate so the global +X axis becomes parallel to *v* (in XY-plane)."""
-        vec = v.xyz if isinstance(v, Vector) else Vector(v).xyz
+        # a copy: neither the (frozen) Vector nor the caller's array is changed
+        vec = np.array(v.xyz if isinstance(v, Vector) else Vector(v).xyz)
         vec[2] = 0  # force into XY-plane
         if np.allclose(vec[:2], 0):
             return cls.identity()  # already along X or vector is zero
@@ -350,33 +293,6 @@ class Transform:
         )
 
     @classmethod
-    def align_normal_to_z(cls, normal: "Vector | npt.ArrayLike") -> "Transform":
-        """Rotate so *normal* becomes the global +Z axis.
-
-        Args:
-            normal: Plane normal to be aligned.
-
-        Returns:
-            Transform: 4 × 4 rotation matrix.
-        """
-        n = normal.xyz if isinstance(normal, Vector) else Vector(normal).xyz
-        n = n / np.linalg.norm(n)
-
-        # Find any vector not parallel to n
-        ref = (
-            np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        )
-
-        x_n = np.cross(ref, n)
-        x_n /= np.linalg.norm(x_n)
-        y_n = np.cross(n, x_n)
-
-        R = np.vstack((x_n, y_n, n))  # rows → new basis
-        T = np.eye(4, dtype=float)
-        T[:3, :3] = R
-        return cls(T)
-
-    @classmethod
     def from_point_correspondences(
         cls,
         src: npt.ArrayLike,
@@ -431,13 +347,22 @@ class Transform:
 
     # --------------------------------------------------------------------- numeric operators
 
-    def __matmul__(self, other: "Transform") -> "Transform":
-        """Compose two transforms (`self` after `other`)."""
-        return Transform(other.mat @ self.mat)
+    def __matmul__(self, other: "Transform | npt.ArrayLike") -> "Transform":
+        """Compose like the matrix product: ``(A @ B).mat == A.mat @ B.mat``.
 
-    def __rmatmul__(self, other: "Transform") -> "Transform":
-        """Compose two transforms (`other` after `self`)."""
-        return Transform(self.mat @ other.mat)
+        ``A @ B`` applies ``B`` first, then ``A`` (``self`` after ``other``),
+        as for the underlying 4 x 4 matrices.
+        """
+        other_mat = other.mat if isinstance(other, Transform) else np.asarray(other)
+        return Transform(self.mat @ other_mat)
+
+    def __rmatmul__(self, other: "npt.ArrayLike") -> "Transform":
+        """``other @ self`` for a non-Transform 4 x 4 ``other``: other after self.
+
+        (A NumPy array on the left uses its own ``@`` with :meth:`__array__`
+        and returns an array.)
+        """
+        return Transform(np.asarray(other, dtype=float) @ self.mat)
 
     # --------------------------------------------------------------------- convenience operations
 
@@ -455,7 +380,9 @@ class Transform:
 
     # --------------------------------------------------------------------- interoperability helpers
 
-    def __array__(self, dtype: npt.DTypeLike | None = None) -> np.ndarray:
+    def __array__(
+        self, dtype: npt.DTypeLike | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         """Return the underlying 4 × 4 matrix for NumPy / Open3D.
 
         NumPy calls this automatically inside ``np.asarray(T)``.  Because
@@ -466,15 +393,13 @@ class Transform:
 
         Args:
             dtype: Optional dtype to cast to (NumPy passes this through).
+            copy: NumPy 2 ``copy`` keyword; ``True`` returns a copy.
 
         Returns:
             numpy.ndarray: The (4, 4) homogeneous matrix.
         """
-        return self.mat.astype(dtype) if dtype is not None else self.mat
-
-    def to_open3d(self) -> np.ndarray:
-        """Return a view of the matrix suitable for Open3D."""
-        return self.mat
+        arr = self.mat.astype(dtype) if dtype is not None else self.mat
+        return arr.copy() if copy else arr
 
     def as_ndarray(self) -> FloatArray:
         """Return a **copy** of the underlying 4 x 4 array."""
@@ -486,7 +411,8 @@ class Vector:
     """Immutable homogeneous 4-vector.
 
     Accepts a 3- or 4-element vector. If a 3-vector is provided it is promoted
-    to homogeneous form by appending ``1.0``.
+    to homogeneous form by appending ``1.0``. Dot products (``dot``, ``@``) use
+    the Cartesian ``xyz`` part only, so the homogeneous ``w`` never adds to them.
     """
 
     vec: FloatArray
@@ -514,9 +440,9 @@ class Vector:
 
     # ------------------------------------------------------------------ numeric helpers
     def dot(self, other: "Vector | npt.ArrayLike") -> float:
-        """Return the dot product with another vector (auto-promotes)."""
+        """Return the dot product of the ``xyz`` parts (``w`` is ignored)."""
         o = other if isinstance(other, Vector) else Vector(other)
-        return float(np.dot(self.vec, o.vec))
+        return float(np.dot(self.xyz, o.xyz))
 
     # Use the @ operator for dot products
     def __matmul__(self, other: "Vector | npt.ArrayLike") -> float:  # self @ other
@@ -526,58 +452,16 @@ class Vector:
         return Vector(other).dot(self)
 
     # ------------------------------------------------------------------ interoperability
-    def __array__(self, dtype: npt.DTypeLike | None = None) -> np.ndarray:
+    def __array__(
+        self, dtype: npt.DTypeLike | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         """Return the underlying 4-element array for NumPy / Open3D."""
-        return self.vec.astype(dtype) if dtype is not None else self.vec
+        arr = self.vec.astype(dtype) if dtype is not None else self.vec
+        return arr.copy() if copy else arr
 
     def as_ndarray(self) -> FloatArray:
         """Return a copy of the underlying 4-vector."""
         return self.vec.copy()
-
-    # ------------------------------------------------------------------ orientation helpers
-    def intrinsic_zyx_angles(self) -> tuple[float, float, float]:
-        """Return the intrinsic Z–Y–X (yaw, pitch, roll) angles in **radians**.
-
-        The angles describe the rotation that aligns the global +Z axis with this
-        vector’s direction using the Tait-Bryan (yaw–pitch–roll) convention:
-
-        1. **γ**  (roll)  – rotation about **X** (default 0 because a single
-           direction doesn’t constrain roll).
-        2. **β**  (pitch) – rotation about **Y** to tilt in the XZ-plane so the
-           vector’s X/Z ratio matches.
-        3. **α**  (yaw)   – rotation about **Z**; for a single vector we set it
-           to 0 because yaw is also unconstrained.
-
-        Returns:
-            tuple: (α, β, γ) = (yaw_Z, pitch_Y, roll_X) in radians.
-        """
-        x, y, z = self.xyz / np.linalg.norm(self.xyz)
-
-        # Pitch (β): angle between vector and +Z in the XZ-plane (Y-axis rotation)
-        beta = np.arctan2(x, z)  # +Y rotation: left/right tilt
-
-        # Roll (γ): angle between vector and its XZ projection in the YZ-plane
-        gamma = -np.arctan2(y, np.hypot(x, z))  # +X rotation: up/down tilt
-
-        alpha = 0.0  # yaw about Z is undefined for a lone direction; set to 0
-
-        return alpha, beta, gamma
-
-
-def calculate_vector_angle(opposite_y, adjacent_x):
-    """Return the angle (in degrees) between a 2D vector and the x-axis.
-
-    Args:
-        opposite_y: The vertical (y) component of the vector.
-        adjacent_x: The horizontal (x) component of the vector.
-
-    Returns:
-        Angle in degrees between the vector and the x-axis.
-
-    Formerly:
-        calculate_angle_between_two_lengths
-    """
-    return np.degrees(np.arctan2(opposite_y, adjacent_x))
 
 
 def fit_correspondences_rejecting_outliers(
@@ -846,9 +730,9 @@ def chunk_transform_to_enu(
     chunk = np.asarray(chunk_transform, dtype=float)
     if chunk.shape != (4, 4):
         raise ValueError(f"chunk_transform must have shape (4, 4); got {chunk.shape}")
-    scale = float(np.cbrt(np.linalg.det(chunk[:3, :3])))
-    if scale <= 0:
+    if np.linalg.det(chunk[:3, :3]) <= 0:
         raise ValueError("chunk_transform has a non-positive determinant")
+    scale = _uniform_scale(chunk)
     ref_ecef = transform_coords(np.asarray(ref_point, dtype=float), chunk)
     lat, lon, _ = ecef_to_geodetic(ref_ecef)
     enu = ecef_to_enu_transform(lat, lon, 0.0)

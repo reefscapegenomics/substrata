@@ -50,7 +50,8 @@ What you can do with substrata
 * **Scaling & orientation** — recover real-world scale from scalebars and orient
   a reconstruction into a world coordinate frame.
 * **Measurements** — compute terrain and ecology metrics such as TPI/TRI,
-  rugosity, fractal dimension, surface area, gap fraction, and depth regression.
+  roughness (Ra/Rq), plane angles, vector dispersion, gap fraction, benthic
+  fraction, surface area, and depth regression.
 * **Visualization** — render composite views and QC report PDFs with ``open3d``
   and ``matplotlib``.
 
@@ -64,8 +65,20 @@ instructions, including the conda environment used for the heavy dependencies
 Tutorials
 ---------
 
-If you're new to substrata, these notebook tutorials walk through complete
-workflows end to end:
+These tutorials walk through complete workflows, with the commands in order, the
+files each step reads and writes, and how to check the result:
+
+* :doc:`tutorials/plot_workflow` — from a Metashape project to a scaled,
+  oriented, colour-corrected plot ready to measure
+* :doc:`tutorials/annotate_and_classify` — point intercepts, labels, a trained
+  classifier, predictions and a segmented cloud
+* :doc:`tutorials/closeups` — pose close-up (macro) photos of colonies, turn them
+  into annotations and make one page per colony
+* :doc:`tutorials/measurements_in_python` — TPI/TRI, roughness, plane angles,
+  vector dispersion, gap fraction and benthic fraction around annotations, and
+  exactly what each computes
+
+These notebooks show more workflows in Python, with their saved output:
 
 * :doc:`notebooks/scaling_and_orientation` — scale and orient a point cloud
   from scalebar markers
@@ -103,6 +116,10 @@ documents all modules, classes, and functions.
    :maxdepth: 1
    :caption: Tutorials
 
+   tutorials/plot_workflow
+   tutorials/annotate_and_classify
+   tutorials/closeups
+   tutorials/measurements_in_python
    notebooks/scaling_and_orientation
    notebooks/transferring_annotations
    notebooks/measurements_tpi

@@ -100,12 +100,20 @@ def parse_time(value) -> Optional[_dt.datetime]:
 
 
 def by_time(cams) -> Dict[_dt.datetime, Any]:
-    """The cameras by their ``datetime`` (the first of several at the same second), those without one left out."""
+    """The cameras by their ``datetime`` (to the second), those without one left out. Of several at the same
+    second the first is kept, with a warning giving how many were left out."""
     out: Dict[_dt.datetime, Any] = {}
+    dropped = 0
     for c in (cams.data.values() if hasattr(cams, "data") else cams):
         t = parse_time(getattr(c, "datetime", None))
-        if t is not None and t not in out:
-            out[t] = c
+        if t is None:
+            continue
+        if t in out:
+            dropped += 1
+            continue
+        out[t] = c
+    if dropped:
+        logger.warning(f"{dropped} camera(s) share a second with another one; one camera per second is used")
     return out
 
 
@@ -133,28 +141,62 @@ def _cv2():
     return cv2
 
 
-def _gray(path: str, reduce: int = 1):
+def read_gray(path: str, reduce: int = 1):
+    """The photo in grey, its JPEG decoded at 1/``reduce`` size, in its stored pixel grid (EXIF orientation not
+    applied, whatever ``reduce``: :func:`substrata.fileio.imread`)."""
+    from .fileio import imread
+
     cv2 = _cv2()
     flag = {1: cv2.IMREAD_GRAYSCALE, 2: cv2.IMREAD_REDUCED_GRAYSCALE_2, 4: cv2.IMREAD_REDUCED_GRAYSCALE_4,
             8: cv2.IMREAD_REDUCED_GRAYSCALE_8}[reduce]
-    img = cv2.imread(path, flag)
+    img = imread(path, flag)
     if img is None:
         raise OSError(f"Cannot read {path}")
     return img
 
 
-def _resize_width(img, width: int):
+_gray = read_gray  # deprecated alias (renamed 2026-11-25)
+
+
+def resize_to_width(img, width: int):
     cv2 = _cv2()
     h, w = img.shape[:2]
     return cv2.resize(img, (int(width), max(1, int(round(h * width / w)))), interpolation=cv2.INTER_AREA)
 
 
-def _reduce_for(width_full: int, width_wanted: float) -> int:
+_resize_width = resize_to_width  # deprecated alias (renamed 2026-11-25)
+
+
+def jpeg_reduction_for(width_full: int, width_wanted: float) -> int:
     """The JPEG reduction (1, 2, 4, 8) that still leaves at least ``width_wanted`` px."""
     for r in (8, 4, 2):
         if width_full / r >= width_wanted:
             return r
     return 1
+
+
+_reduce_for = jpeg_reduction_for  # deprecated alias (renamed 2026-11-25)
+
+
+def to_sensor_px(pts, scale: float, offset=(0.0, 0.0)) -> np.ndarray:
+    """Keypoints of a resized image as continuous pixels of the full-size image.
+
+    Matchers (OpenCV, kornia) give a pixel's centre as its integer index; the projections (Metashape's
+    convention, :func:`substrata.cameras.camera_points_to_pixels`) put pixel ``i``'s centre at ``i + 0.5``. A keypoint ``p`` of
+    an image resized by ``1 / scale`` (cut at ``offset`` from the full-size image first, if a crop) is therefore at
+    ``(p + 0.5) * scale + offset`` in the full-size image - not ``p * scale``, which is off by up to half a reduced
+    pixel (``scale / 2`` full-size px).
+
+    Args:
+        pts: ``(N, 2)`` keypoints (x, y) in the resized image.
+        scale: Full-size px per resized px.
+        offset: The crop's top-left corner in the full-size image (px).
+
+    Returns:
+        ``(N, 2)`` float array.
+    """
+    p = np.asarray(pts, float).reshape(-1, 2)
+    return (p + 0.5) * float(scale) + np.asarray(offset, float).reshape(1, 2)
 
 
 def _sift(img, n: int = 3000):
@@ -167,9 +209,9 @@ def _sift(img, n: int = 3000):
 def _coarse_source(path: str):
     """SIFT on a frame, small: (points in the frame's full-resolution px, descriptors)."""
     w_full = _image_width(path)
-    img = _gray(path, _reduce_for(w_full, COARSE_SOURCE_WIDTH))
-    p, d = _sift(_resize_width(img, COARSE_SOURCE_WIDTH), COARSE_SOURCE_FEATURES)
-    return p * (w_full / COARSE_SOURCE_WIDTH), d
+    img = read_gray(path, jpeg_reduction_for(w_full, COARSE_SOURCE_WIDTH))
+    p, d = _sift(resize_to_width(img, COARSE_SOURCE_WIDTH), COARSE_SOURCE_FEATURES)
+    return to_sensor_px(p, w_full / COARSE_SOURCE_WIDTH), d
 
 
 def _image_width(path: str) -> int:
@@ -181,10 +223,10 @@ def _image_width(path: str) -> int:
 
 def _coarse_target(path: str, width_full: int):
     """SIFT on a close-up, small: (points in the close-up's full-resolution px, descriptors)."""
-    img = _gray(path, _reduce_for(width_full, COARSE_TARGET_WIDTH))
+    img = read_gray(path, jpeg_reduction_for(width_full, COARSE_TARGET_WIDTH))
     sc = COARSE_TARGET_WIDTH / img.shape[1] * (img.shape[1] / width_full)
-    p, d = _sift(_resize_width(img, COARSE_TARGET_WIDTH))
-    return p / sc, d
+    p, d = _sift(resize_to_width(img, COARSE_TARGET_WIDTH))
+    return to_sensor_px(p, 1.0 / sc), d
 
 
 def homography_inliers(A: np.ndarray, B: np.ndarray, threshold: float = HOMOGRAPHY_THRESHOLD_PX, usac: bool = False):
@@ -600,7 +642,7 @@ def match_targets(
 
     def frame(ts):
         if ts not in frames_cache:
-            frames_cache[ts] = _gray(sources[ts].filepath)
+            frames_cache[ts] = read_gray(sources[ts].filepath)
             if len(frames_cache) > 4 * (2 * frames + 1):
                 frames_cache.popitem(last=False)
         return frames_cache[ts]
@@ -621,7 +663,7 @@ def match_targets(
         best: Dict[str, Any] = dict(n=0)
         cid = str(c.cam_id)
         if t is not None:
-            img = _resize_width(_gray(c.filepath, _reduce_for(c.sensor.width, tw)), tw)
+            img = resize_to_width(read_gray(c.filepath, jpeg_reduction_for(c.sensor.width, tw)), tw)
             img = img[: img.shape[0] // 8 * 8]
             ih, iw = img.shape
             tsc = c.sensor.width / tw
@@ -646,7 +688,8 @@ def match_targets(
                     a, b = m.match(gray, g, ft, m.features(g))
                     if len(a) < 8:
                         continue
-                    A, B = unrotate(a, k, iw, ih) * tsc, b / sc + [box[0], box[1]]
+                    A = to_sensor_px(unrotate(a, k, iw, ih), tsc)
+                    B = to_sensor_px(b, 1.0 / sc, (box[0], box[1]))
                     n, H, keep = homography_inliers(A, B, usac=True)
                     if n > best["n"]:
                         best = dict(n=n, source=sources[ts], dt=int((ts - t).total_seconds()) - offset, A=A[keep],
@@ -701,14 +744,19 @@ def pose_from_points(obj: np.ndarray, img: np.ndarray, sensor, *, threshold: flo
     RANSAC (EPnP), then refined on the inliers. Returns (R world -> camera, centre, inlier indices, per-inlier
     reprojection errors in px) or None."""
     cv2 = _cv2()
-    from .cameras import _undistort
+    from .cameras import pixels_to_normalized
 
     obj = np.asarray(obj, np.float64)
     img = np.asarray(img, np.float64)
     if len(obj) < max(PNP_MIN_INLIERS, 6):
         return None
-    xn, yn = _undistort(img[:, 0], img[:, 1], sensor)
+    xn, yn = pixels_to_normalized(img[:, 0], img[:, 1], sensor)
     norm = np.stack([xn, yn], 1).astype(np.float64)
+    # (a pixel the lens model cannot reach undistorts to NaN: left out, as a non-finite 3-D point)
+    finite = np.isfinite(norm).all(1) & np.isfinite(obj).all(1)
+    obj, norm = obj[finite], norm[finite]
+    if len(obj) < max(PNP_MIN_INLIERS, 6):
+        return None
     K = np.eye(3)
     cv2.setRNGSeed(seed)
     ok, rvec, tvec, inl = cv2.solvePnPRansac(obj, norm, K, None, reprojectionError=threshold * sensor.width / sensor.f,
@@ -809,34 +857,42 @@ def assess(poses: Dict[str, Optional[Dict[str, Any]]], second: Optional[Dict[str
 # --------------------------------------------------------------------------- writing a pose
 
 
+def pose_transform(R: np.ndarray, C: np.ndarray, scale: float) -> np.ndarray:
+    """A current-frame camera transform from ``R`` (world -> camera) and centre ``C``: ``T[:3, :3]`` =
+    ``scale * R.T`` (the world transform's scale carried in the pose, as for cameras loaded from the project),
+    ``T[:3, 3]`` = ``C``."""
+    T = np.eye(4)
+    T[:3, :3] = scale * np.asarray(R, float).T
+    T[:3, 3] = np.asarray(C, float)
+    return T
+
+
 def set_pose(cam, R: np.ndarray, C: np.ndarray, world_transform: np.ndarray) -> None:
     """Give ``cam`` the pose ``R`` (world -> camera) / centre ``C`` in the current (world) frame, and the matching
     original-frame pose (what ``Cameras.save`` writes to the meta JSON). The world transform's scale is carried in
     the current frame's camera transform, as for cameras loaded from the project."""
-    from .cameras import _projection_changed
+    from .cameras import invalidate_projection_cache
+
+    from .frames import uniform_scale
 
     W = np.asarray(world_transform, float)
-    s = float(np.linalg.norm(W[:3, 0]))
-    T = np.eye(4)
-    T[:3, :3] = s * np.asarray(R, float).T
-    T[:3, 3] = np.asarray(C, float)
-    cam.camera_transform = T
+    cam.camera_transform = pose_transform(R, C, uniform_scale(W))
     cam.coords = np.asarray(C, float).copy()
     cam.reverse_transform_coords(W)
     for flag in ("missing_pose_from_meta", "missing_pose_from_timematch", "pose_cleared"):
         if hasattr(cam, flag):
             delattr(cam, flag)
-    _projection_changed()
+    invalidate_projection_cache()
 
 
 def clear_pose(cam) -> None:
     """Leave ``cam`` without a pose (``Cameras.save`` then writes a null pose) and disabled."""
-    from .cameras import _projection_changed
+    from .cameras import invalidate_projection_cache
 
     cam.missing_pose_from_meta = True
     cam.pose_cleared = True
     cam.enabled = False
-    _projection_changed()
+    invalidate_projection_cache()
 
 
 # --------------------------------------------------------------------------- all steps
@@ -1150,130 +1206,10 @@ def poses_payload(report: Dict[str, Any], targets: Sequence[Any], *, pose_source
                 n_cameras=len(cams), cameras=cams)
 
 
-def _thumb(path: str, size: int):
-    from PIL import Image
-
-    im = Image.open(path)
-    im.draft("RGB", (size, size))
-    im = im.convert("RGB")
-    im.thumbnail((size, size))
-    return im
-
-
 def write_report_pdf(report: Dict[str, Any], targets: Sequence[Any], path: str, *, title: str = "",
                      max_posed: int = 9, per_page: int = 3) -> str:
-    """The run's quality check: a summary page with the offset's scores, then close-ups next to their frame (the
-    close-up's centre mapped into the frame by the matches' homography: red; where its pose aims: green). Every
-    close-up that was not posed is shown, and up to ``max_posed`` posed ones (spread over the run)."""
-    import matplotlib
+    """The run's quality-check PDF (:func:`substrata.visualizations.write_imagesync_report_pdf`)."""
+    from substrata import visualizations  # lazy: figures only
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    off = report["offset"]
-    status = report["status"]
-    counts: Dict[str, int] = {}
-    for s, _n in status.values():
-        counts[s] = counts.get(s, 0) + 1
-    with PdfPages(path) as pdf:
-        fig = plt.figure(figsize=(11.7, 8.3))
-        lines = [title or "camsync --match-images", "",
-                 f"Time offset: {report['time_offset']} s (a close-up taken at t is in the frame of t + offset)"
-                 if report["time_offset"] is not None else f"No time offset: {off.get('reason', '')}",
-                 f"  from the images: peak {off.get('offset')} s, {off.get('prominence', 0):.1f}x the median vote, "
-                 f"{off.get('n_agree', 0)} of {off.get('n_targets', 0)} close-ups agree; offsets tried "
-                 f"{off.get('window')}",
-                 "  confirmed with the learned matcher: " + ", ".join(
-                     f"{r['matched']} of {r['sampled']} close-ups match at {r['offset']} s"
-                     for r in (report.get("confirm") or {}).get("tried", [])) if (report.get("confirm") or {}).get("tried")
-                 else "",
-                 f"  close-up centre in a frame ~{tuple(int(v) for v in report['aim'])} px, ~{report['width_px']:.0f} px "
-                 f"wide, turned {off.get('rotation_deg') or 0:.0f} deg (matched turned {90 * report.get('turns', 0)} deg)"
-                 if report.get("aim") else "",
-                 "  unaligned frames posed by substrata (--pose-frames): {} of {}".format(
-                     sum(bool(r.get("used")) for r in report["frame_poses"].values()), len(report["frame_poses"]))
-                 if report.get("frame_poses") else "",
-                 "  rig (close-up relative to its frame) from {n} posed close-ups: spread {a:.1f} cm, {b:.1f} deg; "
-                 "close-ups without a good match estimated from it".format(
-                     n=report["rig"]["n"], a=100 * report["rig"]["spread_m"], b=report["rig"]["spread_deg"])
-                 if report.get("rig") else "", "",
-                 "Close-ups: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))]
-        rng = [p["range"] for cid, p in report["poses"].items() if p and status.get(cid, ("",))[0] == "posed"]
-        if rng:
-            lines.append(f"  posed: camera to reef {np.median(rng):.2f} m (median; {min(rng):.2f}-{max(rng):.2f})")
-        fig.text(0.05, 0.95, "\n".join(lines), va="top", family="monospace", fontsize=9)
-        if off.get("ks") is not None and len(off["ks"]):
-            ax = fig.add_axes([0.08, 0.08, 0.86, 0.45])
-            ax.plot(off["ks"], off["curve"], lw=0.8)
-            if off.get("offset") is not None:
-                ax.axvline(off["offset"], color="red", lw=0.8, ls="--")
-            ax.set_xlabel("offset (s): frame time - close-up time")
-            ax.set_ylabel("votes (each close-up's matches / its best)")
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        rows = sorted(targets, key=lambda c: c.filename)
-        posed = [c for c in rows if status.get(str(c.cam_id), ("",))[0] == "posed"]
-        keep = {str(c.cam_id) for c in rows if status.get(str(c.cam_id), ("",))[0] != "posed"}
-        if rng:  # (and the posed ones at an unusual range)
-            med = float(np.median(rng))
-            keep |= {str(c.cam_id) for c in posed if (report["poses"].get(str(c.cam_id)) or {}).get("range")
-                     and not (med / 1.5 <= report["poses"][str(c.cam_id)]["range"] <= 1.5 * med)}
-        if posed and max_posed > 0:
-            keep |= {str(posed[i].cam_id) for i in np.linspace(0, len(posed) - 1, min(max_posed, len(posed))).round()
-                     .astype(int)}
-        show = [c for c in rows if str(c.cam_id) in keep]
-        for start in range(0, len(show), per_page):
-            fig, axes = plt.subplots(per_page, 2, figsize=(8.3, 11.7))
-            for r, c in enumerate(show[start:start + per_page]):
-                cid = str(c.cam_id)
-                s, note = status.get(cid, ("no pose", ""))
-                m = report["matches"].get(cid) or {}
-                p = report["poses"].get(cid) or {}
-                a0, a1 = axes[r]
-                a0.imshow(_thumb(c.filepath, 700))
-                head = f"{c.filename}: {s}" + (f" ({note})" if note else "")
-                info = f"{m.get('n', 0)} matches"
-                if p and s != "estimated":
-                    info += f", {p['inliers']} pose inliers, error {p['error']:.0f} px" + (
-                        f", range {p['range']:.2f} m" if p.get("range") else "")
-                elif p:
-                    info += f"; estimated: range {p['range']:.2f} m" if p.get("range") else "; estimated"
-                a0.set_title(head + "\n" + info, fontsize=7, loc="left")
-                src = m.get("source")
-                if s == "estimated" and p.get("frame") is not None and p.get("aim") is not None:
-                    src = p["frame"]
-                    x, y, *_ = src.get_pixel_coords(p["aim"])
-                    big = _thumb(src.filepath, max(src.sensor.width, src.sensor.height))
-                    if x is not None:
-                        half = 1.5 * max(report.get("width_px") or 400, 200)
-                        box = (int(x - half), int(y - 0.6 * half), int(x + half), int(y + 0.6 * half))
-                        a1.imshow(big.crop(box), extent=(box[0], box[2], box[3], box[1]))
-                        a1.plot(x, y, "x", color="lime", ms=10, mew=2)
-                    else:
-                        a1.imshow(big)
-                    a1.set_title(f"{src.filename} ({p.get('dt', 0):+d} s from the offset time): where the estimate "
-                                 "aims (green)", fontsize=7, loc="left")
-                elif src is not None and m.get("H") is not None:
-                    hc = map_point(m["H"], (c.sensor.width / 2, c.sensor.height / 2))
-                    big = _thumb(src.filepath, max(src.sensor.width, src.sensor.height))
-                    half = 1.5 * max(report.get("width_px") or 400, 200)
-                    box = (int(hc[0] - half), int(hc[1] - 0.6 * half), int(hc[0] + half), int(hc[1] + 0.6 * half))
-                    a1.imshow(big.crop(box), extent=(box[0], box[2], box[3], box[1]))
-                    a1.plot(*hc, "+", color="red", ms=14, mew=2)
-                    if p and p.get("aim") is not None:
-                        x, y, *_ = src.get_pixel_coords(p["aim"])
-                        if x is not None:
-                            a1.plot(x, y, "x", color="lime", ms=10, mew=2)
-                    a1.set_title(f"{src.filename} ({m.get('dt', 0):+d} s from the offset time)", fontsize=7, loc="left")
-                for a in (a0, a1):
-                    a.set_xticks([])
-                    a.set_yticks([])
-            for r in range(len(show[start:start + per_page]), per_page):
-                axes[r][0].axis("off")
-                axes[r][1].axis("off")
-            fig.tight_layout()
-            pdf.savefig(fig)
-            plt.close(fig)
-    return path
+    return visualizations.write_imagesync_report_pdf(
+        report, targets, path, title=title, max_posed=max_posed, per_page=per_page)

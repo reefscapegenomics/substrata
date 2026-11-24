@@ -17,12 +17,14 @@ from __future__ import annotations
 import csv
 import os
 import re
-import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 # Local Modules
 from substrata import settings
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.compat import warn_renamed_kwarg as _warn_renamed_kwarg
+from substrata.fileio import atomic_write_text as _fileio_write_text
 from substrata.logging import logger
 
 # Result of an interactive decision: ("pick", path) / ("skip", None) /
@@ -133,7 +135,8 @@ def build_image_index(
     root: str,
     exts: Tuple[str, ...] = settings.PATHREPAIR_IMAGE_EXTS,
     skip_dir_names: Tuple[str, ...] = settings.PATHREPAIR_SKIP_DIR_NAMES,
-    quiet: bool = False,
+    verbose: bool = True,
+    quiet: Optional[bool] = None,
 ) -> Dict[str, List[str]]:
     """Index every image file under a directory tree by lower-cased basename.
 
@@ -150,12 +153,17 @@ def build_image_index(
         root: Directory to search recursively.
         exts: Lower-case file extensions to index.
         skip_dir_names: Directory names to prune.
-        quiet: Suppress the indexed-count message.
+        verbose: Print the indexed-count message.
+        quiet: Deprecated (renamed 2026-11-25): ``quiet=True`` is
+            ``verbose=False``.
 
     Returns:
         dict[str, list[str]]: Lower-cased basename to a sorted list of absolute
         filepaths. A list with more than one entry is a duplicate basename.
     """
+    if quiet is not None:  # deprecated keyword (renamed 2026-11-25)
+        _warn_renamed_kwarg(build_image_index, "quiet", "verbose (= not quiet)")
+        verbose = not quiet
     root_abs = os.path.abspath(root)
     index: Dict[str, List[str]] = {}
     n_files = 0
@@ -171,7 +179,7 @@ def build_image_index(
     for paths in index.values():
         paths.sort()
     logger.info("Indexed %s image file(s) under %s", n_files, root_abs)
-    if not quiet:
+    if verbose:
         print(f"Indexed {n_files} image file(s) under {root_abs}")
     return index
 
@@ -224,7 +232,9 @@ def resolve_image_paths(
 
     1. The stored path already exists on disk, recorded as unchanged.
     2. A remembered old-to-new directory mapping yields an existing file.
-    3. Exactly one index entry for the basename, taken silently.
+    3. Exactly one index entry for the basename, taken silently when its
+       folder has the stored folder's name (or no ``on_duplicate`` is given:
+       then with a warning if it has not); otherwise put to ``on_duplicate``.
     4. Several index entries, exactly one of which sits in a directory whose
        final component matches the stored path's, taken silently.
     5. Several index entries, put to ``on_duplicate``.
@@ -318,10 +328,22 @@ def resolve_image_paths(
         candidates = index.get(basename.lower(), [])
 
         if len(candidates) == 1:
-            _record(plan, cam_id, stored, candidates[0], old_dir)
-            continue
+            # 3. One file of that name: taken silently when its folder has the
+            # stored folder's name (or no callback can ask). In another folder it
+            # may be another photo of the same name (GoPro and camera names repeat
+            # across dives), so it is put to on_duplicate once; the answer is
+            # remembered for the rest of the folder (rule 2).
+            want = _final_dir(stored)
+            if on_duplicate is None or not want or _final_dir(candidates[0]) == want:
+                if on_duplicate is None and want and _final_dir(candidates[0]) != want:
+                    logger.warning(
+                        "Camera %s: the only %s found is in another folder (%s); taken",
+                        cam_id, basename, path_dirname(candidates[0]),
+                    )
+                _record(plan, cam_id, stored, candidates[0], old_dir)
+                continue
 
-        if len(candidates) > 1:
+        if candidates:
             # 4. Disambiguate by matching final directory component. This
             # removes most duplicate prompts in practice (dive1 vs dive2).
             want = _final_dir(stored)
@@ -886,33 +908,18 @@ def read_csv_column(path: str, column: str) -> List[str]:
         return [r[i] for r in reader if len(r) > i and r[i].strip()]
 
 
-def atomic_write_text(text: str, out_path: str) -> str:
-    """Write text to a path atomically.
+@_renamed_kwargs(out_path="output_path")
+def atomic_write_text(text: str, output_path: str) -> str:
+    """Write text to a path atomically (:func:`substrata.fileio.atomic_write`).
 
-    Writes to a temporary file in the same directory and ``os.replace``s it into
-    position, so an interrupted write cannot truncate the original. Mirrors
-    :func:`substrata.cameras._atomic_write_json`, duplicated here rather than
-    imported because this module must not depend on ``cameras``.
+    An interrupted write cannot truncate the original, and the file keeps its
+    permission mode. The text is written as is (no newline translation).
 
     Args:
         text: Contents to write.
-        out_path: Destination path (created or replaced).
+        output_path: Destination path (created or replaced).
 
     Returns:
         str: The absolute path written.
     """
-    out_abs = os.path.abspath(out_path)
-    out_dir = os.path.dirname(out_abs) or "."
-    fd, tmp_path = tempfile.mkstemp(suffix=".yaml.tmp", prefix=".pathrepair_",
-                                    dir=out_dir)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp_path, out_abs)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return out_abs
+    return _fileio_write_text(output_path, text, newline="")

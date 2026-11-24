@@ -1,7 +1,4 @@
 import os
-import re
-
-OUTPUT_FOLDER = "output"
 
 # measure_all parallelism. Capped (rather than -1 = all cores) because the
 # measurements are memory-heavy: gap fraction shares the full point cloud across
@@ -12,7 +9,15 @@ DEFAULT_MEASURE_N_JOBS = 4
 DEFAULT_INLIER_RANGE = 0.01
 DEFAULT_TPI_RADIUS_INNER = 0.1  # metres; excludes focal object from neighbourhood
 DEFAULT_TPI_RADIUS_OUTER = 0.5  # metres; outer limit of annulus neighbourhood
-CANOPY_COVER_POINT_SPACING = 0.01
+# TPI/TRI: smallest fraction of the annulus area (equal-area polar cells, see
+# measurements.annulus_coverage) that must hold points for a valid result. Below
+# it the annulus is one-sided (e.g. near the edge of the cloud) and the
+# neighbourhood mean is biased by the slope, so NaN is returned.
+TPI_MIN_ANNULUS_COVERAGE = 0.75
+# TPI/TRI: XY cell size (metres) for area weighting: the annulus points of each cell
+# are replaced by their mean before any statistic, so densely photographed parts do
+# not weigh more. None weights every point equally (the default before 0.2.0).
+TPI_RASTER_CELL_SIZE = 0.01
 
 # calc_benthic_fraction: annulus neighbourhood + grid sampling of the surface.
 DEFAULT_BENTHIC_RADIUS_INNER = 0.1  # metres; excludes the focal object
@@ -68,8 +73,6 @@ CAMERA_TARGET_MAX_SEARCH_RADIUS = 0.03
 DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN = 0.01
 DEFAULT_REPROJECTION_THRESHOLD_DISCARD = 0.5
 
-DEFAULT_PIXEL_REPROJECTION_THRESHOLD = 2
-
 DEFAULT_DEPTH_ACCURACY_THRESHOLD = 0.3
 FIREFISH_DEPTH_ALTITUDE_OUTLIER_THRESHOLD = 4.0
 FIREFISH_MIN_NUM_CAM_MATCHES = 100
@@ -99,6 +102,15 @@ TRAIN_DELETE_PREVIEW = 5  # example paths shown before deleting redundant crops
 # controls which shown entries are bolded (i.e. used as training labels).
 TRAIN_MIN_VISIBLE_COUNT = 1
 TRAIN_SPLIT = (80, 10, 10)  # train / validation / test percentages
+# `train --split-by`: what shares a split (the collated CSV's split_key). "photo":
+# all points of a photo (neighbouring points of one photo look alike, so a
+# per-point split puts near-copies in train and validation and inflates the
+# metrics); "plot": all points of an annotation file's plot; "point": each
+# point on its own (the behaviour before 2026-11, to reproduce older runs).
+TRAIN_SPLIT_BY = "photo"
+TRAIN_SPLIT_BY_CHOICES = ("photo", "plot", "point")
+# Random seed of the fastai crop classifier's training (recorded in the summary)
+TRAIN_SEED = 0
 TRAIN_CROP_DIRS = ("training_crops", "validation_crops", "test_crops")
 # `train --arch`: a DINOv2 / DINOv3 backbone (point-feature classifier, the
 # default; a short-hand of POINT_ARCH_ALIASES or a torch.hub name) or a
@@ -191,6 +203,10 @@ CURATION_ACTIONS = ("accept", "relabel", "exclude", "clear")
 # Reasons offered for excluding a point (any text is accepted)
 CURATION_EXCLUDE_REASONS = ("mixed", "misplaced", "unclear", "photo", "other")
 CURATION_CV_FOLDS = 5  # cross-validated probabilities (grouped by photo)
+# Splits whose points `substrata curate` scores and lists for review (None: all).
+# Only the train split by default: relabelling held-out points where the model
+# disagrees would tune the validation / test labels towards the model.
+CURATION_SPLITS = ("train",)
 # Neighbourhood ring: positions this far from the point (model px; 2 feature
 # cells at the default 448 px window) in CURATION_RING_N directions
 CURATION_RING_RADIUS_PX = 28
@@ -266,7 +282,6 @@ CORALNET_POINTS_DIR = "coralnet_points"  # converted CSVs, under --output
 # ANSI styling for bolded (training-label) entries in terminal tree output.
 TRAIN_BOLD = "\033[1m"
 TRAIN_RESET = "\033[0m"
-TRAIN_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 # --- Annotation crops, thumbnails and predictions (substrata crops/predict) ---
 CROP_SIZE_DEFAULT = (800, 800)  # pixels (w, h); centred on the image match
@@ -283,6 +298,21 @@ CROPS_DIR_SUFFIX = ".cropped"  # default crops dir: <annotations csv stem>.cropp
 ANNOTATION_SIDECAR_SUFFIX = ".yaml"
 THUMBNAIL_MAX_SIZE = (1024, 768)  # pixels; bounding box, aspect ratio is kept
 THUMBNAILS_DIR_SUFFIX = ".thumbnails"  # default thumbnails dir: <id>.thumbnails
+# --- Display contrast (imageadjust.auto_contrast) ------------------------------
+CONTRAST_METHOD_DEFAULT = "stretch"  # none / stretch / stretch-rgb / clahe (or a registered method)
+CONTRAST_CUTOFF_PERCENT = 0.5  # stretches: percent of darkest / brightest clipped
+CONTRAST_STATS_MAX_PX = 1_000_000  # reference subsampled to this many pixels for the statistics
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID = 8
+# --- Annotation pages (substrata images --layout pages; annotationpages.py) --
+PAGES_DPI = 300  # page raster; the bottom panel shows its photo at 100% (1 px = 1 dot)
+PAGES_SIZE_MM = (297.0, 210.0)  # A4 landscape
+PAGES_ZOOM_M = 0.5  # overview zoom width (m) at least; else ZOOM_CLOSEUP x the closeup's frame width
+PAGES_ZOOM_CLOSEUP = 2.5
+PAGES_ZOOM_FRACTION = 0.25  # overview zoom without a metric scale: this share of the photo width
+PAGES_JPEG_QUALITY = 85
+PAGES_CLEAR_OF_EDGE_PX = (1500, 1000)  # overview: prefer views with this crop around the point inside the photo
+PAGES_CLOSEUP_GROUP = "closeup"  # the camera group cams2annos targets by default
 # Default label set: next to the annotations CSV, in <id>.annos/, else the
 # project folder (legacy); see ProjectInitializer.default_classes_path
 CLASSES_FILE = "classes.csv"
@@ -294,7 +324,7 @@ CROPS_PER_OTHER_TYPE = 0
 VIEWS_MAX_DEFAULT = 10
 MAX_PHOTOS_TO_PREDICT_DEFAULT = 10
 # View selection (crops, training views). Occlusion is tested on the plot's
-# stratified PLY subsample (substrata.occlusion): a view is blocked when at
+# stratified PLY subsample (substrata.stratified.Occluder): a view is blocked when at
 # least OCCLUSION_BLOCKED_MIN subsample points lie on its line of sight. Only
 # the OCCLUSION_CHECK_VIEWS most relevant views of a point are tested.
 # 3: a single surface crossing the line of sight leaves ~4-5 subsample points;

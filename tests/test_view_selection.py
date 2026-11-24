@@ -181,7 +181,7 @@ class _FakeOccluder:
     def normal_at(self, p):
         return None
 
-    def line_of_sight_margin(self):
+    def line_of_sight_margin(self, scale_factor=None):
         return 0.01
 
     def blockers(self, eye, p, margin, normal=None):

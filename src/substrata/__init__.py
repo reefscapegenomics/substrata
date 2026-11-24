@@ -39,7 +39,8 @@ from .logging import logger
 _STAR_MODULES = (
     "annotations", "sidecars", "color_calibration", "pathrepair", "cameras", "pointclouds",
     "stratified", "initializer", "measurements", "visualizations", "geom", "settings",
-    "classification", "pointfeatures", "ortho", "animations", "segmentation",
+    "classification", "pointfeatures", "ortho", "animations", "segmentation", "imageadjust",
+    "annotationpages", "imagecrops",
 )
 _state = {"loaded": False, "loading": False}
 
@@ -69,11 +70,27 @@ def _load_all():
         _state["loading"] = False
 
 
+def _is_submodule(name):
+    """True when ``name`` is a module of this package (``<name>.py`` or ``<name>/__init__.py``)."""
+    import os
+
+    here = os.path.dirname(__file__)
+    return name.isidentifier() and (
+        os.path.isfile(os.path.join(here, f"{name}.py"))
+        or os.path.isfile(os.path.join(here, name, "__init__.py"))
+    )
+
+
 def __getattr__(name):
     # while loading, a missing name is a submodule not imported yet (`from . import x`): Python then
     # imports it itself
     if (name.startswith("__") and name != "__all__") or _state["loading"] or _state["loaded"]:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    # `from substrata import cameras` (inside the package) imports just that module, not every
+    # module of the flat namespace: `import substrata.measurements` then stays free of matplotlib,
+    # plotly and the other figure libraries
+    if _is_submodule(name):
+        return _importlib.import_module(f".{name}", __name__)
     _load_all()
     try:
         return globals()[name]

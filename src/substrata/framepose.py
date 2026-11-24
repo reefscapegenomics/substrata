@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from . import imagesync as isy
+from .frames import uniform_scale
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ def world_to_cam(T: np.ndarray) -> np.ndarray:
     """The rotation world -> camera of a current-frame camera transform ``T`` (which carries the world
     transform's scale: ``T[:3, :3]`` = s R_cw)."""
     M = np.asarray(T, float).reshape(4, 4)[:3, :3]
-    return (M / np.cbrt(np.linalg.det(M))).T
+    return (M / uniform_scale(M)).T
 
 
 def rotation_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
@@ -83,13 +84,7 @@ def rotation_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip(c, -1, 1))))
 
 
-def pose_transform(R: np.ndarray, C: np.ndarray, scale: float) -> np.ndarray:
-    """A current-frame camera transform (as :func:`imagesync.set_pose` writes) from ``R`` (world -> camera) and
-    centre ``C``."""
-    T = np.eye(4)
-    T[:3, :3] = scale * np.asarray(R, float).T
-    T[:3, 3] = np.asarray(C, float)
-    return T
+pose_transform = isy.pose_transform  # (one definition, shared with imagesync.set_pose)
 
 
 def roll_turns(T_view: np.ndarray, T_source: np.ndarray) -> int:
@@ -106,7 +101,7 @@ class DepthLookup:
     """A camera's depth map of a (local, thinned) cloud: the 3-D point each of its pixels sees.
 
     ``sensor`` and ``T`` (its current-frame camera transform) are enough, so a pose being tried can be used as
-    well as a camera's own. The cloud's points are projected (the lens as :func:`cameras._distort`) into cells of
+    well as a camera's own. The cloud's points are projected (the lens as :func:`cameras.camera_points_to_pixels`) into cells of
     ``cell`` px, keeping the nearest; empty cells and those seen through a gap (deeper than their neighbours) take
     the nearest of the 3 x 3 cells round them. A pixel's point is then where its ray (the lens undone) reaches
     that depth."""
@@ -114,19 +109,19 @@ class DepthLookup:
     def __init__(self, sensor, T: np.ndarray, points: np.ndarray, *, spacing: float = LOCAL_VOXEL,
                  cell: Optional[int] = None):
         from scipy.ndimage import minimum_filter
-        from .cameras import _distort
+        from .cameras import camera_points_to_pixels
 
         self.sensor, self.T = sensor, np.asarray(T, float).reshape(4, 4)
         Ti = np.linalg.inv(self.T)
         pc = np.asarray(points, float) @ Ti[:3, :3].T + Ti[:3, 3]
         front = pc[:, 2] > 0
         pc = pc[front]
-        x, y, inv = _distort(pc[:, 0], pc[:, 1], pc[:, 2], sensor)
+        x, y, inv = camera_points_to_pixels(pc[:, 0], pc[:, 1], pc[:, 2], sensor)
         x, y, z = x[inv], y[inv], pc[inv, 2]
         self.n_points = int(len(z))
         if cell is None:
             # (the thinned points' spacing in px at the median depth; the transform's scale turns m into its units)
-            s = float(np.cbrt(np.linalg.det(self.T[:3, :3])))
+            s = uniform_scale(self.T)
             zmed = float(np.median(z)) if len(z) else 1.0
             cell = int(np.clip(CELL_SPACING * sensor.f * spacing / max(zmed * s, 1e-6), 2, 64))
         self.cell = int(cell)
@@ -142,14 +137,14 @@ class DepthLookup:
     def lift(self, px: np.ndarray) -> np.ndarray:
         """The 3-D points (world frame) seen at pixels ``px`` (N x 2, full resolution); NaN rows where the map has
         no depth or the lens model has no ray."""
-        from .cameras import _undistort
+        from .cameras import pixels_to_normalized
 
         px = np.asarray(px, float).reshape(-1, 2)
         h, w = self.depth.shape
         ix = np.clip((px[:, 0] // self.cell).astype(int), 0, w - 1)
         iy = np.clip((px[:, 1] // self.cell).astype(int), 0, h - 1)
         z = self.depth[iy, ix]
-        xn, yn = _undistort(px[:, 0], px[:, 1], self.sensor)
+        xn, yn = pixels_to_normalized(px[:, 0], px[:, 1], self.sensor)
         bad = ~np.isfinite(z) | ~np.isfinite(xn) | ~np.isfinite(yn)
         z, xn, yn = np.where(bad, 0.0, z), np.where(bad, 0.0, xn), np.where(bad, 0.0, yn)
         out = np.stack([xn * z, yn * z, z], 1) @ self.T[:3, :3].T + self.T[:3, 3]
@@ -254,12 +249,12 @@ class FramePoser:
         self._img: "OrderedDict[Any, Any]" = OrderedDict()
         self._cache = cache
         W = np.asarray(pcd.world_transform, float)
-        self.scale = float(np.linalg.norm(W[:3, 0]))
+        self.scale = uniform_scale(W)
 
     # ---- images and matching
     @staticmethod
     def _image(path: str, full_width: int, width: int):
-        g = isy._resize_width(isy._gray(path, isy._reduce_for(full_width, width)), width)
+        g = isy.resize_to_width(isy.read_gray(path, isy.jpeg_reduction_for(full_width, width)), width)
         return np.ascontiguousarray(g[: g.shape[0] // 8 * 8])
 
     def source_image(self, cam):
@@ -375,8 +370,8 @@ class FramePoser:
                 a, b = self._match(views[k], sg)
                 if len(a) < SOURCE_MIN_INLIERS:
                     continue
-                a = isy.unrotate(a, k, g.shape[1], g.shape[0]) * fsc
-                got = source_pose(sensor, cam, a, b * ssc, local, seed=seed)
+                a = isy.to_sensor_px(isy.unrotate(a, k, g.shape[1], g.shape[0]), fsc)
+                got = source_pose(sensor, cam, a, isy.to_sensor_px(b, ssc), local, seed=seed)
                 if got is None:
                     continue
                 ok, _note = plausible(dict(ok=True, C=got["C"]), nbrs)
@@ -455,7 +450,7 @@ class FramePoser:
                                                   fr.VERIFY_THRESHOLD_PX, 0.999, 5000)
                 n = 0 if mask is None else int(mask.sum())
                 if n >= fr.VERIFY_MIN_INLIERS and (best is None or n > best[1]):
-                    best = (cam, n, b[mask.ravel().astype(bool)] * ssc)
+                    best = (cam, n, isy.to_sensor_px(b[mask.ravel().astype(bool)], ssc))
             if best is not None:
                 break
         if best is None:

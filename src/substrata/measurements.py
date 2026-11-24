@@ -1,74 +1,165 @@
+"""Terrain and ecology metrics computed from point clouds.
+
+Plane fits and orientation (:func:`get_best_fit_plane_pca`,
+:func:`get_plane_angles`), roughness (:func:`calc_roughness`), topographic
+position / ruggedness (:func:`calc_tpi_and_tri`), vector dispersion, colour
+statistics, hemispherical gap fraction (:func:`calc_gap_fraction`), benthic
+fraction, the depth regression (:func:`fit_depth_regression`) and the sampling
+grids used by ``substrata intercepts``.
+
+Conventions: coordinates are in the world frame (metres after scaling, +Z up,
+depth negative below the surface). Fitted plane normals are oriented by the
+point normals when the cloud has them, otherwise towards +Z.
+"""
+
 # Standard Library
 import sys
-import random
-import copy
 from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, Union
 
 # Third-Party Libraries
 import numpy as np
-from scipy.spatial import KDTree
-import cv2
-from tqdm import tqdm
-import pandas as pd
-import matplotlib.pyplot as plt  # TO REMOVE? (if you no longer need it, you can comment it out or remove it)
-from mpl_toolkits.mplot3d import Axes3D
-from joblib import Parallel, delayed
-from open3d import geometry, utility, cpu
-import open3d as o3d
-from scipy.signal import convolve2d
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from dataclasses import dataclass
 
-try:  # TO DO
-    import alphashape
-    from scipy.spatial import distance_matrix
-    from alphashape import optimizealpha
-    from shapely.geometry import Point
-    from shapely.geometry import Polygon, MultiPolygon
-    from matplotlib.patches import Polygon as MplPolygon
-except ImportError:
-    pass
+# open3d, cv2, scipy and sklearn are imported in the functions that use them, so
+# `import substrata.measurements` (e.g. substrata-explore's conduct_pca) stays
+# light; figures are drawn by substrata.visualizations, imported lazily too.
 
 # Local Modules
-from substrata import cameras, pointclouds, visualizations, settings, geom
+from substrata import settings
+from substrata.compat import renamed_kwargs as _renamed_kwargs
 from substrata.logging import logger
 
+__all__ = [
+    # plane fits, PCA and orientation
+    "conduct_pca",
+    "conduct_xy_pca",
+    "get_best_fit_plane_pca",
+    "get_best_fit_plane_ransac",
+    "get_plane_angles",
+    "plane_orientation",
+    "distances_to_plane",
+    "slope_normal_from_transform",
+    "get_elevation_angle",
+    # roughness, TPI/TRI, dispersion, colour
+    "get_dev_rugosity",
+    "calc_roughness",
+    "annulus_coverage",
+    "calc_tpi_and_tri",
+    "annulus_plane",
+    "tpi_point_values",
+    "get_vector_dispersion",
+    "vector_dispersion_from_normals",
+    "normal_deviation_deg",
+    "get_rgb_stats",
+    # benthic fraction
+    "calc_benthic_fraction",
+    "benthic_fraction_from_results",
+    # gap fraction
+    "hemispherical_disk",
+    "hemispherical_pixels",
+    "hemispherical_cover",
+    "gap_fractions",
+    "calc_gap_fraction",
+    # sampling grids (substrata intercepts)
+    "cloud_xy_histogram",
+    "find_optimal_box_position",
+    "subdivide_boxes",
+    "generate_random_xy_points_within_cells",
+    "depth_band_sample",
+    # surface area (photo mask)
+    "get_mask_surface_area",
+    # depth regression
+    "DepthRegressionResult",
+    "normalize_depth_sign",
+    "fit_depth_regression",
+    "regression_errors",
+    "DepthResidualAnalyzer",
+    # alignment QC
+    "PcdCorrespondence",
+    "pcd_correspondence",
+    "camera_residuals",
+    # deprecated aliases (renamed 2026-11-25)
+    "conduct_PCA",
+    "conduct_xy_PCA",
+    "get_best_fit_plane_PCA",
+]
 
-def conduct_PCA(pcd, sort=True):
-    """
-    Calculate eigenvalues/eigenvectors for pointcloud
-    """
+# TPI/TRI annulus coverage threshold (see settings.TPI_MIN_ANNULUS_COVERAGE)
+TPI_MIN_ANNULUS_COVERAGE = settings.TPI_MIN_ANNULUS_COVERAGE
+TPI_RASTER_CELL_SIZE = settings.TPI_RASTER_CELL_SIZE
+TPI_MIN_RASTER_FILL = 0.5  # warn below this fraction of filled raster cells
 
-    matrix = np.cov(pcd.points.T)
-    eigenvalues, eigenvectors = np.linalg.eig(matrix)
+
+def _points_array(pcd) -> np.ndarray:
+    """The (N, 3) float array of ``pcd.points`` (numpy, open3d or SimplePointCloud)."""
+    return np.asarray(pcd.points, dtype=float)
+
+
+def _normals_array(pcd, n_points: int) -> Optional[np.ndarray]:
+    """``pcd.normals`` as an (N, 3) array, or None when missing / not one per point."""
+    normals = getattr(pcd, "normals", None)
+    if normals is None:
+        return None
+    normals = np.asarray(normals, dtype=float)
+    if normals.ndim != 2 or normals.shape != (n_points, 3):
+        return None
+    return normals
+
+
+def conduct_pca(pcd, sort=True):
+    """Principal component analysis of a point cloud's XYZ coordinates.
+
+    Eigen-decomposition of the 3 x 3 covariance matrix of ``pcd.points`` with
+    ``numpy.linalg.eigh`` (the covariance is symmetric, so eigenvalues and
+    eigenvectors are real and the eigenvectors orthonormal).
+
+    Args:
+        pcd: Object with ``points`` convertible to an (N, 3) array.
+        sort: Sort by decreasing eigenvalue (default). With False the order is
+            ``eigh``'s (increasing).
+
+    Returns:
+        tuple: ``(eigenvalues, eigenvectors)``; ``eigenvectors[:, i]`` (a
+        column) is the axis of ``eigenvalues[i]``. Sorted, column 0 is the
+        principal axis and column 2 the normal of the best-fit plane. The sign of
+        each eigenvector is arbitrary.
+    """
+    matrix = np.cov(_points_array(pcd).T)
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
 
     if sort:
-        sort = eigenvalues.argsort()[::-1]
-        eigenvalues = eigenvalues[sort]
-        eigenvectors = eigenvectors[:, sort]
+        order = eigenvalues.argsort()[::-1]
+        eigenvalues = eigenvalues[order]
+        eigenvectors = eigenvectors[:, order]
 
     return eigenvalues, eigenvectors
 
 
-def best_fit_plane_normal(pcd) -> geom.Vector:
-    """Return a unit normal (Vector) of the PCA best-fit plane."""
-    a, b, c, _ = conduct_PCA(pcd)[:4]
-    return geom.Vector([a, b, c, 0])  # promote to 4-vector
+conduct_PCA = conduct_pca  # deprecated alias (renamed 2026-11-25)
 
 
-def conduct_xy_PCA(pcd, sort=True, visualize=False):
+def conduct_xy_pca(pcd, sort=True, visualize=False):
+    """Principal component analysis of the XY coordinates only.
+
+    Like :func:`conduct_pca` on the 2 x 2 covariance of X and Y
+    (``numpy.linalg.eigh``).
+
+    Args:
+        pcd: Object with ``points`` convertible to an (N, 3) array.
+        sort: Sort by decreasing eigenvalue (default).
+        visualize: Plot the points with the principal axes.
+
+    Returns:
+        tuple: ``(eigenvalues, eigenvectors)``; ``eigenvectors[:, i]`` is the
+        axis of ``eigenvalues[i]`` (sign arbitrary).
     """
-    Calculate eigenvalues/eigenvectors for x/y plane only.
-    Optionally print and plot the results.
-    """
-    xy_points = pcd.points[:, :2]
+    xy_points = _points_array(pcd)[:, :2]
     mean_xy = np.mean(xy_points, axis=0)
     centered_xy = xy_points - mean_xy  # shape (N, 2)
 
     cov = np.cov(centered_xy, rowvar=False)  # shape (2, 2)
-    eigenvalues, eigenvectors = np.linalg.eig(cov)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
 
     if sort:
         sort_idx = np.argsort(eigenvalues)[::-1]
@@ -76,6 +167,8 @@ def conduct_xy_PCA(pcd, sort=True, visualize=False):
         eigenvectors = eigenvectors[:, sort_idx]
 
     if visualize:
+        from substrata import visualizations  # lazy: figures only
+
         visualizations.plot_xy_pca(
             points=xy_points, mean=mean_xy, eig_vecs=eigenvectors, eig_vals=eigenvalues
         )
@@ -83,39 +176,74 @@ def conduct_xy_PCA(pcd, sort=True, visualize=False):
     return eigenvalues, eigenvectors
 
 
-def get_best_fit_plane_PCA(
+conduct_xy_PCA = conduct_xy_pca  # deprecated alias (renamed 2026-11-25)
+
+
+def _orient_plane(a, b, c, d, pcd, points, inliers_idx, align_normals):
+    """Orient plane coefficients: along the point normals if present, else +Z.
+
+    With ``align_normals`` and one normal per point, the plane normal is flipped
+    when it points against the mean normal of the inliers (all points if there
+    are no inliers). Without normals (or with ``align_normals=False``) it is
+    flipped to ``c >= 0`` (facing +Z), so the result never depends on the
+    arbitrary sign of the eigenvector / RANSAC model.
+    """
+    normals = _normals_array(pcd, len(points)) if align_normals else None
+    if normals is not None and len(normals):
+        sel = normals[inliers_idx] if len(inliers_idx) else normals
+        if np.dot(sel.mean(axis=0), [a, b, c]) < 0:
+            return -a, -b, -c, -d
+        return a, b, c, d
+    if c < 0:
+        return -a, -b, -c, -d
+    return a, b, c, d
+
+
+def get_best_fit_plane_pca(
     pcd, inlier_range=settings.DEFAULT_INLIER_RANGE, print_eq=False, align_normals=True
 ):
-    """
-    Get best fit plane based on PCA
+    """Least-squares (orthogonal) best-fit plane from PCA.
+
+    The plane passes through the centroid with the smallest-variance principal
+    axis as its normal (total least squares). Points within ``inlier_range`` of
+    the plane are reported as inliers (they do not change the fit).
+
+    The normal's sign is set by :func:`_orient_plane`: along the mean point
+    normal of the inliers when ``align_normals`` and the cloud has one normal
+    per point, otherwise towards +Z (``c >= 0``).
+
+    Args:
+        pcd: Object with ``points`` (N, 3) and optionally ``normals`` (N, 3).
+        inlier_range: Distance from the plane for a point to count as an inlier
+            (point-cloud units).
+        print_eq: Print the plane equation.
+        align_normals: Orient the plane by the point normals when available.
+
+    Returns:
+        tuple: ``(a, b, c, d, inliers_idx)`` with ``a x + b y + c z + d = 0``
+        and ``(a, b, c)`` a unit normal.
 
     author: DvH
     """
+    points = _points_array(pcd)
+    _, eigenvectors = conduct_pca(pcd)
+    normal = eigenvectors[:, 2]
+    d = -(np.dot(normal, points.mean(axis=0)))
 
-    _, eigenvectors = conduct_PCA(pcd)
-    a, b, c = normal = eigenvectors[:, 2]
-    mean = np.mean(np.asarray(pcd.points), axis=0)
-    d = -(np.dot(normal, mean))
+    dist = points @ normal + d
+    inliers_idx = np.flatnonzero(np.abs(dist) <= inlier_range)
+
+    a, b, c = (float(v) for v in normal)
+    a, b, c, d = _orient_plane(a, b, c, float(d), pcd, points, inliers_idx,
+                               align_normals)
 
     if print_eq:
         print(f"Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
 
-    mask1 = -inlier_range <= np.asarray(pcd.points).dot(normal) + d
-    mask2 = np.asarray(pcd.points).dot(normal) + d <= inlier_range
-    combined_mask = np.logical_and.reduce([mask1, mask2])
-    inliers_idx = np.where(combined_mask == True)[0]
-
-    # If requested, adjust the plane normal based on the point cloud normals.
-    if align_normals:
-        normals = np.asarray(pcd.normals)
-        if normals.size > 0:
-            inlier_normals = normals[inliers_idx]
-            avg_normal = np.mean(inlier_normals, axis=0)
-            # If the average normal points in the opposite direction, flip the plane.
-            if np.dot(avg_normal, [a, b, c]) < 0:
-                a, b, c, d = -a, -b, -c, -d
-
     return a, b, c, d, inliers_idx
+
+
+get_best_fit_plane_PCA = get_best_fit_plane_pca  # deprecated alias (renamed 2026-11-25)
 
 
 def get_best_fit_plane_ransac(
@@ -124,30 +252,35 @@ def get_best_fit_plane_ransac(
     print_eq: bool = False,
     align_normals: bool = True,
 ) -> tuple[float, float, float, float, np.ndarray]:
-    """
-    Fit a plane to a point cloud using the RANSAC method.
+    """Fit a plane to a point cloud with RANSAC (open3d ``segment_plane``).
 
-    If the input pcd is a SimplePointCloud, it is converted to an Open3D point cloud.
-
-    The resulting plane follows the equation: a*x + b*y + c*z + d = 0.
+    The resulting plane follows ``a*x + b*y + c*z + d = 0``. RANSAC is
+    stochastic: repeated calls can give slightly different planes. The normal's
+    sign is set as in :func:`get_best_fit_plane_pca` (point normals when
+    available and ``align_normals``, else +Z).
 
     Args:
-        pcd: A point cloud object. Can be a SimplePointCloud or a full
-             PointCloud instance.
+        pcd: A ``PointCloud`` (its ``o3d_pcd`` is used), an open3d point cloud,
+            or any object with ``points`` (and optionally ``normals``).
         inlier_range (float): Distance threshold for including a point as an inlier.
         print_eq (bool): If True, prints the plane equation.
         align_normals (bool): If True, adjusts the plane normal so it aligns with
-                              the general direction of the point cloud normals.
+            the general direction of the point cloud normals.
 
     Returns:
-        tuple: (a, b, c, d, inliers_idx), where (a, b, c, d) are the plane coefficients
-               and inliers_idx is a NumPy array of indices for points within the inlier range.
+        tuple: (a, b, c, d, inliers_idx), where (a, b, c, d) are the plane
+        coefficients and inliers_idx is a NumPy array of indices for points
+        within the inlier range.
     """
-    # Convert to Open3D point cloud if necessary.
-    if isinstance(pcd, pointclouds.SimplePointCloud):
-        o3d_pcd = pcd.get_o3d_pcd()
-    else:
+    import open3d as o3d
+
+    geometry = o3d.geometry
+    if isinstance(pcd, geometry.PointCloud):
+        o3d_pcd = pcd
+    elif isinstance(getattr(pcd, "o3d_pcd", None), geometry.PointCloud):
         o3d_pcd = pcd.o3d_pcd
+    else:
+        o3d_pcd = geometry.PointCloud(o3d.utility.Vector3dVector(_points_array(pcd)))
 
     # Use RANSAC to segment the plane.
     plane_model, inliers_idx = o3d_pcd.segment_plane(
@@ -155,17 +288,10 @@ def get_best_fit_plane_ransac(
         ransac_n=settings.RANSAC_N,
         num_iterations=settings.RANSAC_ITERATIONS,
     )
-    a, b, c, d = plane_model
-
-    # If requested, adjust the plane normal based on the point cloud normals.
-    if align_normals:
-        normals = np.asarray(o3d_pcd.normals)
-        if normals.size > 0:
-            inlier_normals = normals[inliers_idx]
-            avg_normal = np.mean(inlier_normals, axis=0)
-            # If the average normal points in the opposite direction, flip the plane.
-            if np.dot(avg_normal, [a, b, c]) < 0:
-                a, b, c, d = -a, -b, -c, -d
+    a, b, c, d = (float(v) for v in plane_model)
+    inliers_idx = np.asarray(inliers_idx, dtype=int)
+    a, b, c, d = _orient_plane(a, b, c, d, pcd, _points_array(pcd), inliers_idx,
+                               align_normals)
 
     if print_eq:
         print(f"Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
@@ -173,12 +299,68 @@ def get_best_fit_plane_ransac(
     return a, b, c, d, inliers_idx
 
 
+def distances_to_plane(points, plane) -> np.ndarray:
+    """Signed perpendicular distances of points to a plane.
+
+    The plane is ``a x + b y + c z + d = 0``.
+
+    Positive on the side the normal ``(a, b, c)`` points to.
+
+    Args:
+        points: (N, 3) array (or an object with ``points``).
+        plane: ``(a, b, c, d)``; the normal need not be unit length.
+
+    Raises:
+        ValueError: For a zero-length normal.
+    """
+    pts = np.asarray(getattr(points, "points", points), dtype=float)
+    a, b, c, d = (float(v) for v in plane[:4])
+    normal = np.array([a, b, c], dtype=float)
+    denom = np.linalg.norm(normal)
+    if denom == 0.0:
+        raise ValueError("plane has a zero-length normal")
+    return (pts @ normal + d) / denom
+
+
+def plane_orientation(normal) -> Tuple[float, float, float, Optional[float]]:
+    """Orientation angles (degrees) of a plane normal (see :func:`get_plane_angles`).
+
+    Args:
+        normal: Length-3 normal ``(a, b, c)`` (normalised here).
+
+    Returns:
+        tuple: ``(theta_deg, psi_deg, elev_deg, az_deg)``: ``theta = atan2(n_x,
+        n_z)``, ``psi = atan2(-n_y, hypot(n_x, n_z))`` (``n = R_y(theta) @
+        R_x(psi) @ z``), the elevation (angle to +Z, as
+        :func:`get_elevation_angle`) and the azimuth of the normal projected on
+        XY from +X counter-clockwise (``None`` for a nearly vertical normal).
+
+    Raises:
+        ValueError: For a zero-length normal.
+    """
+    n = np.asarray(normal, dtype=float)[:3]
+    n_norm = np.linalg.norm(n)
+    if n_norm == 0:
+        raise ValueError("Degenerate plane normal.")
+    nx, ny, nz = n / n_norm
+
+    elev_deg = float(np.degrees(np.arccos(np.clip(nz, -1.0, 1.0))))
+    theta_deg = float(np.degrees(np.arctan2(nx, nz)))
+    psi_deg = float(np.degrees(np.arctan2(-ny, np.hypot(nx, nz))))
+    if np.hypot(nx, ny) < 1e-8:
+        az_deg = None
+    else:
+        az_deg = float((np.degrees(np.arctan2(ny, nx)) + 360.0) % 360.0)
+    return theta_deg, psi_deg, elev_deg, az_deg
+
+
 def get_plane_angles(pcd, vis=False, generate_image=True):
     """Calculate orientation angles for the best-fit plane of a point cloud.
 
-    The plane normal is aligned with the point cloud normals by
-    ``get_best_fit_plane_PCA``, so its direction encodes whether the surface
-    faces upward or downward.
+    The plane is :func:`get_best_fit_plane_pca`'s; its normal follows the
+    point normals when the cloud has them (so it encodes whether the surface
+    faces upward or downward), otherwise it faces +Z (elevation 0-90 degrees:
+    an overhang cannot be told from the plane alone).
 
     Args:
         pcd: Point cloud object with ``.points`` (and optionally ``.normals``).
@@ -189,9 +371,13 @@ def get_plane_angles(pcd, vis=False, generate_image=True):
 
     Returns:
         tuple: A 6-element tuple containing:
-            - **theta_deg** (*float*): Rotation about +Y to null the x-component
-              of n in the xz-plane (brings n's xz-projection toward +Z).
-            - **psi_deg** (*float*): Rotation about +X to then align n with +Z.
+            - **theta_deg** (*float*): ``atan2(n_x, n_z)``, the tilt of the
+              normal from +Z towards +X in the XZ-plane.
+            - **psi_deg** (*float*): ``atan2(-n_y, hypot(n_x, n_z))``.
+              Together ``n = R_y(theta) @ R_x(psi) @ [0, 0, 1]`` (right-handed
+              rotations about +Y and +X): rotating +Z about +X by ``psi`` and
+              then about +Y by ``theta`` gives the normal, and the inverse,
+              ``R_x(-psi) @ R_y(-theta)``, brings the normal to +Z.
             - **elev_deg** (*float*): Angle between the plane normal and +Z
               (0 = up, 90 = vertical, 180 = down).
             - **plane** (*list[float]*): Plane coefficients ``[a, b, c, d]``.
@@ -204,50 +390,24 @@ def get_plane_angles(pcd, vis=False, generate_image=True):
     if len(pcd.points) <= 1:
         return 0.0, 0.0, 0.0, [], None, None
 
-    a, b, c, d, inliers_idx = get_best_fit_plane_PCA(pcd)
-
-    n = np.array([a, b, c], dtype=float)
-    n_norm = np.linalg.norm(n)
-    if n_norm == 0:
-        raise ValueError("Degenerate plane normal.")
-    n = n / n_norm
-
-    nx, ny, nz = n
-
-    elev = np.arccos(np.clip(nz, -1.0, 1.0))
-    elev_deg = float(np.degrees(elev))
-
-    # Y-then-X rotations to align n -> +Z
-    theta = np.arctan2(nx, nz)
-    psi = np.arctan2(-ny, np.hypot(nx, nz))
-
-    theta_deg = float(np.degrees(theta))
-    psi_deg = float(np.degrees(psi))
-
-    r_xy = np.hypot(nx, ny)
-    if r_xy < 1e-8:
-        az_deg = None
-    else:
-        az = np.arctan2(ny, nx)
-        az_deg = float((np.degrees(az) + 360.0) % 360.0)
-
-    if vis:
-        visualizations.visualize_elevation_angle(pcd, [a, b, c, d], interactive=True)
+    a, b, c, d, _ = get_best_fit_plane_pca(pcd)
+    theta_deg, psi_deg, elev_deg, az_deg = plane_orientation([a, b, c])
+    plane = [float(a), float(b), float(c), float(d)]
 
     image = None
-    if generate_image:
-        image = visualizations.visualize_elevation_angle(
-            pcd, [a, b, c, d], interactive=False
-        )
+    if vis or generate_image:
+        from substrata import visualizations  # lazy: figures only
 
-    return (
-        theta_deg,
-        psi_deg,
-        elev_deg,
-        [float(a), float(b), float(c), float(d)],
-        az_deg,
-        image,
-    )
+        if vis:
+            visualizations.visualize_elevation_angle(
+                pcd, plane, interactive=True, elev_deg=elev_deg
+            )
+        if generate_image:
+            image = visualizations.visualize_elevation_angle(
+                pcd, plane, interactive=False, elev_deg=elev_deg
+            )
+
+    return theta_deg, psi_deg, elev_deg, plane, az_deg, image
 
 
 def slope_normal_from_transform(transform) -> np.ndarray:
@@ -298,13 +458,15 @@ def get_elevation_angle(normal) -> float:
 
 
 def get_dev_rugosity(pcd):
-    """
-    Calculate deviation rugosity for a pointcloud (how much the points vary from the best fitting plane).
-    Also called "plane-detrended roughness"
+    """Deviation rugosity: mean absolute distance of the points to their best-fit plane.
+
+    Also called "plane-detrended roughness"; identical to ``Ra`` of
+    :func:`calc_roughness` (same plane, same formula), kept for the ``dev_rug``
+    measurement key.
 
     author: DvH
     """
-    [a, b, c, d] = get_best_fit_plane_PCA(pcd)[0:4]
+    [a, b, c, d] = get_best_fit_plane_pca(pcd)[0:4]
     dist = abs(
         (np.dot(np.asarray(pcd.points), [a, b, c]) + d)
         / np.sqrt(np.sum(np.square([a, b, c])))
@@ -356,15 +518,9 @@ def calc_roughness(pcd, generate_image=True):
         raise ValueError("Point cloud has no points")
 
     # Plane: a*x + b*y + c*z + d = 0
-    a, b, c, d = get_best_fit_plane_PCA(pcd)[:4]
-
-    normal = np.array([a, b, c], dtype=float)
-    denom = np.linalg.norm(normal)
-    if denom == 0.0:
-        raise ValueError("Best-fit plane has zero-length normal")
-
+    plane = get_best_fit_plane_pca(pcd)[:4]
     # Perpendicular distances of all points to the plane
-    dist = np.abs(pts @ normal + d) / denom
+    dist = np.abs(distances_to_plane(pts, plane))
 
     ra = float(dist.mean())
     rq = float(np.sqrt((dist**2).mean()))
@@ -373,9 +529,10 @@ def calc_roughness(pcd, generate_image=True):
     # for (e.g. batch runs via measure_all default to metrics only).
     image = None
     if generate_image:
-        # Pass ra and rq to avoid recalculating in visualize_roughness
+        from substrata import visualizations  # lazy: figures only
+
         image = visualizations.visualize_roughness(
-            pcd, interactive=False, ra=ra, rq=rq
+            pcd, interactive=False, ra=ra, rq=rq, plane=plane
         )
 
     return ra, rq, image
@@ -413,6 +570,101 @@ def _resolve_outer_radius(
     return radius_outer if radius_outer is not None else default_outer
 
 
+def annulus_coverage(
+    xy: np.ndarray,
+    center_xy: np.ndarray,
+    radius_inner: float,
+    radius_outer: float,
+    n_sectors: int = 24,
+    n_rings: int = 4,
+) -> float:
+    """Fraction of an annulus's area that contains points (0-1).
+
+    The annulus ``radius_inner <= r <= radius_outer`` around ``center_xy`` is
+    split into ``n_sectors x n_rings`` polar cells of equal area (ring
+    boundaries at ``sqrt(r_in^2 + k / n_rings * (r_out^2 - r_in^2))``); the
+    coverage is the fraction of cells holding at least one point. A focal point
+    on a straight cloud edge gives about 0.5; inside a cloud with no gaps
+    larger than a cell, 1.0. Clouds so sparse that cells are empty by chance
+    (fewer than a few points per cell) also read low.
+
+    Args:
+        xy: (N, 2) XY coordinates (only those inside the annulus count).
+        center_xy: (2,) annulus centre.
+        radius_inner: Inner radius (same units as ``xy``).
+        radius_outer: Outer radius.
+        n_sectors: Number of angular sectors.
+        n_rings: Number of equal-area rings.
+
+    Returns:
+        The covered fraction of the annulus area.
+    """
+    d = np.asarray(xy, dtype=float)[:, :2] - np.asarray(center_xy, dtype=float)[:2]
+    r2 = np.einsum("ij,ij->i", d, d)
+    r_in2, r_out2 = float(radius_inner) ** 2, float(radius_outer) ** 2
+    inside = (r2 >= r_in2) & (r2 <= r_out2)
+    if not np.any(inside) or r_out2 <= r_in2:
+        return 0.0
+    ring = np.floor((r2[inside] - r_in2) / (r_out2 - r_in2) * n_rings).astype(int)
+    ring = np.clip(ring, 0, n_rings - 1)
+    ang = np.arctan2(d[inside, 1], d[inside, 0])
+    sector = np.floor((ang + np.pi) / (2 * np.pi) * n_sectors).astype(int)
+    sector = np.clip(sector, 0, n_sectors - 1)
+    occupied = np.unique(ring * n_sectors + sector)
+    return float(len(occupied) / (n_sectors * n_rings))
+
+
+def annulus_plane(annulus_pts) -> Optional[Tuple[np.ndarray, float]]:
+    """Best-fit plane of annulus points, its normal oriented to +Z.
+
+    Total least squares via SVD (the normal is the last right-singular vector of
+    the centred points). Used by :func:`calc_tpi_and_tri`.
+
+    Args:
+        annulus_pts: (N, 3) points.
+
+    Returns:
+        ``(normal, d)`` with ``normal @ p + d = 0`` on the plane (``normal``
+        unit length, ``normal[2] >= 0`` so that distances are positive above
+        the plane), or None for fewer than 3 points.
+    """
+    annulus_pts = np.asarray(annulus_pts, dtype=float)
+    if len(annulus_pts) < 3:
+        return None
+    centroid = annulus_pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(annulus_pts - centroid, full_matrices=False)
+    normal = vt[-1]
+    # Orient the normal to +Z so the signed tpi_plane is physically
+    # meaningful: positive = crest/elevated, negative = hollow/depressed.
+    # SVD's sign is otherwise arbitrary and not reproducible across inputs.
+    if normal[2] < 0:
+        normal = -normal
+    return normal, float(-normal @ centroid)
+
+
+def tpi_point_values(points, focal_pt, plane=None) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-point TPI values relative to a focal point (the TPI figure's colours).
+
+    Args:
+        points: (N, 3) points.
+        focal_pt: (3,) focal point (its Z is the focal height of ``TPI_abs``).
+        plane: The annulus plane ``(normal, d)`` of :func:`annulus_plane`, or
+            None.
+
+    Returns:
+        tuple: ``(z_rel, plane_rel)``: each point's Z minus the focal Z, and
+        each point's signed distance from the annulus plane minus the focal
+        point's (NaN without a plane).
+    """
+    points = np.asarray(points, dtype=float)
+    focal_pt = np.asarray(focal_pt, dtype=float)
+    z_rel = points[:, 2] - focal_pt[2]
+    if plane is None:
+        return z_rel, np.full(len(points), np.nan)
+    normal, d = plane
+    return z_rel, points @ normal + d - float(normal @ focal_pt + d)
+
+
 def calc_tpi_and_tri(
     pcd,
     center: Optional[np.ndarray] = None,
@@ -421,7 +673,8 @@ def calc_tpi_and_tri(
     annulus_width: Optional[float] = None,
     generate_image: bool = True,
     center_z_from_inner: bool = False,
-    raster_cell_size: Optional[float] = None,
+    raster_cell_size: Optional[float] = TPI_RASTER_CELL_SIZE,
+    min_annulus_coverage: Optional[float] = TPI_MIN_ANNULUS_COVERAGE,
 ) -> Tuple[float, float, float, float, float, float, Optional[np.ndarray]]:
     """Compute TPI and TRI for a point cloud (Weiss 2001; Wilson et al. 2007).
 
@@ -450,6 +703,28 @@ def calc_tpi_and_tri(
     Positive TPI values indicate a crest / elevated position; negative indicate
     a hollow / depressed position.
 
+    Area weighting: the annulus (and, with ``center_z_from_inner``, the inner
+    disc) is rasterized in XY at ``raster_cell_size`` (default 1 cm,
+    ``settings.TPI_RASTER_CELL_SIZE``) and each cell's points are replaced by
+    their mean, so every cell of the surface counts once, as on the elevation
+    grid TPI is defined on. Photogrammetric clouds are denser where cameras
+    were closer: on 83 close-up targets of a 40 m plot the points per 1 cm cell
+    varied 5x within an annulus, and weighting by point instead changed
+    ``TPI_abs`` by 0.02 m (median; values about 0.19 m), while 5 mm, 1 cm and
+    2 cm cells agreed within 2 mm. The cells must not be finer than the
+    cloud's point spacing (empty cells would favour the dense parts again; a
+    warning is logged when fewer than half of the annulus cells hold points).
+    ``raster_cell_size=None`` weights every point equally (the default before
+    0.2.0). The cell size is in the cloud's units: metres in the world frame.
+
+    Partial annulus: when the focal point is near the edge of the cloud (or of
+    the extracted neighbourhood), part of the annulus is empty and, on a slope,
+    the neighbourhood mean comes only from the up- or downslope side. The
+    covered fraction of the annulus area is measured with
+    :func:`annulus_coverage`; below ``min_annulus_coverage`` all six metrics
+    are returned as NaN with a warning. Neighbourhoods should therefore be
+    extracted as vertical cylinders (XY radius) at least ``radius_outer`` wide.
+
     TRI variants (Wilson et al. 2007):
 
     - ``TRI_abs``: Mean absolute Z-difference between the focal point and all
@@ -472,7 +747,8 @@ def calc_tpi_and_tri(
     Args:
         pcd: Point cloud with a ``.points`` attribute convertible to (N, 3).
         center: (3,) focal point.  If ``None``, the XY centroid + mean Z of
-            the point cloud is used.
+            the whole point cloud is used (including the focal object itself,
+            e.g. a colony, which lifts the focal Z).
         radius_inner: Inner radius of the annulus in metres.
         radius_outer: Absolute outer radius.  Mutually exclusive with
             ``annulus_width``.
@@ -483,12 +759,14 @@ def calc_tpi_and_tri(
             points within ``radius_inner`` (the colony footprint), rather than
             using ``center[2]`` directly.  More robust when the provided center
             coordinate sits above or below the actual surface.
-        raster_cell_size: If set, rasterize the neighbourhood in XY at this cell
-            size (metres) before computing any statistics.  Each cell contributes
-            one representative point (mean XYZ of all points within it),
-            equalising spatial weight regardless of local point density — useful
-            for variable-density photogrammetric clouds.  Has no effect when
-            ``None`` (default).
+        raster_cell_size: XY cell size (metres) for area weighting: each cell
+            contributes one representative point (the mean XYZ of its points)
+            to every statistic. Default ``TPI_RASTER_CELL_SIZE`` (0.01); ``None``
+            weights every point equally.
+        min_annulus_coverage: Smallest covered fraction of the annulus area
+            (:func:`annulus_coverage`, computed on the points before
+            rasterizing) for a result; below it NaN is returned. ``None`` or 0
+            disables the check. Default ``TPI_MIN_ANNULUS_COVERAGE``.
 
     Returns:
         A tuple ``(tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane,
@@ -496,7 +774,7 @@ def calc_tpi_and_tri(
 
         - ``tpi_abs``: Absolute TPI at the focal point.
         - ``std_annulus_z``: Standard deviation of Z within the annulus
-          (habitat topographic heterogeneity).
+          (habitat topographic heterogeneity; population SD, ``ddof=0``).
         - ``tpi_plane``: Plane-relative TPI at the focal point.  ``NaN`` if the
           annulus has fewer than 3 points.
         - ``std_annulus_plane``: Standard deviation of annulus-point distances
@@ -516,6 +794,8 @@ def calc_tpi_and_tri(
             ``radius_inner >= outer_radius``.
 
     Note:
+        All six metrics are ``NaN`` when the annulus is empty or covered below
+        ``min_annulus_coverage``.
         The three plane-based outputs (``tpi_plane``, ``std_annulus_plane``,
         ``tri_plane``) require at least 3 annulus points for a defined best-fit
         plane; with fewer they are returned as ``NaN`` rather than computed from
@@ -580,6 +860,20 @@ def calc_tpi_and_tri(
 
     annulus_pts = pts[annulus_mask]
 
+    if min_annulus_coverage:
+        coverage = annulus_coverage(
+            annulus_pts[:, :2], focal_xy, radius_inner, outer_radius
+        )
+        if coverage < min_annulus_coverage:
+            logger.warning(
+                "calc_tpi_and_tri: only %.0f%% of the annulus around (%.3f, %.3f) "
+                "has points (minimum %.0f%%): the focal point is near the edge of "
+                "the cloud, or the neighbourhood is a sphere on a slope (use "
+                "get_point_cloud_by_radius(..., cylinder=True)); returning NaN",
+                100 * coverage, focal_xy[0], focal_xy[1], 100 * min_annulus_coverage,
+            )
+            return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None
+
     if raster_cell_size is not None:
         keys = np.floor(annulus_pts[:, :2] / raster_cell_size).astype(int)
         _, inverse, counts = np.unique(
@@ -588,6 +882,16 @@ def calc_tpi_and_tri(
         voxel_sums = np.zeros((len(counts), 3))
         np.add.at(voxel_sums, inverse, annulus_pts)
         annulus_pts = voxel_sums / counts[:, np.newaxis]
+        # Cells finer than the point spacing stay partly empty, and the dense
+        # parts again hold more (filled) cells: area weighting needs most cells filled.
+        n_cells = np.pi * (outer_radius ** 2 - radius_inner ** 2) / raster_cell_size ** 2
+        if len(counts) < TPI_MIN_RASTER_FILL * n_cells:
+            logger.warning(
+                "calc_tpi_and_tri: only %.0f%% of the %.3g-unit raster cells in the "
+                "annulus hold points: the cloud is sparser than the cells, so denser "
+                "parts still weigh more (use a larger raster_cell_size)",
+                100 * len(counts) / n_cells, raster_cell_size,
+            )
 
     annulus_mean_z = annulus_pts[:, 2].mean()
     std_annulus_z = float(annulus_pts[:, 2].std())
@@ -601,73 +905,30 @@ def calc_tpi_and_tri(
     # Plane-based metrics need >=3 annulus points for a defined best-fit plane;
     # with fewer (e.g. after aggressive raster_cell_size voxelization) they
     # degrade to NaN rather than being computed from a degenerate plane.
-    if len(annulus_pts) >= 3:
-        # Best-fit plane of annulus via SVD; normal = last right-singular vector
-        # (already unit-length, since SVD returns orthonormal rows).
-        centroid = annulus_pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(annulus_pts - centroid, full_matrices=False)
-        normal = vt[-1]
-        # Orient the normal to +Z so the signed tpi_plane is physically
-        # meaningful: positive = crest/elevated, negative = hollow/depressed.
-        # SVD's sign is otherwise arbitrary and not reproducible across inputs.
-        if normal[2] < 0:
-            normal = -normal
-        d = -normal @ centroid
+    plane = annulus_plane(annulus_pts)
+    if plane is not None:
+        normal, d = plane
         tpi_plane = float(normal @ focal_pt + d)
         std_annulus_plane = float(np.std(annulus_pts @ normal + d))
         # TRI_plane: mean absolute residual about the annulus plane
         tri_plane = float(np.abs(annulus_pts @ normal + d).mean())
     else:
-        normal = None
         tpi_plane = std_annulus_plane = tri_plane = np.nan
 
     image = None
     if generate_image:
-        if raster_cell_size is not None:
-            # Show only the voxelized annulus points — not the dense background.
-            # Including the background causes visualize_tpi's random subsampling
-            # (max_output_points=50000) to discard most voxels, since they are
-            # vastly outnumbered by the original cloud (~300k pts vs ~2k voxels).
-            # The radius circles and star marker provide sufficient spatial context.
-            display_pcd = pointclouds.SimplePointCloud(annulus_pts)
-            display_pts = annulus_pts
-            # Scale marker size so each voxel dot fills its physical footprint.
-            # visualize_tpi renders height=500px at 100dpi over ~2*outer_radius m;
-            # ~65 % of the height is axes area after labels/padding.
-            # matplotlib scatter s is in pts² (1 pt = 100/72 px at 100 dpi).
-            px_per_m = (500 * 0.65) / (2 * outer_radius)
-            pt_diameter = raster_cell_size * px_per_m * (72 / 100)
-            vis_point_size = max(2, int(pt_diameter**2))
-        else:
-            display_pcd = pcd
-            display_pts = pts
-            vis_point_size = None
-        vis_tpi_abs = display_pts[:, 2] - focal_z
-        if normal is not None:
-            vis_tpi_plane = display_pts @ normal + d - tpi_plane
-        else:
-            # Plane undefined (<3 annulus points): render the plane panel as
-            # NaN, which visualize_tpi displays as light-gray "no data" points.
-            vis_tpi_plane = np.full(len(display_pts), np.nan)
-        vis_kwargs = dict(
-            interactive=False,
-            mean_tpi_abs=tpi_abs,
-            mean_tpi_plane=tpi_plane,
-            mean_tri_abs=tri_abs,
-            mean_tri_plane=tri_plane,
-            center=focal_pt,
-            radius_inner=radius_inner,
-            radius_outer=outer_radius,
-        )
-        if vis_point_size is not None:
-            vis_kwargs["point_size"] = vis_point_size
-        image = visualizations.visualize_tpi(
-            display_pcd, vis_tpi_abs, vis_tpi_plane, **vis_kwargs
+        from substrata import visualizations  # lazy: figures only
+
+        image = visualizations.tpi_figure(
+            pcd, focal_pt, radius_inner, outer_radius,
+            tpi_abs=tpi_abs, tpi_plane=tpi_plane, tri_abs=tri_abs,
+            tri_plane=tri_plane, plane=plane, raster_cell_size=raster_cell_size,
+            annulus_points=annulus_pts if raster_cell_size is not None else None,
         )
     return tpi_abs, std_annulus_z, tpi_plane, std_annulus_plane, tri_abs, tri_plane, image
 
 
-def _benthic_fraction_from_results(
+def benthic_fraction_from_results(
     results: Dict[str, Optional[Dict[str, Any]]], target_class: str,
     weight_by_probability: bool,
 ) -> Tuple[float, Dict[str, Any]]:
@@ -716,6 +977,10 @@ def _benthic_fraction_from_results(
     else:
         fraction = n_target / n_classified
     return fraction, breakdown
+
+
+#: Former name of :func:`benthic_fraction_from_results`.
+_benthic_fraction_from_results = benthic_fraction_from_results
 
 
 def _colony_base_z(
@@ -773,7 +1038,7 @@ def _benthic_interaction_from_results(
 ) -> Tuple[float, Dict[str, Any]]:
     """Height-weighted "interaction cover" of ``target_class`` over the annulus.
 
-    Like :func:`_benthic_fraction_from_results` but each sample's target
+    Like :func:`benthic_fraction_from_results` but each sample's target
     contribution is multiplied by a height weight (:func:`_height_weight`) so
     that only ``target_class`` (e.g. sand) at or above the colony base counts
     fully, with a linear falloff below it. The denominator is the whole annulus
@@ -992,7 +1257,8 @@ def calc_benthic_fraction(
             ``cams``, as the ``ProjectInitializer`` guarantees). Sample points
             are taken from and matched against this world-frame cloud.
         cams: ``Cameras`` container (or a list of ``Camera`` objects).
-        classifier: Loaded fastai learner or path to a ``.pkl`` learner; a path
+        classifier: A loaded classifier or a path to one (``.pkl`` crop classifier or
+            ``.pt`` point classifier); a path
             is loaded once up front (not per sample).
         target_class: Class label whose areal fraction is measured.
         center: (3,) focal point. If ``None``, the XY centroid + mean Z of
@@ -1009,7 +1275,7 @@ def calc_benthic_fraction(
         batch_size: Inference batch size for the (batched) classification pass.
         weight_by_probability: Average ``P(target_class)`` over samples instead
             of counting hard predictions (see
-            :func:`_benthic_fraction_from_results`).
+            :func:`benthic_fraction_from_results`).
         colony_base_percentile: Percentile of the inner-footprint (within
             ``radius_inner``) Z used as the colony **base** level ``z_colony``
             for the height-weighted ``fraction_interacting`` (see
@@ -1175,7 +1441,7 @@ def calc_benthic_fraction(
     results = intercepts.classify_image_matches(
         learn, crop_size, batch_size=batch_size
     )
-    fraction, breakdown = _benthic_fraction_from_results(
+    fraction, breakdown = benthic_fraction_from_results(
         results, target_class, weight_by_probability
     )
     result.update(fraction=fraction, **breakdown)
@@ -1211,163 +1477,141 @@ def calc_benthic_fraction(
         f"fraction({target_class})", fraction, z_colony, fraction_interacting,
     )
 
-    # The local neighbourhood (the "simple_pcd" around the colony) within the
-    # outer radius gives the visualisations the same colony-centred context as
-    # visualize_tpi rather than rendering the whole model, in true RGB colour.
-    neighborhood = neigh_cols = None
     if generate_image or show_image_matches:
-        neigh_mask = np.linalg.norm(pts[:, :2] - focal_xy, axis=1) <= outer_radius
-        neighborhood = pointclouds.SimplePointCloud(pts[neigh_mask])
-        try:
-            cols = np.asarray(pcd.colors, dtype=float)
-            neigh_cols = cols[neigh_mask] if len(cols) == len(pts) else None
-        except Exception:  # noqa: BLE001 - colours are optional context.
-            neigh_cols = None
+        from substrata import visualizations  # lazy: figures only
 
-    # The combined fraction-vs-crops comparison plot (when requested) becomes the
-    # measurement image; otherwise the standalone fraction view is used.
-    if show_image_matches:
-        # Use the colony's existing image match (from the source annotation) for
-        # the inner-circle inset; only compute one if it isn't already there.
-        focal_im = getattr(focal_annotation, "image_match", None)
-        if focal_im is None:
-            try:
-                focal_anns = pcd.get_z_intercepts(
-                    np.array([focal_xy]), intercept_search_radius
-                )
-                for fann in focal_anns.data.values():
-                    fann.get_image_matches(
-                        cam_list, max_cams=1, pcd=pcd, use_orig_coords=False,
-                        intercept_radius=reprojection_intercept_radius,
-                        reprojection_threshold_discard=(
-                            reprojection_threshold_discard
-                        ),
-                    )
-                fvals = list(focal_anns.data.values())
-                focal_im = fvals[0].image_match if fvals else None
-            except Exception as e:  # noqa: BLE001 - colony inset is best-effort.
-                logger.debug("focal image match failed: %s", e)
-
-        combined = visualizations.visualize_benthic_image_matches(
-            intercepts, results, target_class, crop_size,
-            center=focal_pt, radius_inner=radius_inner,
-            radius_outer=outer_radius, weighted=weight_by_probability,
-            background_pcd=neighborhood, background_colors=neigh_cols,
-            focal_image_match=focal_im, cell_size=sample_spacing,
-            sample_weights=sample_weights,
-            fraction_interacting=fraction_interacting, z_colony=z_colony,
-        )
-        # The combined plot is the single measurement image; show it on demand
-        # via annotation.show_measurement_images().
-        result["image"] = combined
-    elif generate_image:
-        result["image"] = visualizations.visualize_benthic_fraction(
-            intercepts, results, target_class, center=focal_pt,
-            radius_inner=radius_inner, radius_outer=outer_radius,
-            background_pcd=neighborhood, background_colors=neigh_cols,
-            weighted=weight_by_probability, sample_weights=sample_weights,
-            fraction_interacting=fraction_interacting, z_colony=z_colony,
+        result["image"] = visualizations.benthic_fraction_figure(
+            pcd, result, intercepts, results, cam_list=cam_list,
+            sample_weights=sample_weights, crop_size=crop_size,
+            sample_spacing=sample_spacing, focal_annotation=focal_annotation,
+            show_image_matches=show_image_matches,
+            intercept_search_radius=intercept_search_radius,
+            reprojection_threshold_discard=reprojection_threshold_discard,
+            reprojection_intercept_radius=reprojection_intercept_radius,
         )
 
     return result
 
 
-def get_fractal_dimension(pcd, iterations=10, plot=False):
-    """
-    get the fractal_dimension of a PCD following Schroeder, 1991 & Yuval, 2023
-    """
-    lower, upper = pcd.bounding_box
-    vox_size = np.max(upper - lower) * 1.0001
-    box_sizes = []
-    box_counts = []
-    for i in range(0, iterations):
-        voxel_grid = geometry.VoxelGrid.create_from_point_cloud_within_bounds(
-            pcd.o3d_pcd, vox_size, lower, upper
-        )
-        vox_count = len(voxel_grid.get_voxels())
-        box_sizes.append(vox_size)
-        box_counts.append(vox_count)
-        vox_size = vox_size / 2
-    log_box_sizes = np.log(1 / np.array(box_sizes))
-    log_counts = np.log(box_counts)
+def vector_dispersion_from_normals(normals) -> float:
+    """Fisher's spherical dispersion ``(N - R) / (N - 1)`` of (N, 3) normals.
 
-    slope, intercept, r_value, p_value, std_err = scipy.stats.linregress(
-        log_box_sizes, log_counts
-    )
-    if plot:
-        plt.scatter(log_box_sizes, log_counts, label="Data")
-        plt.plot(
-            log_box_sizes,
-            intercept + slope * log_box_sizes,
-            "r",
-            label=f"Fit: D = {slope:.2f}",
-        )
-        plt.xlabel("log(1/box size)")
-        plt.ylabel("log(count)")
-        plt.legend()
-        plt.show()
-        print(f"Fractal Dimension: {slope:.2f}")
-    return slope
-
-
-def get_vector_dispersion(geom, generate_image=True):
+    ``R`` is the length of the sum of the unit normals; 0.0 for fewer than 2
+    normals. See :func:`get_vector_dispersion`.
     """
-    Function to get the vector normal dispersion of a geometry (either
-    PointCloud or Mesh). Adapted from Young et al., 2017.
-
-    Returns the dispersion scalar and a static visualization image (numpy array),
-    same pattern as calc_roughness. Only PointCloud-like geometry is visualized;
-    for TriangleMesh, the image is None. When ``generate_image`` is False the
-    (expensive plotly/Kaleido) image is skipped and returned as None.
-    """
-    if isinstance(
-        geom,
-        (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
-    ):
-        normals = geom.normals
-        i = len(geom.points)
-    elif isinstance(geom, geometry.TriangleMesh):
-        normals = np.asarray(geom.triangle_normals)
-        i = len(geom.triangles)
+    normals = np.asarray(normals, dtype=float)
+    n = len(normals)
+    if n > 0:
+        unit = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+        resultant = float(np.linalg.norm(unit.sum(axis=0)))
     else:
-        raise TypeError(f"Unsupported geometry type: {type(geometry).__name__}.")
-    cos_x = normals[:, 0] / np.sqrt(
-        normals[:, 0] ** 2 + normals[:, 1] ** 2 + normals[:, 2] ** 2
-    )
-    cos_y = normals[:, 1] / np.sqrt(
-        normals[:, 0] ** 2 + normals[:, 1] ** 2 + normals[:, 2] ** 2
-    )
-    cos_z = normals[:, 2] / np.sqrt(
-        normals[:, 0] ** 2 + normals[:, 1] ** 2 + normals[:, 2] ** 2
-    )
-    R1 = np.sqrt(sum(cos_x) ** 2 + sum(cos_y) ** 2 + sum(cos_z) ** 2)
-    vector_normal_dispersion = (i - R1) / (i - 1) if i > 1 else 0.0
+        resultant = 0.0
+    return (n - resultant) / (n - 1) if n > 1 else 0.0
+
+
+def normal_deviation_deg(normals, reference_normals=None):
+    """Angle (degrees, 0-180) of each normal from the mean (resultant) direction.
+
+    Directional, like :func:`vector_dispersion_from_normals`: a flipped normal
+    counts as 180 degrees. Zero-length normals are left as they are (angle 90).
+
+    Args:
+        normals: (N, 3) normals whose deviation is returned.
+        reference_normals: Normals whose resultant defines the mean direction
+            (default: ``normals``), e.g. the full cloud when ``normals`` is a
+            displayed subsample.
+
+    Returns:
+        tuple: ``(deviation_deg, mean_normal)``; ``mean_normal`` is the unit
+        resultant, or None when the resultant vanishes (then every deviation
+        is 90).
+    """
+    def _unit(v):
+        v = np.asarray(v, dtype=float).reshape(-1, 3)
+        norms = np.linalg.norm(v, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return v / norms
+
+    unit = _unit(normals)
+    ref = unit if reference_normals is None else _unit(reference_normals)
+    resultant = ref.sum(axis=0)
+    r_len = float(np.linalg.norm(resultant))
+    if r_len <= 1e-10:
+        return np.full(len(unit), 90.0), None
+    mean_normal = resultant / r_len
+    alignment = unit @ mean_normal
+    return np.degrees(np.arccos(np.clip(alignment, -1.0, 1.0))), mean_normal
+
+
+@_renamed_kwargs(geom="pcd")
+def get_vector_dispersion(pcd, generate_image=True):
+    """Vector (normal) dispersion of a point cloud or mesh (Young et al. 2017).
+
+    Fisher's spherical dispersion of the unit normals,
+    ``(N - R) / (N - 1)`` with ``R`` the length of the resultant (sum of the
+    unit normals): 0 when all normals are parallel, 1 for uniformly scattered
+    normals, up to 2 for normals in two opposite groups. The statistic is
+    *directional*, not axial: the normals must be consistently oriented (e.g.
+    all facing outward / up); flipping half of identical normals gives 1.0.
+
+    Args:
+        pcd: A ``PointCloud`` / ``SimplePointCloud`` / open3d point cloud (or
+            any object with ``points`` and ``normals``), or an open3d
+            ``TriangleMesh`` (its triangle normals are used).
+        generate_image: Also render the QC image (expensive plotly/Kaleido
+            render) for point clouds; ``None`` otherwise.
+
+    Returns:
+        tuple: ``(dispersion, image)``; ``dispersion`` is 0.0 for fewer than 2
+        normals.
+
+    Raises:
+        TypeError: For an unsupported geometry type, or a point cloud without
+            one normal per point.
+    """
+    is_point_cloud = False
+    o3d = sys.modules.get("open3d")  # an open3d mesh implies open3d is loaded
+    if o3d is not None and isinstance(pcd, o3d.geometry.TriangleMesh):
+        if not pcd.has_triangle_normals():
+            pcd.compute_triangle_normals()
+        normals = np.asarray(pcd.triangle_normals, dtype=float)
+    elif hasattr(pcd, "points") and hasattr(pcd, "normals"):
+        normals = np.asarray(pcd.normals, dtype=float)
+        n_points = len(np.asarray(pcd.points))
+        if normals.shape != (n_points, 3):
+            raise TypeError(
+                f"{type(pcd).__name__} needs one normal per point "
+                f"(normals {normals.shape}, {n_points} points)"
+            )
+        is_point_cloud = True
+    else:
+        raise TypeError(f"Unsupported geometry type: {type(pcd).__name__}.")
+
+    vector_normal_dispersion = vector_dispersion_from_normals(normals)
 
     image = None
-    if (
-        generate_image
-        and isinstance(
-            geom,
-            (pointclouds.SimplePointCloud, pointclouds.PointCloud, geometry.PointCloud),
-        )
-        and i > 0
-    ):
+    if generate_image and is_point_cloud and len(normals) > 0:
+        from substrata import visualizations  # lazy: figures only
+
         image = visualizations.visualize_vector_dispersion(
-            geom, interactive=False, dispersion=vector_normal_dispersion
+            pcd, interactive=False, dispersion=vector_normal_dispersion
         )
 
     return vector_normal_dispersion, image
 
 
 def get_rgb_stats(pcd):
-    """Compute per-channel median colors and overall luminance of a point cloud.
+    """Compute per-channel median colors and a luma of a point cloud.
 
     Args:
         pcd: A point cloud whose ``colors`` are RGB values in [0, 1].
 
     Returns:
-        tuple: ``(median_red, median_green, median_blue, luminance)``, where
-        luminance is the Rec. 709 weighted sum of the median channel values.
+        tuple: ``(median_red, median_green, median_blue, luminance)``. The
+        "luminance" is the Rec. 709 weighted sum of the three *median* channel
+        values (not the median of per-point luminance), computed on the stored
+        (gamma-encoded) colours, i.e. a luma rather than a radiometric
+        luminance.
     """
     median_red = np.median(np.asarray(pcd.colors)[:, 0])
     median_green = np.median(np.asarray(pcd.colors)[:, 1])
@@ -1376,200 +1620,153 @@ def get_rgb_stats(pcd):
     return median_red, median_green, median_blue, luminance
 
 
-def generate_filled_circle(center, radius, spacing):
-    """Generate a grid of points filling a horizontal circle.
+def hemispherical_disk(resolution: int) -> np.ndarray:
+    """The imaging disk of a ``resolution`` x ``resolution`` hemispherical image.
 
-    Points are laid out on a regular grid in the x-y plane at the center's z
-    height, keeping only those within ``radius`` of the center.
-
-    Args:
-        center: Sequence ``(cx, cy, cz)`` giving the circle center coordinates.
-        radius (float): Circle radius.
-        spacing (float): Grid spacing between candidate points.
+    Pixels whose centres lie within ``resolution / 2`` of the image centre: the
+    whole upper hemisphere (zenith 0-90 degrees) in the projection of
+    :func:`hemispherical_cover`.
 
     Returns:
-        numpy.ndarray: Array of shape ``(N, 3)`` with the points inside the
-        circle, all sharing the center's z value.
+        (resolution, resolution) bool array.
     """
-    points = []
-    cx, cy, cz = center  # Center coordinates
-    for x in np.arange(cx - radius, cx + radius + spacing, spacing):
-        for y in np.arange(cy - radius, cy + radius + spacing, spacing):
-            if (x - cx) ** 2 + (y - cy) ** 2 <= radius**2:
-                points.append((x, y, cz))
-    return np.asarray(points)
+    c = np.arange(resolution) + 0.5 - resolution / 2.0
+    return (c[:, None] ** 2 + c[None, :] ** 2) <= (resolution / 2.0) ** 2
 
 
-def get_canopy_cover_hemisphere(pcd, annotation, radius=0.2, colors=False):
+def hemispherical_pixels(points, center, resolution, max_radius=None):
+    """Project the points above ``center`` onto the hemispherical image.
+
+    Equidistant (polar) projection: a point at zenith angle ``phi`` and
+    azimuth ``theta`` (from +X towards +Y) lands at ``phi / pi * resolution``
+    pixels from the image centre. Image rows follow world +X, columns world +Y.
+
+    Returns:
+        tuple: ``(rows, cols, keep, dist)``: pixel indices of the kept points,
+        the boolean mask of kept points (above ``center``, and within
+        ``max_radius`` horizontally if given) over the input, and the kept
+        points' distances from ``center``.
     """
+    rel = np.asarray(points, dtype=float) - np.asarray(center, dtype=float)
+    keep = rel[:, 2] > 0
+    if max_radius is not None:
+        keep &= np.hypot(rel[:, 0], rel[:, 1]) <= max_radius
+    rel = rel[keep]
+    dist = np.linalg.norm(rel, axis=1)
+    theta = np.arctan2(rel[:, 1], rel[:, 0])
+    phi = np.arccos(rel[:, 2] / dist)
+    u = ((phi * np.cos(theta)) + np.pi / 2) / np.pi * resolution
+    v = ((phi * np.sin(theta)) + np.pi / 2) / np.pi * resolution
+    rows = np.clip(np.floor(u).astype(int), 0, resolution - 1)
+    cols = np.clip(np.floor(v).astype(int), 0, resolution - 1)
+    return rows, cols, keep, dist
 
-    Author: DvH
+
+#: Former name of :func:`hemispherical_pixels`.
+_hemispherical_pixels = hemispherical_pixels
+
+
+def hemispherical_cover(
+    points: np.ndarray,
+    center: np.ndarray,
+    resolution: int = 200,
+    max_radius: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Binary canopy-cover raster of the hemisphere above ``center``.
+
+    Every point above ``center`` (``z > center_z``; within ``max_radius``
+    horizontally if given) marks the pixel it projects to as covered, in the
+    equidistant projection of :func:`hemispherical_pixels` (radius
+    proportional to zenith angle; rows follow world +X, columns world +Y).
+    Each point covers exactly one pixel, so the cover depends on point density
+    and ``resolution``: a sparse cloud or a fine raster leaves pixel holes in
+    solid surfaces (read as sky).
+
+    Args:
+        points: (N, 3) point coordinates.
+        center: (3,) viewpoint (e.g. the annotation).
+        resolution: Image size in pixels (the disk spans zenith 0-90 degrees).
+        max_radius: Only use points within this horizontal distance.
+
+    Returns:
+        tuple: ``(cover, disk)``, two (resolution, resolution) bool arrays: the
+        covered pixels (inside the disk) and the imaging disk
+        (:func:`hemispherical_disk`).
     """
-    # Project point cloud points onto a hemisphere
-    dir_vecs = np.asarray(pcd.points) - annotation.coords
-    dir_vec_lengths = np.linalg.norm(dir_vecs, axis=1, keepdims=True)
-    vecs_to_sphere = (radius / dir_vec_lengths) * dir_vecs
-    sphere_projection = annotation.coords + vecs_to_sphere
-    hemisphere = sphere_projection[sphere_projection[:, 2] > annotation.coords[2]]
-
-    # Stereographical projection of hemisphere by projecting
-    # points towards the southpole stopping at the equator
-    southpole_coords = (
-        annotation.coords[0],
-        annotation.coords[1],
-        annotation.coords[2] - radius,
-    )
-    equator_z = annotation.coords[2]
-    southpole_vecs = southpole_coords - hemisphere
-    southpole_vec_lengths = (equator_z - hemisphere[:, 2]) / southpole_vecs[:, 2]
-    southpole_vec_lengths = southpole_vec_lengths[:, np.newaxis]
-    stereograph_projection = hemisphere + southpole_vecs * southpole_vec_lengths
-    hemisphere2d = geometry.PointCloud()
-    hemisphere2d.points = utility.Vector3dVector(stereograph_projection)
-    if colors:
-        sphere_cloud = geometry.PointCloud()
-        sphere_cloud.points = utility.Vector3dVector(sphere_projection)
-        sphere_cloud.colors = pcd.colors
-        hemisphere2d.colors = utility.Vector3dVector(
-            np.asarray(sphere_cloud.colors)[
-                np.asarray(sphere_cloud.points)[:, 2] > annotation.coords[2]
-            ]
-        )
-
-    # Calculate % cover with point grid distance by projecting
-    # onto 2D circle point grid (pointcloud)
-    circle_points = generate_filled_circle(
-        annotation.coords, radius, settings.CANOPY_COVER_POINT_SPACING
-    )
-    uncovered_cloud = geometry.PointCloud()
-    uncovered_cloud.points = utility.Vector3dVector(circle_points)
-    uncovered_cloud.paint_uniform_color([1, 0, 0])
-    dist_pcds = uncovered_cloud.compute_point_cloud_distance(hemisphere2d)
-    dist_pcds = np.asarray(dist_pcds)
-    uncovered_id = np.where(dist_pcds > settings.CANOPY_COVER_POINT_SPACING)[0]
-    uncovered_cloud = uncovered_cloud.select_by_index(uncovered_id)
-    CR = (len(circle_points) - len(uncovered_id)) / len(circle_points)
-
-    # Visualize
-    visualizations.capture_geoms_to_file(
-        [hemisphere2d, uncovered_cloud],
-        "{0}/{1}_cover.png".format(settings.OUTPUT_FOLDER, annotation.id),
-    )
-
-    return CR
+    rows, cols, _, _ = hemispherical_pixels(points, center, resolution, max_radius)
+    disk = hemispherical_disk(resolution)
+    cover = np.zeros((resolution, resolution), dtype=bool)
+    cover[rows, cols] = True
+    return cover & disk, disk
 
 
-def create_mesh_ball_pivot(pcd):
+def gap_fractions(
+    cover_px: np.ndarray, img_mask: np.ndarray, seed_points_px
+) -> Tuple[float, float, np.ndarray]:
+    """Raw and connected ("filled") gap fractions of a binary cover raster.
+
+    Sky is ``img_mask & ~cover_px``. ``gapF_raw`` is the sky area over the
+    disk area. ``gapF_fill`` counts only the sky connected (4-connectivity:
+    pixels sharing an edge) to at least one seed: the union of the connected
+    sky components that contain a seed, over the disk area. Sky enclosed by
+    cover (pixel holes in a canopy, gaps under an overhang) is then left out.
+    Seeds that fall on cover or outside the disk are skipped with a warning.
+
+    Args:
+        cover_px: (H, W) bool array, True where covered.
+        img_mask: (H, W) bool array of the imaging disk.
+        seed_points_px: Iterable of ``(x, y)`` pixel seeds, ``x`` the column and
+            ``y`` the row (OpenCV order).
+
+    Returns:
+        tuple: ``(gapF_raw, gapF_fill, connected)``; ``connected`` is the
+        (H, W) bool mask of the seeded sky.
+
+    Raises:
+        ValueError: If the masks differ in shape or the disk is empty.
     """
-    Create a mesh from a point cloud through the ball pivot method (geometry.PointCloud)
-    """
-    avg_point_dist = np.mean(pcd.compute_nearest_neighbor_distance())
-    # Create a list of radii to use for the ball pivot method
-    radii = [1.5 * avg_point_dist * i for i in range(1, 10)]
-    # Create a mesh from the point cloud using the ball pivot method
-    return geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-        pcd, utility.DoubleVector(radii)
-    )
-
-
-def get_largest_cluster(mesh):
-    """
-    Return the largest cluster from a mesh (geometry.TriangleMesh)
-    """
-    clust_idx, clust_n_tria, _ = get_cluster_triangles(mesh)
-    largest_cluster_idx = clust_n_tria.argmax()
-    triangles_to_remove = clust_idx != largest_cluster_idx
-    # Create a new mesh retaining only the largest cluster
-    import copy
-
-    largest_mesh: cpu.pybind.geometry.TriangleMesh = copy.deepcopy(mesh)
-    largest_mesh.remove_triangles_by_mask(triangles_to_remove)
-    return largest_mesh
-
-
-def get_cluster_triangles(mesh):
-    """
-    Cluster connected triangles, and return the cluster indices, the number
-    of triangles in each cluster and the area of each cluster
-    """
-    clust_idx, clust_n_tria, clust_area = mesh.cluster_connected_triangles()
-    return map(np.asarray, (clust_idx, clust_n_tria, clust_area))
-
-
-def get_3D_area(mesh):
-    """
-    Calculate the 3D area of a mesh (geometry.TriangleMesh)
-    """
-    return mesh.get_surface_area()
-
-
-def get_2D_area(pcd, alpha="optimize", vis=False):
-    """
-    Calculate the 2D area when rotating point cloud
-    to best fit plane with the xy axis (geometry.PointCloud)
-    """
-    homogeneous_coords = np.hstack([pcd.points, np.ones((pcd.points.shape[0], 1))])
-    transform_coords = np.dot(
-        homogeneous_coords, transforms.get_rotation_to_xy_plane(pcd)
-    )
-    points_2D = transform_coords[:, 0:2]
-    if alpha == "optimize":
-        alpha = optimizealpha(points_2D)
-
-    print("alpha is", alpha)
-    hull = alphashape.alphashape(points_2D, alpha)
-
-    # Check that the hull is a valid polygon
-    if hull is None or not isinstance(hull, (Polygon, MultiPolygon)):
+    cover_px = np.asarray(cover_px, dtype=bool)
+    img_mask = np.asarray(img_mask, dtype=bool)
+    if cover_px.shape != img_mask.shape:
         raise ValueError(
-            "alphashape did not return a valid 2D polygon. Try adjusting alpha."
+            f"cover {cover_px.shape} and mask {img_mask.shape} differ in shape"
         )
+    area = int(img_mask.sum())
+    if area == 0:
+        raise ValueError("the imaging disk (img_mask) is empty")
+    sky = img_mask & ~cover_px
+    gapF_raw = float(sky.sum()) / area
 
-    if vis:
-        fig, ax = plt.subplots()
-        ax.scatter(points_2D[:, 0], points_2D[:, 1], s=1)
+    import cv2
 
-        def draw_polygon(poly, facecolor="blue", edgecolor="black", transparency=0.5):
-            # Exterior
-            ext_coords = list(poly.exterior.coords)
-            ax.add_patch(
-                MplPolygon(
-                    ext_coords,
-                    closed=True,
-                    facecolor=facecolor,
-                    edgecolor=edgecolor,
-                    alpha=transparency,
-                )
-            )
-
-        if isinstance(hull, Polygon):
-            draw_polygon(hull)
-        elif isinstance(hull, MultiPolygon):
-            for poly in hull.geoms:
-                draw_polygon(poly)
-        plt.axis("equal")
-        plt.show()
-
-    return hull.area
-
-
-def get_3d_rugosity(area_2D, area_3D):
-    """
-    Get 3D rugosity: ratio of 3D area to 2D area
-    """
-    try:
-        return area_3D / area_2D
-    except ZeroDivisionError:
-        return None
+    _, labels = cv2.connectedComponents(sky.astype(np.uint8), connectivity=4)
+    h, w = sky.shape
+    seeded = set()
+    for x, y in seed_points_px:
+        x, y = int(x), int(y)
+        if not (0 <= x < w and 0 <= y < h):
+            logger.warning("gap_fractions: seed (%d, %d) is outside the image; "
+                           "skipped", x, y)
+            continue
+        label = int(labels[y, x])
+        if label == 0:
+            logger.warning("gap_fractions: seed (%d, %d) is on cover (or outside "
+                           "the imaging disk); skipped", x, y)
+            continue
+        seeded.add(label)
+    connected = np.isin(labels, sorted(seeded)) if seeded else np.zeros_like(sky)
+    gapF_fill = float(connected.sum()) / area
+    return gapF_raw, gapF_fill, connected
 
 
+@_renamed_kwargs(output_filename="output_path")
 def calc_gap_fraction(
     annotation,
     pcd,
     resolution=200,
     color_output=True,
     max_radius=None,
-    output_filename=None,
+    output_path=None,
     seed_points=None,
     fill_color=settings.GAP_FRACTION_FILL_COLOR,
     show_rings=False,
@@ -1578,32 +1775,51 @@ def calc_gap_fraction(
     width=500,
     height=500,
 ):
-    """
-    Calculate gap fraction based on hemispherical projection:
-    ratio of "sky pixels" to "benthic pixels" in the resulting 2D image
+    """Gap fraction from a hemispherical projection of the cloud above a point.
+
+    The points above the annotation are projected onto a hemispherical image
+    (:func:`hemispherical_cover`; equidistant projection: the image radius is
+    proportional to the zenith angle, rows follow world +X and columns world
+    +Y). The metrics are computed on that binary raster by
+    :func:`gap_fractions`, independently of the display options:
+
+    - ``gapF_raw``: sky pixels / all pixels of the imaging disk (sky over
+      total, not sky over benthos).
+    - ``gapF_fill``: the sky connected to the seed points / all pixels (holes
+      enclosed by cover do not count).
+
+    Interpretation: pixels are equal steps of zenith angle, not equal solid
+    angles, so these are equidistant-image fractions (an opaque canopy over
+    zenith 0-45 degrees gives 0.75, whereas the open solid angle fraction would
+    be cos 45 = 0.71). Each point covers one pixel, so ``gapF_raw`` rises with
+    sparser clouds and finer ``resolution`` (holes in solid surfaces read as
+    sky); compare values only at the same resolution and similar point
+    density. ``gapF_fill`` is less sensitive to such holes.
 
     Args:
         annotation: Annotation object with coords attribute.
         pcd: Point cloud object.
         resolution: Image resolution (default 200).
-        color_output: Whether to use color output (default True).
-        max_radius: Optional maximum radius for filtering points.
-        output_filename: Optional filename to save the image. If None, the image
-            is not saved to file. If not provided, uses default path based on
-            annotation.id and settings.OUTPUT_FOLDER.
+        color_output: Paint the cover in the point colours (default True) or
+            white. Display only.
+        max_radius: Optional maximum horizontal distance of the points used.
+        output_path: Optional filename to save the image to (not saved
+            when None).
         seed_points: Optional list of ``(x, y)`` tuples with proportional
-            coordinates in ``[0, 1]`` specifying flood-fill seed locations
+            coordinates in ``[0, 1]`` specifying the seeds of the connected sky
             (``x`` horizontal, ``y`` vertical, origin top-left). If ``None``,
-            the default seeds ``(0.5, 0.5)`` (image centre) and ``(0.25, 0.5)``
-            (an "upslope" point) are used. When provided, the seed points are
-            drawn as markers on the output image after the gap fraction is
-            calculated, so they do not affect the result and can be used to
-            iteratively tune their placement.
+            the default seeds ``(0.5, 0.5)`` (image centre: the zenith) and
+            ``(0.25, 0.5)`` are used; the latter is at zenith 45 degrees towards
+            world -Y (historically called "upslope"; after
+            ``align_y_upslope`` +Y is upslope, so it is downslope). Seeds on
+            cover are skipped with a warning. When provided, the seed points are
+            drawn as markers on the output image (after the gap fraction is
+            calculated), which helps to tune their placement.
         fill_color: RGB colour used to paint the connected sky region, as a
             3-tuple in 0-255 (default ``settings.GAP_FRACTION_FILL_COLOR``, an
             ocean blue from the ``RdBu_r`` colour map used by the TPI plot).
-            Display only: ``gapF_fill`` is measured from the flood-fill region
-            itself, so the colour may also occur in the benthic imagery.
+            Display only: the gap fractions come from the binary cover raster,
+            so the colour may also occur in the benthic imagery.
         show_rings: When True, draw concentric zenith-angle rings at 22.5, 45,
             67.5 and 90 degrees over the output image (default False). In this
             projection the radius scales linearly with the zenith angle, so the
@@ -1624,636 +1840,45 @@ def calc_gap_fraction(
 
     Returns:
         tuple: ``(gapF_raw, gapF_fill, image)`` - the raw gap fraction, the
-            flood-filled (connected sky) gap fraction, and the hemispherical
-            projection as an ``(H, W, 3)`` uint8 RGB array.
+            connected-sky gap fraction, and the hemispherical projection as an
+            ``(H, W, 3)`` uint8 RGB array (sky dark grey, cover in the point
+            colours or white, connected sky in ``fill_color``).
     """
-    fill_color = tuple(int(c) for c in fill_color)
-    if len(fill_color) != 3 or not all(0 <= c <= 255 for c in fill_color):
-        raise ValueError(
-            f"fill_color must be an RGB 3-tuple in 0-255, got {fill_color!r}"
-        )
-    if ring_color is None:
-        ring_color = (0, 0, 0) if show_axes else (255, 255, 255)
-    ring_color = tuple(int(c) for c in ring_color)
-    if len(ring_color) != 3 or not all(0 <= c <= 255 for c in ring_color):
-        raise ValueError(
-            f"ring_color must be an RGB 3-tuple in 0-255, got {ring_color!r}"
-        )
-
-    # Translate the point cloud by the negation of the center coordinates
-    # and remove points with a negative z value
-    trans_points = np.asarray(pcd.points) - annotation.coords
-    points_to_keep = trans_points[:, 2] > 0
-
-    # If max_radius is defined, filter points to keep based on xy distance to annotation
-    if max_radius is not None:
-        xy_distances = np.linalg.norm(trans_points[:, :2], axis=1)
-        points_to_keep = points_to_keep & (xy_distances <= max_radius)
-
-    trans_points = trans_points[points_to_keep]
-
-    # Convert to spherical coordinates
-    theta = np.arctan2(trans_points[:, 1], trans_points[:, 0])
-    phi = np.arccos(trans_points[:, 2] / np.linalg.norm(trans_points, axis=1))
-
-    # Convert from spherical to normalized 2D polar coordinates,
-    # scale by image resolution, and convert to pixel coordinates (integers)
-    x = (((phi * np.cos(theta)) + np.pi / 2) / np.pi) * resolution
-    y = (((phi * np.sin(theta)) + np.pi / 2) / np.pi) * resolution
-
-    cover_pixels = np.stack(
-        (
-            np.clip(x.astype(int), 0, resolution - 1),
-            np.clip(y.astype(int), 0, resolution - 1),
-        ),
-        axis=-1,
+    radius = resolution // 2
+    points = np.asarray(pcd.points)
+    cover, img_mask = hemispherical_cover(
+        points, annotation.coords, resolution, max_radius
     )
 
-    # Set circular imaging area (in dark gray)
-    radius = resolution // 2
-    image = np.zeros((resolution, resolution, 3), dtype=np.uint8)
-    x, y = np.meshgrid(np.arange(resolution), np.arange(resolution))
-    img_mask = (x - (radius)) ** 2 + (y - (radius)) ** 2 <= radius**2
-    image[img_mask] = [80, 80, 80]
-    img_area = np.sum(img_mask)
-
-    # Calculate the raw cover
-    raw_cover = len(np.unique(cover_pixels, axis=0))
-    gapF_raw = (img_area - raw_cover) / img_area
-
-    # Map the points(/colors) to the image pixels. Vectorized so this scales to
-    # the full point cloud without a Python-level per-point loop (which made
-    # this the runtime bottleneck for large clouds).
-    if color_output:
-        rgb_colors = (np.asarray(pcd.colors)[points_to_keep] * 255).astype(np.uint8)
-        # For each pixel keep the colour of the point closest to the centre. We
-        # scatter-assign in order of decreasing distance so the nearest point
-        # (smallest norm) is written last and therefore wins per pixel.
-        norms = np.linalg.norm(trans_points, axis=1)
-        order = np.argsort(-norms, kind="stable")
-        image_flat = image.reshape(-1, 3)
-        flat_idx = cover_pixels[:, 0] * resolution + cover_pixels[:, 1]
-        image_flat[flat_idx[order]] = rgb_colors[order]
-    else:
-        image[cover_pixels[:, 0], cover_pixels[:, 1]] = [255, 255, 255]
-
-    # Apply floodFill algorithm to calculate center gap fraction.
-    # By default, use a centre point and an "upslope" point; otherwise convert
-    # the user-supplied proportional coordinates to pixel coordinates.
+    # Seeds in pixels (x = column, y = row). By default the centre (zenith) and
+    # a point at zenith 45 deg towards -Y; otherwise the user's proportional
+    # coordinates.
     if seed_points is None:
         seed_points_px = [(radius, radius), (radius // 2, radius)]
-        visualize_seeds = False
     else:
         seed_points_px = [
             (
-                int(round(sx * resolution)),
-                int(round(sy * resolution)),
+                int(np.clip(round(sx * resolution), 0, resolution - 1)),
+                int(np.clip(round(sy * resolution), 0, resolution - 1)),
             )
             for sx, sy in seed_points
         ]
-        visualize_seeds = True
 
-    # The connected sky region is taken from the flood-fill mask (not by
-    # counting pixels of the fill colour), so the display colour cannot be
-    # confused with identical colours in the benthic imagery.
-    diff = (1, 1, 1)
-    fill_mask = np.zeros((resolution + 2, resolution + 2), dtype=np.uint8)
-    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (1 << 8)
-    for seed_point in seed_points_px:
-        cv2.floodFill(image, fill_mask, seed_point, fill_color, diff, diff, flags)
-    filled = fill_mask[1:-1, 1:-1].astype(bool)
-    image[filled] = fill_color
+    # The metrics, from the binary raster only (no display colours involved)
+    gapF_raw, gapF_fill, connected = gap_fractions(cover, img_mask, seed_points_px)
 
-    fill_pixel_count = int(filled.sum())
-    gapF_fill = fill_pixel_count / img_area
+    # The image (display only; drawn after the metrics, never read back)
+    from substrata import visualizations  # lazy: figures only
 
-    # Draw the zenith-angle rings AFTER counting so they don't affect
-    # gapF_fill. The projected radius is (phi / pi) * resolution, so a zenith
-    # angle of `deg` sits at (deg / 180) * resolution pixels from the centre -
-    # evenly spaced quarters of the imaging area, with 90 deg on its edge.
-    # With show_axes the rings are drawn as dashed vector circles in the figure.
-    if show_rings and not show_axes:
-        ring_thickness = max(1, resolution // 400)
-        for deg in (22.5, 45.0, 67.5, 90.0):
-            ring_px = int(round((deg / 180.0) * resolution))
-            cv2.circle(
-                image,
-                (radius, radius),
-                ring_px,
-                ring_color,
-                thickness=ring_thickness,
-                lineType=cv2.LINE_AA,
-            )
-
-    # Draw seed markers AFTER counting so they don't affect gapF_fill.
-    # A high-contrast green cross with a thin black outline is used so the
-    # markers remain visible against the dark gray sky, navy fill, and varied
-    # benthic colours.
-    if visualize_seeds:
-        marker_size = max(6, resolution // 25)
-        for seed_point in seed_points_px:
-            cv2.drawMarker(
-                image,
-                seed_point,
-                color=(0, 0, 0),
-                markerType=cv2.MARKER_CROSS,
-                markerSize=marker_size,
-                thickness=3,
-                line_type=cv2.LINE_AA,
-            )
-            cv2.drawMarker(
-                image,
-                seed_point,
-                color=(0, 255, 0),
-                markerType=cv2.MARKER_CROSS,
-                markerSize=marker_size,
-                thickness=1,
-                line_type=cv2.LINE_AA,
-            )
-
-    if show_axes:
-        image = visualizations.render_gap_fraction_axes(
-            image,
-            img_mask,
-            width=width,
-            height=height,
-            rings=(22.5, 45.0, 67.5, 90.0) if show_rings else (),
-            ring_color=ring_color,
-        )
-
-    # Output the image only if output_filename is provided
-    if output_filename is not None:
-        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_filename, image_bgr)
-
+    image = visualizations.render_gap_fraction(
+        pcd, annotation.coords, resolution, connected,
+        max_radius=max_radius, color_output=color_output,
+        seed_points_px=seed_points_px if seed_points is not None else None,
+        fill_color=fill_color, show_rings=show_rings, ring_color=ring_color,
+        show_axes=show_axes, width=width, height=height,
+        output_filename=output_path,
+    )
     return gapF_raw, gapF_fill, image
-
-
-def apply_vector_transform_points(points, transform_vector):
-    """
-    apply transformation so an array of points aligns to the tranform_vector
-    TBD: should this go to transforms?
-    """
-    transform_matrix = transforms.get_up_vector_transform(transform_vector)
-    points_hom = np.hstack((points, np.ones((len(points), 1))))
-    points_hom = np.dot(points_hom, np.array(transform_matrix))
-    points_transformed = points_hom[:, :-1]  # TODO: Make homogenous function?
-    return points_transformed
-
-
-def cast_ray_pointcloud(starting_coord, ray_vector, points, dist_threshold):
-    """
-    a function that mimics raycasting but with a pointcloud instead of a mesh
-    the dist_threshold argument helps ignore points that are not of interest
-    author: DVH
-    """
-    # using dot product calculate distance between the ray and the pointcloud
-    t = np.dot(points - starting_coord, ray_vector)
-    ray = starting_coord + t[:, np.newaxis] * ray_vector
-    closest_index_intersection = np.argmin(np.linalg.norm(ray - points, axis=1))
-    closest_point_along_ray = (
-        np.dot(ray_vector, (points[closest_index_intersection] - starting_coord))
-        / np.linalg.norm(ray_vector)
-    ) * ray_vector + starting_coord
-    if (
-        np.sqrt(
-            np.sum((closest_point_along_ray - points[closest_index_intersection]) ** 2)
-        )
-        <= dist_threshold
-    ):
-        return closest_index_intersection
-    return None
-
-
-def generate_point_grid(bounding_box, spacing):
-    """Generate a regular horizontal grid of points above a bounding box.
-
-    Grid points span the box in x and y at the given spacing and all share a
-    single z value set just above the box top (``max_bound[2] + spacing``).
-
-    Args:
-        bounding_box: Pair ``[min_bound, max_bound]`` of 3-D corner
-            coordinates, e.g. ``[[min_x, min_y, min_z], [max_x, max_y, max_z]]``.
-        spacing (float): Spacing between grid points.
-
-    Returns:
-        numpy.ndarray: Array of shape ``(N, 3)`` with the flattened grid points.
-    """
-    min_bound, max_bound = bounding_box
-    x_range = np.arange(min_bound[0], max_bound[0], spacing)
-    y_range = np.arange(min_bound[1], max_bound[1], spacing)
-    z_value = max_bound[2] + spacing
-    xx, yy, zz = np.meshgrid(x_range, y_range, z_value, indexing="ij")
-    grid_points = np.column_stack(
-        (xx.flatten(), yy.flatten(), np.full_like(xx.flatten(), z_value))
-    )
-    return grid_points
-
-
-def get_point_intercept_grid_KdTree(pcd, spacing=1, vis=True):
-    """
-    Get the coordinates of points on the grid that are closest to the point cloud using KDTree.
-
-    bounding_box = [[min_x, min_y, min_z], [max_x, max_y, max_z]]
-    """
-    bounding_box = pcd.bounding_box
-    grid_points = np.asarray(generate_point_grid(bounding_box, spacing))[:, :2]
-    point_cloud_2d = np.array(pcd.points)[:, :2]  # Extract only x, y from point cloud
-    kd_tree = KDTree(point_cloud_2d)
-    distances, closest_indices = kd_tree.query(grid_points)
-    closest_points_3d = np.array(pcd.points)[closest_indices]
-
-    if vis:
-        # Visualization (optional)
-        pcd_copy = copy.deepcopy(pcd)
-        visualizations.show_grid_points(pcd_copy, closest_indices)
-
-    return closest_points_3d, closest_indices
-
-
-def get_point_intercept_grid(pcd, proj_vector=[0, 0, 1], spacing=1, vis=True):
-    """
-    get the coordinates of matrix point at a certain spacing and from a certain view point.
-    standard usage is 1m distance and a top-down view.
-
-    grid z = max_z
-
-    bounding_box = [[min_x, min_y, min_z], [max_x, max_y, max_z]]
-    author: DVH
-    """
-    bounding_box = pcd.bounding_box
-    grid_points = generate_point_grid(bounding_box, spacing)
-
-    if proj_vector != [0, 0, 1]:
-        grid_points = apply_vector_transform_points(grid_points, proj_vector)
-
-    # Compute intersection points for each grid point in parallel
-    ray_vector = proj_vector / np.linalg.norm(proj_vector)
-    max_spacing = spacing / 2  # TODO: Make this a setting?
-    closest_indices = Parallel(n_jobs=-1)(
-        delayed(cast_ray_pointcloud)(grid_point, ray_vector, pcd.points, max_spacing)
-        for grid_point in grid_points
-    )  # TODO: Centralize Parallel
-    grid_point_idx = [value for value in closest_indices if value is not None]
-    if vis:
-        pcd_copy = copy.deepcopy(pcd)
-        visualizations.show_grid_points(pcd_copy, closest_indices)
-
-    return pcd.points[grid_point_idx]
-
-
-def project_points_onto_plane(points, plane_normal):
-    """
-    Project 3D points onto a plane defined by its normal vector.
-    """
-    plane_normal = plane_normal / np.linalg.norm(plane_normal)
-    projected_points = points - np.outer(np.dot(points, plane_normal), plane_normal)
-    return projected_points
-
-
-def generate_transect_points(markers, num_points=50):
-    """Return a PointCloud containing points along a transect line
-    with num_points defining the number of points per fragment"""
-    transect_points = []
-    for i in range(len(markers.data) - 1):
-        transect_points.append(
-            np.linspace(markers.coords[i], markers.coords[i + 1], num_points)
-        )
-    transect_points_all = np.vstack(transect_points)
-
-    return transect_points_all
-
-
-def generate_grid_transect(
-    pcd, markers, spacing, distance, proj_vector=[0, 0, 1], vis=True
-):
-    """
-    create a sampling matrix design around the transect line marked by cattle tags.
-    markers = cattle tags, spacing = spacing between matrix points, distance= distance from transect
-    """
-    # create a "bounding box" for the markers
-    bounding_box = markers.get_bounding_box()  # create a "bounding box" for the markers
-    grid_points = generate_point_grid(bounding_box, spacing)
-
-    if proj_vector != [0, 0, 1]:
-        grid_points = apply_vector_transform_points(grid_points, proj_vector)
-    transect = generate_transect_points(markers)
-    # Filter grid points based on distance from original points
-    ray_vector = proj_vector / np.linalg.norm(proj_vector)
-    closest_indices = Parallel(n_jobs=-1)(
-        delayed(cast_ray_pointcloud)(grid_point, ray_vector, pcd.points, spacing)
-        for grid_point in grid_points
-    )
-    closest_indices = [index for index in closest_indices if index is not None]
-    transect_sample_points = []
-    transect_sample_idx = []
-    proj_plane_points = project_points_onto_plane(
-        pcd.points[closest_indices], proj_vector
-    )  # still remove none from list
-    proj_plane_transect = project_points_onto_plane(transect, proj_vector)
-    for index, closest_point in enumerate(closest_indices):
-        planar_distance = np.min(
-            np.sqrt(
-                np.sum((proj_plane_points[index] - proj_plane_transect) ** 2, axis=1)
-            )
-        )
-        if planar_distance <= distance:
-            transect_sample_points.append(pcd.points[closest_point])
-            transect_sample_idx.append(closest_point)
-    if vis:
-        pcd_copy = copy.deepcopy(pcd)
-        visualizations.show_grid_points(pcd_copy, transect_sample_idx)
-
-    return transect_sample_points
-
-
-def generate_grid_transect_KDtree(pcd, markers, spacing, distance, vis=True):
-    """
-    create a sampling matrix design around the transect line marked by cattle tags.
-    markers = cattle tags, spacing = spacing between matrix points, distance= distance from transect
-    """
-
-    bounding_box = pcd.bounding_box
-    grid_points = np.asarray(generate_point_grid(bounding_box, spacing))[:, :2]
-
-    point_cloud_2d = np.array(pcd.points)[:, :2]
-    kd_tree = KDTree(point_cloud_2d)
-    distances, closest_indices = kd_tree.query(grid_points)
-    mask = distances <= 0.01
-    closest_indices = closest_indices[mask]
-    grid_points = pcd.points[closest_indices]
-
-    transect = generate_transect_points(markers, 50)
-    transect_2d = np.array(transect)[:, :2]  # Only consider x, y
-    kd_tree_transect = KDTree(transect_2d)  # KDTree of the transect line
-
-    # Find closest distances from grid points to transect line
-    distances, closest_indices_transect = kd_tree_transect.query(grid_points[:, :2])
-    mask = distances <= distance  # Filter points within the distance threshold
-
-    # Filter grid points based on distance to transect
-    transect_sample_idx = closest_indices[mask]
-    transect_sample_points = pcd.points[transect_sample_idx]
-    if vis:
-        pcd_copy = copy.deepcopy(pcd)
-        if not hasattr(pcd, "o3d_pcd_tree"):
-            pcd_copy.build_kd_tree()
-        for point in transect_sample_idx:
-            [k, idx, _] = pcd_copy.o3d_pcd_tree.search_radius_vector_3d(
-                pcd.points[point], 0.1
-            )
-            np.asarray(pcd_copy.colors)[idx[1:], :] = [1, 0, 0]
-
-        visualizations.show_coords_as_lines(pcd_copy, transect, Jupyter=False)
-
-    return transect_sample_points
-
-
-def get_distance_to_closest_point(points, point):
-    """
-    Get the distance to the closest point in a point cloud
-    """
-    distances = np.linalg.norm(np.asarray(points) - point, axis=1)
-    return np.min(distances)
-
-
-def calc_scale_factor(annotations, scalebars):
-    """Calculate scale factor from annotations and scalebars.
-
-    Example::
-
-        scalebars = [['target 5', 'target 6', 0.500],
-                     ['target 7', 'target 8', 0.499]]
-    """
-    scale_factors = []
-    for scalebar in scalebars:
-        if scalebar[0] in annotations and scalebar[1] in annotations:
-            target1 = annotations[scalebar[0]].coords
-            target2 = annotations[scalebar[1]].coords
-            distance = np.linalg.norm(target1 - target2)
-            scale_factor = scalebar[2] / distance
-            scale_factors.append(scale_factor)
-    return np.mean(scale_factors)
-
-
-def create_grid_cells_from_pcd(pcd, cell_size):
-    """Divide the XY extent of a point cloud into a grid of square cells.
-
-    The grid starts at the minimum x and y of the points and covers their full
-    extent, so cells along the far edges may extend beyond the data.
-
-    Contributed by Dennis van Hulten (Reefscape Genomics Lab, California Academy
-    of Sciences; University of Auckland).
-
-    Args:
-        pcd: Point cloud with a ``points`` attribute (e.g. an
-            ``open3d.geometry.PointCloud``); only the x and y coordinates are used.
-        cell_size: Side length of each square cell, in point-cloud units
-            (meters for a scaled point cloud).
-
-    Returns:
-        List of ``(min_corner, max_corner)`` tuples, where each corner is an
-        ``[x, y]`` list.
-    """
-    pcd_points = np.asarray(pcd.points)[:, :2]
-
-    x_min, y_min = np.min(pcd_points, axis=0)
-    x_max, y_max = np.max(pcd_points, axis=0)
-    nx = int(np.ceil((x_max - x_min) / cell_size))
-    ny = int(np.ceil((y_max - y_min) / cell_size))
-
-    bounding_boxes = []
-    for i in range(nx):
-        for j in range(ny):
-            min_corner = [x_min + i * cell_size, y_min + j * cell_size]
-            max_corner = [x_min + (i + 1) * cell_size, y_min + (j + 1) * cell_size]
-            bounding_boxes.append((min_corner, max_corner))
-
-    return bounding_boxes
-
-
-def cells_share_edge(bbox1, bbox2, tol=1e-9):
-    """
-    Check if two bounding boxes share an edge.
-    Each bbox is defined as ([x_min, y_min], [x_max, y_max]).
-    """
-    (x1_min, y1_min), (x1_max, y1_max) = bbox1
-    (x2_min, y2_min), (x2_max, y2_max) = bbox2
-
-    # Check for vertical edge sharing.
-    if abs(x1_max - x2_min) < tol or abs(x2_max - x1_min) < tol:
-        y_overlap = min(y1_max, y2_max) - max(y1_min, y2_min)
-        if y_overlap > tol:
-            return True
-
-    # Check for horizontal edge sharing.
-    if abs(y1_max - y2_min) < tol or abs(y2_max - y1_min) < tol:
-        x_overlap = min(x1_max, x2_max) - max(x1_min, x2_min)
-        if x_overlap > tol:
-            return True
-
-    return False
-
-
-def create_xy_grid_cells_with_spread_filter(
-    pcd,
-    cell_size,
-    vis=True,
-    vis_colors=False,
-    sub_divisions=10,
-    min_points_sub=1,
-    min_proportion=0.5,
-    require_adjacent=True,
-):
-    """Create 2D grid cells from a point cloud, filtered by point spread.
-
-    Each cell is dropped if it does not exhibit a sufficient spread of points
-    over the cell. Additionally, optionally filter out cells that do not belong
-    to the main connected set, where connectivity is defined by sharing at least
-    one edge.
-
-    Also prints statistics:
-
-    1. original grid squares,
-    2. after spread filtering,
-    3. after connected component filtering,
-    4. and the total surface area of (3).
-    """
-    # Extract x-y coordinates and colors.
-    pcd_points = np.asarray(pcd.points)[:, :2]
-    pcd_colors = np.asarray(pcd.colors)
-
-    # Overall bounds.
-    x_min, y_min = np.min(pcd_points, axis=0)
-    x_max, y_max = np.max(pcd_points, axis=0)
-
-    # Number of grid cells.
-    nx = int(np.ceil((x_max - x_min) / cell_size))
-    ny = int(np.ceil((y_max - y_min) / cell_size))
-    total_cells = nx * ny
-
-    # Define the function that processes a single cell.
-    def process_cell(idx):
-        i = idx // ny
-        j = idx % ny
-
-        # Define cell bounds.
-        cell_x_min = x_min + i * cell_size
-        cell_y_min = y_min + j * cell_size
-        cell_x_max = cell_x_min + cell_size
-        cell_y_max = cell_y_min + cell_size
-
-        # Extract points within this cell.
-        in_cell = (
-            (pcd_points[:, 0] >= cell_x_min)
-            & (pcd_points[:, 0] < cell_x_max)
-            & (pcd_points[:, 1] >= cell_y_min)
-            & (pcd_points[:, 1] < cell_y_max)
-        )
-        cell_points = pcd_points[in_cell]
-
-        # Subdivide the cell.
-        sub_cell_size = cell_size / sub_divisions
-        subcell_count = 0
-        filled_subcells = 0
-        for m in range(sub_divisions):
-            for n in range(sub_divisions):
-                sub_x_min = cell_x_min + m * sub_cell_size
-                sub_y_min = cell_y_min + n * sub_cell_size
-                sub_x_max = sub_x_min + sub_cell_size
-                sub_y_max = sub_y_min + sub_cell_size
-                subcell_count += 1
-
-                # Count points in the subcell.
-                in_subcell = np.where(
-                    (cell_points[:, 0] >= sub_x_min)
-                    & (cell_points[:, 0] < sub_x_max)
-                    & (cell_points[:, 1] >= sub_y_min)
-                    & (cell_points[:, 1] < sub_y_max)
-                )[0]
-                if len(in_subcell) >= min_points_sub:
-                    filled_subcells += 1
-
-        # Return the cell's bounding box if it meets the spread criterion.
-        if filled_subcells / subcell_count >= min_proportion:
-            return ([cell_x_min, cell_y_min], [cell_x_max, cell_y_max])
-        else:
-            return None
-
-    print(
-        "Creating {0}x{0}m2 grid cells with {1}x{1} subdivision.".format(
-            cell_size, sub_divisions
-        )
-    )
-    # Run the main loop in parallel with a progress bar.
-    results = Parallel(n_jobs=-1)(
-        delayed(process_cell)(idx)
-        for idx in tqdm(range(total_cells), desc="Processing grid cells")
-    )
-
-    print(
-        "Filtering for the largest group of cells that have {0} of subdivisions with at least {1} points.".format(
-            min_proportion, min_points_sub
-        )
-    )
-    # Filter out cells that did not meet the criterion.
-    filtered_bboxes = [res for res in results if res is not None]
-
-    # Save the initial filtered list.
-    initial_bboxes = filtered_bboxes.copy()
-
-    # Further filter cells to only include the largest connected set.
-    if require_adjacent and filtered_bboxes:
-        n = len(filtered_bboxes)
-        # Build connectivity graph.
-        graph = {i: [] for i in range(n)}
-        for i in range(n):
-            for j in range(i + 1, n):
-                if cells_share_edge(filtered_bboxes[i], filtered_bboxes[j]):
-                    graph[i].append(j)
-                    graph[j].append(i)
-
-        # Find connected components using DFS.
-        seen = set()
-        components = []
-        for i in range(n):
-            if i not in seen:
-                comp = []
-                stack = [i]
-                while stack:
-                    cur = stack.pop()
-                    if cur in seen:
-                        continue
-                    seen.add(cur)
-                    comp.append(cur)
-                    stack.extend(graph[cur])
-                components.append(comp)
-
-        # Select the largest component.
-        largest = max(components, key=len)
-        filtered_bboxes = [filtered_bboxes[i] for i in largest]
-
-    # Compute statistics.
-    orig_count = total_cells
-    init_count = len(initial_bboxes)
-    final_count = len(filtered_bboxes)
-    total_area = final_count * cell_size**2
-
-    print("Original grid squares: {}".format(orig_count))
-    print("After initial filtering: {}".format(init_count))
-    print("After largest-component filtering: {}".format(final_count))
-    print("Total surface area: {:.3f} m²".format(total_area))
-
-    if vis:
-        if vis_colors:
-            point_colors = pcd.colors
-        else:
-            point_colors = None
-        visualizations.vis_create_xy_grid_cells_with_spread_filter(
-            pcd_points, point_colors, filtered_bboxes, cell_size, sub_divisions
-        )
-
-    return filtered_bboxes
 
 
 def cloud_xy_histogram(points, step_size=0.1):
@@ -2271,20 +1896,31 @@ def cloud_xy_histogram(points, step_size=0.1):
     return hist, x_edges, y_edges
 
 
-def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=True):
-    """
-    Find the optimal rectangle (box) position from a point cloud using a convolution-based approach.
+def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=False):
+    """Position of the axis-aligned box that contains the most cloud points.
 
-    Parameters:
-      pcd       : Point cloud object with attribute `points` (Nx3 array).
-      box_length: float, the rectangle's length (x-dimension).
-      box_width : float, the rectangle's width (y-dimension).
-      step_size : float, resolution of the grid used for the convolution.
-      vis       : bool, whether to visualize the result.
+    The cloud's XY points are counted on a grid of ``step_size`` cells
+    (:func:`cloud_xy_histogram`) and the grid is convolved with a box of
+    ``round(box_length / step_size) x round(box_width / step_size)`` cells; the
+    box is anchored on a grid edge. The box dimensions should be multiples of
+    ``step_size``: otherwise the search uses the rounded box (logged as a
+    warning) while the returned box has the requested size.
+
+    Args:
+        pcd: Point cloud object with attribute ``points`` (N x 3 array).
+        box_length: The box's length along X.
+        box_width: The box's width along Y.
+        step_size: Grid resolution of the search (same units).
+        vis: Show the box on the cloud (a figure; off by default).
 
     Returns:
-      best_box   : tuple (x_min, y_min, x_max, y_max) of the optimal rectangle's bounding coordinates.
-      best_count : int, the maximum point count found within that rectangle.
+        tuple: ``([x_min, y_min], [x_max, y_max])`` of the box.
+
+    A box larger than the cloud along an axis starts at the cloud's minimum
+    along that axis (with a warning).
+
+    Raises:
+        ValueError: If the box is smaller than one grid cell.
     """
     # A 2D histogram of the point cloud on a grid of the step size.
     points = np.asarray(pcd.points)[:, :2]
@@ -2293,11 +1929,37 @@ def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=Tru
     # Map rectangle dimensions to the number of bins.
     box_length_bins = int(np.round(box_length / step_size))
     box_width_bins = int(np.round(box_width / step_size))
+    if box_length_bins < 1 or box_width_bins < 1:
+        raise ValueError(
+            f"box {box_length} x {box_width} is smaller than the grid step {step_size}"
+        )
+    if box_length_bins > hist.shape[0] or box_width_bins > hist.shape[1]:
+        # Larger than the cloud along an axis: pad the grid (empty cells beyond
+        # the cloud) so the box starts at the cloud's minimum along that axis.
+        logger.warning(
+            "find_optimal_box_position: box %g x %g is larger than the cloud's XY "
+            "extent (%.2f x %.2f)", box_length, box_width,
+            hist.shape[0] * step_size, hist.shape[1] * step_size,
+        )
+        pad_x = max(0, box_length_bins - hist.shape[0])
+        pad_y = max(0, box_width_bins - hist.shape[1])
+        hist = np.pad(hist, ((0, pad_x), (0, pad_y)))
+        x_edges = x_edges[0] + step_size * np.arange(hist.shape[0] + 1)
+        y_edges = y_edges[0] + step_size * np.arange(hist.shape[1] + 1)
+    searched = (box_length_bins * step_size, box_width_bins * step_size)
+    tol = 1e-6 * step_size
+    if not np.allclose(searched, (box_length, box_width), rtol=0, atol=tol):
+        logger.warning(
+            "find_optimal_box_position: box %g x %g is not a multiple of the step "
+            "%g; searched with %g x %g", box_length, box_width, step_size, *searched,
+        )
 
     # Create a kernel corresponding to the rectangle.
     kernel = np.ones((box_length_bins, box_width_bins))
 
     # Convolve the histogram with the kernel.
+    from scipy.signal import convolve2d
+
     conv_result = convolve2d(hist, kernel, mode="valid")
 
     # Find the location of the maximum value in the convolved result.
@@ -2316,6 +1978,8 @@ def find_optimal_box_position(pcd, box_length, box_width, step_size=0.1, vis=Tru
     )
 
     if vis:
+        from substrata import visualizations  # lazy: figures only
+
         visualizations.show_grid_cells(pcd, best_box)
 
     return best_box
@@ -2404,181 +2068,6 @@ def generate_random_xy_points_within_cells(bboxes, points_per_cell, z_value=0):
     return random_points
 
 
-def create_mesh_poisson(pcd, depth):
-    """Reconstruct a triangle mesh from a point cloud via Poisson meshing.
-
-    Runs Open3D Poisson surface reconstruction and trims the lowest-density
-    vertices (bottom 10% by density) to remove poorly supported geometry.
-
-    Args:
-        pcd: A point cloud exposing an ``o3d_pcd`` Open3D point cloud with
-            estimated normals.
-        depth (int): Poisson reconstruction depth (octree depth); higher values
-            yield finer detail.
-
-    Returns:
-        open3d.geometry.TriangleMesh: The reconstructed, density-trimmed mesh.
-    """
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd.o3d_pcd, depth=depth
-    )
-    vertices_to_remove = densities < np.quantile(densities, 0.1)
-    mesh.remove_vertices_by_mask(vertices_to_remove)
-    return mesh
-
-
-def get_random_stratified_points_raycast(
-    pcd, cell_size, num_points, vis=True
-):  # Should we exclude the meshing in this step?
-    """Sample stratified random surface points via top-down raycasting.
-
-    Builds a Poisson mesh of the point cloud, divides its extent into square
-    grid cells of ``cell_size``, generates random ray origins above each cell,
-    and casts downward (-z) rays onto the mesh. Each hit is snapped back to the
-    nearest original point (within 0.01 units), giving stratified samples that
-    lie on actual point-cloud vertices.
-
-    Args:
-        pcd: A point cloud with ``points`` and an ``o3d_pcd`` used for meshing.
-        cell_size (float): Side length of the square stratification cells.
-        num_points (int): Number of random rays generated per cell.
-        vis (bool): If True, display the point cloud with sampled points
-            highlighted. Defaults to True.
-
-    Returns:
-        tuple: ``(random_points_coords, random_points_idx)`` where the first is
-        an array of the sampled point coordinates and the second is the array of
-        their indices into ``pcd.points``.
-    """
-    mesh = create_mesh_poisson(pcd, depth=9)
-    bounding_boxes = create_grid_cells_from_pcd(pcd, cell_size)
-    z_max = np.max(pcd.points[:, 2]) + 10  # might be good not to hardcode this
-
-    ray_points = generate_random_points_within_cells(bounding_boxes, num_points, z_max)
-    direction_vectors = np.tile([0, 0, -1], (ray_points.shape[0], 1))
-    rays = np.hstack((ray_points, direction_vectors))
-    rays = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
-    surface = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    scene = o3d.t.geometry.RaycastingScene()
-    surface_id = scene.add_triangles(surface)
-    ans = scene.cast_rays(rays)
-
-    hit = ans["t_hit"].isfinite()
-    points = rays[hit][:, :3] + rays[hit][:, 3:] * ans["t_hit"][hit].reshape((-1, 1))
-    ray_pcd = o3d.t.geometry.PointCloud(points)
-    points = points.numpy()
-
-    kdtree = KDTree(np.asarray(pcd.points))
-    distances, indices = kdtree.query(points)
-    mask = distances <= 0.01
-    random_points_idx = indices[mask]
-    random_points_coords = pcd.points[random_points_idx]
-
-    if vis:
-        pcd_copy = copy.deepcopy(pcd)
-        if not hasattr(pcd, "o3d_pcd_tree"):
-            pcd_copy.build_kd_tree()
-        for index in indices:
-            [k, idx, _] = pcd_copy.o3d_pcd_tree.search_radius_vector_3d(
-                pcd_copy.points[index], 0.02
-            )
-            np.asarray(pcd_copy.colors)[idx[1:], :] = [1, 0, 0]
-
-        visualizations.show([pcd_copy.o3d_pcd])
-
-    print(
-        "Returning {0} out of {1} random points".format(
-            len(random_points_coords), len(ray_points)
-        )
-    )
-    return random_points_coords, random_points_idx
-
-
-def get_random_stratified_points_raycast_temp(pcd, ray_points, mesh_depth=9):
-    """Raycast pre-supplied ray origins onto a Poisson mesh to sample points.
-
-    Temporary/experimental variant of ``get_random_stratified_points_raycast``.
-    Instead of generating ray origins internally from stratification cells, it
-    accepts caller-provided ``ray_points`` and exposes the mesh depth, and it
-    performs no visualization. Rays are cast downward (-z) onto a Poisson mesh
-    of the point cloud, and hits are snapped to the nearest original point
-    (within 0.01 units).
-
-    Args:
-        pcd: A point cloud with ``points`` and an ``o3d_pcd`` used for meshing.
-        ray_points (numpy.ndarray): Array of shape ``(N, 3)`` of ray origin
-            coordinates (rays travel in the -z direction).
-        mesh_depth (int): Poisson reconstruction depth. Defaults to 9.
-
-    Returns:
-        tuple: ``(random_points_coords, random_points_idx)`` where the first is
-        an array of the sampled point coordinates and the second is the array of
-        their indices into ``pcd.points``.
-    """
-    print("Creating mesh...")
-    mesh = create_mesh_poisson(pcd, depth=mesh_depth)
-
-    direction_vectors = np.tile([0, 0, -1], (ray_points.shape[0], 1))
-    rays = np.hstack((ray_points, direction_vectors))
-    rays = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
-    surface = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    scene = o3d.t.geometry.RaycastingScene()
-    surface_id = scene.add_triangles(surface)
-    ans = scene.cast_rays(rays)
-
-    hit = ans["t_hit"].isfinite()
-    points = rays[hit][:, :3] + rays[hit][:, 3:] * ans["t_hit"][hit].reshape((-1, 1))
-    ray_pcd = o3d.t.geometry.PointCloud(points)
-    points = points.numpy()
-
-    kdtree = KDTree(np.asarray(pcd.points))
-    distances, indices = kdtree.query(points)
-    mask = distances <= 0.01
-    random_points_idx = indices[mask]
-    random_points_coords = pcd.points[random_points_idx]
-
-    return random_points_coords, random_points_idx
-
-
-def get_random_stratified_points(pcd, cell_size, num_points_per_cell, vis=True):
-    """
-    Perform stratified random sampling in each 2D bounding box (cell).
-    :param grid_points: Array of 2D points (x, y).
-    :param bounding_boxes: List of 2D bounding boxes (min and max corners).
-    :param num_points_per_cell: Number of random points to sample in each cell.
-    :return: List of sampled points.
-    """
-    pcd_points = np.asarray(pcd.points)[:, :2]
-    sampled_points = []
-    bounding_boxes = create_grid_cells_from_pcd(pcd, cell_size)
-
-    for min_corner, max_corner in bounding_boxes:
-        # Get points within the bounding box (cell)
-        points_in_cell_idx = np.where(
-            (pcd_points[:, 0] >= min_corner[0])
-            & (pcd_points[:, 0] <= max_corner[0])
-            & (pcd_points[:, 1] >= min_corner[1])
-            & (pcd_points[:, 1] <= max_corner[1])
-        )[0]
-
-        points_in_cell = list(pcd_points[points_in_cell_idx])
-
-        # Randomly sample points from this cell
-        if len(points_in_cell) > num_points_per_cell:
-            sampled_points.extend(random.sample(points_in_cell, num_points_per_cell))
-        else:
-            # If not enough points, include all available points
-            sampled_points.extend(points_in_cell)
-    if vis:
-        pcd_copy = copy.deepcopy(pcd)
-        pcd_points = np.asarray(pcd_copy.points)[:, :2]
-        kd_tree = KDTree(pcd_points)
-        distance, closest_points = kd_tree.query(sampled_points)
-        visualizations.show_grid_points(pcd_copy, closest_points)
-
-    return np.array(sampled_points)
-
-
 def get_mask_surface_area(annotation, predictor=None):
     """Calculate and return the surface area of the mask in the image."""
     if annotation.image_match:
@@ -2587,111 +2076,20 @@ def get_mask_surface_area(annotation, predictor=None):
         return None
 
 
-def get_intercept_points_using_cams(xy_coords, search_radius, pcd, cams, vis=False):
-    """
-    Find intercept points in a PointCloud but prioritizing points that are visible in the cameras.
-    """
-    # Ensure the point cloud has a KDTree for XY coordinates.
-    if not hasattr(pcd, "o3d_pcd_tree_xy"):
-        pcd.build_kd_tree_xy()
-
-    no_points_within_search_radius = 0
-    intercept_points = []
-    non_intercept_points = []
-
-    for xy_coord in tqdm(xy_coords):
-        # Build query: flatten xy_coord by appending z=0.
-        query_xy = np.array([xy_coord[0], xy_coord[1], 0.0])
-
-        # Use the prebuilt XY kd-tree (assumed attached as pcd.o3d_pcd_tree_xy).
-        [k, idx, _] = pcd.o3d_pcd_tree_xy.search_radius_vector_3d(
-            query_xy, search_radius
-        )
-        if k == 0:
-            no_points_within_search_radius += 1
-            continue
-
-        # Retrieve candidate points (using original 3D data).
-        candidates = pcd.points[idx]
-
-        # Compute the median z value.
-        median_z = np.median(candidates[:, 2])
-        intercept = np.array([xy_coord[0], xy_coord[1], median_z])
-
-        # Determine the closest candidate by 3D Euclidean distance.
-        distances = np.linalg.norm(candidates - intercept, axis=1)
-        # Sort candidates by their distances.
-        sorted_indices = np.argsort(distances)
-
-        # Loop over each candidate (sorted by distance)
-        found_intercept_point = False
-        for i in sorted_indices:
-            orig_coords = utils.transform_coords(
-                candidates[i], np.linalg.inv(pcd.world_transform)
-            )
-            for cam in cams:
-                x, y, depth, relevance = cam.get_pixel_coords(orig_coords)
-                if x is not None:
-                    obstructions = get_intercept(pcd, cam.coords, candidates[i])
-                    if obstructions is None:
-                        intercept_points.append(candidates[i])
-                        found_intercept_point = True
-                        break
-            if found_intercept_point:
-                break
-        if not found_intercept_point:
-            max_z = np.max(candidates[:, 2])
-            max_z_intercept = np.array([xy_coord[0], xy_coord[1], max_z])
-            max_z_distances = np.linalg.norm(candidates - max_z_intercept, axis=1)
-            non_intercept_points.append(candidates[np.argmin(max_z_distances)])
-
-    print("Total queried points:", len(xy_coords))
-    print("No points within search radius:", no_points_within_search_radius)
-    print(
-        "No unobstructed image for any of the points:",
-        len(xy_coords) - len(intercept_points) - no_points_within_search_radius,
-    )
-    print("Points with image match:", len(intercept_points))
-    print(
-        "Proportion of points with image match:", len(intercept_points) / len(xy_coords)
-    )
-
-    return intercept_points, non_intercept_points
-
-
-def slerp(u: np.ndarray, v: np.ndarray, t: float) -> np.ndarray:
-    """
-    Spherical linear interpolation between unit vectors u and v
-    at fraction t in [0,1].
-    """
-    dot_uv = np.dot(u, v)
-    dot_uv = np.clip(dot_uv, -1.0, 1.0)
-    angle = np.arccos(dot_uv)
-
-    # If angle ~ 0, vectors are almost identical → no arc.
-    if angle < 1e-8:
-        return u
-    # If angle ~ pi, vectors are nearly opposite → fallback to linear
-    # to avoid singularities.
-    elif abs(angle - np.pi) < 1e-8:
-        return (1.0 - t) * u + t * v
-
-    # Normal slerp
-    return (np.sin((1.0 - t) * angle) / np.sin(angle)) * u + (
-        np.sin(t * angle) / np.sin(angle)
-    ) * v
-
-
 @dataclass
 class DepthRegressionResult:
     """Result of fitting a linear regression of depth against 3-D position.
 
     Produced by ``fit_depth_regression``, which models depth as a linear
-    function of ``(x, y, z)``.
+    function of ``(x, y, z)``. Depths follow the package convention, negative
+    below the surface (see :func:`normalize_depth_sign`): ``depths``,
+    ``depths_pred``, ``depth_offset`` and the model
+    ``depth = depth_offset + up_vector . p`` are all in that convention, so
+    ``up_vector`` points up.
     """
 
-    #: Regression coefficient vector, sign-adjusted so that stepping along it
-    #: decreases depth (points "up").
+    #: Regression coefficient vector: the gradient of depth (negative below the
+    #: surface), so it points up (towards shallower water).
     up_vector: np.ndarray
     #: Regression intercept (depth at the origin).
     depth_offset: float
@@ -2709,16 +2107,90 @@ class DepthRegressionResult:
     depths_pred: np.ndarray
     #: Residuals (observed minus predicted depth).
     depths_res: np.ndarray
+    #: The observed depths used for the fit (after the sign normalisation).
+    depths: np.ndarray = field(default_factory=lambda: np.empty(0))
+    #: True when the given depths were positive below the surface and negated.
+    depths_negated: bool = False
+
+
+def normalize_depth_sign(depths, what: str = "depths") -> Tuple[np.ndarray, bool]:
+    """Return depths in the package convention: negative below the surface.
+
+    Depth sensors and CSVs often record depth as a positive number. When the
+    median of the finite ``depths`` is positive they are negated (with a
+    warning), so that depth increases upwards like the world Z axis.
+
+    Args:
+        depths: Array-like of depths in metres.
+        what: Name used in the warning.
+
+    Returns:
+        tuple: ``(depths, negated)``, a float array and whether it was negated.
+    """
+    depths = np.asarray(depths, dtype=float)
+    finite = depths[np.isfinite(depths)]
+    if finite.size and np.median(finite) > 0:
+        logger.warning(
+            "%s are positive (median %.2f m): negated to the convention "
+            "'depth negative below the surface'", what, float(np.median(finite)),
+        )
+        return -depths, True
+    return depths, False
+
+
+def regression_errors(observed, predicted) -> Dict[str, float]:
+    """Error metrics of predictions against observations.
+
+    Args:
+        observed: (N,) observed values (e.g. sensor depths).
+        predicted: (N,) predicted values.
+
+    Returns:
+        dict: ``n``, ``mse`` (mean squared error), ``rmse``, ``mae`` (mean
+        absolute error) and ``r2`` (coefficient of determination, scikit-learn's
+        ``r2_score``: 1.0 for a perfect fit of constant observations, 0.0 for an
+        imperfect one).
+    """
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    observed = np.asarray(observed, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    mse = float(mean_squared_error(observed, predicted))
+    return {
+        "n": int(len(observed)),
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(mean_absolute_error(observed, predicted)),
+        "r2": float(r2_score(observed, predicted)),
+    }
 
 
 def fit_depth_regression(
     points: np.ndarray, depths: np.ndarray
 ) -> DepthRegressionResult:
+    """Fit the linear depth model ``depth ≈ depth_offset + up_vector · (x, y, z)``.
+
+    Ordinary least squares of depth on the point coordinates (e.g. camera or
+    depth-sensor positions in the model frame). Depths are first brought to the
+    convention "negative below the surface" (:func:`normalize_depth_sign`;
+    positive depths are negated with a warning), so the coefficient vector is
+    the depth gradient pointing up: ``Transform.from_up_vector(up_vector)``
+    levels the model with +Z up, and ``depth_per_unit = |up_vector|`` is the
+    model-to-metre scale along the vertical.
+
+    Args:
+        points: (N, 3) positions.
+        depths: (N,) depths in metres (either sign convention).
+
+    Returns:
+        DepthRegressionResult: model, error metrics (in metres), predictions
+        and residuals, all in the negative-below-surface convention.
+
+    Raises:
+        ValueError: For mismatched shapes or fewer than 2 points.
     """
-    Fit linear regression: depth ≈ intercept + coef · (x, y, z).
-    Returns up-vector (coef; sign adjusted so stepping along it decreases depth),
-    offset, per-unit depth change, and error metrics with predictions/residuals.
-    """
+    points = np.asarray(points, dtype=float)
+    depths = np.asarray(depths, dtype=float)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must be shape (N, 3)")
     if depths.ndim != 1 or depths.shape[0] != points.shape[0]:
@@ -2726,38 +2198,32 @@ def fit_depth_regression(
     if len(points) < 2:
         raise ValueError("Need at least 2 points for regression")
 
+    depths, negated = normalize_depth_sign(depths)
+
+    from sklearn.linear_model import LinearRegression
+
     model = LinearRegression()
     model.fit(points, depths)
     coef = model.coef_.astype(float)
     depth_offset = float(model.intercept_)
     depth_per_unit = float(np.linalg.norm(coef))
 
-    # Evaluate sign: flip so that stepping along coef decreases depth
-    centroid = points.mean(axis=0)
-    depth_centroid = float(model.predict([centroid])[0])
-    p_step = centroid + 1.0 * coef
-    depth_step = float(model.predict([p_step])[0])
-    if depth_step < depth_centroid:
-        coef = -coef
-
     depths_pred = model.predict(points).astype(float)
-    depths_res = depths.astype(float) - depths_pred
-
-    mse = float(mean_squared_error(depths, depths_pred))
-    rmse = float(np.sqrt(mse))
-    mae = float(mean_absolute_error(depths, depths_pred))
-    r2 = float(r2_score(depths, depths_pred))
+    depths_res = depths - depths_pred
+    errors = regression_errors(depths, depths_pred)
 
     return DepthRegressionResult(
         up_vector=coef,
         depth_offset=depth_offset,
         depth_per_unit=depth_per_unit,
-        mse=mse,
-        rmse=rmse,
-        mae=mae,
-        r2=r2,
+        mse=errors["mse"],
+        rmse=errors["rmse"],
+        mae=errors["mae"],
+        r2=errors["r2"],
         depths_pred=depths_pred,
         depths_res=depths_res,
+        depths=depths,
+        depths_negated=negated,
     )
 
 
@@ -2767,6 +2233,11 @@ class DepthResidualAnalyzer:
     Works with both Cameras and Annotations containers that have:
     - Items with depth_sensor_m and coords/orig_coords attributes
     - Parent container with up_vector and depth_offset attributes
+
+    Sensor depths are reported in the convention of :func:`fit_depth_regression`
+    (negative below the surface; :func:`normalize_depth_sign`), so they compare
+    with the model's estimates. The filtered containers returned share the
+    items with the original container; the items keep their ``parent``.
     """
 
     def __init__(self, container):
@@ -2802,13 +2273,15 @@ class DepthResidualAnalyzer:
                 coords = getattr(item, "coords", None)
             # Depth sensor mounted away from the camera centre (lever arm): use the
             # sensor position, as in the regression that produced up_vector
-            offset_units = cameras._sensor_offset_units(
+            from substrata import cameras
+
+            offset_units = cameras.sensor_offset_units(
                 getattr(parent, "depth_sensor_offset", None),
                 getattr(parent, "depth_sensor_offset_scale", 1.0),
             )
             if offset_units is not None and coords is not None:
                 coords = item.sensor_coords(
-                    offset_units, orig=getattr(item, "orig_coords", None) is not None
+                    offset_units, use_orig_coords=getattr(item, "orig_coords", None) is not None
                 )
         else:
             # For Annotations, prefer orig_coords (preserves original values used in regression)
@@ -2820,7 +2293,27 @@ class DepthResidualAnalyzer:
         if coords is None:
             return None
 
-        return float(parent.depth_offset + float(np.dot(parent.up_vector, coords)))
+        # up_vector may be a geom.Vector (homogeneous 4-vector): use its xyz
+        up = np.asarray(getattr(parent.up_vector, "xyz", parent.up_vector), float)[:3]
+        coords = np.asarray(coords, dtype=float)[:3]
+        return float(parent.depth_offset + float(np.dot(up, coords)))
+
+    @staticmethod
+    def _sensor_depths(items):
+        """The items' sensor depths, negative below the surface (list of float)."""
+        depths, _ = normalize_depth_sign(
+            [item.depth_sensor_m for item in items], "sensor depths"
+        )
+        return [float(d) for d in depths]
+
+    def _filtered_container(self, items):
+        """An empty-like container holding ``items`` (their ``parent`` unchanged)."""
+        filtered = self.container._empty_like()
+        for item in items:
+            item_id = getattr(item, "cam_id", None) or getattr(item, "id", None)
+            if item_id:
+                filtered.data[item_id] = item
+        return filtered
 
     def _filter_items_with_depth(
         self, depth_accuracy_threshold=None, use_accuracy_filter=False
@@ -2870,7 +2363,7 @@ class DepthResidualAnalyzer:
         items = self._filter_items_with_depth(
             depth_accuracy_threshold, use_accuracy_filter
         )
-        depths = [item.depth_sensor_m for item in items]
+        depths = self._sensor_depths(items)
         est_depths = [self._calculate_estimated_depth(item) for item in items]
 
         # Filter out None values from est_depths
@@ -2879,15 +2372,7 @@ class DepthResidualAnalyzer:
         est_depths = [est_depths[i] for i in valid_indices]
         items = [items[i] for i in valid_indices]
 
-        # Create filtered container
-        filtered = self.container._empty_like()
-        for item in items:
-            item_id = getattr(item, "cam_id", None) or getattr(item, "id", None)
-            if item_id:
-                filtered.data[item_id] = item
-                item.parent = filtered
-
-        return depths, est_depths, filtered
+        return depths, est_depths, self._filtered_container(items)
 
     def get_depths_and_z_coords(
         self, depth_accuracy_threshold=None, use_accuracy_filter=False
@@ -2908,157 +2393,42 @@ class DepthResidualAnalyzer:
         items = self._filter_items_with_depth(
             depth_accuracy_threshold, use_accuracy_filter
         )
-        depths = [item.depth_sensor_m for item in items]
+        depths = self._sensor_depths(items)
         z_coords = [item.coords[2] for item in items]
-
-        # Create filtered container
-        filtered = self.container._empty_like()
-        for item in items:
-            item_id = getattr(item, "cam_id", None) or getattr(item, "id", None)
-            if item_id:
-                filtered.data[item_id] = item
-                item.parent = filtered
-
-        return depths, z_coords, filtered
+        return depths, z_coords, self._filtered_container(items)
 
     def show_depth_vs_est_depth_residuals(self, width=15, height=5, **kwargs):
-        """Show residuals between predicted and recorded depths.
+        """Figures of sensor vs estimated depths (``(fig1, fig2)``).
 
-        Args:
-            width (float): Figure width in inches (default: 15)
-            height (float): Figure height in inches (default: 5)
-            **kwargs: Additional arguments passed to get_depths_and_estimated_depths
-
-        Returns:
-            tuple: (fig1, fig2) matplotlib figure objects
+        See :func:`substrata.visualizations.depth_residual_figures`.
         """
-        from substrata import visualizations
+        from substrata import visualizations  # lazy: figures only
 
-        depths, est_depths, filtered = self.get_depths_and_estimated_depths(**kwargs)
-        fig1 = visualizations.plot_depth_regression(
-            depths,
-            est_depths,
-            width=width,
-            height=height,
-            title="Depth vs Estimated Depth",
+        return visualizations.depth_residual_figures(
+            self, "estimated", width, height, **kwargs
         )
-
-        # Use appropriate visualization function based on container type
-        container_type = type(self.container).__name__
-        if container_type == "Cameras":
-            fig2 = visualizations.plot_cam_residuals(
-                filtered, depths, est_depths, width=width, height=height
-            )
-        else:
-            # For annotations, use a simpler residual plot
-            # TODO: Create plot_annotation_residuals if needed
-            fig2 = visualizations.plot_depth_regression(
-                depths,
-                est_depths,
-                width=width,
-                height=height,
-                title="Depth Residuals",
-            )
-        return fig1, fig2
 
     def show_z_vs_depth_residuals(self, width=15, height=5, **kwargs):
-        """Show residuals between z-coordinates and recorded depths.
+        """Figures of sensor depths vs Z coordinates (``(fig1, fig2)``).
 
-        Args:
-            width (float): Figure width in inches (default: 15)
-            height (float): Figure height in inches (default: 5)
-            **kwargs: Additional arguments passed to get_depths_and_z_coords
-
-        Returns:
-            tuple: (fig1, fig2) matplotlib figure objects
+        See :func:`substrata.visualizations.depth_residual_figures`.
         """
-        from substrata import visualizations
+        from substrata import visualizations  # lazy: figures only
 
-        depths, z_coords, filtered = self.get_depths_and_z_coords(**kwargs)
-        fig1 = visualizations.plot_depth_regression(
-            depths, z_coords, width=width, height=height, title="Depth vs Z-Coordinate"
+        return visualizations.depth_residual_figures(
+            self, "z", width, height, **kwargs
         )
 
-        # Use appropriate visualization function based on container type
-        container_type = type(self.container).__name__
-        if container_type == "Cameras":
-            fig2 = visualizations.plot_cam_residuals(
-                filtered, depths, z_coords, width=width, height=height
-            )
-        else:
-            # For annotations, use a simpler residual plot
-            fig2 = visualizations.plot_depth_regression(
-                depths,
-                z_coords,
-                width=width,
-                height=height,
-                title="Z-Coordinate Residuals",
-            )
-        return fig1, fig2
-
     def save_depth_residuals_pdf(self, filepath=None, width=15, height=5, **kwargs):
-        """Save depth residuals visualization as a PDF.
+        """Save the depth-residual figures as a PDF; returns the filepath.
 
-        Args:
-            filepath (str, optional): Path to save the PDF file. If None, generates
-                a default filename.
-            width (float): Figure width in inches (default: 15)
-            height (float): Figure height in inches (default: 5)
-            **kwargs: Additional arguments passed to residual methods
-
-        Returns:
-            str: The filepath where the PDF was saved.
+        See :func:`substrata.visualizations.save_depth_residuals_pdf`.
         """
-        import matplotlib
-        from matplotlib.backends.backend_pdf import PdfPages
-        import os
+        from substrata import visualizations  # lazy: figures only
 
-        backend_original = matplotlib.get_backend()
-        matplotlib.use("Agg", force=True)
-        try:
-            if filepath is None:
-                # Generate default filename
-                container_type = type(self.container).__name__.lower()
-                if (
-                    hasattr(self.container, "cams_meta_filepath")
-                    and self.container.cams_meta_filepath
-                ):
-                    base, _ = os.path.splitext(self.container.cams_meta_filepath)
-                    filepath = f"{base}_depth_residuals.pdf"
-                elif (
-                    hasattr(self.container, "markers_filepath")
-                    and self.container.markers_filepath
-                ):
-                    base, _ = os.path.splitext(self.container.markers_filepath)
-                    filepath = f"{base}_depth_residuals.pdf"
-                else:
-                    filepath = f"{container_type}_depth_residuals.pdf"
-
-            # Get the figures
-            fig1, fig2 = self.show_depth_vs_est_depth_residuals(
-                width=width, height=height, **kwargs
-            )
-            fig3, fig4 = self.show_z_vs_depth_residuals(
-                width=width, height=height, **kwargs
-            )
-
-            # Save all figures to PDF
-            pdf = PdfPages(filepath)
-            pdf.savefig(fig1)
-            pdf.savefig(fig2)
-            pdf.savefig(fig3)
-            pdf.savefig(fig4)
-            pdf.close()
-
-            # Close figures to free memory
-            plt.close(fig1)
-            plt.close(fig2)
-            plt.close(fig3)
-            plt.close(fig4)
-
-            return filepath
-        finally:
-            matplotlib.use(backend_original, force=True)
+        return visualizations.save_depth_residuals_pdf(
+            self, filepath, width, height, **kwargs
+        )
 
 
 def depth_band_sample(
@@ -3104,32 +2474,207 @@ def depth_band_sample(
     lo, hi = sorted((abs(float(depth_min)), abs(float(depth_max))))
     if not hi > lo:
         raise ValueError(f"an empty depth band ({depth_min:g} to {depth_max:g} m)")
-    span =[float(np.nanmin(depth)), float(np.nanmax(depth))] if len(pts) else [float("nan")] * 2
+    span = [float(np.nanmin(depth)), float(np.nanmax(depth))] if len(pts) else [float("nan")] * 2
     band = (depth >= lo) & (depth < hi)
     if not band.any():
         raise ValueError(f"no cloud between {lo:g} and {hi:g} m depth (the cloud spans "
                          f"{span[0]:.1f} to {span[1]:.1f} m)")
-    P, d = pts[band], depth[band]
+    band_pts, band_depth = pts[band], depth[band]
     rng = np.random.default_rng(seed)
     # the across direction: along the depth contours of a plane z = a x + b y + c fitted to the band
-    S = P if len(P) <= 200_000 else P[rng.choice(len(P), 200_000, replace=False)]
-    (a, b, _c), *_ = np.linalg.lstsq(np.c_[S[:, 0], S[:, 1], np.ones(len(S))], S[:, 2], rcond=None)
-    g = float(np.hypot(a, b))
-    across = np.array([-b, a]) / g if g > 1e-9 else np.array([1.0, 0.0])
-    u = P[:, :2] @ across
-    u0 = float(u.min())
-    col = ((u - u0) // width_step).astype(np.int64)
-    row = ((d - lo) // depth_step).astype(np.int64)
+    fit_pts = (band_pts if len(band_pts) <= 200_000
+               else band_pts[rng.choice(len(band_pts), 200_000, replace=False)])
+    (a, b, _c), *_ = np.linalg.lstsq(
+        np.c_[fit_pts[:, 0], fit_pts[:, 1], np.ones(len(fit_pts))], fit_pts[:, 2], rcond=None)
+    gradient = float(np.hypot(a, b))
+    across = np.array([-b, a]) / gradient if gradient > 1e-9 else np.array([1.0, 0.0])
+    across_pos = band_pts[:, :2] @ across
+    u0 = float(across_pos.min())
+    col = ((across_pos - u0) // width_step).astype(np.int64)
+    row = ((band_depth - lo) // depth_step).astype(np.int64)
     ncol = int(col.max()) + 1
     nrow = int(np.ceil((hi - lo) / depth_step - 1e-9))
     key = row * ncol + col
     cells, inv = np.unique(key, return_inverse=True)
     # a random position in each cell; its nearest point in (across, depth)
-    cu = u0 + (cells % ncol + rng.random(len(cells))) * width_step
-    cd = lo + (cells // ncol + rng.random(len(cells))) * depth_step
-    dist = (u - cu[inv]) ** 2 + (d - cd[inv]) ** 2
+    cell_across = u0 + (cells % ncol + rng.random(len(cells))) * width_step
+    cell_depth = lo + (cells // ncol + rng.random(len(cells))) * depth_step
+    dist = (across_pos - cell_across[inv]) ** 2 + (band_depth - cell_depth[inv]) ** 2
     order = np.lexsort((dist, inv))
     first = order[np.r_[0, np.flatnonzero(np.diff(inv[order])) + 1]]
-    return dict(points=P[first], cells=np.c_[cells % ncol, cells // ncol], across=across, u0=u0,
-                width=float(u.max() - u0), columns=ncol, rows=nrow, cells_with_cloud=len(cells),
-                band_points=int(band.sum()), cloud_depth=span)
+    return dict(points=band_pts[first], cells=np.c_[cells % ncol, cells // ncol], across=across,
+                u0=u0, width=float(across_pos.max() - u0), columns=ncol, rows=nrow,
+                cells_with_cloud=len(cells), band_points=int(band.sum()), cloud_depth=span)
+
+
+def _subsample_idx(n, k, rng):
+    """Indices of at most ``k`` of ``n`` items (all of them if ``n <= k``)."""
+    if n <= k:
+        return np.arange(n)
+    return np.sort(rng.choice(n, size=k, replace=False))
+
+
+@dataclass
+class PcdCorrespondence:
+    """How well a source cloud coincides with a target cloud in their overlap.
+
+    Produced by :func:`pcd_correspondence`; drawn by
+    :func:`substrata.visualizations.plot_pcd_correspondence`. Distances are in
+    the clouds' units.
+    """
+
+    #: (M, 3) source points the distances were computed for (a sample).
+    sample: np.ndarray
+    #: (M,) C2C: distance of each sample point to the nearest target point.
+    c2c: np.ndarray
+    #: (M,) signed vertical offset (source z minus the z of a plane fitted to
+    #: the 8 nearest target points); NaN on near-vertical surfaces and over
+    #: target gaps.
+    dz: np.ndarray
+    #: (K, 3) target points within the source bounding box (plus the margin).
+    target_overlap: np.ndarray
+    #: Median nearest-neighbour spacing of the target in the overlap.
+    target_spacing: float
+    #: Source bounding box (min corner, max corner).
+    bbox_min: np.ndarray
+    bbox_max: np.ndarray
+    #: The summary numbers (see :func:`pcd_correspondence`).
+    stats: Dict[str, float] = field(default_factory=dict)
+
+
+def pcd_correspondence(
+    src,
+    tgt,
+    units: str = "m",
+    max_sample_points: int = 1_000_000,
+    margin: float = 0.05,
+    labels: Tuple[str, str] = ("source", "target"),
+    seed: int = 0,
+) -> PcdCorrespondence:
+    """Distances between two clouds in the same frame, in their overlap.
+
+    The target is cropped to the source bounding box (plus ``margin`` of its
+    extent) and, for a random sample of at most ``max_sample_points`` source
+    points (``seed``), two distances are computed:
+
+    - C2C: distance to the nearest target point (3-D).
+    - dz: signed vertical difference, source z minus the z of a plane fitted
+      to the 8 nearest target points (3-D neighbours keep the matching surface
+      under overhangs; the plane stops a slope from absorbing the offset). It
+      is NaN where the plane is steep (``|n_z| < 0.3``) or the 8th neighbour is
+      more than 10 target spacings away (a gap in the target).
+
+    ``stats`` holds ``n_sample``, ``n_target_overlap``, ``target_spacing``
+    (median nearest-neighbour distance of up to 200 000 overlap points, the
+    bound on the attainable C2C), ``c2c_median``, ``c2c_p90``, ``dz_median``,
+    ``dz_iqr`` (of the finite dz), ``dz_coverage`` (finite share of dz) and,
+    with ``units="m"``, ``c2c_within_{2,5,10}cm`` (share of the sample).
+
+    Args:
+        src: Source point cloud (anything with ``points``).
+        tgt: Target point cloud, same frame as ``src``.
+        units: Coordinate unit; ``"m"`` adds the within-2/5/10-cm shares.
+        max_sample_points: Source points used for the statistics.
+        margin: Fraction of the source extent added around it when cropping
+            the target.
+        labels: Names of ``src`` and ``tgt`` (error message).
+        seed: Seed of the source sample.
+
+    Raises:
+        ValueError: When no target point lies in the source bounding box.
+    """
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(seed)
+    s_pts = _points_array(src)
+    t_pts = _points_array(tgt)
+
+    lo, hi = s_pts.min(axis=0), s_pts.max(axis=0)
+    pad = margin * (hi - lo)
+    in_box = np.all((t_pts >= lo - pad) & (t_pts <= hi + pad), axis=1)
+    t_crop = t_pts[in_box]
+    if len(t_crop) == 0:
+        raise ValueError(
+            f"No {labels[1]} points overlap the {labels[0]} bounding box"
+        )
+
+    s_sample = s_pts[_subsample_idx(len(s_pts), max_sample_points, rng)]
+    t_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(t_crop))
+    s_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(s_sample))
+    c2c = np.asarray(s_o3d.compute_point_cloud_distance(t_o3d))
+    tree = cKDTree(t_crop)
+    spacing_idx = _subsample_idx(len(t_crop), 200_000, rng)
+    spacing, _ = tree.query(t_crop[spacing_idx], k=2)
+    spacing = float(np.median(spacing[:, 1]))
+
+    d_nn, i_nn = tree.query(s_sample, k=8)
+    nbrs = t_crop[i_nn]
+    nb_mean = nbrs.mean(axis=1)
+    rel = nbrs - nb_mean[:, None, :]
+    _, vecs = np.linalg.eigh(np.einsum("nki,nkj->nij", rel, rel))
+    normal = vecs[:, :, 0]
+    tilt = np.einsum("ni,ni->n", normal[:, :2], s_sample[:, :2] - nb_mean[:, :2])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z_plane = nb_mean[:, 2] - tilt / normal[:, 2]
+    dz = s_sample[:, 2] - z_plane
+    dz[(np.abs(normal[:, 2]) < 0.3) | (d_nn[:, -1] > 10 * spacing)] = np.nan
+    dz_ok = dz[np.isfinite(dz)]
+
+    stats = {
+        "n_sample": int(len(s_sample)),
+        "n_target_overlap": int(len(t_crop)),
+        "target_spacing": spacing,
+        "c2c_median": float(np.median(c2c)),
+        "c2c_p90": float(np.percentile(c2c, 90)),
+        "dz_median": float(np.median(dz_ok)) if len(dz_ok) else float("nan"),
+        "dz_iqr": (
+            float(np.subtract(*np.percentile(dz_ok, [75, 25])))
+            if len(dz_ok)
+            else float("nan")
+        ),
+        "dz_coverage": float(len(dz_ok) / len(dz)),
+    }
+    if units == "m":
+        for cm in (2, 5, 10):
+            stats[f"c2c_within_{cm}cm"] = float(np.mean(c2c < cm / 100))
+
+    return PcdCorrespondence(
+        sample=s_sample, c2c=c2c, dz=dz, target_overlap=t_crop,
+        target_spacing=spacing, bbox_min=lo, bbox_max=hi, stats=stats,
+    )
+
+
+def camera_residuals(src_xyz, tgt_xyz, inliers=None) -> Dict[str, Any]:
+    """Residual distances between matched camera positions in a common frame.
+
+    Args:
+        src_xyz: (N, 3) source camera centres, already in the target frame.
+        tgt_xyz: (N, 3) corresponding target camera centres.
+        inliers: Optional boolean mask of the pairs used for the fit (default
+            all).
+
+    Returns:
+        dict: ``residuals`` (N,), ``inliers`` (N,) bool, ``n_inliers``,
+        ``n_rejected``, ``rms`` and ``median`` of the inlier residuals, and
+        ``rejected_min`` / ``rejected_max`` (NaN without rejected pairs).
+    """
+    src_xyz = np.asarray(src_xyz, dtype=float)
+    tgt_xyz = np.asarray(tgt_xyz, dtype=float)
+    residuals = np.linalg.norm(src_xyz - tgt_xyz, axis=1)
+    inl = (
+        np.ones(len(residuals), bool) if inliers is None
+        else np.asarray(inliers, dtype=bool)
+    )
+    r_in, r_out = residuals[inl], residuals[~inl]
+    nan = float("nan")
+    return {
+        "residuals": residuals,
+        "inliers": inl,
+        "n_inliers": int(inl.sum()),
+        "n_rejected": int((~inl).sum()),
+        "rms": float(np.sqrt(np.mean(r_in**2))) if len(r_in) else nan,
+        "median": float(np.median(r_in)) if len(r_in) else nan,
+        "rejected_min": float(r_out.min()) if len(r_out) else nan,
+        "rejected_max": float(r_out.max()) if len(r_out) else nan,
+    }

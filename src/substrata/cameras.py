@@ -7,16 +7,13 @@ import datetime
 import importlib
 import json
 import logging
+import operator
 import os
 import re
-import sys
-import tempfile
 import xml.etree.ElementTree as ET
 
 # Third-Party Libraries
 import cv2
-from joblib.externals.cloudpickle.cloudpickle import _property_reduce
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw
@@ -27,43 +24,31 @@ from joblib import Parallel, delayed
 import exifread
 
 # Local Modules
-from substrata import visualizations, settings, geom, measurements
+from substrata import settings, geom, measurements
+from substrata.compat import renamed_kwargs as _renamed_kwargs
+from substrata.fileio import atomic_write as _atomic_write
+from substrata.fileio import atomic_write_text as _atomic_write_text
+from substrata.fileio import imread as _imread
+from substrata.imagecrops import classifier_crop_box, get_crop_img
 from substrata.pathrepair import path_basename
 from substrata.logging import tqdm_joblib
 
 logger = logging.getLogger(__name__)
 
 
-def _atomic_write_json(data: dict, out_path: str) -> str:
-    """Write ``data`` as indented JSON to ``out_path`` atomically.
-
-    Writes to a temporary file in the same directory and ``os.replace``s it into
-    position, so an interrupted write cannot truncate the original file.
+def _atomic_write_json(data: dict, output_path: str) -> str:
+    """Write ``data`` as indented JSON to ``output_path`` atomically
+    (:func:`substrata.fileio.atomic_write`: an interrupted write cannot truncate
+    the original file; its permission mode is kept).
 
     Args:
         data: JSON-serializable mapping to write.
-        out_path: Destination path (created or replaced).
+        output_path: Destination path (created or replaced).
 
     Returns:
         str: The absolute path written.
     """
-    out_abs = os.path.abspath(out_path)
-    out_dir = os.path.dirname(out_abs) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".json.tmp", prefix=".cams_meta_", dir=out_dir
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, out_abs)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return out_abs
+    return _atomic_write_text(output_path, json.dumps(data, indent=2) + "\n")
 
 
 def _sync_camera_enabled_to_cams_xml(cameras: Cameras, xml_path: str) -> None:
@@ -97,18 +82,8 @@ def _sync_camera_enabled_to_cams_xml(cameras: Cameras, xml_path: str) -> None:
     if updated == 0:
         return
     xml_abs = os.path.abspath(xml_path)
-    out_dir = os.path.dirname(xml_abs) or "."
-    fd, tmp_path = tempfile.mkstemp(suffix=".xml.tmp", prefix=".cams_", dir=out_dir)
-    try:
-        with os.fdopen(fd, "wb") as xf:
-            tree.write(xf, encoding="utf-8", xml_declaration=True)
-        os.replace(tmp_path, xml_abs)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    with _atomic_write(xml_abs, "wb") as xf:
+        tree.write(xf, encoding="utf-8", xml_declaration=True)
     print(f"Updated {updated} <camera enabled> flags in {xml_abs}")
 
 
@@ -127,7 +102,7 @@ def _size_pair(size) -> tuple:
     return int(w), int(h)
 
 
-def _photo_folder_name(filepath: str) -> str | None:
+def photo_folder_name(filepath: str) -> str | None:
     """Name of the folder holding a photo (e.g. ``ton_tof.auv``), if any.
 
     Handles both ``/`` and ``\\`` separators, as Metashape may store Windows
@@ -135,6 +110,9 @@ def _photo_folder_name(filepath: str) -> str | None:
     """
     parts = [p for p in re.split(r"[\\/]", filepath or "") if p]
     return parts[-2] if len(parts) >= 2 else None
+
+
+_photo_folder_name = photo_folder_name  # deprecated alias (renamed 2026-11-25)
 
 
 def view_crop_name(cam_filepath: str, x: float, y: float) -> str:
@@ -158,7 +136,7 @@ def find_view_crop(
     legacy ``<root>/<ann_id>/<photo file>``), whose pixel is unknown.
     """
     base = os.path.join(root, str(ann_id))
-    folder = _photo_folder_name(cam_filepath)
+    folder = photo_folder_name(cam_filepath)
     sub = os.path.join(base, folder) if folder else base
     photo = re.split(r"[\\/]", cam_filepath or "")[-1]
     return _first_existing(
@@ -177,10 +155,10 @@ def _first_existing(*paths) -> str | None:
 
 # --- Projection (3-D points -> pixels) -----------------------------------------
 # One core shared by Camera.get_pixel_coords (a point, one camera), Camera.project_points
-# (many points, one camera) and pixel_hits (a point, many cameras): _distort and
+# (many points, one camera) and pixel_hits (a point, many cameras): camera_points_to_pixels and
 # _relevance. The poses are inverted per call for one camera (always its current
 # pose); for many cameras they are stacked once (CameraStack), cached on their
-# Cameras and rebuilt after _projection_changed.
+# Cameras and rebuilt after invalidate_projection_cache.
 
 _SENSOR_FIELDS = ("k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4", "b2", "fx", "fy", "cx", "cy", "width", "height",
                   "r2_max")
@@ -189,13 +167,16 @@ _PROJ_STATE = {"gen": 0}  # bumped when poses or sensors change in place: every 
 _HITS_CACHE: dict = {}  # stacks of camera lists that do not belong to a Cameras
 
 
-def _projection_changed() -> None:
+def invalidate_projection_cache() -> None:
     """Camera poses, sensors or the cameras of a :class:`Cameras` changed: stacks are rebuilt on next use."""
     _PROJ_STATE["gen"] += 1
     _HITS_CACHE.clear()
 
 
-def _lens(x, y, s):
+_projection_changed = invalidate_projection_cache  # deprecated alias (renamed 2026-11-25)
+
+
+def lens_distortion(x, y, s):
     """Metashape's frame camera distortion of normalised coordinates ``(x, y)`` (``X/Z``, ``Y/Z``) through
     sensor ``s``: the distorted normalised coordinates ``(x', y')``. Agisoft Metashape manual, appendix
     "Camera models" (frame cameras)::
@@ -214,8 +195,11 @@ def _lens(x, y, s):
     return x_dist, y_dist
 
 
+_lens = lens_distortion  # deprecated alias (renamed 2026-11-25)
+
+
 def _lens_jacobian(x, y, s):
-    """The derivatives of :func:`_lens` at ``(x, y)``: ``(dx'/dx, dx'/dy, dy'/dx, dy'/dy)``."""
+    """The derivatives of :func:`lens_distortion` at ``(x, y)``: ``(dx'/dx, dx'/dy, dy'/dx, dy'/dy)``."""
     r2 = x * x + y * y
     radial = 1 + r2 * (s.k1 + r2 * (s.k2 + r2 * (s.k3 + r2 * s.k4)))
     d_radial = s.k1 + r2 * (2 * s.k2 + r2 * (3 * s.k3 + r2 * 4 * s.k4))  # (d radial / d r2)
@@ -241,9 +225,9 @@ def _r2_max(k1, k2, k3, k4, fx, width, height) -> float:
     return min([bound, *folds])
 
 
-def _undistort(x_img, y_img, s, iterations: int = 20):
+def pixels_to_normalized(x_img, y_img, s, iterations: int = 20):
     """The normalised coordinates ``(x, y)`` that sensor ``s`` images at pixel ``(x_img, y_img)``: the
-    inverse of :func:`_distort` (Newton's method on :func:`_lens`, from the undistorted guess). Scalars or
+    inverse of :func:`camera_points_to_pixels` (Newton's method on :func:`lens_distortion`, from the undistorted guess). Scalars or
     arrays. Converges to ~1e-12 px over the image for the calibrations Metashape produces (closer than
     Metashape's own ``unproject``); NaN where there is no such point (a pixel the lens model cannot reach:
     the far corners of a strongly distorted photo; or one beyond the fold, see :func:`_r2_max`)."""
@@ -251,13 +235,13 @@ def _undistort(x_img, y_img, s, iterations: int = 20):
     x_d = (np.asarray(x_img, float) - s.cx - s.b2 * y_d) / s.fx
     x, y = x_d.copy(), y_d.copy()
     for _ in range(iterations):
-        ex, ey = _lens(x, y, s)
+        ex, ey = lens_distortion(x, y, s)
         ex, ey = ex - x_d, ey - y_d
         a, b, c, d = _lens_jacobian(x, y, s)
         det = a * d - b * c
         x = x - (d * ex - b * ey) / det
         y = y - (a * ey - c * ex) / det
-    ex, ey = _lens(x, y, s)
+    ex, ey = lens_distortion(x, y, s)
     off = np.hypot(ex - x_d, ey - y_d) * s.fy > 1e-4  # (px: not converged, no solution)
     bad = off | ~(x * x + y * y < s.r2_max)
     if np.ndim(bad):
@@ -267,36 +251,71 @@ def _undistort(x_img, y_img, s, iterations: int = 20):
     return x, y
 
 
-def _distort(xc, yc, zc, s):
+_undistort = pixels_to_normalized  # deprecated alias (renamed 2026-11-25)
+
+
+def camera_points_to_pixels(xc, yc, zc, s):
     """Pixels of camera-frame points ``(xc, yc, zc)`` through sensor ``s`` (a :class:`Sensor`, or a
-    :class:`CameraStack`, row by row): Metashape's frame camera model (:func:`_lens`: K1-K4 radial, P1-P4
+    :class:`CameraStack`, row by row): Metashape's frame camera model (:func:`lens_distortion`: K1-K4 radial, P1-P4
     tangential), then ``u = cx + x' fx + y' B2`` (fx = f + B1: affinity; B2: skew), ``v = cy + y' fy``.
     Scalars or arrays (broadcast).
+
+    Pixel coordinates are continuous, in Metashape's convention: ``(0, 0)`` is the top-left corner of the
+    top-left pixel, pixel ``(i, j)`` (column, row) covers ``[i, i + 1) x [j, j + 1)`` and its centre is
+    ``(i + 0.5, j + 0.5)``; the grid is the image as stored (EXIF orientation not applied, see
+    :func:`substrata.fileio.imread`).
 
     Returns:
         ``(x_img, y_img, in_view)``, unrounded. In view: in front of the camera (one behind it can project
         into the image too), within the radius the lens images (``r2_max``: before its distortion folds
-        back into the image, see :func:`_r2_max`) and inside the image, borders included.
+        back into the image, see :func:`_r2_max`) and inside the image: ``0 <= x < width``,
+        ``0 <= y < height``.
     """
     x_norm = xc / zc
     y_norm = yc / zc
     r2 = x_norm**2 + y_norm**2
-    x_dist, y_dist = _lens(x_norm, y_norm, s)
+    x_dist, y_dist = lens_distortion(x_norm, y_norm, s)
     x_img = s.fx * x_dist + s.b2 * y_dist + s.cx
     y_img = s.fy * y_dist + s.cy
     in_view = (
         (zc > 0)
         & (r2 < s.r2_max)
-        & (x_img >= 0) & (x_img <= s.width)
-        & (y_img >= 0) & (y_img <= s.height)
+        & (x_img >= 0) & (x_img < s.width)
+        & (y_img >= 0) & (y_img < s.height)
     )
     return x_img, y_img, in_view
 
 
-def _relevance(depth, dist_sq, x_img, y_img, fx, fy, width, height):
-    """Relevance of a view (lower is better): the point's depth plus its squared distance to the camera
-    centre, over fx * fy, times (10 + the pixel's distance from the image centre, L1)."""
-    return np.abs((np.abs(depth) + dist_sq) / (fx * fy)) * (
+_distort = camera_points_to_pixels  # deprecated alias (renamed 2026-11-25)
+
+
+def int_pixel(v, size):
+    """The integer pixel coordinate of an in-view continuous coordinate ``v`` (:func:`camera_points_to_pixels`): ``v``
+    rounded (half to even), at most ``size - 1``.
+
+    Rounded, not floored: a crop of even size centred on the integer coordinate then has the point within
+    half a pixel of its centre (the crop's centre is a pixel corner), and the crop names
+    (:func:`view_crop_name`) of stored crops stay as they are. The pixel *containing* the point, to index an
+    image array with, is ``floor(v)`` instead. Clamped, so ``v`` in ``[size - 0.5, size)`` gives the last
+    pixel, never ``size``. Scalars or arrays.
+    """
+    return np.minimum(np.rint(v), np.asarray(size, float) - 1)
+
+
+_int_pixel = int_pixel  # deprecated alias (renamed 2026-11-25)
+
+
+def _relevance(dist_sq, x_img, y_img, fx, fy, width, height):
+    """Relevance of a view (a cost: lower is better): the squared distance from the camera centre to the point
+    over ``fx * fy`` (the area one pixel covers there, for a surface facing the camera), times
+    (10 + the pixel's distance from the image centre, L1).
+
+    Every term of the first factor is a squared length, so scaling the chunk scales every cost alike: the
+    ranking of views, and the relevance weights of ``predict --method weighted`` (``relevance_min /
+    relevance``), do not depend on the chunk's units. Until November 2026 the first factor was
+    ``(|depth| + dist_sq) / (fx * fy)``, which mixed a length with a squared length; on sa3_40m (model units
+    of 0.19 m) 97 % of 400 points keep the same best view."""
+    return (dist_sq / (fx * fy)) * (
         10 + np.abs(x_img - 0.5 * width) + np.abs(y_img - 0.5 * height)
     )
 
@@ -363,10 +382,12 @@ def _stack_for(cams: list, use_orig_coords: bool = True, owner=None):
     """The :class:`CameraStack` of ``cams`` (a non-empty list), made once per list of cameras and frame.
 
     Kept on ``owner`` (the :class:`Cameras` they come from; by default the first camera's parent), the last
-    ``_STACKS_KEPT`` lists, else in ``_HITS_CACHE``. A list is known by its length and a sample of its
-    cameras (held by the stack, so their ids cannot be reused). Poses and sensors are taken as fixed: what
+    ``_STACKS_KEPT`` lists, else in ``_HITS_CACHE``. A list is looked up by its length and a sample of its
+    cameras, and a hit is checked against the whole list (the cameras are held, so their ids cannot be
+    reused): two lists of the same length that differ only between the sampled cameras get their own
+    stacks. Poses and sensors are taken as fixed: what
     changes them in place (world transforms, camera sync, reading sensors, replacing cameras) calls
-    :func:`_projection_changed`. ``enabled`` is not stacked, nor are cameras that cannot project
+    :func:`invalidate_projection_cache`. ``enabled`` is not stacked, nor are cameras that cannot project
     (:func:`can_project`). None if a pose cannot be read or inverted (then pixel_hits goes one camera at a
     time); that is remembered too.
     """
@@ -376,7 +397,8 @@ def _stack_for(cams: list, use_orig_coords: bool = True, owner=None):
     store = owner.__dict__.setdefault("_proj_stacks", {}) if isinstance(owner, Cameras) else _HITS_CACHE
     gen = _PROJ_STATE["gen"]
     got = store.get(key)
-    if got is not None and got[0] == gen:
+    # (the key samples the list: a hit is confirmed on the whole list, by identity - C speed, ~1 ms for 60k)
+    if got is not None and got[0] == gen and len(got[2]) == n and all(map(operator.is_, got[2], cams)):
         return got[1]
     try:
         st = CameraStack(cams, use_orig_coords)
@@ -386,7 +408,7 @@ def _stack_for(cams: list, use_orig_coords: bool = True, owner=None):
         del store[k]
     while len(store) >= _STACKS_KEPT:
         del store[next(iter(store))]
-    store[key] = (gen, st)
+    store[key] = (gen, st, list(cams))
     return st
 
 
@@ -406,8 +428,8 @@ def pixel_hits(cams, coords, use_orig_coords: bool = True, enabled_only: bool = 
         enabled_only: Skip cameras whose ``enabled`` is False (read afresh on every call).
 
     Returns:
-        ``[(camera, x, y, depth, relevance)]`` in the order of ``cams``: ``x``, ``y`` rounded int pixels,
-        ``depth`` and ``relevance`` floats.
+        ``[(camera, x, y, depth, relevance)]`` in the order of ``cams``: ``x``, ``y`` int pixels
+        (:func:`int_pixel`), ``depth`` and ``relevance`` floats.
     """
     owner = cams if isinstance(cams, Cameras) else None
     cams = cams if isinstance(cams, list) else list(cams)
@@ -426,17 +448,18 @@ def pixel_hits(cams, coords, use_orig_coords: bool = True, enabled_only: bool = 
     p = np.append(np.asarray(coords, float).ravel()[:3], 1.0)
     proj = st.inv @ p
     with np.errstate(divide="ignore", invalid="ignore"):
-        xi, yi, ok = _distort(proj[:, 0], proj[:, 1], proj[:, 2], st)
+        xi, yi, ok = camera_points_to_pixels(proj[:, 0], proj[:, 1], proj[:, 2], st)
     idx = np.flatnonzero(ok)
     if enabled_only:  # (read afresh, of the hits only: cheap, and never stale)
         idx = np.array([i for i in idx.tolist() if getattr(st.cams[i], "enabled", True) is not False], int)
     if not len(idx):
         return []
     dist_sq = ((st.centres[idx] - p[:3]) ** 2).sum(1)
-    rm = _relevance(proj[idx, 2], dist_sq, xi[idx], yi[idx],
+    rm = _relevance(dist_sq, xi[idx], yi[idx],
                     st.fx[idx], st.fy[idx], st.width[idx], st.height[idx])
-    return [(st.cams[i], int(round(xi[i])), int(round(yi[i])), float(proj[i, 2]), r)
-            for i, r in zip(idx.tolist(), rm.tolist())]
+    xs, ys = int_pixel(xi[idx], st.width[idx]), int_pixel(yi[idx], st.height[idx])
+    return [(st.cams[i], int(x), int(y), float(proj[i, 2]), r)
+            for i, x, y, r in zip(idx.tolist(), xs.tolist(), ys.tolist(), rm.tolist())]
 
 
 def _file_names(folder: str) -> set:
@@ -448,12 +471,15 @@ def _file_names(folder: str) -> set:
         return set()
 
 
-def _count_statuses(statuses) -> dict:
+def count_crop_statuses(statuses) -> dict:
     """Count crop/thumbnail statuses, always including every status key."""
     counts = {status: 0 for status in _CROP_STATUSES}
     for status in statuses:
         counts[status] = counts.get(status, 0) + 1
     return counts
+
+
+_count_statuses = count_crop_statuses  # deprecated alias (renamed 2026-11-25)
 
 
 def assign_camera_types(cams, focal_tol: float = settings.CAMERA_TYPE_FOCAL_TOL):
@@ -537,11 +563,9 @@ def save_photo_crops(matches, root=None, crop_size=None, overwrite: bool = False
                 if not m.is_clear_from_image_edge((crop_w, crop_h), img.size):
                     out[i] = "rejected"
                     continue
-                # Same box arithmetic as visualizations.get_crop_img, so a centre
+                # The classifier crop box (imagecrops.get_crop_img's), so a centre
                 # crop of this crop equals a crop cut from the photo directly.
-                left = int(m.x - crop_w / 2)
-                top = int(m.y - crop_h / 2)
-                crop = img.crop((left, top, left + crop_w, top + crop_h))
+                crop = img.crop(classifier_crop_box(m.x, m.y, crop_w, crop_h))
                 if crop.mode not in ("RGB", "L"):
                     crop = crop.convert("RGB")
                 exif_bytes = _exif_with_crop_metadata(exif_src, {
@@ -561,21 +585,12 @@ def save_photo_crops(matches, root=None, crop_size=None, overwrite: bool = False
     return out
 
 
-def _save_image_atomic(img, out_path: str, **save_kwargs) -> None:
-    """Save a PIL image as JPEG via a temp file, so readers never see a partial file."""
-    out_dir = os.path.dirname(os.path.abspath(out_path))
-    os.makedirs(out_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(suffix=".jpg.tmp", prefix=".crop_", dir=out_dir)
-    os.close(fd)
-    try:
-        img.save(tmp_path, format="JPEG", **save_kwargs)
-        os.replace(tmp_path, out_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+def _save_image_atomic(img, output_path: str, **save_kwargs) -> None:
+    """Save a PIL image as JPEG atomically, so readers never see a partial file
+    (:func:`substrata.fileio.atomic_write`)."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with _atomic_write(output_path, "wb") as fh:
+        img.save(fh, format="JPEG", **save_kwargs)
 
 
 def _exif_with_crop_metadata(exif_source, data: dict) -> bytes:
@@ -650,13 +665,16 @@ def read_crop_metadata(path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _update_crop_metadata(path: str, updates: dict) -> None:
+def update_crop_metadata(path: str, updates: dict) -> None:
     """Merge ``updates`` into a crop's metadata without re-encoding the JPEG."""
     import piexif
 
     data = read_crop_metadata(path) or {}
     data.update(updates)
     piexif.insert(_exif_with_crop_metadata(path, data), path)
+
+
+_update_crop_metadata = update_crop_metadata  # deprecated alias (renamed 2026-11-25)
 
 
 def _nominal_sensor(sensor_elem, sensor_id, label, resolution) -> "Sensor | None":
@@ -679,7 +697,7 @@ def _nominal_sensor(sensor_elem, sensor_id, label, resolution) -> "Sensor | None
 
 class Sensor:
     """Class that holds calibration parameters for a specific camera sensor (Metashape's frame camera
-    model: see :func:`_lens`)."""
+    model: see :func:`lens_distortion`)."""
 
     # (defaults for the optional terms, also for a Sensor pickled before they were read)
     b1 = b2 = k4 = p3 = p4 = 0.0
@@ -836,11 +854,11 @@ class Cameras:
 
     def __setitem__(self, key, value):
         self.data[key] = value
-        _projection_changed()
+        invalidate_projection_cache()
 
     def __delitem__(self, key):
         del self.data[key]
-        _projection_changed()
+        invalidate_projection_cache()
 
     def __getstate__(self):
         """Pickled / copied without the cached projection stacks (rebuilt on use)."""
@@ -866,11 +884,8 @@ class Cameras:
         return key in self.data
 
     def __iter__(self):
-        self._iter = iter(self.data.values())
-        return self
-
-    def __next__(self):
-        return next(self._iter)
+        """Iterate over the cameras (a fresh iterator each time, so loops can nest)."""
+        return iter(self.data.values())
 
     def __len__(self):
         """Return the number of cameras in the collection."""
@@ -940,49 +955,43 @@ class Cameras:
         else:
             self.data[cam.cam_id] = cam
             self.data[cam.cam_id].parent = self
-            _projection_changed()
+            invalidate_projection_cache()
             # TO DO: any other changes (eg transforms) to be implemented on append?
 
-    def transform_coords(self, transform_matrix):
-        """Apply a transformation to all camera coordinates and their transforms.
+    @_renamed_kwargs(transform_matrix="transform")
+    def apply_transform(self, transform):
+        """Apply a 4x4 transform to all camera coordinates and their poses.
+
+        ``world_transform`` becomes ``transform @ world_transform``.
 
         Args:
-            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+            transform (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
         for cam_id in self.data:
-            self.data[cam_id].transform_coords(transform_matrix)
-        self.world_transform = np.dot(np.array(transform_matrix), self.world_transform)
+            self.data[cam_id].transform_coords(transform)
+        self.world_transform = np.dot(np.array(transform), self.world_transform)
 
-    def reset_transform(self):
-        """Reset all camera coordinates and transforms to their original state.
+    transform_coords = apply_transform  # deprecated alias (renamed 2026-11-25)
 
-        Applies the inverse of the current world_transform to all cameras,
-        then sets world_transform to the identity matrix.
-        """
-        if not self.world_transform_is_identity:
-            for cam_id in self.data:
-                self.data[cam_id].reverse_transform_coords(self.world_transform)
-            self.world_transform = np.eye(4)
+    @_renamed_kwargs(transform_matrix="transform")
+    def reverse_transform(self, transform):
+        """Set the original poses from the current ones and the transform between them.
 
-    def apply_transform(self, transform_matrix):
-        """Alias for transform_coords for compatibility.
+        For cameras whose ``coords`` / ``camera_transform`` are in a frame
+        ``transform`` maps the original (model) frame to:
+        ``orig = inv(T) @ current``, and ``world_transform`` becomes ``T``
+        (``current = T @ orig`` then holds, whatever it was before).
 
         Args:
-            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+            transform (np.ndarray): The 4x4 transform from the original
+                frame to the current one.
         """
-        self.transform_coords(transform_matrix)
-
-    def get_original_coords(self, transform_matrix):
-        """Restore original camera coordinates and transforms.
-
-        Args:
-            transform_matrix (np.ndarray): The transformation matrix to reverse.
-        """
+        T = np.asarray(transform, dtype=float)
         for cam_id in self.data:
-            self.data[cam_id].reverse_transform_coords(transform_matrix)
-        self.world_transform = np.dot(
-            np.array(transform_matrix), self.world_transform
-        )  # TODO: CHECK!
+            self.data[cam_id].reverse_transform_coords(T)
+        self.world_transform = T.copy()
+
+    get_original_coords = reverse_transform  # deprecated alias (renamed 2026-11-25)
 
     def subset(self, length):
         """Return a new container with the first ``length`` cameras.
@@ -991,12 +1000,11 @@ class Cameras:
             length (int): Number of cameras to include, taken in insertion order.
 
         Returns:
-            Cameras: New container with the selected cameras re-parented to it.
+            Cameras: New container with the selected cameras.
         """
         cameras_subset = self._empty_like()
         for cam_id in list(self.data.keys())[:length]:
             cameras_subset.data[cam_id] = self.data[cam_id]
-            cameras_subset.data[cam_id].parent = cameras_subset
         return cameras_subset
 
     def subset_by_filename_prefix(self, prefix):
@@ -1012,24 +1020,6 @@ class Cameras:
         for cam in self.data.values():
             if cam.filename.startswith(prefix):
                 cameras_subset.data[cam.cam_id] = cam
-                cam.parent = cameras_subset
-        return cameras_subset
-
-    def subset_by_filepath_postfix(self, postfix):
-        """Return a subset of cameras whose containing folder ends with a given postfix.
-
-        Args:
-            postfix (str): Postfix string to match at the end of the containing folder.
-
-        Returns:
-            Cameras: New container with matching cameras.
-        """
-        cameras_subset = self._empty_like()
-        for cam in self.data.values():
-            folder = os.path.dirname(cam.filepath)
-            if folder.endswith(postfix) or folder.endswith(postfix + os.sep):
-                cameras_subset.data[cam.cam_id] = cam
-                cam.parent = cameras_subset
         return cameras_subset
 
     def subset_by_group(self, group_name):
@@ -1045,7 +1035,6 @@ class Cameras:
         for cam in self.data.values():
             if getattr(cam, "group", None) == group_name:
                 cameras_subset.data[cam.cam_id] = cam
-                cam.parent = cameras_subset
         return cameras_subset
 
     def subset_by_sensor(self, sensor_id):
@@ -1061,7 +1050,6 @@ class Cameras:
         for cam in self.data.values():
             if getattr(cam, "sensor_id", None) == sensor_id:
                 cameras_subset.data[cam.cam_id] = cam
-                cam.parent = cameras_subset
         if len(cameras_subset.data) == 0:
             print(f"No cameras found with sensor_id={sensor_id}")
         return cameras_subset
@@ -1089,7 +1077,6 @@ class Cameras:
                 continue
             if str(dt)[:10] in wanted:
                 cameras_subset.data[cam.cam_id] = cam
-                cam.parent = cameras_subset
         return cameras_subset
 
     def datetime_date_counts(self) -> dict[str, int]:
@@ -1126,40 +1113,42 @@ class Cameras:
         return self.subset_by_group(group_name)
 
     def _empty_like(self) -> "Cameras":
-        """Return an empty Cameras container inheriting this instance's metadata."""
+        """An empty container with this one's metadata (``world_transform``,
+        ``sensors``, ``up_vector``, file paths, ...), for the subset helpers.
+
+        The subset helpers put the *same* :class:`Camera` objects in the new
+        container without re-parenting them: a camera's ``parent`` stays the
+        container it was loaded into, so its ``group`` (and anything else
+        derived from its parent) does not change when a subset is taken.
+        Arrays, dicts and lists are copied (one level); private caches (the
+        projection stacks, the filename prefixes) are not carried over.
+        """
         subset = Cameras()
         for attr, val in self.__dict__.items():
-            if attr == "data":
+            if attr == "data" or attr.startswith("_"):
                 continue
+            if isinstance(val, np.ndarray):
+                val = val.copy()
+            elif isinstance(val, (dict, list)):
+                val = type(val)(val)
             try:
                 setattr(subset, attr, val)
-            except Exception:
+            except Exception:  # noqa: BLE001 - e.g. a read-only property
                 pass
-        subset.data = {}
         return subset
 
     def filter_by_ids(self, cam_ids):
         """Return a new Cameras container containing only the specified camera ids.
 
-        Copies container metadata (shallow) and re-parents included Camera objects
-        so downstream code can rely on attributes like world_transform, up_vector, etc.
+        Copies container metadata (see :meth:`_empty_like`); the cameras keep
+        their parent.
         """
         subset = self._empty_like()
         for cid in cam_ids:
             cam = self.data.get(cid)
             if cam is not None:
                 subset.data[cid] = cam
-                cam.parent = subset
         return subset
-
-    def filter_by_cams(self, cams_list):
-        """Return a new Cameras container containing only the specified Camera objects.
-
-        Equivalent to calling filter_by_ids([cam.cam_id for cam in cams_list]).
-        """
-        ids = [getattr(cam, "cam_id", None) for cam in cams_list]
-        ids = [cid for cid in ids if cid is not None]
-        return self.filter_by_ids(ids)
 
     def match_by_name(self, other: "Cameras") -> list[tuple[str, "Camera", "Camera"]]:
         """Pair cameras in this container with same-named cameras in ``other``.
@@ -1336,7 +1325,7 @@ class Cameras:
         Args:
             cams_meta_filepath (str): Path to the JSON file with camera metadata.
         """
-        _projection_changed()  # (cameras (re)loaded)
+        invalidate_projection_cache()  # (cameras (re)loaded)
         with open(cams_meta_filepath, "r") as f:
             data = json.load(f)
         n_placeholder = 0
@@ -1361,11 +1350,16 @@ class Cameras:
                 )
                 if "reference" in cam_data:
                     self.data[cam_id].reference = cam_data["reference"]
-                    # Ensure depth is negative (in meters)
-                    self.data[cam_id].depth_sensor_m = -abs(cam_data["reference"][2])
+                    # Ensure depth is negative (in meters); none without a reference z
+                    ref_z = _reference_z(cam_data["reference"])
+                    self.data[cam_id].depth_sensor_m = (
+                        None if ref_z is None else -abs(ref_z)
+                    )
                 if "reference_accuracy" in cam_data:
                     self.data[cam_id].reference_acc = cam_data["reference_accuracy"]
-                    self.data[cam_id].depth_acc = float(cam_data["reference_accuracy"][2])
+                    self.data[cam_id].depth_acc = _reference_z(
+                        cam_data["reference_accuracy"]
+                    )
                 if "center_crs" in cam_data:
                     self.data[cam_id].center_crs = cam_data["center_crs"]
                 if "enabled" in cam_data:
@@ -1546,14 +1540,15 @@ class Cameras:
             if cam is not None:
                 cam.set_filepath(path)
 
-    def missing_image_paths(self, use_orig: bool = False) -> dict:
+    @_renamed_kwargs(use_orig="use_orig_filepath")
+    def missing_image_paths(self, use_orig_filepath: bool = False) -> dict:
         """Cameras whose image file does not exist on disk.
 
         Zero-byte files are *not* reported as missing: locating an image and
         validating it are separate jobs.
 
         Args:
-            use_orig: Check :attr:`Camera.orig_filepath` (the value persisted to
+            use_orig_filepath: Check :attr:`Camera.orig_filepath` (the value persisted to
                 the meta JSON) rather than the resolved :attr:`Camera.filepath`,
                 which may have container-level find/replace rules applied.
 
@@ -1563,7 +1558,7 @@ class Cameras:
         """
         missing, listed = {}, {}
         for cam_id, cam in self.data.items():
-            path = cam.orig_filepath if use_orig else cam.filepath
+            path = cam.orig_filepath if use_orig_filepath else cam.filepath
             if not path:
                 missing[cam_id] = path
                 continue
@@ -1589,7 +1584,7 @@ class Cameras:
         # 1. Parse all sensors and create Sensor objects
         sensors_section = root.find(".//sensors")
         if sensors_section is None:
-            sys.exit("No sensors section found in XML file!")
+            raise ValueError(f"No sensors section found in {cams_xml_filepath}")
 
         for sensor_elem in sensors_section.findall("sensor"):
             sensor_id = int(sensor_elem.get("id"))
@@ -1709,7 +1704,7 @@ class Cameras:
                 self, "_no_sensor_message_printed", False
             )
             if cam_id in self.data:
-                _projection_changed()  # (sensors changed: restack)
+                invalidate_projection_cache()  # (sensors changed: restack)
                 self.data[cam_id].sensor_id = sensor_id
                 self.data[cam_id].sensor = self.sensors.get(sensor_id)
                 if self.data[cam_id].sensor is not None:
@@ -1725,32 +1720,47 @@ class Cameras:
                 # logger.warning(f"Camera {cam_id} from XML not found in loaded cameras")
 
         if not self.sensors:
-            sys.exit("No valid sensors found in XML file!")
+            raise ValueError(f"No valid sensors found in {cams_xml_filepath}")
 
     def load_camera_attributes(self, input_filepath):
         """Load camera attributes from a CSV file.
 
-        Updates each camera in the container with attributes such as path,
-        datetime, distance, and depth information (stored in depth_sensor_m).
+        Reads the cache :meth:`save_camera_attributes` writes: each camera's
+        ``datetime``, ``camdist`` (float) and depth (``depth_sensor_m``). The
+        photo path in the file is not applied (the cameras' own paths, e.g.
+        after a path repair, are current; the cache's may be older): a camera
+        whose path differs is only counted in a log message.
 
         Args:
             input_filepath (str): Path to the CSV file with camera attributes.
         """
         cam_counter = 0
         not_found_counter = 0
-        with open(input_filepath, "r") as csvfile:
+        other_path = 0
+
+        def number(value):
+            return float(value) if value not in (None, "", "None", "nan") else None
+
+        with open(input_filepath, newline="", encoding="utf-8-sig") as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 cam_id = row.get("cam_id", row.get("id"))
                 if cam_id in self.data:
                     cam = self.data[cam_id]
-                    cam.orig_filepath = row.get("path", row.get("label"))
-                    cam.datetime = row["datetime"] if row["datetime"] else None
-                    cam.camdist = row["camdist"] if row["camdist"] else None
-                    cam.depth_sensor_m = float(row["depth"]) if row["depth"] else None
+                    path = row.get("path", row.get("label"))
+                    if path and path_basename(path) != cam.filename:
+                        other_path += 1
+                    cam.datetime = row.get("datetime") or None
+                    cam.camdist = number(row.get("camdist"))
+                    cam.depth_sensor_m = number(row.get("depth"))
                     cam_counter += 1
                 else:
                     not_found_counter += 1
+        if other_path:
+            logger.warning(
+                f"{other_path} camera(s) in {input_filepath} name another photo "
+                "than the camera's; their cached values were applied by camera id"
+            )
         if not_found_counter > 0:
             logger.warning(
                 f"File had {not_found_counter} cameras that were not found..."
@@ -1758,16 +1768,17 @@ class Cameras:
         if cam_counter == 0:
             logger.warning(f"No cameras found in file {input_filepath}")
 
-    def save_camera_attributes(self, output_filepath):
+    @_renamed_kwargs(output_filepath="output_path")
+    def save_camera_attributes(self, output_path):
         """Save camera attributes to a CSV file.
 
         Writes camera ID, path, datetime, distance, depth, predicted depth,
         and depth residual for each camera.
 
         Args:
-            output_filepath (str): Path to the output CSV file.
+            output_path (str): Path to the output CSV file.
         """
-        with open(output_filepath, "w", newline="") as csvfile:
+        with _atomic_write(output_path, "w", newline="") as csvfile:
             fieldnames = [
                 "id",
                 "orig_x",
@@ -1796,11 +1807,6 @@ class Cameras:
                     }
                 )
 
-    def get_average_vector(self):
-        """Get the average vector of the cameras."""
-        vectors = np.array([cam.vector for cam in self.data.values()])
-        return vectors.mean(axis=0)
-
     def get_timematches(self, other_cams):
         """Get the timematches between the cameras.
 
@@ -1809,7 +1815,9 @@ class Cameras:
         """
         timematches = []
         for cam in self.data.values():
-            other_cam = other_cams.get_camera_by_datetime(cam.datetime)
+            other_cam = other_cams.get_camera_by_datetime(
+                cam.datetime, getattr(cam, "datetime_subsec", None)
+            )
             if other_cam is not None:
                 timematches.append((cam, other_cam))
             else:
@@ -1841,38 +1849,31 @@ class Cameras:
         matched_ids: list[str] = []
         unmatched: list[tuple[str, str]] = []  # (cam_id, datetime)
         for cam in self.data.values():
-            other_cam = other_cams.get_camera_by_datetime(cam.datetime)
+            other_cam = other_cams.get_camera_by_datetime(
+                cam.datetime, getattr(cam, "datetime_subsec", None)
+            )
             if other_cam is not None:
+                # (copies as float arrays: a pose read from JSON is a nested list,
+                # and the two cameras must not share one array)
+                other_T = np.array(other_cam.camera_transform, dtype=float).reshape(4, 4)
+                other_C = np.array(other_cam.coords, dtype=float).reshape(3)
                 if offset_xyz is not None:
-                    # Transform offset_xyz from camera coordinate system to world coordinates
-                    # Extract rotation matrix from camera transform and orthonormalize it
-                    rotation_matrix = np.array(other_cam.camera_transform, dtype=float)[
-                        :3, :3
-                    ]
-                    # Use SVD to obtain the nearest rotation (handles potential scaling/shear)
-                    U, _, Vt = np.linalg.svd(rotation_matrix)
-                    R = U @ Vt
-                    # Ensure a proper rotation with det(R) == +1
-                    if np.linalg.det(R) < 0:
-                        Vt[-1, :] *= -1
-                        R = U @ Vt
-                    # Transform the offset to world coordinates using the pure rotation
-                    world_offset = R @ np.array(offset_xyz, dtype=float)
-                    # Add the transformed offset to the camera position
-                    cam.coords = other_cam.coords + world_offset
-                    # Also apply the offset to the camera_transform translation
-                    cam.camera_transform = other_cam.camera_transform.copy()
-                    cam.camera_transform[:3, 3] = (
-                        np.array(cam.camera_transform[:3, 3], dtype=float)
-                        + world_offset
-                    )
+                    # The offset is in the camera's frame: rotate it into the world
+                    # (the pose's nearest proper rotation: any scale/shear removed)
+                    R = orthonormal_rotation_from_camera_transform(other_T)
+                    world_offset = R @ np.asarray(offset_xyz, dtype=float).reshape(3)
+                    cam.coords = other_C + world_offset
+                    cam.camera_transform = other_T
+                    cam.camera_transform[:3, 3] += world_offset
                     cam.reverse_transform_coords(other_cam.parent.world_transform)
                 else:
-                    cam.coords = other_cam.coords
-                    cam.camera_transform = other_cam.camera_transform
-                    cam.orig_coords = other_cam.orig_coords
-                    cam.orig_camera_transform = other_cam.orig_camera_transform
-                    _projection_changed()  # (orig pose changed: restack)
+                    cam.coords = other_C
+                    cam.camera_transform = other_T
+                    cam.orig_coords = np.array(other_cam.orig_coords, dtype=float).reshape(3)
+                    cam.orig_camera_transform = np.array(
+                        other_cam.orig_camera_transform, dtype=float
+                    ).reshape(4, 4)
+                    invalidate_projection_cache()  # (orig pose changed: restack)
                 if hasattr(cam, "missing_pose_from_meta"):
                     delattr(cam, "missing_pose_from_meta")
                 if hasattr(cam, "missing_pose_from_timematch"):
@@ -1886,7 +1887,7 @@ class Cameras:
         unmatched_ids = [cid for cid, _ in unmatched]
 
         if unmatched:
-            from substrata.firefish import get_time_diff_in_secs
+            from substrata.firefish import get_time_diff_s
 
             other_dts = sorted(
                 str(c.datetime)
@@ -1898,10 +1899,10 @@ class Cameras:
             if other_dts:
                 try:
                     diffs = [
-                        (abs(get_time_diff_in_secs(d, first_dt)), d) for d in other_dts
+                        (abs(get_time_diff_s(d, first_dt)), d) for d in other_dts
                     ]
                     _, closest = min(diffs, key=lambda x: x[0])
-                    signed = get_time_diff_in_secs(closest, first_dt)
+                    signed = get_time_diff_s(closest, first_dt)
                     closest_info = (
                         f"\n  Closest other_cams datetime to first unmatched: "
                         f"{closest} (off by {signed:+.1f}s)."
@@ -1948,22 +1949,6 @@ class Cameras:
             replace_str (str): The string to replace find_str with.
         """
         self.filepath_replace = [find_str, replace_str]
-
-    def set_filename_prefix(self, filename_prefix):
-        """Set a filename prefix for adjusting filepaths.
-
-        Args:
-            filename_prefix (str): The filename prefix to use.
-        """
-        self.filename_prefix = filename_prefix
-
-    def set_base_path(self, base_path):
-        """Set a replacement base path for adjusting filepaths.
-
-        Args:
-            base_path (str): The new base path to use.
-        """
-        self.filepath_replace = ["", base_path]
 
     def get_cam_dists(
         self,
@@ -2044,16 +2029,21 @@ class Cameras:
                 delayed(cam.make_thumbnail)(root, max_size, overwrite)
                 for cam in cams_list
             )
-        counts = _count_statuses(statuses)
+        counts = count_crop_statuses(statuses)
         counts.pop("rejected", None)
         return counts
 
-    def get_datetime_originals(self, offset_secs=None):
-        """Retrieve DateTimeOriginal metadata from image EXIF for all cameras."""
+    @_renamed_kwargs(offset_secs="offset_s")
+    def get_datetime_originals(self, offset_s=None):
+        """Read every camera's EXIF time into ``cam.datetime`` (``YYYY:MM:DD
+        HH:MM:SS``, see :meth:`Camera.get_datetime_original`) and its
+        sub-second part, when the photo has one, into ``cam.datetime_subsec``
+        (seconds, else None; used to tell photos of the same second apart in
+        :meth:`get_camera_by_datetime`)."""
         for cam in tqdm(
             self.data.values(), desc="Retrieving timestamps from camera files..."
         ):
-            cam.datetime = cam.get_datetime_original(offset_secs)
+            cam.datetime, cam.datetime_subsec = cam._read_datetime_original(offset_s)
 
     def earliest_exif_datetime(
         self, cam_ids: list[str] | None = None
@@ -2100,17 +2090,6 @@ class Cameras:
                 return cam
         return None
 
-    def get_camera_by_filename_partial_match(self, filename):
-        """Get a camera object by a partial filename match.
-
-        Args:
-            filename (str): The filename to search for.
-        """
-        for cam in self.data.values():
-            if filename in cam.filename:
-                return cam
-        return None
-
     def get_camera_by_filepath(self, filepath):
         """Get a camera object by its filepath.
 
@@ -2124,16 +2103,52 @@ class Cameras:
                 return cam
         return None
 
-    def get_camera_by_datetime(self, datetime):
-        """Get a camera object by its datetime.
+    def get_camera_by_datetime(self, datetime, subsec=None):
+        """The camera whose ``datetime`` equals ``datetime`` (to the second).
+
+        When several cameras share that second, the one whose
+        ``datetime_subsec`` is nearest ``subsec`` is taken if both are known;
+        otherwise the first in order, with a warning (once per second of
+        time).
 
         Args:
             datetime (str): The datetime to search for.
+            subsec (float, optional): The sub-second part of the time searched.
+
+        Returns:
+            Camera or None.
         """
+        if datetime is None:
+            return None
+        hits = self._cameras_by_datetime().get(str(datetime), [])
+        if len(hits) <= 1:
+            return hits[0] if hits else None
+        known = [c for c in hits if getattr(c, "datetime_subsec", None) is not None]
+        if subsec is not None and known:
+            return min(known, key=lambda c: abs(c.datetime_subsec - subsec))
+        warned = self.__dict__.setdefault("_ambiguous_times_warned", set())
+        if datetime not in warned:
+            warned.add(datetime)
+            logger.warning(
+                f"{len(hits)} cameras share the time {datetime} (no sub-second "
+                f"time to tell them apart); taking {hits[0].cam_id}"
+            )
+        return hits[0]
+
+    def _cameras_by_datetime(self) -> dict:
+        """``{datetime string: [cameras]}``, in ``data`` order (rebuilt when a
+        camera's ``datetime`` or the cameras change)."""
+        stamp = tuple((id(c), getattr(c, "datetime", None)) for c in self.data.values())
+        cached = getattr(self, "_datetime_index", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        index: dict = {}
         for cam in self.data.values():
-            if cam.datetime == datetime:
-                return cam
-        return None
+            dt = getattr(cam, "datetime", None)
+            if dt is not None:
+                index.setdefault(str(dt), []).append(cam)
+        self._datetime_index = (stamp, index)
+        return index
 
     def get_time_delta_between_first_and_last_photo(self):
         """Calculate the time delta between the first and last photos.
@@ -2144,15 +2159,14 @@ class Cameras:
         """
         import substrata.firefish as firefish
 
-        cams_with_datetime = [
-            cam for cam in self.data.values() if hasattr(cam, "datetime")
+        times = [
+            firefish.get_unix_time(cam.datetime)
+            for cam in self.data.values()
+            if getattr(cam, "datetime", None) is not None
         ]
-        first_cam = cams_with_datetime[0]
-        last_cam = cams_with_datetime[-1]
-        return int(
-            firefish.get_unix_time(last_cam.datetime)
-            - firefish.get_unix_time(first_cam.datetime)
-        )
+        if not times:
+            raise ValueError("No camera has a datetime (run get_datetime_originals)")
+        return int(max(times) - min(times))
 
     def get_up_vector_from_camera_depths(
         self,
@@ -2197,7 +2211,7 @@ class Cameras:
 
         # Conduct regression on the filtered cameras
         cam_ids = [cam.cam_id for cam in cams_filtered]
-        offset_units = _sensor_offset_units(sensor_offset, scale_factor)
+        offset_units = sensor_offset_units(sensor_offset, scale_factor)
         points = np.array([cam.sensor_coords(offset_units) for cam in cams_filtered])
         depths = np.array([cam.depth_sensor_m for cam in cams_filtered])
 
@@ -2207,7 +2221,9 @@ class Cameras:
         if plot:
             from substrata import visualizations
 
-            visualizations.plot_depth_regression(depths, res.depths_pred)
+            visualizations.plot_depth_regression(
+                res.depths, res.depths_pred, errors=res
+            )
 
         # Print summary statistics
         print(
@@ -2503,7 +2519,9 @@ def xyz_offset_datetime_matches_report(
     unmatched: list[str] = []
 
     for tcam in target_cams.data.values():
-        pose = pose_cams.get_camera_by_datetime(tcam.datetime)
+        pose = pose_cams.get_camera_by_datetime(
+            tcam.datetime, getattr(tcam, "datetime_subsec", None)
+        )
         if pose is None:
             unmatched.append(str(tcam.cam_id))
             rows.append(
@@ -2602,7 +2620,8 @@ class Camera:
         camera_vector /= np.linalg.norm(camera_vector)
         return camera_vector
 
-    def sensor_coords(self, offset=None, orig=False):
+    @_renamed_kwargs(orig="use_orig_coords")
+    def sensor_coords(self, offset=None, use_orig_coords=False):
         """Position of a rig-mounted sensor, given its offset from this camera.
 
         Args:
@@ -2610,29 +2629,17 @@ class Camera:
                 the camera centre in the camera frame (x: image right, y: image
                 down, z: view direction), in coordinate units. None returns the
                 camera centre.
-            orig (bool): Use the original (untransformed) coordinates and pose
+            use_orig_coords (bool): Use the original (untransformed) coordinates and pose
                 instead of the current ones.
 
         Returns:
             np.ndarray: Sensor coordinates.
         """
-        coords = self.orig_coords if orig else self.coords
+        coords = self.orig_coords if use_orig_coords else self.coords
         if offset is None or coords is None:
             return coords
-        transform = self.orig_camera_transform if orig else self.camera_transform
+        transform = self.orig_camera_transform if use_orig_coords else self.camera_transform
         return geom.offset_in_camera_frame(coords, transform, offset)
-
-    @property
-    def orig_vector(self):
-        """Obtain the original camera vector from the original transform.
-
-        Returns:
-            np.ndarray: A normalized 3D vector.
-        """
-        transform_matrix = np.array(self.orig_camera_transform).reshape((4, 4))
-        camera_orig_vector = transform_matrix[:3, 2]
-        camera_orig_vector /= np.linalg.norm(camera_orig_vector)
-        return camera_orig_vector
 
     @property
     def filepath(self):
@@ -2800,7 +2807,7 @@ class Camera:
         Returns:
             str: The thumbnail filepath (which may not exist yet).
         """
-        folder = _photo_folder_name(self.filepath)
+        folder = photo_folder_name(self.filepath)
         if folder is None:
             return os.path.join(root, self.filename)
         return os.path.join(root, folder, self.filename)
@@ -2887,21 +2894,25 @@ class Camera:
             print("Cameras 'up_vector' and/or depth_offset not set")
             return None
 
+        # (a geom.Vector up_vector is homogeneous: use its xyz)
+        up = self.parent.up_vector
+        up = np.asarray(getattr(up, "xyz", up), dtype=float).ravel()[:3]
         return float(
             self.parent.depth_offset
-            + float(np.dot(self.parent.up_vector, self.orig_coords))
+            + float(np.dot(up, np.asarray(self.orig_coords, dtype=float).ravel()[:3]))
         )
 
-    def transform_coords(self, transform_matrix):
+    @_renamed_kwargs(transform_matrix="transform")
+    def transform_coords(self, transform):
         """Apply a transformation to the camera coordinates and transform.
 
         Args:
-            transform_matrix (np.ndarray): A 4x4 homogeneous transformation matrix.
+            transform (np.ndarray): A 4x4 homogeneous transformation matrix.
         """
         if self.coords is not None:
-            _projection_changed()  # (world pose changed: restack)
-            self.coords = self.__transform_coords(self.coords, transform_matrix)
-            self.camera_transform = np.dot(transform_matrix, self.camera_transform)
+            invalidate_projection_cache()  # (world pose changed: restack)
+            self.coords = self.__transform_coords(self.coords, transform)
+            self.camera_transform = np.dot(transform, self.camera_transform)
 
     def reverse_transform_coords(self, transform):
         """Restore original coordinates by applying the inverse
@@ -2910,7 +2921,7 @@ class Camera:
         Args:
             transform (np.ndarray): The transformation matrix to invert.
         """
-        _projection_changed()  # (orig pose changed: restack)
+        invalidate_projection_cache()  # (orig pose changed: restack)
         inverse_transform = np.linalg.inv(transform)
         self.orig_coords = self.__transform_coords(self.coords, inverse_transform)
         self.orig_camera_transform = np.dot(
@@ -2931,7 +2942,7 @@ class Camera:
         """Compute the image pixel coordinates of one 3D point.
 
         Projects the point through the camera's current pose (inverted per call)
-        and applies the lens distortion (Metashape's frame camera model, :func:`_lens`): the projection core
+        and applies the lens distortion (Metashape's frame camera model, :func:`lens_distortion`): the projection core
         shared with :meth:`project_points` (many points) and
         :func:`pixel_hits` (many cameras), which give the same values.
 
@@ -2941,21 +2952,27 @@ class Camera:
             required_to_be_in_view (bool): If True, only return the pixel coordinates if the point is in view.
 
         Returns:
-            tuple: (x, y, depth, relevance metric), x and y rounded int pixels
-                   (half to even), or (None, None, None, None) if out of view
+            tuple: (x, y, depth, relevance metric), x and y int pixels
+                   (:func:`int_pixel`: rounded half to even), or (None, None, None, None) if out of view
                    (behind the camera, beyond the image borders), and always for a camera that cannot
                    project (:func:`can_project`: no calibrated sensor or no pose).
         """
         if not can_project(self, use_orig_coords):
             return None, None, None, None
         cam_coords, cam_transform = self._projection_pose(use_orig_coords)
+        coords = np.asarray(coords, dtype=float).ravel()[:3]
+        cam_coords = np.asarray(cam_coords, dtype=float).ravel()[:3]  # (a list, as read from the meta JSON)
         proj_point = np.dot(np.linalg.inv(cam_transform), np.append(coords, 1))
         s = self.sensor
-        x_img, y_img, in_view = _distort(proj_point[0], proj_point[1], proj_point[2], s)
+        x_img, y_img, in_view = camera_points_to_pixels(proj_point[0], proj_point[1], proj_point[2], s)
         if in_view or not required_to_be_in_view:
             dist_sq = np.sum((cam_coords - coords) ** 2)
-            rm = _relevance(proj_point[2], dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
-            return (int(round(x_img)), int(round(y_img)), float(proj_point[2]), rm)
+            rm = _relevance(dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
+            if in_view:
+                x_img, y_img = int_pixel(x_img, s.width), int_pixel(y_img, s.height)
+            else:
+                x_img, y_img = np.rint(x_img), np.rint(y_img)
+            return (int(x_img), int(y_img), float(proj_point[2]), rm)
         else:
             return None, None, None, None
 
@@ -2978,7 +2995,7 @@ class Camera:
 
         Returns:
             Tuple ``(x, y, depth, relevance, in_view)`` of length-``N`` arrays
-            (``x``/``y`` are integer-valued float pixels, rounded half to even,
+            (``x``/``y`` are integer-valued float pixels, :func:`int_pixel` where in view,
             ``in_view`` is boolean). For a single input point, scalar values are
             returned. Unlike :meth:`get_pixel_coords`, out-of-view points are
             *not* dropped - the caller filters on ``in_view``. A camera that
@@ -2999,14 +3016,14 @@ class Camera:
         proj = homog @ np.linalg.inv(cam_transform).T          # (N, 4)
         depth = proj[:, 2]
         s = self.sensor
-        x_img, y_img, in_view = _distort(proj[:, 0], proj[:, 1], depth, s)
+        x_img, y_img, in_view = camera_points_to_pixels(proj[:, 0], proj[:, 1], depth, s)
 
         cam_center = np.asarray(cam_coords, dtype=float).ravel()[:3]
         dist_sq = np.sum((cam_center - pts) ** 2, axis=1)
-        relevance = _relevance(depth, dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
+        relevance = _relevance(dist_sq, x_img, y_img, s.fx, s.fy, s.width, s.height)
 
-        x_px = np.rint(x_img)
-        y_px = np.rint(y_img)
+        x_px = np.where(in_view, int_pixel(x_img, s.width), np.rint(x_img))
+        y_px = np.where(in_view, int_pixel(y_img, s.height), np.rint(y_img))
         if single:
             return (
                 float(x_px[0]), float(y_px[0]), float(depth[0]),
@@ -3035,9 +3052,9 @@ class Camera:
             tuple: (origin, direction) where origin is a 3D point (the camera
             center) and direction is a normalized 3D vector in world coordinates.
         """
-        # The lens distortion undone (the inverse of _distort; use_optimization is no longer needed:
+        # The lens distortion undone (the inverse of camera_points_to_pixels; use_optimization is no longer needed:
         # Newton's method converges in a few steps either way).
-        x_norm, y_norm = (float(v) for v in _undistort(x_img, y_img, self.sensor, iterations))
+        x_norm, y_norm = (float(v) for v in pixels_to_normalized(x_img, y_img, self.sensor, iterations))
 
         # Create a direction vector in camera space. Here, we assume the
         # image plane is at unit distance (z = 1).
@@ -3082,7 +3099,9 @@ class Camera:
             x_img (float): Pixel x-coordinate in the image.
             y_img (float): Pixel y-coordinate in the image.
             pcd (PointCloud): Point cloud to intercept the ray against.
-            search_radius (float): Search radius for the ray-cloud intercept.
+            search_radius (float): Search radius for the ray-cloud intercept, in
+                the cloud's units (metres once the world transform is applied;
+                the 0.001 default is 1 mm there, but 1 model unit before).
             reprojection_threshold (float, optional): Maximum allowed pixel
                 distance between the input pixel and the re-projected 3D
                 intercept. If exceeded, the match is rejected.
@@ -3142,7 +3161,10 @@ class Camera:
             self.get_pixel_coords(ann.orig_coords, use_orig_coords=True)
             for ann in annotations
         ]
-        pixel_coords_2d = np.array(pixel_coords)[:, :2]
+        # (a point out of view has no pixel: NaN, so its pairs drop out below)
+        pixel_coords_2d = np.array(
+            [(np.nan, np.nan) if p[0] is None else p[:2] for p in pixel_coords], dtype=float
+        )
         pixel_dists = pd.DataFrame(
             squareform(pdist(pixel_coords_2d, metric="euclidean"))
         )
@@ -3162,50 +3184,43 @@ class Camera:
         reprojection_threshold_uncertain=settings.DEFAULT_REPROJECTION_THRESHOLD_UNCERTAIN,
         reprojection_threshold_discard=settings.DEFAULT_REPROJECTION_THRESHOLD_DISCARD,
     ):
-        """
-        Obtain image matches for annotation points that are in view.
+        """The annotations this camera sees, as image matches.
+
+        Args:
+            anns: Annotations (any iterable of :class:`Annotation`).
+            pcd: Optional point cloud for the reprojection occlusion test
+                (:func:`keep_by_reprojection`, as
+                :meth:`Annotation.get_image_matches` with ``pcd``).
+            use_orig_coords: Project the annotations' ``orig_coords`` through
+                the original pose (else ``coords`` through the current pose).
+            intercept_radius: Search radius of the reprojection test.
+            reprojection_threshold_uncertain: Error from which a match is
+                flagged ``potentially_obstructed``.
+            reprojection_threshold_discard: Error above which it is dropped.
+
+        Returns:
+            list[ImageMatch]: Sorted by relevance (unobstructed first with
+            ``pcd``); empty if the camera sees none of them.
         """
         image_matches = []
         for ann in anns:
+            coords = ann.orig_coords if use_orig_coords else ann.coords
             x, y, depth, relevance = self.get_pixel_coords(
-                ann.orig_coords, use_orig_coords=use_orig_coords
+                coords, use_orig_coords=use_orig_coords
             )
-            # If pixel coordinates are within the camera bounds
-            if x is not None:
-
-                image_match = ImageMatch(self, x, y, depth, relevance, annotation=ann)
-                # Classify according to reprojection error if pcd is provided
-                if pcd is not None:
-                    image_match.get_reprojection_error(pcd, intercept_radius)
-                    if image_match.reprojection_error is None:
-                        continue  # do not store if no intercept found
-                    elif (
-                        image_match.reprojection_error > reprojection_threshold_discard
-                    ):
-                        continue  # do not store if error exceeds threshold
-                    elif (
-                        image_match.reprojection_error
-                        >= reprojection_threshold_uncertain
-                    ):
-                        image_match.potentially_obstructed = True
-                        image_matches.append(image_match)
-                    else:
-                        image_match.potentially_obstructed = False
-                        image_matches.append(image_match)
-                else:
-                    # If no pcd provided: add image_match regardless
-                    image_matches.append(image_match)
-
-        # If ImageMatches found, sort by relevance and obstruction
-        if len(image_matches) > 0:
-            if pcd is not None:
-                image_matches = sorted(
-                    image_matches, key=lambda x: (x.potentially_obstructed, x.relevance)
-                )
-            else:
-                image_matches = sorted(image_matches, key=lambda x: (x.relevance))
-
-            return image_matches
+            if x is None:
+                continue
+            image_match = ImageMatch(self, x, y, depth, relevance, annotation=ann)
+            if pcd is None or keep_by_reprojection(
+                image_match, pcd, intercept_radius,
+                reprojection_threshold_uncertain, reprojection_threshold_discard,
+            ):
+                image_matches.append(image_match)
+        if pcd is not None:
+            return sorted(
+                image_matches, key=lambda m: (m.potentially_obstructed, m.relevance)
+            )
+        return sorted(image_matches, key=lambda m: m.relevance)
 
     def render(self, highlight_pixels=None, orient=False, square=False,
                highlight_radius: int = 50, highlight_outline_width: int = 10):
@@ -3346,61 +3361,73 @@ class Camera:
         """Display the camera image with optional highlight markers."""
         img = self.render(highlight_pixels=highlight_pixels, orient=orient, square=square)
         if img is not None:
+            import matplotlib.pyplot as plt
+
             plt.imshow(np.array(img))
             plt.axis("off")
             plt.show()
 
-    def get_datetime_original(self, offset_secs=None):
+    @_renamed_kwargs(offset_secs="offset_s")
+    def get_datetime_original(self, offset_s=None):
         """Retrieve the DateTimeOriginal from the image file EXIF data, with optional offset.
 
+        Read with exifread (``EXIF DateTimeOriginal``, else ``Image DateTime``),
+        else with PIL (DateTimeOriginal from the Exif IFD, else the IFD0
+        DateTime), else from a ``..._YYYYMMDD_HHMMSS`` file name suffix (e.g.
+        video frames extracted by ffmpeg). The value has whole seconds; the
+        sub-second part (``SubSecTimeOriginal``) is read by
+        :meth:`Cameras.get_datetime_originals` into ``datetime_subsec``.
+
         Args:
-            offset_secs (float or int, optional): If provided, apply this many seconds to the EXIF datetime.
+            offset_s (float or int, optional): If provided, apply this many seconds to the EXIF datetime.
 
         Returns:
-            str or None: The (possibly offset) DateTimeOriginal value as a string, else None.
+            str or None: The (possibly offset) DateTimeOriginal value as a string
+            (``YYYY:MM:DD HH:MM:SS``), else None.
         """
+        return self._read_datetime_original(offset_s)[0]
+
+    def _read_datetime_original(self, offset_s=None):
+        """``(datetime string, sub-second fraction or None)`` of the photo (see
+        :meth:`get_datetime_original`)."""
         if not os.path.isfile(self.filepath):
             logger.error(f"Image file not found: {self.filepath}")
-            return None
+            return None, None
 
-        # Try using exifread first (more comprehensive)
+        def shifted(value):
+            if offset_s is None:
+                return value
+            dt = datetime.datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+            return (dt + datetime.timedelta(seconds=offset_s)).strftime(
+                "%Y:%m:%d %H:%M:%S"
+            )
+
+        # exifread first (also reads files PIL cannot)
         try:
             with open(self.filepath, "rb") as f:
                 tags = exifread.process_file(f, details=False)
+            for key, sub in (("EXIF DateTimeOriginal", "EXIF SubSecTimeOriginal"),
+                             ("Image DateTime", "EXIF SubSecTime")):
+                if key in tags:
+                    return shifted(str(tags[key]).strip()), _subsec(tags.get(sub))
+        except Exception as e:  # noqa: BLE001 - unreadable EXIF: try PIL
+            logger.debug("exifread could not read %s: %s", self.filepath, e)
 
-                if "EXIF DateTimeOriginal" in tags:
-                    dt_orig = str(tags["EXIF DateTimeOriginal"])
-                    if offset_secs is not None:
-                        dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
-                        dt_offset = dt + datetime.timedelta(seconds=offset_secs)
-                        return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
-                    else:
-                        return dt_orig
-                elif "Image DateTime" in tags:
-                    dt_orig = str(tags["Image DateTime"])
-                    if offset_secs is not None:
-                        dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
-                        dt_offset = dt + datetime.timedelta(seconds=offset_secs)
-                        return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
-                    else:
-                        return dt_orig
-        except ImportError:
-            pass
-        except Exception as e:
-            pass
-
-        # Fallback to PIL
-        image = Image.open(self.filepath)
-        exif_data = image.getexif()
-        if exif_data:
-            dt_orig = exif_data.get(36867) or exif_data.get(306)
-            if dt_orig:
-                if offset_secs is not None:
-                    dt = datetime.datetime.strptime(dt_orig, "%Y:%m:%d %H:%M:%S")
-                    dt_offset = dt + datetime.timedelta(seconds=offset_secs)
-                    return dt_offset.strftime("%Y:%m:%d %H:%M:%S")
-                else:
-                    return dt_orig
+        # Fallback to PIL: DateTimeOriginal (0x9003) and SubSecTimeOriginal
+        # (0x9291) live in the Exif IFD (0x8769), DateTime (0x0132) in IFD0
+        try:
+            with Image.open(self.filepath) as image:
+                exif_data = image.getexif()
+                exif_ifd = exif_data.get_ifd(0x8769) if exif_data else {}
+                candidates = (
+                    (exif_ifd.get(0x9003), exif_ifd.get(0x9291)),
+                    (exif_data.get(0x0132) if exif_data else None, exif_ifd.get(0x9290)),
+                )
+                for value, sub in candidates:
+                    if value:
+                        return shifted(str(value).strip()), _subsec(sub)
+        except (OSError, ValueError) as e:
+            logger.debug("PIL could not read EXIF of %s: %s", self.filepath, e)
 
         # Final fallback: parse "..._YYYYMMDD_HHMMSS" suffix from the filename
         # (e.g. for ffmpeg-extracted video frames that carry no EXIF segment).
@@ -3412,14 +3439,12 @@ class Camera:
                 dt = datetime.datetime.strptime(
                     match.group(1) + match.group(2), "%Y%m%d%H%M%S"
                 )
-                if offset_secs is not None:
-                    dt = dt + datetime.timedelta(seconds=offset_secs)
-                return dt.strftime("%Y:%m:%d %H:%M:%S")
+                return shifted(dt.strftime("%Y:%m:%d %H:%M:%S")), None
             except ValueError:
                 pass
 
         logger.error(f"No exif data for: {self.filepath}")
-        return None
+        return None, None
 
     def has_coords_datetime(self):
         """Whether the camera has both ``coords`` and ``datetime`` set.
@@ -3432,21 +3457,6 @@ class Camera:
             and self.coords is not None
             and hasattr(self, "datetime")
             and self.datetime is not None
-        )
-
-    def has_coords_datetime_camdist(self):
-        """Whether ``coords``, ``datetime`` and ``camdist`` are all set.
-
-        Returns:
-            bool: True if all three attributes exist and are not None.
-        """
-        return (
-            hasattr(self, "coords")
-            and self.coords is not None
-            and hasattr(self, "datetime")
-            and self.datetime is not None
-            and hasattr(self, "camdist")
-            and self.camdist is not None
         )
 
     def _get_updated_filepath(self):
@@ -3467,7 +3477,7 @@ class Camera:
                 self.parent.filepath_replace[0],
                 self.parent.filepath_replace[1],
             )
-            if find_str and replace_str:
+            if find_str:  # (an empty replace_str removes find_str)
                 updated = updated.replace(find_str, replace_str)
             elif replace_str:
                 updated = self.__replace_base_path(updated, replace_str)
@@ -3498,7 +3508,13 @@ class Camera:
             str: The updated filepath.
         """
         match_string = base_path.rstrip("/").split("/")[-1]
-        replace_index = orig_filepath.find(match_string) + len(match_string)
+        found = orig_filepath.find(match_string)
+        if not match_string or found < 0:  # (the base folder's name is not in the path: unchanged)
+            logger.warning(
+                f"Base path {base_path!r}: folder {match_string!r} not in {orig_filepath}"
+            )
+            return orig_filepath
+        replace_index = found + len(match_string)
         return base_path.rstrip("/") + orig_filepath[replace_index:]
 
     @staticmethod
@@ -3514,6 +3530,30 @@ class Camera:
         else:
             path_parts[0] += "/"
         return os.path.join(*path_parts)
+
+
+def keep_by_reprojection(
+    image_match, pcd, intercept_radius, threshold_uncertain, threshold_discard
+) -> bool:
+    """The legacy (reprojection) occlusion test of one image match.
+
+    The ray through the match's pixel is intersected with ``pcd``
+    (:meth:`ImageMatch.get_reprojection_error`); the distance from that
+    intercept to the annotation is the reprojection error. A match without an
+    intercept, or with an error above ``threshold_discard``, is dropped
+    (False); one with an error from ``threshold_uncertain`` on is kept with
+    ``potentially_obstructed`` True, the others with it False. Shared by
+    :meth:`Camera.get_image_matches` and :meth:`Annotation.get_image_matches`.
+
+    Returns:
+        bool: Whether to keep the match.
+    """
+    image_match.get_reprojection_error(pcd, intercept_radius)
+    error = image_match.reprojection_error
+    if error is None or error > threshold_discard:
+        return False
+    image_match.potentially_obstructed = bool(error >= threshold_uncertain)
+    return True
 
 
 class LocalMask:
@@ -3543,8 +3583,6 @@ class ImageMatch:
     def __init__(self, cam, x, y, depth, relevance, annotation=None):
         self.annotation = annotation
         self.cam = cam
-        self.filename = cam.filename
-        self.filepath = cam.filepath
         self.x = x
         self.y = y
         self.depth = depth
@@ -3554,6 +3592,16 @@ class ImageMatch:
         self.masks = None
         self.mask = None  # selected mask for measurements
 
+    @property
+    def filepath(self):
+        """The photo's path: the camera's current one (after a path repair too)."""
+        return self.cam.filepath
+
+    @property
+    def filename(self):
+        """The photo's file name (the camera's)."""
+        return self.cam.filename
+
     def set_image_mask_id(self, mask_id):
         """Select the mask to use for measurements by its index.
 
@@ -3561,22 +3609,6 @@ class ImageMatch:
             mask_id (int): Index into ``self.masks`` of the mask to select.
         """
         self.mask = self.masks[mask_id]
-
-    def check_if_obstructed(self, pcd, reprojection_threshold, intercept_radius):
-        """Check if the image match is obstructed"""
-        # Get reprojection error if not already present
-        if self.reprojection_error is None:
-            self.get_reprojection_error(pcd, intercept_radius)
-
-        # Check if the error is above the threshold
-        if self.reprojection_error is None:
-            return None
-        else:
-            if self.reprojection_error > reprojection_threshold:
-                self.obstructed = True
-            else:
-                self.obstructed = False
-            return self.obstructed
 
     def get_reprojection_error(self, pcd, intercept_radius):
         """Check if the image match is obstructed"""
@@ -3611,7 +3643,7 @@ class ImageMatch:
         crosshair_anns = self.annotation.get_crosshair_points(
             self.cam.vector, measure_dist
         )
-        crosshair_anns.get_original_coords(self.cam.parent.world_transform)
+        crosshair_anns.reverse_transform(self.cam.parent.world_transform)
         self.pixel_scales = self.cam.calc_pixel_scale(crosshair_anns)
         self.pixel_scale = np.mean(self.pixel_scales)
 
@@ -3682,7 +3714,7 @@ class ImageMatch:
             str: The crop filepath (which may not exist yet).
         """
         root = self._crops_root(root)
-        folder = _photo_folder_name(self.cam.filepath)
+        folder = photo_folder_name(self.cam.filepath)
         parts = [root, str(self.annotation.id)]
         if folder is not None:
             parts.append(folder)
@@ -3721,10 +3753,11 @@ class ImageMatch:
         if image_size is None:
             image_size = (self.cam.sensor.width, self.cam.sensor.height)
         img_w, img_h = image_size
+        # (the crop covers [x - w/2, x + w/2) x [y - h/2, y + h/2) in continuous pixel coordinates)
         return (
-            self.x - crop_w / 2 > 0
+            self.x - crop_w / 2 >= 0
             and self.x + crop_w / 2 <= img_w
-            and self.y - crop_h / 2 > 0
+            and self.y - crop_h / 2 >= 0
             and self.y + crop_h / 2 <= img_h
         )
 
@@ -3773,72 +3806,6 @@ class ImageMatch:
         self.mask.area_in_cm2 = self.mask.area_in_px * (self.pixel_scale**2) * 10000
         return self.mask.area_in_cm2
 
-    def create_rectangular_masks(self, mask_sizes):
-        """
-        Create rectangular masks of specified sizes around the match point.
-
-        Args:
-            mask_sizes (list): List of [width_m, height_m] tuples specifying mask
-                sizes in meters. Each entry creates a separate mask.
-
-        Returns:
-            None: Masks are stored in self.masks, with the first mask also
-                assigned to self.mask.
-        """
-        if not self.pixel_scale:
-            self.calc_pixel_scale_from_crosshair()
-
-        if not self.pixel_scale:
-            raise ValueError(
-                "Pixel scale not available. Call calc_pixel_scale_from_crosshair() first."
-            )
-
-        # Validate input
-        if not mask_sizes or len(mask_sizes) == 0:
-            raise ValueError("mask_sizes must be a non-empty list")
-
-        # Get image dimensions
-        img = cv2.imread(self.filepath)
-        if img is None:
-            raise ValueError(f"Cannot load image: {self.filepath}")
-
-        img_height, img_width = img.shape[:2]
-
-        # Create masks for each size
-        mask_objects = []
-        for idx, (width_m, height_m) in enumerate(mask_sizes):
-            # Convert meters to pixels using pixel scale
-            width_px = round(width_m / self.pixel_scale)
-            height_px = round(height_m / self.pixel_scale)
-
-            # Calculate rectangle bounds
-            x1 = max(0, self.x - width_px // 2)
-            y1 = max(0, self.y - height_px // 2)
-            x2 = min(img_width, self.x + width_px // 2)
-            y2 = min(img_height, self.y + height_px // 2)
-
-            # Create binary mask (use uint8 instead of bool for OpenCV compatibility)
-            mask_vals = np.zeros((img_height, img_width), dtype=np.uint8)
-            mask_vals[y1:y2, x1:x2] = 255
-
-            # Create Mask object
-            mask_obj = LocalMask(mask_vals, score=1.0)
-            mask_obj.area_in_px = cv2.countNonZero(mask_vals)
-            mask_obj.area_in_cm2 = mask_obj.area_in_px * (self.pixel_scale**2) * 10000
-
-            mask_objects.append(mask_obj)
-
-            print(f"Created rectangular mask {idx+1}: {width_m:.2f}m x {height_m:.2f}m")
-            print(f"Mask bounds: ({x1}, {y1}) to ({x2}, {y2})")
-            print(
-                f"Mask area: {mask_obj.area_in_px} pixels = {mask_obj.area_in_cm2/10000:.4f} m²"
-            )
-
-        # Store all masks
-        self.masks = np.array(mask_objects)
-        # Assign the first mask as the primary mask
-        self.mask = mask_objects[0]
-
     def create_circular_masks(self, radii):
         """Create circular masks of specified radii around the match point.
 
@@ -3860,7 +3827,7 @@ class ImageMatch:
         if not radii or len(radii) == 0:
             raise ValueError("radii must be a non-empty list")
 
-        img = cv2.imread(self.filepath)
+        img = _imread(self.filepath)
         if img is None:
             raise ValueError(f"Cannot load image: {self.filepath}")
 
@@ -3874,7 +3841,8 @@ class ImageMatch:
             radius_px = round(radius_m / self.pixel_scale)
 
             mask_vals = np.zeros((img_height, img_width), dtype=np.uint8)
-            cv2.circle(mask_vals, (self.x, self.y), radius_px, 255, thickness=-1)
+            centre = (int(np.floor(self.x)), int(np.floor(self.y)))  # (the pixel holding the point)
+            cv2.circle(mask_vals, centre, radius_px, 255, thickness=-1)
 
             mask_obj = LocalMask(mask_vals, score=1.0)
             mask_obj.radius_m = radius_m
@@ -3949,6 +3917,8 @@ class ImageMatch:
                 cos_a, sin_a = np.cos(a_abs), np.sin(a_abs)
                 inflate = int(max(crop_w, crop_h) * (cos_a + sin_a)) + 2
                 rotate_pad = (cos_a + sin_a - 1.0) / 2.0
+                from substrata import visualizations  # lazy: figures only
+
                 arr = visualizations.get_crop_img_from_masks(
                     self, inflate, inflate, single_mask=single_mask,
                     pad_ratio=rotate_pad, show_text=show_text,
@@ -3961,6 +3931,8 @@ class ImageMatch:
                 top = (ih - crop_h) // 2
                 pil_img = pil_img.crop((left, top, left + crop_w, top + crop_h))
             else:
+                from substrata import visualizations  # lazy: figures only
+
                 arr = visualizations.get_crop_img_from_masks(
                     self, crop_w, crop_h, single_mask=single_mask,
                     show_text=show_text, show_radius=show_radius,
@@ -3968,7 +3940,7 @@ class ImageMatch:
                 )
                 pil_img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
         else:
-            pil_img = visualizations.get_crop_img(
+            pil_img = get_crop_img(
                 self.cam.filepath, self.x, self.y, crop_w, crop_h
             )
             if not isinstance(pil_img, Image.Image):
@@ -4084,333 +4056,30 @@ class ImageMatch:
             show_point=show_point,
         )
 
+        import matplotlib.pyplot as plt
+
         plt.imshow(np.array(img))
         plt.show()
 
 
-class Frame:
-    """
-    Class representing a single frame from a video.
-    """
-
-    def __init__(self, frame_number, timestamp_seconds, image_array, video_source):
-        """
-        Initialize a Frame object.
-
-        Args:
-            frame_number (int): Sequential frame number (0-based)
-            timestamp_seconds (float): Timestamp in seconds from video start
-            image_array (np.ndarray): The frame image as numpy array
-            video_source (Video): Reference to the parent Video object
-        """
-        self.frame_number = frame_number
-        self.timestamp_seconds = timestamp_seconds
-        self.image_array = image_array
-        self.video_source = video_source
-
-    def __repr__(self):
-        return f"Frame(frame_number={self.frame_number}, timestamp={self.timestamp_seconds:.2f}s)"
-
-    def show(self, figsize=(10, 8)):
-        """
-        Display the frame using matplotlib.
-
-        Args:
-            figsize (tuple): Figure size for display
-        """
-        import matplotlib.pyplot as plt
-
-        plt.figure(figsize=figsize)
-        plt.imshow(cv2.cvtColor(self.image_array, cv2.COLOR_BGR2RGB))
-        plt.title(f"Frame {self.frame_number} at {self.timestamp_seconds:.2f}s")
-        plt.axis("off")
-        plt.show()
-
-    def save(self, filepath):
-        """
-        Save the frame to a file.
-
-        Args:
-            filepath (str): Path where to save the frame image
-        """
-        cv2.imwrite(filepath, self.image_array)
-        print(f"Frame saved to: {filepath}")
-
-
-class Video:
-    """
-    Class for processing video files and extracting frames at specified intervals.
-    """
-
-    def __init__(
-        self, video_filepath, frame_interval_seconds=1.0, round_timestamps=True
-    ):
-        """
-        Initialize a Video object.
-
-        Args:
-            video_filepath (str): Path to the video file (.mov, .mp4, etc.)
-            frame_interval_seconds (float): Interval between extracted frames in seconds
-            round_timestamps (bool): If True, round timestamps to nearest frame_interval_seconds
-        """
-        self.video_filepath = video_filepath
-        self.frame_interval_seconds = frame_interval_seconds
-        self.round_timestamps = round_timestamps
-        self.frames = []
-        self.video_info = {}
-
-        # Validate file exists
-        if not os.path.exists(video_filepath):
-            raise FileNotFoundError(f"Video file not found: {video_filepath}")
-
-        # Extract frames
-        self._extract_frames()
-
-    def _extract_frames(self):
-        """
-        Extract frames from the video at the specified interval.
-        """
-        cap = cv2.VideoCapture(self.video_filepath)
-
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video file: {self.video_filepath}")
-
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration_seconds = total_frames / fps if fps > 0 else 0
-
-        self.video_info = {
-            "fps": fps,
-            "total_frames": total_frames,
-            "duration_seconds": duration_seconds,
-            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        }
-
-        # Calculate frame interval in frame numbers
-        frame_interval = max(1, int(fps * self.frame_interval_seconds))
-
-        print(f"Extracting frames from: {self.video_filepath}")
-        print(
-            f"Video info: {self.video_info['width']}x{self.video_info['height']}, "
-            f"{fps:.2f} fps, {duration_seconds:.2f}s duration"
-        )
-        print(
-            f"Extracting every {frame_interval} frames ({self.frame_interval_seconds}s intervals)"
-        )
-
-        frame_number = 0
-        extracted_count = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Extract frame at specified interval
-            if frame_number % frame_interval == 0:
-                # Calculate exact timestamp
-                exact_timestamp = frame_number / fps
-
-                # Round timestamp if requested
-                if self.round_timestamps:
-                    timestamp_seconds = (
-                        round(exact_timestamp / self.frame_interval_seconds)
-                        * self.frame_interval_seconds
-                    )
-                else:
-                    timestamp_seconds = exact_timestamp
-
-                frame_obj = Frame(frame_number, timestamp_seconds, frame.copy(), self)
-                self.frames.append(frame_obj)
-                extracted_count += 1
-
-                if extracted_count % 10 == 0:
-                    print(f"Extracted {extracted_count} frames...")
-
-            frame_number += 1
-
-        cap.release()
-        print(f"Extraction complete: {len(self.frames)} frames extracted")
-
-    def __len__(self):
-        """Return the number of extracted frames."""
-        return len(self.frames)
-
-    def __getitem__(self, index):
-        """Get a frame by index."""
-        return self.frames[index]
-
-    def __iter__(self):
-        """Iterate over frames."""
-        return iter(self.frames)
-
-    def get_frame_by_timestamp(self, timestamp_seconds, tolerance_seconds=0.1):
-        """
-        Get the frame closest to a specific timestamp.
-
-        Args:
-            timestamp_seconds (float): Target timestamp in seconds
-            tolerance_seconds (float): Maximum allowed difference from target timestamp
-
-        Returns:
-            Frame or None: The closest frame within tolerance, or None if not found
-        """
-        closest_frame = None
-        min_diff = float("inf")
-
-        for frame in self.frames:
-            diff = abs(frame.timestamp_seconds - timestamp_seconds)
-            if diff < min_diff:
-                min_diff = diff
-                closest_frame = frame
-
-        if min_diff <= tolerance_seconds:
-            return closest_frame
-        else:
-            return None
-
-    def get_frames_in_timerange(self, start_seconds, end_seconds):
-        """
-        Get all frames within a time range.
-
-        Args:
-            start_seconds (float): Start time in seconds
-            end_seconds (float): End time in seconds
-
-        Returns:
-            list: List of Frame objects within the time range
-        """
-        return [
-            frame
-            for frame in self.frames
-            if start_seconds <= frame.timestamp_seconds <= end_seconds
-        ]
-
-    def get_frame_at_exact_second(self, target_second):
-        """
-        Get the frame closest to an exact second boundary.
-
-        Args:
-            target_second (int): Target second (e.g., 5 for 5.0 seconds)
-
-        Returns:
-            Frame or None: The frame closest to the target second
-        """
-        target_timestamp = float(target_second)
-        return self.get_frame_by_timestamp(target_timestamp, tolerance_seconds=0.5)
-
-    def get_frames_at_second_intervals(self, start_second=0, end_second=None):
-        """
-        Get frames at exact second intervals (0s, 1s, 2s, etc.).
-
-        Args:
-            start_second (int): Starting second (default: 0)
-            end_second (int): Ending second (default: video duration)
-
-        Returns:
-            list: List of Frame objects at second boundaries
-        """
-        if end_second is None:
-            end_second = int(self.video_info["duration_seconds"])
-
-        frames = []
-        for second in range(start_second, end_second + 1):
-            frame = self.get_frame_at_exact_second(second)
-            if frame is not None:
-                frames.append(frame)
-
-        return frames
-
-    def save_frames_to_directory(self, output_directory, filename_prefix="frame"):
-        """
-        Save all extracted frames to a directory.
-
-        Args:
-            output_directory (str): Directory to save frames
-            filename_prefix (str): Prefix for frame filenames
-        """
-        os.makedirs(output_directory, exist_ok=True)
-
-        for frame in self.frames:
-            filename = f"{filename_prefix}_{frame.frame_number:06d}_{frame.timestamp_seconds:.2f}s.jpg"
-            filepath = os.path.join(output_directory, filename)
-            frame.save(filepath)
-
-        print(f"Saved {len(self.frames)} frames to: {output_directory}")
-
-    def get_video_info(self):
-        """
-        Get information about the video.
-
-        Returns:
-            dict: Video information including fps, dimensions, duration, etc.
-        """
-        return self.video_info.copy()
-
-    def show_frame(self, frame_index=0):
-        """
-        Display a specific frame.
-
-        Args:
-            frame_index (int): Index of the frame to display
-        """
-        if 0 <= frame_index < len(self.frames):
-            self.frames[frame_index].show()
-        else:
-            print(f"Frame index {frame_index} out of range (0-{len(self.frames)-1})")
-
-    def get_frame_statistics(self):
-        """
-        Get statistics about the extracted frames.
-
-        Returns:
-            dict: Statistics about frame extraction
-        """
-        if not self.frames:
-            return {}
-
-        timestamps = [frame.timestamp_seconds for frame in self.frames]
-        frame_numbers = [frame.frame_number for frame in self.frames]
-
-        return {
-            "total_extracted_frames": len(self.frames),
-            "first_frame_time": min(timestamps),
-            "last_frame_time": max(timestamps),
-            "time_span": max(timestamps) - min(timestamps),
-            "average_interval": np.mean(np.diff(timestamps)),
-            "frame_interval_seconds": self.frame_interval_seconds,
-            "frame_numbers": frame_numbers,
-            "timestamps": timestamps,
-        }
-
-    def show_timestamp_mapping(self, max_frames=10):
-        """
-        Show the mapping between frame numbers, exact timestamps, and rounded timestamps.
-
-        Args:
-            max_frames (int): Maximum number of frames to display
-        """
-        print(
-            f"Timestamp mapping (showing first {min(max_frames, len(self.frames))} frames):"
-        )
-        print(
-            f"{'Frame':<6} {'Exact Time':<12} {'Rounded Time':<12} {'Difference':<10}"
-        )
-        print("-" * 45)
-
-        for i, frame in enumerate(self.frames[:max_frames]):
-            exact_time = frame.frame_number / self.video_info["fps"]
-            rounded_time = frame.timestamp_seconds
-            difference = abs(exact_time - rounded_time)
-
-            print(
-                f"{frame.frame_number:<6} {exact_time:<12.3f} {rounded_time:<12.3f} {difference:<10.3f}"
-            )
-
-        if len(self.frames) > max_frames:
-            print(f"... and {len(self.frames) - max_frames} more frames")
+def _reference_z(reference) -> float | None:
+    """The z (depth) of a meta JSON ``reference`` / ``reference_accuracy`` entry, None when missing
+    (a null value, or a shorter or null list)."""
+    try:
+        z = reference[2]
+    except (TypeError, IndexError, KeyError):
+        return None
+    try:
+        return None if z is None or z == "null" else float(z)
+    except (TypeError, ValueError):
+        return None
+
+
+def _subsec(value) -> float | None:
+    """An EXIF SubSecTime* value (digits: the fraction's decimals, e.g. ``"07"`` = 0.07 s) as a fraction
+    of a second; None if missing or not digits."""
+    text = str(value).strip().rstrip("\x00 ") if value is not None else ""
+    return float("0." + text) if text.isdigit() else None
 
 
 def _filename_prefix(filename: str) -> str:
@@ -4420,7 +4089,7 @@ def _filename_prefix(filename: str) -> str:
     return os.path.splitext(filename)[0]
 
 
-def _sensor_offset_units(sensor_offset, scale_factor=1.0):
+def sensor_offset_units(sensor_offset, scale_factor=1.0):
     """Convert a camera-frame sensor offset in metres to coordinate units.
 
     Returns None when there is no (or an all-zero) offset.
@@ -4431,3 +4100,6 @@ def _sensor_offset_units(sensor_offset, scale_factor=1.0):
     if not np.any(offset):
         return None
     return offset / scale_factor
+
+
+_sensor_offset_units = sensor_offset_units  # deprecated alias (renamed 2026-11-25)

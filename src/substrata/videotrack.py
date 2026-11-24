@@ -56,6 +56,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import imagesync as _isy
+from .compat import renamed_kwargs as _renamed_kwargs
+from .fileio import atomic_write as _atomic_write
+from .fileio import imread as _imread
+
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTS = (".mp4", ".mov")
@@ -136,39 +141,40 @@ def video_keys(videos: Sequence[str]) -> Dict[str, str]:
             for v in videos}
 
 
-def extract_keyframes(video: str, out_dir: str, info: Optional[Dict[str, Any]] = None) -> List[Tuple[str, float]]:
-    """One frame a second of ``video`` as JPEGs in ``out_dir`` (done once: a ``.done`` file marks it): the
+@_renamed_kwargs(out_dir="output_dir")
+def extract_keyframes(video: str, output_dir: str, info: Optional[Dict[str, Any]] = None) -> List[Tuple[str, float]]:
+    """One frame a second of ``video`` as JPEGs in ``output_dir`` (done once: a ``.done`` file marks it): the
     keyframes when they are at most ``KEYFRAME_MAX_GAP_S`` apart (a GoPro's), else frames sampled at 1 fps.
     Returns [(path, time s)], also written as ``frames.csv``."""
-    listing = os.path.join(out_dir, "frames.csv")
-    if os.path.exists(os.path.join(out_dir, ".done")) and os.path.exists(listing):
+    listing = os.path.join(output_dir, "frames.csv")
+    if os.path.exists(os.path.join(output_dir, ".done")) and os.path.exists(listing):
         with open(listing) as f:
-            return [(os.path.join(out_dir, r["file"]), float(r["t_s"])) for r in csv.DictReader(f)]
+            return [(os.path.join(output_dir, r["file"]), float(r["t_s"])) for r in csv.DictReader(f)]
     info = info or probe_video(video)
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir)
+    if os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
     base = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
     subprocess.run(base + ["-skip_frame", "nokey", "-i", video, "-fps_mode", "passthrough", "-frame_pts", "1",
-                           "-q:v", "3", os.path.join(out_dir, "f_%07d.jpg")], check=True)
-    files = sorted(f for f in os.listdir(out_dir) if f.startswith("f_"))
+                           "-q:v", "3", os.path.join(output_dir, "f_%07d.jpg")], check=True)
+    files = sorted(f for f in os.listdir(output_dir) if f.startswith("f_"))
     nums = np.array([int(f[2:9]) for f in files])
     fps = info["fps"]
     if len(nums) < 2 or np.median(np.diff(nums)) / fps > KEYFRAME_MAX_GAP_S:
         for f in files:
-            os.remove(os.path.join(out_dir, f))
+            os.remove(os.path.join(output_dir, f))
         subprocess.run(base + ["-i", video, "-vf", "fps=1", "-fps_mode", "passthrough", "-frame_pts", "1", "-q:v",
-                               "3", os.path.join(out_dir, "f_%07d.jpg")], check=True)
-        files = sorted(f for f in os.listdir(out_dir) if f.startswith("f_"))
+                               "3", os.path.join(output_dir, "f_%07d.jpg")], check=True)
+        files = sorted(f for f in os.listdir(output_dir) if f.startswith("f_"))
         rows = [(f, float(int(f[2:9]))) for f in files]  # (pts in s at 1 fps)
     else:
         rows = [(f, n / fps) for f, n in zip(files, nums)]
-    with open(listing, "w", newline="") as f:
+    with _atomic_write(listing, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["file", "t_s"])
         w.writerows([(name, "%.3f" % t) for name, t in rows])
-    open(os.path.join(out_dir, ".done"), "w").close()
-    return [(os.path.join(out_dir, name), t) for name, t in rows]
+    open(os.path.join(output_dir, ".done"), "w").close()
+    return [(os.path.join(output_dir, name), t) for name, t in rows]
 
 
 def _flow_p30(a, b) -> float:
@@ -190,13 +196,13 @@ def frame_motion(frames: Sequence[Tuple[str, float]], cache: Optional[str] = Non
             return np.array(vals)
     out, prev = [], None
     for path, _t in frames:
-        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        im = _imread(path, cv2.IMREAD_GRAYSCALE)
         im = cv2.resize(im, (MOTION_WIDTH, round(im.shape[0] * MOTION_WIDTH / im.shape[1])), interpolation=cv2.INTER_AREA)
         out.append(np.nan if prev is None else _flow_p30(prev, im))
         prev = im
     out = np.array(out)
     if cache:
-        with open(cache, "w", newline="") as f:
+        with _atomic_write(cache, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t_s", "flow_p30"])
             w.writerows([("%.3f" % t, "%.3f" % v) for (_p, t), v in zip(frames, out)])
@@ -238,22 +244,31 @@ def _thumb_job(args):
     from PIL import Image
 
     if not os.path.exists(dst):
-        im = Image.open(src)
-        im.draft("RGB", (im.width // THUMB_REDUCE, im.height // THUMB_REDUCE))
-        im = im.convert("RGB")
-        tmp = dst + ".tmp.jpg"
-        im.save(tmp, quality=90)
-        os.replace(tmp, dst)
+        with Image.open(src) as im:
+            im.draft("RGB", (im.width // THUMB_REDUCE, im.height // THUMB_REDUCE))
+            im = im.convert("RGB")
+            with _atomic_write(dst, "wb") as fh:
+                im.save(fh, format="JPEG", quality=90)
     return dst
+
+
+def thumb_name(cam) -> str:
+    """The file name of a photo's cached thumbnail: ``<photo folder>__<file name>`` (photos of the same name in
+    different folders, e.g. two dives' ``GOPR0001.JPG``, get their own), the file name alone for a photo
+    without a folder."""
+    import re
+
+    parts = [p for p in re.split(r"[\\/]", getattr(cam, "filepath", None) or "") if p]
+    return f"{parts[-2]}__{cam.filename}" if len(parts) >= 2 else cam.filename
 
 
 def cache_thumbnails(cams: Sequence[Any], folder: str, workers: int = 8,
                      progress: Optional[Callable[[int, int], None]] = None) -> None:
     """Small copies (1/``THUMB_REDUCE``) of the photos of ``cams`` in ``folder`` (read once; a survey photo on a
-    spinning disk takes ~0.1-1 s)."""
+    spinning disk takes ~0.1-1 s), named by :func:`thumb_name`."""
     os.makedirs(folder, exist_ok=True)
-    jobs = [(c.filepath, os.path.join(folder, c.filename)) for c in cams
-            if not os.path.exists(os.path.join(folder, c.filename))]
+    jobs = [(c.filepath, os.path.join(folder, thumb_name(c))) for c in cams
+            if not os.path.exists(os.path.join(folder, thumb_name(c)))]
     if not jobs:
         return
     with ProcessPoolExecutor(workers) as ex:
@@ -278,17 +293,9 @@ def north_turn(cam) -> int:
     return int(np.argmax([v[1] / (np.linalg.norm(v) + 1e-12) for v in dirs]))
 
 
-def unturn(px: np.ndarray, k: int, w: int, h: int) -> np.ndarray:
-    """Pixels of an image turned by ``np.rot90(img, k)`` back to the unturned ``w`` x ``h`` image's."""
-    px = np.asarray(px, float).reshape(-1, 2)
-    k %= 4
-    if k == 0:
-        return px
-    if k == 1:
-        return np.stack([w - 1 - px[:, 1], px[:, 0]], 1)
-    if k == 2:
-        return np.stack([w - 1 - px[:, 0], h - 1 - px[:, 1]], 1)
-    return np.stack([px[:, 1], h - 1 - px[:, 0]], 1)
+# Pixels of an image turned by ``np.rot90(img, k)`` back to the unturned ``w`` x ``h`` image's (one definition,
+# imagesync's)
+unturn = _isy.unrotate
 
 
 class PlotMatcher:
@@ -314,7 +321,14 @@ class PlotMatcher:
         self.matcher = LearnedMatcher("loftr", device=device)
         self.clahe = cv2.createCLAHE(2.0, (8, 8))
         self._gray: Dict[Tuple[int, int], np.ndarray] = {}
-        self._by_name = {c.filename: i for i, c in enumerate(self.photos)}
+        # survey photos by file name (as tracks give them, "photo"): a name several photos have is left out
+        names: Dict[str, List[int]] = {}
+        for i, c in enumerate(self.photos):
+            names.setdefault(c.filename, []).append(i)
+        self._by_name = {f: ii[0] for f, ii in names.items() if len(ii) == 1}
+        if len(self._by_name) < len(names):
+            logger.warning(f"{len(names) - len(self._by_name)} survey photo file name(s) occur in more than one "
+                           "folder: not looked up by name")
 
     def _seed_grid(self, spacing: float) -> List[int]:
         order = np.lexsort((self.C[:, 1], self.C[:, 0]))
@@ -334,7 +348,7 @@ class PlotMatcher:
         key = (i, width)
         g = self._gray.get(key)
         if g is None:
-            im = self.cv2.imread(os.path.join(self.thumb_dir, self.photos[i].filename), self.cv2.IMREAD_GRAYSCALE)
+            im = _imread(os.path.join(self.thumb_dir, thumb_name(self.photos[i])), self.cv2.IMREAD_GRAYSCALE)
             g = np.ascontiguousarray(np.rot90(self._prep(im, width), self.turn[i]))
             if len(self._gray) > 4000:
                 self._gray.clear()
@@ -373,7 +387,7 @@ class PlotMatcher:
         frame: where the frame centre meets the cloud), ``inliers``, ``photo``, ``turn``, ``heading_deg`` and
         ``width_m`` when measured (:meth:`_pose`); ``tried``: photos matched."""
         cv2 = self.cv2
-        im = cv2.imread(frame_path, cv2.IMREAD_GRAYSCALE)
+        im = _imread(frame_path, cv2.IMREAD_GRAYSCALE)
         turns = [turn] + [k for k in range(4) if k != turn] if turn is not None else list(range(4))
         tried = 0
         if near is None:
@@ -412,7 +426,7 @@ class PlotMatcher:
         Af = unturn(A, k, fw, fh)
         pg = self.photo_gray(i, MATCH_PHOTO_WIDTH)  # turned north-up
         ph, pw = (pg.shape[1], pg.shape[0]) if self.turn[i] % 2 else pg.shape
-        Bf = unturn(B, self.turn[i], pw, ph) * (cam.sensor.width / pw)
+        Bf = _isy.to_sensor_px(unturn(B, self.turn[i], pw, ph), cam.sensor.width / pw)
         ctr = np.array([fw / 2, fh / 2])
         nearest = np.argsort(np.linalg.norm(Af - ctr, axis=1))[:CENTRE_MATCHES]
         P, pose = None, {}
@@ -983,17 +997,19 @@ def draw_map(img: np.ndarray, geo: Dict[str, float], tracks: Dict[str, List[Dict
     if out.shape[1] > 6000:
         sc = 6000 / out.shape[1]
         out = cv2.resize(out, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if ok:
+        with _atomic_write(path, "wb") as fh:
+            fh.write(buf.tobytes())
 
 
 def write_csv(path: str, rows: Sequence[Dict[str, Any]], fields: Optional[Sequence[str]] = None) -> None:
+    """Write ``rows`` (dicts) as a CSV, atomically (:func:`substrata.fileio.atomic_write`)."""
     fields = list(fields or (list(dict.fromkeys(k for r in rows for k in r)) if rows else []))
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="") as f:
+    with _atomic_write(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    os.replace(tmp, path)
 
 
 STOP_FIELDS = ["sequence", "diver", "plot", "seq_stop", "video", "stop", "start", "t_start_s", "t_end_s", "duration_s", "placed",
@@ -1128,38 +1144,40 @@ def write_stops_annotations(project, stops: Sequence[Dict[str, Any]], track_dir:
     return path
 
 
-def make_proxy(video: str, out: str, height: int = PROXY_HEIGHT) -> str:
+@_renamed_kwargs(out="output_path")
+def make_proxy(video: str, output_path: str, height: int = PROXY_HEIGHT) -> str:
     """An H.264 copy of ``video`` (``height`` px, a keyframe a second, fast start) for browsers; NVENC when
     available, else libx264. Done once."""
-    if os.path.exists(out):
-        return out
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    tmp = out + ".part.mp4"
+    if os.path.exists(output_path):
+        return output_path
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tmp = output_path + ".part.mp4"
     common = ["-vf", f"scale=-2:{height}", "-g", "30", "-an", "-movflags", "+faststart"]
     base = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", video]
     try:
         subprocess.run(base + common + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "26", tmp], check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
         subprocess.run(base + common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24", tmp], check=True)
-    os.replace(tmp, out)
-    return out
+    os.replace(tmp, output_path)
+    return output_path
 
 
 # --------------------------------------------------------------------------- the whole run
 
 
-def track_videos(videos: Sequence[str], projects: Sequence[Any], out_dir: str, work_dir: str, *,
+@_renamed_kwargs(out_dir="output_dir")
+def track_videos(videos: Sequence[str], projects: Sequence[Any], output_dir: str, work_dir: str, *,
                  probe_frames: int = PROBE_FRAMES, proxies: bool = False, annotations: bool = True,
                  redo: bool = False, device: Optional[str] = None, workers: int = 8, poses: bool = True,
                  log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """Keyframes and motion of every video, which plots each is on (``probe_frames`` seeds per plot; 0: track on
-    every plot), its track and stops there; then the outputs in ``out_dir`` (see the module docstring).
+    every plot), its track and stops there; then the outputs in ``output_dir`` (see the module docstring).
     ``projects``: initialised :class:`ProjectInitializer` s (cloud and cameras loaded, world frame). Per video and
     plot the track is kept in ``work_dir`` and not made again unless ``redo``."""
     if log is None:
         def log(msg: str) -> None:
             print(msg, flush=True)
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     keys = video_keys(videos)
     infos, frames, motion = {}, {}, {}
     for v in videos:
@@ -1233,9 +1251,8 @@ def track_videos(videos: Sequence[str], projects: Sequence[Any], out_dir: str, w
                 if np_:
                     log(f"{keys[v]} on {pr.id}: headings for {np_} stops ({time.time() - t0:.0f} s)")
             if dirty:
-                with open(tp + ".tmp", "w") as f:
+                with _atomic_write(tp, "w") as f:
                     json.dump(d, f)
-                os.replace(tp + ".tmp", tp)
             rows = despike(rows)
             if any("x" in r for r in rows):
                 tracks[(v, pr.id)] = rows
@@ -1263,34 +1280,36 @@ def track_videos(videos: Sequence[str], projects: Sequence[Any], out_dir: str, w
     sequence_stops(stops, tracks, vids, infos)
     lenses, lens_of = (pose_stops(stops, tracks, frames, projects, keys, infos, work_dir, redo=redo, device=device,
                                   workers=workers, log=log) if poses else ({}, {}))
-    return write_outputs(out_dir, work_dir, vids, keys, infos, frames, tracks, stops, projects,
+    return write_outputs(output_dir, work_dir, vids, keys, infos, frames, tracks, stops, projects,
                          proxies=proxies, annotations=annotations, log=log, lenses=lenses, lens_of=lens_of)
 
 
-def read_divers(out_dir: str) -> Dict[str, str]:
-    """sequence -> the diver its camera filmed, from ``<out_dir>/labels.json`` (set in substrata-explore's video
+@_renamed_kwargs(out_dir="output_dir")
+def read_divers(output_dir: str) -> Dict[str, str]:
+    """sequence -> the diver its camera filmed, from ``<output_dir>/labels.json`` (set in substrata-explore's video
     player); {} without."""
     try:
-        with open(os.path.join(out_dir, "labels.json")) as f:
+        with open(os.path.join(output_dir, "labels.json")) as f:
             return {str(k): str(v) for k, v in (json.load(f).get("divers") or {}).items() if v}
     except (OSError, ValueError, AttributeError):
         return {}
 
 
-def write_outputs(out_dir, work_dir, vids, keys, infos, frames, tracks, stops, projects, *, proxies, annotations,
+@_renamed_kwargs(out_dir="output_dir")
+def write_outputs(output_dir, work_dir, vids, keys, infos, frames, tracks, stops, projects, *, proxies, annotations,
                   log, lenses=None, lens_of=None):
     by_plot = {pr.id: pr for pr in projects}
-    divers = read_divers(out_dir)
+    divers = read_divers(output_dir)
     for s in stops:
         s["diver"] = divers.get(s.get("sequence", ""), "")
     if annotations:
         for pid, pr in by_plot.items():
-            p = write_stops_annotations(pr, [s for s in stops if s["plot"] == pid], out_dir)
+            p = write_stops_annotations(pr, [s for s in stops if s["plot"] == pid], output_dir)
             if p:
                 log(f"{pid}: stops written as annotation set {p}")
-    write_csv(os.path.join(out_dir, "stops.csv"), stops, STOP_FIELDS)
+    write_csv(os.path.join(output_dir, "stops.csv"), stops, STOP_FIELDS)
     trows = [dict(r, video=keys[v], plot=pid) for (v, pid), rows in tracks.items() for r in rows if "x" in r]
-    write_csv(os.path.join(out_dir, "track.csv"), trows, TRACK_FIELDS)
+    write_csv(os.path.join(output_dir, "track.csv"), trows, TRACK_FIELDS)
     vrows = []
     for v in vids:
         on = [pid for (vv, pid) in tracks if vv == v]
@@ -1301,14 +1320,14 @@ def write_outputs(out_dir, work_dir, vids, keys, infos, frames, tracks, stops, p
                       "frames_placed": sum(1 for pid in on for r in tracks[(v, pid)] if "x" in r),
                       "stops": sum(1 for s in stops if s["video"] == keys[v]),
                       "stops_placed": sum(1 for s in stops if s["video"] == keys[v] and s["x"] != "")})
-    write_csv(os.path.join(out_dir, "videos.csv"), vrows)
-    with open(os.path.join(out_dir, "README.txt"), "w") as f:
+    write_csv(os.path.join(output_dir, "videos.csv"), vrows)
+    with open(os.path.join(output_dir, "README.txt"), "w") as f:
         f.write(README.format(min_stop=MIN_STOP_S))
     proxy_paths = {}
     if proxies:
         for v in vids:
             t0 = time.time()
-            proxy_paths[v] = make_proxy(v, os.path.join(out_dir, "proxies", keys[v] + ".mp4"))
+            proxy_paths[v] = make_proxy(v, os.path.join(output_dir, "proxies", keys[v] + ".mp4"))
             log(f"{keys[v]}: proxy ({time.time() - t0:.0f} s)")
     seq_colours = {q: i for i, q in enumerate(dict.fromkeys(os.path.basename(os.path.dirname(v)) for v in vids))}
     starts = video_starts(vids, infos)
@@ -1317,7 +1336,7 @@ def write_outputs(out_dir, work_dir, vids, keys, infos, frames, tracks, stops, p
         if not tr:
             continue
         img, geo = plot_map(pr.pcd)
-        draw_map(img, geo, tr, [s for s in stops if s["plot"] == pid], os.path.join(out_dir, f"{pid}_map.jpg"),
+        draw_map(img, geo, tr, [s for s in stops if s["plot"] == pid], os.path.join(output_dir, f"{pid}_map.jpg"),
                  title=pid, colours=seq_colours)
     meta = {"created": _dt.datetime.now().isoformat(timespec="seconds"),
             "plots": [{"id": pr.id, "yaml": getattr(pr, "yaml_path", None), "path": pr.path} for pr in projects],
@@ -1328,9 +1347,9 @@ def write_outputs(out_dir, work_dir, vids, keys, infos, frames, tracks, stops, p
                         "plots": [pid for (vv, pid) in tracks if vv == v]} for v in vids],
             "lenses": lenses or {},
             "settings": {"still_flow_px": STILL_FLOW_PX, "min_stop_s": MIN_STOP_S, "min_inliers": MIN_INLIERS}}
-    with open(os.path.join(out_dir, "videotrack.json"), "w") as f:
+    with _atomic_write(os.path.join(output_dir, "videotrack.json"), "w") as f:
         json.dump(meta, f, indent=1)
     nm = sum(1 for s in stops if s.get("placed") == "matched")
     ne = sum(1 for s in stops if s.get("placed") == "estimated")
-    log(f"{len(stops)} stops: {nm} placed by matching, {ne} estimated; outputs in {out_dir}")
+    log(f"{len(stops)} stops: {nm} placed by matching, {ne} estimated; outputs in {output_dir}")
     return meta

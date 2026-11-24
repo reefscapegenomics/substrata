@@ -8,9 +8,9 @@ Note: All commands look for a YAML project file or default filenames in the curr
 
 Decimate a PLY file to reduce the number of points. With no arguments, uses initializer on CWD, output to `<id>_dec50M.ply`, target = 50,000,000 points.
 
-With `-c` (`--color_calibrate`), the YAML's `color_correction` (from `substrata colors`) is applied to the RGB while writing. The output's header is then marked, so loading it does not apply the correction again (see [Color calibration](#color-calibration)).
+With `-c` (`--color-calibrate`), the YAML's `color_correction` (from `substrata colors`) is applied to the RGB while writing. The output's header is then marked, so loading it does not apply the correction again (see [Color calibration](#color-calibration)).
 
-Usage: `substrata decimate [--input PLY] [--output PLY] [--points N] [-c]`
+Usage: `substrata decimate [--input PLY] [--output PLY] [--points N] [--seed N] [-c]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -133,17 +133,17 @@ substrata head --input pointcloud.ply -n 10
 
 Generate a scalebar PDF from a point cloud and marker annotations. Optionally save the computed scale factor to YAML. By default the project's point cloud is used: `<id>_dec50M.ply` when present, otherwise `<id>.ply` (or the `ply:` entry of the project YAML). The point cloud is only used for the figures; the scale factor comes from the marker coordinates.
 
-Usage: `substrata scalebars [--input PLY] [--markers CSV] [--output_pdf PDF] [--points N] [--save_yaml]`
+Usage: `substrata scalebars [--input PLY] [--markers CSV] [--output-pdf PDF] [--points N] [--save-yaml]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
 substrata scalebars
 
 # With explicit arguments
-substrata scalebars --input cur_sna_20m_20200303_dec50M.ply --markers cur_sna_20m_20200303_markers.csv --output_pdf ~/scalebar_check.pdf
+substrata scalebars --input cur_sna_20m_20200303_dec50M.ply --markers cur_sna_20m_20200303_markers.csv --output-pdf ~/scalebar_check.pdf
 
 # Save scale factor to YAML
-substrata scalebars --save_yaml
+substrata scalebars --save-yaml
 
 # Limit points loaded (stream decimation)
 substrata scalebars --points 10000000
@@ -153,21 +153,21 @@ substrata scalebars --points 10000000
 
 Save composite views PDF for a point cloud showing multiple perspectives.
 
-Usage: `substrata views [--input PLY] [--output_pdf PDF]`
+Usage: `substrata views [--input PLY] [--output-pdf PDF]`
 
 ```bash
 # Using default behavior
 substrata views
 
 # With explicit output path
-substrata views --input pointcloud.ply --output_pdf views.pdf
+substrata views --input pointcloud.ply --output-pdf views.pdf
 ```
 
 ## Orientation and scaling
 
 Calculate and apply scale and orientation transforms, then save to YAML. Also generates composite views and camera depth residuals PDFs.
 
-Usage: `substrata orient [--input PLY] [--use_chunk_transform [--north_up]] [--markers CSV] [--transform] [--manual] [--slope]`
+Usage: `substrata orient [--input PLY] [--use-chunk-transform [--north-up]] [--markers CSV] [--transform] [--manual] [--slope]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -177,10 +177,10 @@ substrata orient
 substrata orient --input pointcloud.ply
 
 # Use the Metashape chunk transform instead of fitting scale/orientation
-substrata orient --use_chunk_transform
+substrata orient --use-chunk-transform
 
 # Same, but keep the map north-up (+Y north) instead of +Y upslope
-substrata orient --use_chunk_transform --north_up
+substrata orient --use-chunk-transform --north-up
 
 # Orient, then align along the slope and save that frame
 substrata orient --slope
@@ -188,11 +188,11 @@ substrata orient --slope
 
 With `--slope`, the oriented cloud is then aligned along its slope exactly as `substrata intercepts --slope` does (a plane is fitted to the terrain and rotated flat about its inlier centroid, then X is aligned with the footprint's principal axis), and the result is saved in the YAML `world_transform`. Z is then height above the slope plane rather than depth (`depth_in_m` still works, as it uses the original coordinates), and later `intercepts --slope` runs are close to a no-op. It runs after any other option, including `--transform`.
 
-With `--use_chunk_transform`, scale and orientation are taken from the `chunk_transform` stored in `<id>.meta.json` (written by `substrata metashape-export`) instead of being fitted to scalebars and camera depths. For a georeferenced chunk this transform maps to geocentric (ECEF) metres, so it is combined with a rotation into a local East-North-Up frame centred on the point cloud: +X east, +Y north, +Z ellipsoidal height (i.e. −depth when the camera references are depths). The cloud is then rotated about Z so +Y points upslope (shallow end at the top of top-down views, also for plots that are elongated downslope): of the plot footprint's long and short axes, the one closest to the fall line of a plane fitted to the terrain is aligned with +Y, so the plot edges stay parallel to X/Y (axis-aligned boxes fit snugly). The cloud is then shifted to positive X/Y; this rotation leaves scale and depth untouched. Add `--north_up` to skip the rotation and keep the georeferenced orientation (+X east, +Y north). The scale factor saved to the YAML is the uniform scale inside the chunk transform, and `up_vector`/`depth_offset`/`depth_per_unit` describe the same transform, so the depth residuals PDF still compares recorded and model depths. This option cannot be combined with `--manual` or `--markers`.
+With `--use-chunk-transform`, scale and orientation are taken from the `chunk_transform` stored in `<id>.meta.json` (written by `substrata metashape-export`) instead of being fitted to scalebars and camera depths. For a georeferenced chunk this transform maps to geocentric (ECEF) metres, so it is combined with a rotation into a local East-North-Up frame centred on the point cloud: +X east, +Y north, +Z ellipsoidal height (i.e. −depth when the camera references are depths). The cloud is then rotated about Z so +Y points upslope (shallow end at the top of top-down views, also for plots that are elongated downslope): of the plot footprint's long and short axes, the one closest to the fall line of a plane fitted to the terrain is aligned with +Y, so the plot edges stay parallel to X/Y (axis-aligned boxes fit snugly). The cloud is then shifted to positive X/Y; this rotation leaves scale and depth untouched. Add `--north-up` to skip the rotation and keep the georeferenced orientation (+X east, +Y north). The scale factor saved to the YAML is the uniform scale inside the chunk transform, and `up_vector`/`depth_offset`/`depth_per_unit` describe the same transform, so the depth residuals PDF still compares recorded and model depths. This option cannot be combined with `--manual` or `--markers`.
 
 ## Segmentation
 
-Segment the point cloud by reusing a trained classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the patch around it, then propagate the labels to every point via nearest neighbour. The patch is as large as the classifier's training crops (recorded in the classifier by `substrata train`; `--crop-size` overrides it, and older classifiers without a recorded size use 224 px). With a point-feature classifier (`point_classifier.pt`, the `substrata train` default) no crops are cut. Each query keeps its `--views` best photos (default 3, by the same relevance as the best photo: close and central; with occlusion filtering every view is checked), every photo that is a view of some query gets one dense probability map (the photo is resampled at its median ground resolution over its views, cut into overlapping 448 px tiles whose per-cell probabilities are blended with centre-weighted weights, so there are no tile seams), and a query's prediction is the mean of its views' probabilities read at its pixel, weighted by relevance as in `predict --method weighted`. Each point then also records how many photos were fused (`pred_n`) and their agreement (`pred_agreement`: the weight share of the views whose own label is the fused one; 1 = all agree) - low agreement flags occlusions, boundaries and ambiguous surfaces worth checking by hand. `--save-masks [DIR]` also keeps every photo's dense map as masks (default folder `<id>_seg[_<tag>]_masks/` in the plot folder; see *Masks* below for the format), e.g. for 2-D area measurements. `--per-point` instead classifies each query from a window around it in its best photo only (the classifier's training view; no fusion; its cost grows with the number of queries, the dense path's with the number of photos). For scale: on a 40 m diver plot (2,510 photos, 200 k queries at 5 cm, RTX 4080) the dense path took ~18 min with 3 views and ~11 min with 1; more views were a little more accurate on held-out annotations (`--views 5` for the best results, at more time). Saves the classified query points as an annotation set `<id>.annos/<id>_seg_points.csv`, the segmentation's source of truth: predictions in `pred_label`/`pred_conf`, `label` left empty to check by hand, and the photo and pixel each point was classified from in `cam_filepath`/`cam_x`/`cam_y`. Its sidecar records `type: segmentation`, the classifier, cell size, sampling, crop size and the label colours. It also writes a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance) in the project folder; the sidecar names the recoloured clouds made from the set (`seg_ply_dec`, `seg_ply`). `--tag NAME` keeps versions side by side: `<id>.annos/<id>_seg_NAME_points.csv` and `<id>_seg_NAME[_dec].ply`. `--from-points CSV` skips sampling and classification and only recolours from an existing points CSV, where a hand-checked `label` wins over `pred_label` (the clouds keep that set's tag). `--output-npz` also saves the compact `.npz` of `Segmentation.save` (not written by default; `Segmentation.from_annotations` reads the CSV).
+Segment the point cloud by reusing a trained classifier: sample a grid of query points across the cloud, project each to its best camera photo, classify the patch around it, then propagate the labels to every point via nearest neighbour. The patch is as large as the classifier's training crops (recorded in the classifier by `substrata train`; `--crop-size` overrides it, and older classifiers without a recorded size use 224 px). With a point-feature classifier (`point_classifier.pt`, the `substrata train` default) no crops are cut. Each query keeps its `--views` best photos (default 3, by the same relevance as the best photo: close and central; with occlusion filtering every view is checked), every photo that is a view of some query gets one dense probability map (the photo is resampled at its median ground resolution over its views - the project's metres per model unit come from its `world_transform`, or its `scale_factor` when the transform is the identity - or, without one, by its width as `predict` and `masks` resample it; cut into overlapping 448 px tiles whose per-cell probabilities are blended with centre-weighted weights, so there are no tile seams), and a query's prediction is the mean of its views' probabilities read at its pixel, weighted by relevance as in `predict --method weighted`. Each point then also records how many photos were fused (`pred_n`) and their agreement (`pred_agreement`: the weight share of the views whose own label is the fused one; 1 = all agree) - low agreement flags occlusions, boundaries and ambiguous surfaces worth checking by hand. `--save-masks [DIR]` also keeps every photo's dense map as masks (default folder `<id>_seg[_<tag>]_masks/` in the plot folder; see *Masks* below for the format), e.g. for 2-D area measurements. `--per-point` instead classifies each query from a window around it in its best photo only (the classifier's training view; no fusion; its cost grows with the number of queries, the dense path's with the number of photos). For scale: on a 40 m diver plot (2,510 photos, 200 k queries at 5 cm, RTX 4080) the dense path took ~18 min with 3 views and ~11 min with 1; more views were a little more accurate on held-out annotations (`--views 5` for the best results, at more time). Saves the classified query points as an annotation set `<id>.annos/<id>_seg_points.csv`, the segmentation's source of truth: predictions in `pred_label`/`pred_conf`, `label` left empty to check by hand, and the photo and pixel each point was classified from in `cam_filepath`/`cam_x`/`cam_y`. Its sidecar records `type: segmentation`, the classifier, cell size, sampling, crop size and the label colours. It also writes a recoloured decimated cloud `<id>_seg_dec.ply` (category colour blended with each point's original luminance) in the project folder; the sidecar names the recoloured clouds made from the set (`seg_ply_dec`, `seg_ply`). `--tag NAME` keeps versions side by side: `<id>.annos/<id>_seg_NAME_points.csv` and `<id>_seg_NAME[_dec].ply`. `--from-points CSV` skips sampling and classification and only recolours from an existing points CSV, where a hand-checked `label` wins over `pred_label` (the clouds keep that set's tag). `--output-npz` also saves the compact `.npz` of `Segmentation.save` (not written by default; `Segmentation.from_annotations` reads the CSV).
 
 Because the points CSV is an ordinary annotation set, its labels can be summarised like any other (e.g. cover per label over depth). With `voxel` sampling each point stands for about the same patch of surface (one per `--cell-size` cell), so a label's share of the points is its 3D (surface) cover; with `xy_grid` it is planar (top-down) cover. Query points that no photo saw, or that failed to classify, are left out, so the cover is of the observed surface. Query matching is fully vectorized and occlusion-aware; cost scales with the number of query points (the spacing), not the number of cloud points. With `--full-ply` it additionally stream-recolours the full-size PLY (memory-safe, never loaded whole).
 
@@ -228,11 +228,13 @@ substrata segment --from-points <id>.annos/<id>_seg_v2_points.csv --full-ply
 
 ## Color calibration
 
-Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and store the affine color correction (matrix + offset) in the project YAML as `color_correction`. The YAML is updated in place: only that key changes, and comments and relative paths are kept. Use `--no-save-yaml` to only write the PDF. The PLY is always loaded in full when `--input` is given (never stream-decimated).
+Run color calibration from the project's ColorChecker marker positions, save a QC PDF, and store the affine color correction (matrix + offset) in the project YAML as `color_correction`. The YAML is updated in place: only that key changes, and comments and relative paths are kept; the fit's RMS residual (`fit_rmse`, RGB units over the fitted patches), the number of patches fitted (`fit_patches`) and its colour space (`fit_space`: sRGB 0-255) are recorded with it and shown in the PDF's summary page. Use `--no-save-yaml` to only write the PDF. The PLY is always loaded in full when `--input` is given (never stream-decimated).
+
+The patches are sampled within 5 mm of their centres and 3 mm of the card plane (metres), so the cloud and the markers are both taken into the project's world frame (its `world_transform`), also with `-n` and with `--markers`; run `substrata orient` first (a project without a `world_transform` is assumed to be in metres, with a warning). Each patch's measured colour is the median over the cards; a card whose value of a patch lies more than 2.5 robust SDs (1.4826 x MAD) from the cross-card median is flagged as an outlier and left out of that patch's median. The affine fit is in gamma-encoded sRGB 0-255 (not linear light).
 
 No PLY is written. Loading the project (`ProjectInitializer.initialize()`) applies `color_correction` to the point cloud in memory, so the original colours stay on disk. To write a colour-corrected PLY as an explicit extra step, use `substrata decimate -c`. Its output header is marked (`comment substrata color_correction applied`), and loading a marked PLY skips the YAML correction, so it is never applied twice. Decimating a marked PLY with `-c` again is refused.
 
-Usage: `substrata colors [--input PLY] [--markers CSV] [--output_pdf PDF] [-n N] [--no-save-yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
+Usage: `substrata colors [--input PLY] [--markers CSV] [--output-pdf PDF] [-n N] [-s | --no-save-yaml] [--exclude-index N ...] [--exclude-name NAME ...]`
 
 ```bash
 # QC PDF + color_correction into the project YAML (auto-detects from CWD)
@@ -256,7 +258,9 @@ substrata decimate -c
 
 Run FireFish/Cameras alignment to determine up vector and generate output PDF. Initializes FireFish and Cameras, then determines the up vector based on camera depth data.
 
-Usage: `substrata firefish [--firefish-file FILE] [--target-depth M] [--cam-depths-file CSV] [--depth-outlier-threshold M] [--cams_group GROUP] [--offset SEC] [--beam-half-angle DEG] [--distance-percentile P] [--sonar-offset X Y Z] [--depth-sensor-offset X Y Z] [--water-level M] [--recompute-camdists] [--input PLY] [--save_yaml]`
+The time offset between the cameras and the FireFish log is searched on the records near the plot depth: `--target-depth M` is the depth below the surface in metres (`20` and `-20` both mean 20 m deep; default: from the folder name, `_20m_`), and only the longest stretch of records within `--depth-outlier-threshold` (default 4 m) of it is used. The same threshold also drops altitudes at or above it as outliers. A depth band without any record stops with an error naming the depths the log covers.
+
+Usage: `substrata firefish [--firefish-file FILE] [--target-depth M] [--cam-depths-file CSV] [--depth-outlier-threshold M] [--cams-group GROUP] [--offset SEC] [--beam-half-angle DEG] [--distance-percentile P] [--sonar-offset X Y Z] [--depth-sensor-offset X Y Z] [--water-level M] [--recompute-camdists] [--input PLY] [--save-yaml]`
 
 The camera-derived altitude (`camdist`, plotted against the FireFish altitude) is the distance from the camera to the point cloud within a cone around the camera view vector. It is matched to the FireFish Ping2 echosounder by default:
 
@@ -265,7 +269,7 @@ The camera-derived altitude (`camdist`, plotted against the FireFish altitude) i
 - `--sonar-offset X Y Z` (default `0 0 0`): sonar position relative to the camera centre in metres, in the camera frame (x: image right, y: image down, z: view direction).
 - `--recompute-camdists`: `camdist` is otherwise only computed when the camdepths CSV does not exist yet.
 
-The up vector is fitted by regressing the FireFish depths against camera positions. If the depth sensor is mounted away from the camera centre, `--depth-sensor-offset X Y Z` (metres, camera frame; default `0 0 0`) regresses the depths against the sensor positions instead, following each photo's orientation (lever-arm correction). For example, a sensor 15 cm behind the camera centre along the view axis is `0 0 -0.15`. With `--save_yaml` the offset is recorded in the YAML as `firefish_depth_sensor_offset`.
+The up vector is fitted by regressing the FireFish depths against camera positions. If the depth sensor is mounted away from the camera centre, `--depth-sensor-offset X Y Z` (metres, camera frame; default `0 0 0`) regresses the depths against the sensor positions instead, following each photo's orientation (lever-arm correction). For example, a sensor 15 cm behind the camera centre along the view axis is `0 0 -0.15`. With `--save-yaml` the offset is recorded in the YAML as `firefish_depth_sensor_offset`.
 
 The FireFish measures depth below the water surface, which moves with the tide. `--water-level M` (default 0) gives the water level relative to mean sea level during the survey (e.g. from a nearby tide gauge; negative below MSL), and converts all FireFish depths to depth below MSL (depth + water level) before the time sync and regression. It is recorded in the YAML as `firefish_water_level`.
 
@@ -273,14 +277,14 @@ The FireFish measures depth below the water surface, which moves with the tide. 
 # Using default behavior (auto-detects from CWD, infers depth from directory name)
 substrata firefish
 
-# With explicit target depth
+# With explicit target depth (20 m below the surface)
 substrata firefish --target-depth 20
 
 # Filter cameras by group
-substrata firefish --cams_group "group_name"
+substrata firefish --cams-group "group_name"
 
 # Save results to YAML
-substrata firefish --save_yaml
+substrata firefish --save-yaml
 
 # With manual time offset
 substrata firefish --offset 30
@@ -299,7 +303,7 @@ substrata firefish --depth-sensor-offset 0 0 -0.15 --water-level -0.32
 
 Create a video from cameras by drawing image matches. Optionally include annotations in the video.
 
-Usage: `substrata cams2video [--input PLY] [--annotations CSV] [--cams_group GROUP] [--label] [--resolution WIDTH] [--output_mp4 MP4]`
+Usage: `substrata cams2video [--input PLY] [--annotations CSV] [--cams-group GROUP] [--label] [--resolution WIDTH] [--output-mp4 MP4]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -309,7 +313,7 @@ substrata cams2video
 substrata cams2video --annotations annotations.csv
 
 # Filter cameras by group
-substrata cams2video --cams_group "group_name"
+substrata cams2video --cams-group "group_name"
 
 # Use label column from annotations
 substrata cams2video --label
@@ -318,7 +322,7 @@ substrata cams2video --label
 substrata cams2video --resolution 1920
 
 # Specify output file
-substrata cams2video --output_mp4 output.mp4
+substrata cams2video --output-mp4 output.mp4
 ```
 
 ## Image sets and points on photos (sample-points)
@@ -570,9 +574,18 @@ substrata baseline cur_sna_20m_20240305/ --link cur_sna_20m_20200303
 
 ## Image matches
 
-Find image matches of annotations and output cropped images to PDF. Optionally apply a transform to annotation coordinates before matching.
+Find image matches of annotations and output them to a PDF, in one of two layouts (`--layout`):
 
-Usage: `substrata images [--input PLY] [--annotations CSV] [--transform] [--pdf-output PDF]`
+- **grid**: each annotation's first image match, cropped, several to a page. Optionally apply a transform to annotation coordinates before matching (`--transform`). Default: `<cwd_basename>_imagematches.pdf`.
+- **pages**: one A4 page per annotation, to check what a close-up (macro) photo shows: top left the best overview photo zoomed on the point (`--zoom`, at least 0.5 m wide, wider to show 2.5x the close-up's frame), top right the close-up's full frame (a box marks the crop below), and across the bottom the close-up at 100% (1 photo pixel = 1 page dot at 300 dpi), centred on the point. The point is marked in each panel, with scale bars from the camera distance (world scale / fx) and a header with the plot, annotation id, label, depth, coordinates and the CSV columns of `--info` (default `label_conf label_source`). Without a close-up of a point, the top right shows the overview's full frame and the bottom the overview at 100%. Default: `<annotations stem>_pages.pdf`.
+
+`--layout auto` (default) makes pages when the set's stored views (`cam_filepath`) are close-ups: a camera-targets set made by `substrata cams2annos` (each point stored with the photo aimed at it), or stored photos of a camera type other than the main one. Other sets get the grid. `--closeup GROUP` names the close-up cameras instead (a camera group, type or photo folder as `predict --camera-group` takes, e.g. `closeup`; implies pages): each point gets its stored view if that is a close-up, else the most relevant close-up camera that sees it. A stored close-up is used even when its camera is disabled, as camsync leaves the poses it estimated rather than matched (cams2annos marks their points `is_extrapolated`); its caption then says so, as the point may be off and the overview match is worth a check.
+
+The overview is chosen as `substrata crops` chooses views (`--occlusion`, `--camera-type`): the most relevant view of the main camera type, among the cameras that are not close-ups, not flagged obstructed. `--labels` / `--ids` select annotations (both layouts).
+
+Photos are shown with a display contrast (`--contrast`, default `stretch`; `substrata.imageadjust.auto_contrast`): `stretch` brightens with one linear stretch for all channels (colours kept; 0.5% clipped at each end), `stretch-rgb` stretches each channel (also removes a blue-green cast, which can shift true colours), `clahe` equalises local contrast, `none` leaves photos as they are. A photo's statistics come from what its top panel shows, so its 100% crop matches its full frame.
+
+Usage: `substrata images [--layout auto|grid|pages] [--closeup GROUP] [--labels LABEL ...] [--ids ID ...] [--zoom M] [--contrast METHOD] [--info COLUMN ...] [--occlusion ...] [--camera-type TYPE] [--annotations CSV] [--input PLY] [--transform] [--size PX] [--pdf-output PDF]`
 
 ```bash
 # Using default behavior (auto-detects from CWD)
@@ -581,12 +594,20 @@ substrata images
 # With explicit annotations file
 substrata images --annotations annotations.csv
 
-# Apply transform to annotation coordinates (interactive)
+# Apply transform to annotation coordinates (interactive; grid)
 substrata images --transform
 
 # Specify output PDF
 substrata images --pdf-output imagematches.pdf
+
+# One page per close-up labelled as Acropora (a cams2annos set: pages by default)
+substrata images --annotations <id>.annos/<id>_closeup_targets.csv --labels CS_ACR
+
+# Pages for any set, with the close-ups that see its points (others: overview only)
+substrata images --annotations points.csv --closeup closeup --contrast clahe
 ```
+
+In Python: `substrata.annotation_page(title, subtitle, overview, closeup)` renders a page from two `PageView`s (photo, pixel, metres per pixel) and `save_pages_pdf(pages, path)` writes them. `auto_contrast(img, method, reference=None)` adjusts any PIL image or array; new methods are added with `@register_contrast_method("name")` (a function of float RGB arrays in [0, 1]).
 
 ## Thumbnails
 
@@ -621,7 +642,7 @@ Other commands that use image matches with a point cloud (`substrata images`, be
 Usage: `substrata crops [--size W H] [--max-photos N] [--output DIR] [--overwrite] [--occlusion auto|subsample|cloud|none] [--no-ply] [--camera-type TYPE|all] [--no-views] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
-# Default 800x800 crops (or the YAML crop_size), up to 10 photos per annotation
+# Default 800x800 crops (or the YAML crop_size), up to 5 photos per annotation
 substrata crops
 
 # Larger crops for a specific annotations file, regenerating existing ones
@@ -672,7 +693,7 @@ A point-feature classifier (`point_classifier.pt`) is also accepted: it reads ea
 
 Do not run this while the same annotations file is open in reefcat, as both write the CSV.
 
-Usage: `substrata predict [--classifier PKL] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--redo] [--batch-size N] [--no-ply] [--occlusion auto|subsample|cloud|none] [--camera-type TYPE] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
+Usage: `substrata predict [--classifier PKL|PT] [--size W H] [--max-photos N] [--method weighted|first] [--crops DIR] [--no-write-crops] [--redo] [--batch-size N] [--no-ply] [--occlusion auto|subsample|cloud|none] [--camera-type TYPE] [--annotations CSV] [--jobs N] [--photo-path-replace OLD NEW] [--local]`
 
 ```bash
 # Classifier from the YAML; crops from `substrata crops`
@@ -832,7 +853,7 @@ substrata match-annotations --random points_matched.csv --output points_matched_
 
 ## Camera time-sync (camsync)
 
-Copy camera centers/transforms from a *pose-source* sensor (e.g. a GoPro) to an *updated-target* sensor (e.g. a macro camera) using EXIF time matching. Per-camera poses are written to the cameras meta JSON only — the `.cams.xml` is not modified (it is read for sensor calibration). The relative timing of the two sensors can be given manually (`--time-offset` / `--pose-time`) or estimated automatically (`--auto-time` / `--auto-xyz` / `--auto-offsets`); auto modes print a detailed report and prompt before saving unless you pass `--yes`.
+Copy camera centers/transforms from a *pose-source* sensor (e.g. a GoPro) to an *updated-target* sensor (e.g. a macro camera) using EXIF time matching. Per-camera poses are written to the cameras meta JSON (backed up first). The `.cams.xml` keeps its sensor calibration; only its cameras' `enabled` flags are updated to match the meta JSON (backed up first). The relative timing of the two sensors can be given manually (`--time-offset` / `--pose-time`) or estimated automatically (`--auto-time` / `--auto-xyz` / `--auto-offsets`); auto modes print a detailed report and prompt before saving unless you pass `--yes`.
 
 Each run writes a sanity-check PDF (`<id>_camsync.pdf`): a summary page, followed by the first time-matched pose/target image pairs side by side (five per page). `--pdf-pairs N` sets how many pairs to render (default 9).
 
@@ -985,7 +1006,7 @@ The YAML is patched line by line, preserving comments, key order and any keys su
 
 All phases are planned in full before any writes, so aborting at any point leaves the project untouched. `--dry-run` prints the plan and writes nothing. For camera images, `--find` with `--replace` does a literal substring substitution and refuses to write unless every resulting path exists; `--find`, `--cams-group` and `--sensor-id` restrict which cameras are considered and apply to phase B only. `--find`/`--replace` also apply to the annotation images; with `--cams-group` or `--sensor-id`, phase C is skipped.
 
-**Use this instead of `--local`.** That flag rebases every path onto the working directory by basename — unverified, and discarding any nested folder structure — and on `orient`, `scalebars`, `colors` and `firefish --save_yaml` it is then persisted into the YAML as a side effect. `path-repair` changes only the paths that are actually broken, and verifies each result before writing.
+**Use this instead of `--local`.** That flag rebases every path onto the working directory by basename — unverified, and discarding any nested folder structure — and on `orient`, `scalebars`, `colors` and `firefish --save-yaml` it is then persisted into the YAML as a side effect. `path-repair` changes only the paths that are actually broken, and verifies each result before writing.
 
 Related: `substrata segment --photo-path-replace OLD NEW` applies the same camera substitution for a single run without saving it; `substrata path-repair --find OLD --replace NEW` makes it permanent.
 
@@ -1025,7 +1046,7 @@ Load annotations from a CSV, apply one or more transforms (entered interactively
 
 Instead of prompting, `--to-parent PROJECT` applies that project's `parent_transform` (see `align --as-parent`). This moves the project's annotations into its parent's orig frame. `--from-parent PROJECT` applies the inverse, moving annotations from the parent into the project.
 
-Usage: `substrata transform INPUT [--output CSV] [--no_header] [--ignore_header] [--inverse] [--to-parent PROJECT | --from-parent PROJECT]`
+Usage: `substrata transform INPUT [--output CSV] [--no-header] [--ignore-header] [--inverse] [--to-parent PROJECT | --from-parent PROJECT]`
 
 ```bash
 # Transform annotations; prompts for the transform matrix/matrices
@@ -1070,8 +1091,8 @@ one is missing does it fall back to the `site/site_depth/model/<final-folder>`
 convention under `--model-path` (or prompt for a substitution), writes a
 consolidated `training_annotations.csv`, and generates `training_crops` /
 `validation_crops` / `test_crops` (80/10/10, assigned deterministically per
-annotation id, or per `split_key` when the annotations CSV has one, so that e.g.
-all points of one image share a split). Finally it trains the model and
+photo: all points of one photo share a split; see *Train / validation / test
+split* below). Finally it trains the model and
 reports validation stats
 (printed and written to a `<split>_stats.pdf` with a per-class report, a
 row-normalised confusion matrix, and example classified crops per category —
@@ -1101,15 +1122,28 @@ image) are skipped at training/evaluation time with a warning of how many were
 ignored, so a single bad image can't crash the run; zero-byte crops are also
 regenerated on the next sync.
 
+**Train / validation / test split.** The split is drawn per `split_key` (a hash
+of it; 80/10/10), which `training_annotations.csv` records for every point.
+`--split-by` sets it: `photo` (default) gives all points of a photo the same
+split (the file stem of `cam_filepath`; CoralNet and pool points already carry
+their image), `plot` all points of an annotation file's plot (its model name),
+and `point` each point on its own (by its id, the behaviour before 2026-11).
+Points of one photo look much alike, so a per-point split puts near-copies of
+training points into validation and test and reports optimistic accuracies;
+use `--split-by point` only to reproduce an older run. The grouping is recorded
+in `training_summary.pdf` (and, for point classifiers, in the model's metadata,
+`split_by`). Changing it moves crops between the split folders on the next run.
+
 **Selection and collapsing live in an editable label map.** A
 `training_label_map.csv` (`--label-map` to relocate it; default in `--output`)
 holds one `label,count,training_class` row per *selected* label (the map is not
 cluttered with the sub-threshold/excluded labels, even though their crops still
 exist on disk). It is *seeded* from the bolded tree; blanking a row's
 `training_class` by hand excludes that label. The seeding
-is controlled by `--min-count` / `--tips_only`, or by
+is controlled by `--min-count` (a tip is bolded when its aggregated count, a
+parent with subcategories when its own count, is at least N) / `--tips-only`, or by
 `--include-classes` (an explicit list of category codes from the tree brackets,
-which overrides `--min-count` / `--tips_only` and errors if any code is absent).
+which overrides `--min-count` / `--tips-only` and errors if any code is absent).
 By default only the selected codes themselves are trained; add `--collapse` to
 fold each selected class's non-selected descendants into it — e.g.
 `--include-classes MAF --collapse` trains `MAFG`, `MAF_T`, … as `MAF`, whereas
@@ -1120,9 +1154,9 @@ immediately. Pass `--keep-map` to instead preserve an existing (hand-edited) map
 and only append newly-seen labels. Both training and `--validate` / `--test`
 read this map, so evaluation always uses the same classes as training.
 
-**Filtering by annotation confidence.** Pass `--min_conf VALUE` to train only on
+**Filtering by annotation confidence.** Pass `--min-conf VALUE` to train only on
 annotations whose `label_conf` is `>= VALUE`. Annotations with an *empty* (no
-value) `label_conf` are **included by default**. Use `--min_conf_strict VALUE`
+value) `label_conf` are **included by default**. Use `--min-conf-strict VALUE`
 for the same threshold but treating an empty `label_conf` as `0`, so those
 annotations are excluded whenever `VALUE > 0`. The two flags are mutually
 exclusive. The confidence filter is applied while collating, and the number of
@@ -1141,7 +1175,7 @@ the run reports how many there were.
 **Without a classes file.** `classes.csv` is only needed for the hierarchical
 (CATAMI) tree. When `--classes` is not given and there is no `classes.csv` in the
 CWD, the labels are listed as a flat table of counts instead and selected by
-`--min-count` (or exactly `--include-classes`); `--tips_only` and `--collapse`
+`--min-count` (or exactly `--include-classes`); `--tips-only` and `--collapse`
 need the hierarchy and are unavailable. Use `--exclude-classes LABEL ...` (in
 either mode) to leave labels out entirely, so no crops are generated for them.
 
@@ -1220,7 +1254,7 @@ tree, label map, `training_annotations.csv`) are as above; then:
   relabelled points take their new label (also in the label tree counts), and
   accepted points are kept whatever their `label_conf`. A decision made with a
   confidence (keys 0-4 in the review grid) carries it as the point's
-  `label_conf`, and `--min_conf` then applies to it. Points of the folder's
+  `label_conf`, and `--min-conf` then applies to it. Points of the folder's
   pools (`curate/pools/*.csv`) that were given a label join the training.
   `--curation JSONL` adds another folder's store (read-only; the folder's own
   decisions win), `--no-curation` ignores them all.
@@ -1236,7 +1270,8 @@ tree, label map, `training_annotations.csv`) are as above; then:
   `predict`, `segment`, `curate` and substrata-explore need the same weights on
   that machine.
 - *The probe* is a class-balanced logistic regression, its regularisation chosen
-  by 5-fold cross-validation on macro-F1 over the training split.
+  by 5-fold cross-validation on macro-F1 over the training split, with the folds
+  grouped by photo (all points of a photo in the same fold).
 - *Outputs:* `point_classifier.pt` (`--model`; a small file - the backbone
   weights come from torch.hub, downloaded once to the torch cache; set
   `SUBSTRATA_POINT_HUB_REPO` to a local clone of `facebookresearch/dinov2` to
@@ -1261,7 +1296,7 @@ inspect before training. After training, `--validate --pdf` or `--test --pdf`
 rebuilds the PDF from the existing crops and map without collating again, and then
 runs the evaluation.
 
-Usage: `substrata train [PATTERN | --sets FILE] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--min-count N] [--tips_only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min_conf CONF | --min_conf_strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes] [--curation JSONL ...] [--no-curation]`
+Usage: `substrata train [PATTERN | --sets FILE] [--classes CSV] [--coralnet] [--image-dir DIR] [--csv-path DIR] [--model-path DIR] [--output DIR] [--split-by photo|plot|point] [--min-count N] [--tips-only] [--include-classes LABEL ...] [--exclude-classes LABEL ...] [--collapse] [--min-conf CONF | --min-conf-strict CONF] [--label-map CSV] [--keep-map] [--prepare-only] [--pdf] [--pdf-max N] [--crop-size PX] [--jobs N] [--arch ARCH] [--feature-mm-px MM | --feature-scale S] [--batch-size N] [--pretrained-weights CKPT] [--epochs N] [--model PATH] [--validate] [--test] [--yes] [--curation JSONL ...] [--no-curation]`
 
 ```bash
 # Collate *_slope_intercepts.csv in CWD, confirm, seed the map, and train a
@@ -1292,13 +1327,16 @@ substrata train --include-classes MAF MAEN --collapse
 substrata train "*_ann.csv" --min-count 50
 
 # Only train on annotations with label_conf >= 0.8 (empty label_conf kept)
-substrata train --min_conf 0.8
+substrata train --min-conf 0.8
 
 # Same, but treat an empty label_conf as 0 so those annotations are excluded
-substrata train --min_conf_strict 0.8
+substrata train --min-conf-strict 0.8
 
 # Keep a hand-edited map, only appending labels from newly added CSVs
 substrata train --keep-map
+
+# Reproduce a run made before 2026-11 (each point split on its own)
+substrata train --split-by point
 
 # CSVs in one dir, image projects in another, output elsewhere, bigger backbone
 substrata train --csv-path /data/annotations --model-path /data/models \
@@ -1343,9 +1381,13 @@ photo folders. The next `substrata train` in the folder applies them (see
 *Curation* under the point-feature classifier); copy the file, or pass
 `--curation PATH`, to use them in another classifier folder.
 
-**Scores.** `substrata curate` (no options) scores every training point for
-review and writes `curate/points.csv` plus a thumbnail of each model input window
-(`curate/tiles/`):
+**Scores.** `substrata curate` (no options) scores the training points of the
+**train split** for review and writes `curate/points.csv` plus a thumbnail of each
+model input window (`curate/tiles/`). Validation and test points are left out by
+default: relabelling held-out points where the model disagrees with them would
+tune their labels towards the model and inflate its validation / test metrics.
+`--all-splits` scores and lists them too (e.g. to clean a set before a new split).
+The points are read at exactly the resolution training used:
 
 - `p_label`: the cross-validated probability of the point's own class (5 folds,
   grouped by photo so neighbouring points of a photo never vouch for each
@@ -1416,7 +1458,7 @@ annotations", off by default): `substrata train` records the files it read in
 `training_sources.json`, and only image-only points (CoralNet exports, or
 annotation CSVs without 3-D positions) are edited, after a backup of each file.
 
-Usage: `substrata curate [--folder DIR] [--model PT] [--annotations CSV] [{--mine IMAGES ... | --image-dir DIR | --points CSV [--image-dir DIR]} --name NAME [--gsd-mm MM] [--domain D] [--mine-images N] [--per-image/--n-points N] [--clusters K] [--seed N] [--resample]] [--status] [--export CSV] [--import CSV] [--sheets [--sheets-max N]] [--curation JSONL ...] [--batch-size N] [--jobs N] [--gui [GUI OPTIONS]]`
+Usage: `substrata curate [--folder DIR] [--model PT] [--annotations CSV] [--all-splits] [{--mine IMAGES ... | --image-dir DIR | --points CSV [--image-dir DIR]} --name NAME [--gsd-mm MM] [--domain D] [--mine-images N] [--per-image/--n-points N] [--clusters K] [--seed N] [--resample]] [--status] [--export CSV] [--import CSV] [--sheets [--sheets-max N]] [--curation JSONL ...] [--batch-size N] [--jobs N] [--gui [GUI OPTIONS]]`
 
 ```bash
 # In the classifier folder, after `substrata train`
@@ -1468,7 +1510,9 @@ photo), size, mean confidence and cover. `masks_cover.csv` has one row per photo
 with the fraction of its cells per class (most likely class), e.g. for percent
 cover per frame. Photos already in the index are skipped, so an interrupted run
 continues where it stopped (`--overwrite` redoes them); the index is saved every
-200 photos. Stems that repeat across folders are prefixed with their folder name.
+200 photos. The index records the classifier's fingerprint (`classifier_fingerprint`,
+as `pred_model`); masks are only reused when made by the same classifier file and
+`--gsd-mm` (a retrained classifier, even with the same classes, redoes all photos). Stems that repeat across folders are prefixed with their folder name.
 
 Usage: `substrata masks IMAGES ... [--classifier PT] [--gsd-mm MM] [--output DIR] [--probs] [--color LABEL=RRGGBB ...] [--overwrite] [--jobs N]`
 
@@ -1498,6 +1542,10 @@ other areas and depths. Classifiers with a physical resolution (mm/px) need the
 ground resolution of the calibration photos (`--gsd-mm`, camera distance / focal
 length, e.g. 1.21 for an AUV flying at ~3.8 m with a 3106 px focal length); at
 prediction time the resolution of each photo comes from its camera geometry.
+The calibration patches are resampled exactly as prediction resamples those
+photos: by `--gsd-mm`, else (fixed-scale classifiers) by the photo width
+relative to the training photos; each photo's scale is stored with the
+calibration in the model's metadata (`calibration.scales`).
 
 Usage: `substrata calibrate IMAGES ... [--classifier PT] [--gsd-mm MM] [--n-images N] [--per-image N] [--output PT] [--batch-size N] [--jobs N]`
 

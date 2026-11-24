@@ -228,7 +228,7 @@ _POSE = _SETUP + textwrap.dedent(
     ray = R_true @ np.array([0, 0, 1.0]); t = (-40.0 - C_true[2]) / ray[2]; aim_true = C_true + t * ray
     P = aim_true + np.c_[rng.uniform(-0.03, 0.03, 60), rng.uniform(-0.02, 0.02, 60), np.zeros(60)]  # (in its ~11 x 7 cm view)
     cam_pts = (P - C_true) @ R_true  # (world -> camera: R^T (P - C))
-    ax, ay, ok = cm._distort(cam_pts[:, 0], cam_pts[:, 1], cam_pts[:, 2], macro_s)
+    ax, ay, ok = cm.camera_points_to_pixels(cam_pts[:, 0], cam_pts[:, 1], cam_pts[:, 2], macro_s)
     assert ok.all()
     A = np.c_[ax, ay]
     B = np.array([gopro.get_pixel_coords(p, required_to_be_in_view=False)[:2] for p in P], float)
@@ -246,7 +246,7 @@ _POSE = _SETUP + textwrap.dedent(
     # set_pose: the camera now sees the reef where the true camera does, in both frames
     isy.set_pose(macro, p["R"], p["C"], W)
     X = aim_true + [0.01, 0.005, 0.0]  # (a point on the reef)
-    want = cm._distort(*((X - C_true) @ R_true), macro_s)[:2]
+    want = cm.camera_points_to_pixels(*((X - C_true) @ R_true), macro_s)[:2]
     x, y, *_ = macro.get_pixel_coords(X)
     assert abs(x - want[0]) < 60 and abs(y - want[1]) < 60, ((x, y), want)  # (< 1 mm at 0.3 m)
     Xo = (np.linalg.inv(W) @ np.r_[X, 1.0])[:3]

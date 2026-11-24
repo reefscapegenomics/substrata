@@ -62,7 +62,7 @@ class TestReprojectViews(unittest.TestCase):
 
     def _new(self, xyz, shift=(0.0, 0.0, 0.0)):
         p = np.asarray(xyz, float) - np.asarray(shift)
-        x, y, ok = cm._distort(p[0], p[1], p[2], self.s)
+        x, y, ok = cm.camera_points_to_pixels(p[0], p[1], p[2], self.s)
         return float(round(float(x))), float(round(float(y))), bool(ok)
 
     def _write(self, rows):

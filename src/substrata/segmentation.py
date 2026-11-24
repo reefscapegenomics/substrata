@@ -1,19 +1,15 @@
 # Standard Library
 import os
-import math
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from ssl import SSLSocket
 from typing import Any, Dict, List, Optional, Tuple
 
 # Third-Party Libraries
 import numpy as np
-import matplotlib.pyplot as plt
 import cv2
 from PIL import Image
 from tqdm import tqdm
-from joblib import Parallel, delayed
 
 # NOTE: ``torch`` and ``sam2`` are heavy/optional and are imported lazily (inside
 # the functions that need them, via ``_require_sam2``) so that importing this
@@ -21,6 +17,7 @@ from joblib import Parallel, delayed
 # what lets ``segmentation`` be added to the package's star-imports.
 
 # Local Modules
+from substrata.logging import logger
 
 # Only the point-cloud segmentation API is star-exported into the flat
 # ``substrata.*`` namespace (this module is in ``__init__``'s star-import list).
@@ -153,6 +150,8 @@ def show_box(box, ax):
     Show the annotated box on the image
     from https://github.com/facebookresearch/sam2
     """
+    import matplotlib.pyplot as plt  # lazy: figures only
+
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(
@@ -173,6 +172,8 @@ def show_masks(
     Show the image masks
     from https://github.com/facebookresearch/sam2
     """
+    import matplotlib.pyplot as plt  # lazy: figures only
+
     for i, (mask, score) in enumerate(zip(masks, scores)):
         plt.figure(figsize=(10, 10))
         plt.imshow(image)
@@ -285,877 +286,6 @@ def get_sam2_masks_multi(image_filepath, pixels, sam_predictor, max_dim=None):
     return results
 
 
-def sift_match_batched(
-    query_frame,
-    target_cams,
-    max_dim=500,
-    target_max_dim=500,
-    downscale_interpolation=None,
-    n_jobs=-1,
-    batch_size=10,  # Process in batches to avoid memory issues
-):
-    """
-    Batched parallel processing for very large datasets.
-    Processes target cameras in batches to manage memory usage.
-    Returns a dictionary with camera IDs as keys and number of matches as values.
-    """
-    from joblib import Parallel, delayed
-    from tqdm import tqdm
-
-    if downscale_interpolation is None:
-        downscale_interpolation = cv2.INTER_AREA
-
-    def load_and_resize_gray(filepath, max_dim):
-        img = cv2.imread(filepath)
-        if img is None:
-            return None
-        h, w = img.shape[:2]
-        scale = min(1.0, float(max_dim) / max(h, w))
-        if scale < 1.0:
-            img = cv2.resize(
-                img,
-                (int(w * scale), int(h * scale)),
-                interpolation=downscale_interpolation,
-            )
-        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        return img_gray
-
-    # Load and resize the query frame
-    query_img_gray = cv2.cvtColor(query_frame.image_array, cv2.COLOR_BGR2GRAY)
-    h, w = query_img_gray.shape[:2]
-    scale = min(1.0, float(max_dim) / max(h, w))
-    if scale < 1.0:
-        query_img_gray = cv2.resize(
-            query_img_gray,
-            (int(w * scale), int(h * scale)),
-            interpolation=downscale_interpolation,
-        )
-
-    # Initialize SIFT
-    sift = cv2.SIFT_create()
-    kp_query, des_query = sift.detectAndCompute(query_img_gray, None)
-
-    if des_query is None or len(kp_query) == 0:
-        print(
-            f"No SIFT features found in query frame at {query_frame.timestamp_seconds:.2f}s"
-        )
-        return
-
-    def process_single_target(target_cam):
-        """Process a single target camera"""
-        # Initialize SIFT and FLANN inside each worker to avoid pickling issues
-        sift = cv2.SIFT_create()
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        flann = cv2.FlannBasedMatcher(index_params, search_params)
-
-        target_img_gray = load_and_resize_gray(target_cam.filepath, target_max_dim)
-        if target_img_gray is None:
-            return {
-                "cam_id": target_cam.cam_id,
-                "filepath": target_cam.filepath,
-                "matches": 0,
-                "message": f"Could not load image for target camera: {target_cam.filepath}",
-            }
-
-        kp_target, des_target = sift.detectAndCompute(target_img_gray, None)
-        if des_target is None or len(kp_target) == 0:
-            return {
-                "cam_id": target_cam.cam_id,
-                "filepath": target_cam.filepath,
-                "matches": 0,
-                "message": f"No SIFT features found in target camera image: {target_cam.filepath}",
-            }
-
-        # Match descriptors using KNN
-        matches = flann.knnMatch(des_query, des_target, k=2)
-
-        # Apply Lowe's ratio test
-        good_matches = []
-        for m, n in matches:
-            if m.distance < 0.75 * n.distance:
-                good_matches.append(m)
-
-        return {
-            "cam_id": target_cam.cam_id,
-            "filepath": target_cam.filepath,
-            "matches": len(good_matches),
-            "message": (
-                f"Camera {target_cam.cam_id}: {len(good_matches)} good matches with query frame at {query_frame.timestamp_seconds:.2f}s "
-                f"(query img size: {query_img_gray.shape[::-1]}, target img size: {target_img_gray.shape[::-1]})"
-            ),
-        }
-
-    # Convert target_cams dict to list for batching
-    target_cam_list = list(target_cams.data.values())
-    total_cameras = len(target_cam_list)
-    num_batches = math.ceil(total_cameras / batch_size)
-
-    all_results = []
-
-    print(f"Processing {total_cameras} cameras in {num_batches} batches...")
-
-    for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
-        start_idx = batch_idx * batch_size
-        end_idx = min((batch_idx + 1) * batch_size, total_cameras)
-        batch_cameras = target_cam_list[start_idx:end_idx]
-
-        # Process this batch in parallel
-        batch_results = Parallel(n_jobs=n_jobs)(
-            delayed(process_single_target)(target_cam) for target_cam in batch_cameras
-        )
-
-        all_results.extend(batch_results)
-
-    # Print all results
-    # for result in all_results:
-    #    print(result['message'])
-
-    # Create dictionary with camera IDs and number of matches
-    matches_dict = {result["cam_id"]: result["matches"] for result in all_results}
-
-    # Find the camera with the highest number of matches
-    if all_results:
-        best_match = max(all_results, key=lambda x: x["matches"])
-
-        print(f"\n{'='*60}")
-        print(f"BEST MATCH:")
-        print(f"Camera ID: {best_match['cam_id']}")
-        print(f"Filepath: {best_match['filepath']}")
-        print(f"Number of matches: {best_match['matches']}")
-        print(f"{'='*60}")
-
-        return matches_dict
-    else:
-        print("No results found.")
-        return {}
-
-
-def visualize_sift_matches(
-    query,
-    target_cam,
-    max_dim=800,
-    downscale_interpolation=None,
-    use_gpu=False,
-    save_path=None,
-    show_plot=True,
-    query_crop=None,
-    target_crop=None,
-):
-    """
-    Visualize SIFT matches between a query frame/camera and target camera side by side.
-
-    Args:
-        query: Frame object or Camera object for the query image
-        target_cam: Camera object for the target image
-        max_dim: Maximum dimension for resizing images
-        downscale_interpolation: Interpolation method for resizing
-        use_gpu: Whether to use GPU acceleration
-        save_path: Optional path to save the visualization
-        show_plot: Whether to display the plot
-        query_crop: Optional array [x, y, width, height] defining crop area for query image
-        target_crop: Optional array [x, y, width, height] defining crop area for target image
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-
-    if downscale_interpolation is None:
-        downscale_interpolation = cv2.INTER_AREA
-
-    def load_and_resize_gray_from_array(img_array, max_dim, crop_area=None):
-        h, w = img_array.shape[:2]
-
-        # Apply crop if specified
-        if crop_area is not None:
-            x, y, crop_w, crop_h = crop_area
-            # Ensure crop coordinates are within image bounds
-            x = max(0, int(x))
-            y = max(0, int(y))
-            crop_w = min(int(crop_w), w - x)
-            crop_h = min(int(crop_h), h - y)
-
-            if crop_w > 0 and crop_h > 0:
-                img_array = img_array[y : y + crop_h, x : x + crop_w]
-            else:
-                print(f"Warning: Invalid crop area {crop_area}, using full image")
-
-        h, w = img_array.shape[:2]
-        scale = min(1.0, float(max_dim) / max(h, w))
-        if scale < 1.0:
-            img_array = cv2.resize(
-                img_array,
-                (int(w * scale), int(h * scale)),
-                interpolation=downscale_interpolation,
-            )
-        img_gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
-        img_rgb = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-        return img_gray, img_rgb
-
-    def load_and_resize_gray_from_file(filepath, max_dim, crop_area=None):
-        img = cv2.imread(filepath)
-        if img is None:
-            return None, None
-
-        h, w = img.shape[:2]
-
-        # Apply crop if specified
-        if crop_area is not None:
-            x, y, crop_w, crop_h = crop_area
-            # Ensure crop coordinates are within image bounds
-            x = max(0, int(x))
-            y = max(0, int(y))
-            crop_w = min(int(crop_w), w - x)
-            crop_h = min(int(crop_h), h - y)
-
-            if crop_w > 0 and crop_h > 0:
-                img = img[y : y + crop_h, x : x + crop_w]
-            else:
-                print(f"Warning: Invalid crop area {crop_area}, using full image")
-
-        h, w = img.shape[:2]
-        scale = min(1.0, float(max_dim) / max(h, w))
-        if scale < 1.0:
-            img = cv2.resize(
-                img,
-                (int(w * scale), int(h * scale)),
-                interpolation=downscale_interpolation,
-            )
-        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img_gray, img_rgb
-
-    # --- Handle query input: Frame or Camera ---
-    # Try to get image array and label info
-    if hasattr(query, "image_array") and query.image_array is not None:
-        # Frame object or Camera with loaded image
-        query_img_gray, query_img_rgb = load_and_resize_gray_from_array(
-            query.image_array, max_dim, query_crop
-        )
-        # Try to get frame_number and timestamp_seconds if present
-        query_frame_number = getattr(query, "frame_number", None)
-        query_timestamp = getattr(query, "timestamp_seconds", None)
-        query_filepath = getattr(query, "filepath", None)
-        query_cam_id = getattr(query, "cam_id", None)
-        query_label = None
-        if query_frame_number is not None and query_timestamp is not None:
-            query_label = f"Frame {query_frame_number} at {query_timestamp:.2f}s"
-        elif query_cam_id is not None:
-            query_label = f"Camera {query_cam_id}"
-        else:
-            query_label = "Query"
-    elif hasattr(query, "filepath"):
-        # Camera object with only filepath
-        query_img_gray, query_img_rgb = load_and_resize_gray_from_file(
-            query.filepath, max_dim, query_crop
-        )
-        query_filepath = query.filepath
-        query_cam_id = getattr(query, "cam_id", None)
-        query_label = f"Camera {query_cam_id}" if query_cam_id is not None else "Query"
-        query_frame_number = None
-        query_timestamp = None
-    else:
-        print(
-            "Query input must be a Frame or Camera object with image_array or filepath."
-        )
-        return
-
-    if query_img_gray is None:
-        print(
-            f"Could not load image for query: {getattr(query, 'filepath', 'unknown')}"
-        )
-        return
-
-    # --- Target image ---
-    target_img_gray, target_img_rgb = load_and_resize_gray_from_file(
-        target_cam.filepath, max_dim, target_crop
-    )
-
-    if target_img_gray is None:
-        print(f"Could not load image for target camera: {target_cam.filepath}")
-        return
-
-    # Initialize SIFT
-    if use_gpu:
-        try:
-            sift = cv2.cuda.SIFT_create()
-            gpu_available = True
-        except Exception:
-            print("GPU SIFT not available, falling back to CPU")
-            gpu_available = False
-            sift = cv2.SIFT_create()
-    else:
-        sift = cv2.SIFT_create()
-        gpu_available = False
-
-    # Detect SIFT features for query image
-    if gpu_available:
-        gpu_query_img = cv2.cuda_GpuMat()
-        gpu_query_img.upload(query_img_gray)
-        kp_query, des_query = sift.detectAndCompute(gpu_query_img, None)
-        des_query = des_query.download()
-    else:
-        kp_query, des_query = sift.detectAndCompute(query_img_gray, None)
-
-    if des_query is None or len(kp_query) == 0:
-        print(f"No SIFT features found in query image: {query_filepath}")
-        return
-
-    # Detect SIFT features for target image
-    if gpu_available:
-        gpu_target_img = cv2.cuda.GpuMat()
-        gpu_target_img.upload(target_img_gray)
-        kp_target, des_target = sift.detectAndCompute(gpu_target_img, None)
-        des_target = des_target.download()
-    else:
-        kp_target, des_target = sift.detectAndCompute(target_img_gray, None)
-
-    if des_target is None or len(kp_target) == 0:
-        print(f"No SIFT features found in target camera image: {target_cam.filepath}")
-        return
-
-    # FLANN matcher setup
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-
-    # Match descriptors using KNN
-    matches = flann.knnMatch(des_query, des_target, k=2)
-
-    # Apply Lowe's ratio test
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
-
-    # Print match info
-    print(
-        f"Found {len(good_matches)} good matches between {query_label} and camera {target_cam.cam_id}"
-    )
-
-    # Create visualization with proper line drawing
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10))
-
-    # Create combined image
-    h1, w1 = query_img_rgb.shape[:2]
-    h2, w2 = target_img_rgb.shape[:2]
-    max_h = max(h1, h2)
-
-    combined_img = np.zeros((max_h, w1 + w2, 3), dtype=np.uint8)
-    combined_img[:h1, :w1] = query_img_rgb
-    combined_img[:h2, w1 : w1 + w2] = target_img_rgb
-
-    # Display combined image
-    ax.imshow(combined_img)
-    ax.set_title(
-        f"SIFT Feature Matching: {query_label} ↔ Target Camera {target_cam.cam_id}\n"
-        f"Matches: {len(good_matches)}/{len(matches)}",
-        fontsize=14,
-        fontweight="bold",
-    )
-    ax.axis("off")
-
-    # Draw matching lines
-    if len(good_matches) > 0:
-        src_pts = np.float32([kp_query[m.queryIdx].pt for m in good_matches]).reshape(
-            -1, 1, 2
-        )
-        dst_pts = np.float32([kp_target[m.trainIdx].pt for m in good_matches]).reshape(
-            -1, 1, 2
-        )
-
-        for i in range(len(src_pts)):
-            x1, y1 = src_pts[i][0]
-            x2, y2 = dst_pts[i][0]
-            x2 += w1
-            ax.plot([x1, x2], [y1, y2], "b-", linewidth=2, alpha=0.7)
-
-    # Add labels for the two images
-    ax.text(
-        w1 // 2,
-        -20,
-        query_label,
-        ha="center",
-        va="top",
-        fontsize=12,
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-    )
-    ax.text(
-        w1 + w2 // 2,
-        -20,
-        f"Target Camera {target_cam.cam_id}",
-        ha="center",
-        va="top",
-        fontsize=12,
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-    )
-
-    # Add filepath information
-    if query_frame_number is not None and query_timestamp is not None:
-        ax.text(
-            10,
-            max_h + 20,
-            f"Query: Frame {query_frame_number} at {query_timestamp:.2f}s",
-            fontsize=8,
-            wrap=True,
-        )
-    elif query_cam_id is not None:
-        ax.text(
-            10,
-            max_h + 20,
-            f"Query: Camera {query_cam_id} ({query_filepath})",
-            fontsize=8,
-            wrap=True,
-        )
-    else:
-        ax.text(
-            10,
-            max_h + 20,
-            f"Query: {query_filepath}",
-            fontsize=8,
-            wrap=True,
-        )
-    ax.text(
-        w1 + 10, max_h + 20, f"Target: {target_cam.filepath}", fontsize=8, wrap=True
-    )
-
-    plt.tight_layout()
-
-    # Save if requested
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Visualization saved to: {save_path}")
-
-    # Show plot if requested
-    if show_plot:
-        plt.show()
-
-    return {
-        "query_keypoints": len(kp_query),
-        "target_keypoints": len(kp_target),
-        "total_matches": len(matches),
-        "good_matches": len(good_matches),
-        "match_ratio": len(good_matches) / len(matches) if len(matches) > 0 else 0,
-    }
-
-
-def visualize_camera_matches_heatmap(
-    cameras,
-    matches_dict,
-    query_cam_id=None,
-    figsize=(10, 3),
-    save_path=None,
-    show_plot=True,
-    top_n_labels=5,
-):
-    """
-    Create a top-down 2D visualization of camera positions with heatmap coloring based on matches.
-
-    Args:
-        cameras: Cameras instance containing all camera objects
-        matches_dict: Dictionary with camera IDs as keys and number of matches as values
-        query_cam_id: Optional camera ID to highlight as the query camera
-        figsize: Figure size as (width, height)
-        save_path: Optional path to save the visualization
-        show_plot: Whether to display the plot
-        top_n_labels: Number of top matches to label (0 for no labels, default: 5)
-
-    Returns:
-        dict: Statistics about the visualization
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    from matplotlib.colors import Normalize
-    import numpy as np
-
-    # Extract camera positions (ignoring z-axis)
-    camera_positions = {}
-    for cam_id, camera in cameras.data.items():
-        if hasattr(camera, "coords") and camera.coords is not None:
-            # Use x, y coordinates (ignore z)
-            camera_positions[cam_id] = (camera.coords[0], camera.coords[1])
-
-    if not camera_positions:
-        print("No camera positions found!")
-        return {}
-
-    # Create figure and axis
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-
-    # Extract coordinates for plotting
-    x_coords = [pos[0] for pos in camera_positions.values()]
-    y_coords = [pos[1] for pos in camera_positions.values()]
-    cam_ids = list(camera_positions.keys())
-
-    # Get match values for each camera
-    match_values = []
-    for cam_id in cam_ids:
-        match_values.append(matches_dict.get(cam_id, 0))
-
-    # Create color mapping based on match values
-    if max(match_values) > 0:
-        norm = Normalize(vmin=0, vmax=max(match_values))
-        colors = plt.cm.viridis(norm(match_values))
-    else:
-        # If no matches, use gray for all cameras
-        colors = [(0.7, 0.7, 0.7, 1.0)] * len(cam_ids)
-
-    # Plot cameras as scatter points
-    scatter = ax.scatter(
-        x_coords,
-        y_coords,
-        c=match_values,
-        cmap="viridis",
-        s=100,
-        alpha=0.8,
-        edgecolors="black",
-        linewidth=1,
-    )
-
-    # Add colorbar
-    if max(match_values) > 0:
-        cbar = plt.colorbar(scatter, ax=ax, shrink=0.8)
-        cbar.set_label("Number of Matches", fontsize=12)
-
-    # Highlight query camera if specified
-    if query_cam_id and query_cam_id in camera_positions:
-        query_pos = camera_positions[query_cam_id]
-        ax.scatter(
-            query_pos[0],
-            query_pos[1],
-            c="red",
-            s=200,
-            marker="*",
-            edgecolors="black",
-            linewidth=2,
-            label=f"Query Camera: {query_cam_id}",
-            zorder=5,
-        )
-
-    # Add camera ID labels for top N matches
-    if top_n_labels > 0:
-        # Create list of (cam_id, matches, index) tuples and sort by matches
-        camera_matches = [(cam_ids[i], match_values[i], i) for i in range(len(cam_ids))]
-        camera_matches.sort(
-            key=lambda x: x[1], reverse=True
-        )  # Sort by matches descending
-
-        # Label top N cameras with matches
-        for i, (cam_id, matches, idx) in enumerate(camera_matches):
-            if i >= top_n_labels or matches == 0:
-                break
-            ax.annotate(
-                f"{cam_id} ({matches})",
-                (x_coords[idx], y_coords[idx]),
-                xytext=(5, 5),
-                textcoords="offset points",
-                fontsize=9,
-                fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9),
-            )
-
-    # Set labels and title
-    ax.set_xlabel("X Coordinate", fontsize=12)
-    ax.set_ylabel("Y Coordinate", fontsize=12)
-
-    title = f"Camera Positions Heatmap - Matches Distribution"
-    if query_cam_id:
-        title += f" (Query: {query_cam_id})"
-    ax.set_title(title, fontsize=14, fontweight="bold")
-
-    # Add legend if query camera is highlighted
-    if query_cam_id and query_cam_id in camera_positions:
-        ax.legend(loc="upper right")
-
-    # Set equal aspect ratio and grid
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    # Save if requested
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Visualization saved to: {save_path}")
-
-    # Show plot if requested
-    if show_plot:
-        plt.show()
-
-    # Calculate statistics for return value
-    total_cameras = len(cameras.data)
-    cameras_with_matches = sum(1 for matches in match_values if matches > 0)
-    max_matches = max(match_values) if match_values else 0
-    avg_matches = np.mean(match_values) if match_values else 0
-
-    # Return statistics
-    return {
-        "total_cameras": total_cameras,
-        "cameras_with_matches": cameras_with_matches,
-        "max_matches": max_matches,
-        "avg_matches": avg_matches,
-        "match_values": match_values,
-        "camera_positions": camera_positions,
-    }
-
-
-def visualize_camera_matches_grid_heatmap(
-    cameras,
-    matches_dict,
-    query_cam_id=None,
-    grid_size=1.0,
-    figsize=(10, 3),
-    save_path=None,
-    show_plot=True,
-    cmap="viridis",
-):
-    """
-    Create a grid-based heatmap visualization of camera matches.
-
-    Divides the area into grid cells (default 1m x 1m) and shows the maximum number
-    of matches for cameras in each cell as a heatmap.
-
-    Args:
-        cameras: Cameras instance containing all camera objects
-        matches_dict: Dictionary with camera IDs as keys and number of matches as values
-        query_cam_id: Optional camera ID to highlight as the query camera
-        grid_size: Size of grid cells in meters (default: 1.0)
-        figsize: Figure size as (width, height)
-        save_path: Optional path to save the visualization
-        show_plot: Whether to display the plot
-        cmap: Colormap to use for the heatmap
-
-    Returns:
-        dict: Statistics about the visualization and grid data
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    from matplotlib.colors import Normalize
-    import numpy as np
-
-    # Extract camera positions (ignoring z-axis)
-    camera_positions = {}
-    for cam_id, camera in cameras.data.items():
-        if hasattr(camera, "coords") and camera.coords is not None:
-            # Use x, y coordinates (ignore z)
-            camera_positions[cam_id] = (camera.coords[0], camera.coords[1])
-
-    if not camera_positions:
-        print("No camera positions found!")
-        return {}
-
-    # Extract coordinates for analysis
-    x_coords = [pos[0] for pos in camera_positions.values()]
-    y_coords = [pos[1] for pos in camera_positions.values()]
-    cam_ids = list(camera_positions.keys())
-
-    # Get match values for each camera
-    match_values = []
-    for cam_id in cam_ids:
-        match_values.append(matches_dict.get(cam_id, 0))
-
-    # Calculate grid boundaries
-    x_min, x_max = min(x_coords), max(x_coords)
-    y_min, y_max = min(y_coords), max(y_coords)
-
-    # Add some padding to the grid
-    padding = grid_size * 0.5
-    x_min -= padding
-    x_max += padding
-    y_min -= padding
-    y_max += padding
-
-    # Create grid
-    x_edges = np.arange(x_min, x_max + grid_size, grid_size)
-    y_edges = np.arange(y_min, y_max + grid_size, grid_size)
-
-    # Initialize grid with zeros
-    grid = np.zeros((len(y_edges) - 1, len(x_edges) - 1))
-
-    # Fill grid with maximum match values for each cell
-    for i, cam_id in enumerate(cam_ids):
-        x, y = x_coords[i], y_coords[i]
-        matches = match_values[i]
-
-        # Find grid cell indices
-        x_idx = int((x - x_min) // grid_size)
-        y_idx = int((y - y_min) // grid_size)
-
-        # Ensure indices are within bounds
-        if 0 <= x_idx < len(x_edges) - 1 and 0 <= y_idx < len(y_edges) - 1:
-            # Take the maximum value in each cell
-            grid[y_idx, x_idx] = max(grid[y_idx, x_idx], matches)
-
-    # Create figure and axis
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-
-    # Create heatmap
-    im = ax.imshow(
-        grid,
-        cmap=cmap,
-        extent=[x_min, x_max, y_min, y_max],
-        origin="lower",
-        aspect="equal",
-    )
-
-    # Add colorbar
-    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label("Max Matches per Grid Cell", fontsize=12)
-
-    # Highlight query camera if specified
-    if query_cam_id and query_cam_id in camera_positions:
-        query_pos = camera_positions[query_cam_id]
-        ax.scatter(
-            query_pos[0],
-            query_pos[1],
-            c="red",
-            s=200,
-            marker="*",
-            edgecolors="black",
-            linewidth=2,
-            label=f"Query Camera: {query_cam_id}",
-            zorder=5,
-        )
-
-    # Add camera positions as small dots
-    ax.scatter(
-        x_coords,
-        y_coords,
-        c="white",
-        s=20,
-        alpha=0.7,
-        edgecolors="black",
-        linewidth=0.5,
-        zorder=3,
-    )
-
-    # Add legend if query camera is highlighted
-    if query_cam_id and query_cam_id in camera_positions:
-        ax.legend(loc="upper right")
-
-    # Set labels and title
-    ax.set_xlabel("X Coordinate (m)", fontsize=12)
-    ax.set_ylabel("Y Coordinate (m)", fontsize=12)
-
-    title = f"Camera Matches Grid Heatmap (Grid Size: {grid_size}m)"
-    if query_cam_id:
-        title += f" (Query: {query_cam_id})"
-    ax.set_title(title, fontsize=14, fontweight="bold")
-
-    # Add grid lines
-    ax.grid(True, alpha=0.3, color="white", linewidth=0.5)
-
-    # Set tick spacing to match grid size
-    ax.set_xticks(x_edges[:: max(1, len(x_edges) // 10)])  # Show ~10 ticks
-    ax.set_yticks(y_edges[:: max(1, len(y_edges) // 10)])  # Show ~10 ticks
-
-    plt.tight_layout()
-
-    # Save if requested
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Grid heatmap saved to: {save_path}")
-
-    # Show plot if requested
-    if show_plot:
-        plt.show()
-
-    # Calculate statistics
-    total_cameras = len(cameras.data)
-    cameras_with_matches = sum(1 for matches in match_values if matches > 0)
-    max_matches = max(match_values) if match_values else 0
-    avg_matches = np.mean(match_values) if match_values else 0
-    max_grid_value = np.max(grid)
-    avg_grid_value = np.mean(grid[grid > 0]) if np.any(grid > 0) else 0
-
-    # Return statistics and grid data
-    return {
-        "total_cameras": total_cameras,
-        "cameras_with_matches": cameras_with_matches,
-        "max_matches": max_matches,
-        "avg_matches": avg_matches,
-        "match_values": match_values,
-        "camera_positions": camera_positions,
-        "grid": grid,
-        "grid_size": grid_size,
-        "x_edges": x_edges,
-        "y_edges": y_edges,
-        "max_grid_value": max_grid_value,
-        "avg_grid_value": avg_grid_value,
-        "grid_shape": grid.shape,
-    }
-
-
-def match_frame_feature(frame, orthomosaic_path, ratio_thresh=0.75):
-    """
-    Locate a frame in an orthomosaic via SIFT and draw its corners.
-
-    Args:
-        frame (Frame): Frame with .image_array (BGR).
-        orthomosaic_path (str): Path to orthomosaic image file.
-        ratio_thresh (float): Lowe's ratio-test threshold.
-
-    Returns:
-        result_img (np.ndarray): Mosaic with match polygon.
-        corners (np.ndarray): 4x2 array of projected frame corners.
-    """
-    # Load and grayscale the mosaic
-    mosaic = cv2.imread(orthomosaic_path)
-    if mosaic is None:
-        raise IOError(f"Cannot load image: {orthomosaic_path}")
-    gray_m = cv2.cvtColor(mosaic, cv2.COLOR_BGR2GRAY)
-    gray_m = cv2.equalizeHist(gray_m)
-
-    # Grayscale and equalize the frame
-    gray_p = cv2.cvtColor(frame.image_array, cv2.COLOR_BGR2GRAY)
-    gray_p = cv2.equalizeHist(gray_p)
-
-    # Detect SIFT keypoints and descriptors
-    sift = cv2.SIFT_create()
-    kp_m, des_m = sift.detectAndCompute(gray_m, None)
-    kp_p, des_p = sift.detectAndCompute(gray_p, None)
-
-    # Match using FLANN + ratio test
-    index_params = {"algorithm": 1, "trees": 5}
-    search_params = {"checks": 50}
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(des_p, des_m, k=2)
-    good = [m for m, n in matches if m.distance < ratio_thresh * n.distance]
-    if len(good) < 4:
-        raise ValueError(f"Not enough matches: {len(good)}")
-
-    # Prepare points for homography
-    src_pts = np.float32([kp_p[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp_m[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-    # Compute homography with RANSAC
-    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-
-    # Project frame corners onto mosaic
-    h, w = gray_p.shape
-    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-    proj = cv2.perspectiveTransform(corners, H)
-    pts = np.int32(proj).reshape(-1, 2)
-
-    # Draw matched polygon on mosaic copy
-    result_img = mosaic.copy()
-    cv2.polylines(result_img, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
-
-    # Display in Jupyter
-    plt.figure(figsize=(10, 8))
-    plt.imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
-    plt.axis("off")
-    plt.title(
-        f"SIFT match: Frame {frame.frame_number} @ " f"{frame.timestamp_seconds:.2f}s"
-    )
-    plt.show()
-
-    return result_img, pts
-
-
 def _require_sam2():
     """Import SAM2 only when needed."""
     try:
@@ -1181,22 +311,13 @@ def _require_sam2():
 # this is a 3-D point-cloud operation; its only heavy dependency (fastai) is
 # imported lazily, so this module stays importable without torch/sam2.
 
-# PLY storage type -> numpy dtype (for the streaming full-size recolor).
-_PLY_NP_DTYPE = {
-    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
-    "short": "i2", "int16": "i2", "ushort": "u2", "uint16": "u2",
-    "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
-    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
-}
-
-
 def _parse_hex(s: str) -> Tuple[int, int, int]:
     """``#rrggbb`` (or ``rrggbb``) as a 0-255 ``(r, g, b)`` tuple."""
     h = str(s).strip().lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def _build_label_colors(
+def build_label_colors(
     codebook: List[str], overrides: Optional[Dict[str, Tuple[int, int, int]]] = None
 ) -> Dict[str, Tuple[int, int, int]]:
     """Build a ``{label: (r, g, b)}`` 0-255 map (tab20 defaults + manual overrides).
@@ -1205,7 +326,7 @@ def _build_label_colors(
     annotations rendering. ``overrides`` (e.g. ``{"CS": (255, 0, 0)}``) win over
     the auto colours; labels not in ``overrides`` get a stable tab20 colour.
     """
-    import matplotlib.pyplot as plt  # already a top-level import; kept explicit
+    import matplotlib.pyplot as plt  # lazy: colour map only
 
     cmap = plt.get_cmap("tab20")
     colors = {
@@ -1215,6 +336,9 @@ def _build_label_colors(
     if overrides:
         colors.update({k: tuple(v) for k, v in overrides.items() if k in codebook})
     return colors
+
+
+_build_label_colors = build_label_colors  # deprecated alias (renamed 2026-11-25)
 
 
 @dataclass
@@ -1292,7 +416,7 @@ class Segmentation:
         ql = np.asarray(labels, dtype=object)[matched]
         qcf = np.asarray(conf, dtype=float)[matched]
         codebook = sorted(set(ql.tolist()))
-        colors = _build_label_colors(codebook, label_colors)
+        colors = build_label_colors(codebook, label_colors)
         qcam = None if cams is None else np.asarray(cams, dtype=object)[matched]
         qpx = None if px is None else np.asarray(px, dtype=float)[matched]
         qnv = None if n_views is None else np.asarray(n_views, dtype=int)[matched]
@@ -1367,7 +491,7 @@ class Segmentation:
         hex_colors = (
             sidecars.read_annotation_sidecar(csv_path).get("segmentation") or {}
         ).get("colors") or {}
-        colors = _build_label_colors(
+        colors = build_label_colors(
             codebook, {k: _parse_hex(v) for k, v in hex_colors.items()}
         )
         return cls(
@@ -1512,7 +636,7 @@ class Segmentation:
         if world_transform is not None and not np.allclose(
             world_transform, np.eye(4)
         ):
-            anns.get_original_coords(world_transform)
+            anns.reverse_transform(world_transform)
         return anns
 
     def summary(self, point_codes: Optional[np.ndarray] = None) -> Dict[str, int]:
@@ -1704,6 +828,8 @@ def _match_points_to_cameras_multi(
         it = (
             tqdm(kept, desc="Occlusion check", unit="view") if verbose else kept
         )
+        n_ray_fail = 0
+        first_error = None
         for qi, j in it:
             cam = cam_list[top_cam[qi, j]]
             try:
@@ -1712,13 +838,20 @@ def _match_points_to_cameras_multi(
                     cam.coords, search_radius=intercept_radius,
                     vector=vector, always_return=True,
                 )
-            except Exception:  # noqa: BLE001 - drop the view on any ray failure
+            except Exception as e:  # noqa: BLE001 - the view is dropped (counted)
                 intercept = None
+                n_ray_fail += 1
+                first_error = first_error or e
             if intercept is None or float(
                 np.linalg.norm(query_coords[qi] - intercept.coords)
             ) > discard_threshold:  # no hit, or line of sight blocked
                 top_cam[qi, j] = -1
                 top_rel[qi, j] = np.inf
+        if n_ray_fail:
+            logger.warning(
+                "Occlusion check: %d of %d view(s) dropped because their ray "
+                "could not be cast (first error: %r)", n_ray_fail, len(kept),
+                first_error)
 
     order = np.argsort(top_rel, axis=1, kind="stable")
     take = (lambda a: np.take_along_axis(a, order, axis=1))
@@ -1727,7 +860,7 @@ def _match_points_to_cameras_multi(
     return out + (available,) if return_available else out
 
 
-def _match_points_to_cameras(
+def match_points_to_cameras(
     query_coords: np.ndarray,
     cams,
     world_transform: Optional[np.ndarray] = None,
@@ -1754,6 +887,9 @@ def _match_points_to_cameras(
     return cam[:, 0], x[:, 0], y[:, 0], depth[:, 0], cam_list
 
 
+_match_points_to_cameras = match_points_to_cameras  # deprecated alias (renamed 2026-11-25)
+
+
 def _classify_crops(
     query_coords: np.ndarray,
     best_cam: np.ndarray,
@@ -1778,7 +914,7 @@ def _classify_crops(
     Returns ``(labels, conf)`` aligned with ``query_coords``
     (unmatched/failed → ``""`` / ``nan``).
     """
-    from substrata import classification
+    from substrata import classification, imagecrops
 
     n = len(query_coords)
     labels = np.full(n, "", dtype=object)
@@ -1802,7 +938,6 @@ def _classify_crops(
     crops: list = []
     crop_qids: list = []
     n_open_fail = n_oob = n_classified = 0
-    half = crop_size // 2
 
     def _flush():
         """Classify the buffered crops, write results, and free the buffer."""
@@ -1816,7 +951,7 @@ def _classify_crops(
         with cm:
             probs, _ = learn.get_preds(dl=dl)
         for qi, p in zip(crop_qids, probs.tolist()):
-            res = classification._result_from_probs(p, vocab)
+            res = classification.result_from_probs(p, vocab)
             labels[qi] = res["label"]
             conf[qi] = res["confidence"]
         n_classified += len(crops)
@@ -1828,15 +963,16 @@ def _classify_crops(
     )
     for fp, group in it:
         try:
-            arr = np.asarray(Image.open(fp).convert("RGB"))
+            with Image.open(fp) as im:
+                arr = np.asarray(im.convert("RGB"))
         except (OSError, ValueError):
             n_open_fail += 1
             continue
         h, w = arr.shape[:2]
         for qi, x, y in group:
-            left, top = int(x - half), int(y - half)
-            lft, tp = max(0, left), max(0, top)
-            rgt, bot = min(w, left + crop_size), min(h, top + crop_size)
+            # the training crops' box (imagecrops.classifier_crop_box)
+            lft, tp, rgt, bot = imagecrops.classifier_crop_box(
+                x, y, crop_size, crop_size, w, h)
             if lft >= rgt or tp >= bot:
                 n_oob += 1
                 continue
@@ -2000,7 +1136,7 @@ def _classify_dense_views(
 
     photos = np.unique(view_cam[valid])
     entries = {ci: np.argwhere(view_cam == ci) for ci in photos}
-    scales = []
+    gsds = []
     for ci in photos:
         q, j = entries[ci].T
         g = None
@@ -2010,7 +1146,13 @@ def _classify_dense_views(
                   for d in view_depth[q, j]]
             gs = [x for x in gs if x is not None]
             g = float(np.median(gs)) if gs else None
-        scales.append(pointfeatures.photo_scale(clf, g))
+        gsds.append(g)
+    # without a ground resolution a photo is resampled by its width, as
+    # predict and masks resample it (pointfeatures.photo_scale)
+    widths = pointfeatures.image_widths(
+        [cam_list[ci].filepath for ci, g in zip(photos, gsds) if g is None])
+    scales = [pointfeatures.photo_scale(clf, g, widths.get(cam_list[ci].filepath))
+              for ci, g in zip(photos, gsds)]
     if verbose:
         print(f"[dense] {len(photos):,} photos for {int(valid.any(1).sum()):,} "
               f"queries ({valid.sum():,} views); median scale "
@@ -2080,6 +1222,7 @@ def segment_point_cloud(
     views: Optional[int] = None,
     dense: bool = True,
     mask_dir: Optional[str] = None,
+    scale_factor: Optional[float] = None,
     verbose: bool = True,
 ) -> Segmentation:
     """Segment a point cloud by classifying camera patches at sampled query points.
@@ -2118,6 +1261,9 @@ def segment_point_cloud(
         dense: point classifiers: dense per-photo maps (default); False
             classifies each query's best view from its own window instead.
         mask_dir: point classifiers (dense): also save each photo's masks here.
+        scale_factor: the project's ``scale_factor`` (metres per model unit),
+            used for ground resolutions when ``world_transform`` is the
+            identity (see :func:`substrata.pointfeatures.metres_per_unit`).
 
     Returns:
         A :class:`Segmentation` (classified query points + codebook + colours).
@@ -2148,7 +1294,8 @@ def segment_point_cloud(
         qc, cams, learn, world_transform=world_transform, pcd=pcd,
         occlusion=occlusion, label_colors=label_colors, crop_size=crop_size,
         batch_size=batch_size, flush_batch=flush_batch, views=views,
-        dense=dense, mask_dir=mask_dir, cell_size=cell_size, verbose=verbose,
+        dense=dense, mask_dir=mask_dir, cell_size=cell_size,
+        scale_factor=scale_factor, verbose=verbose,
     )
     px = np.column_stack([res["x"], res["y"]]).astype(float)
     if res["dense"]:
@@ -2180,6 +1327,7 @@ def classify_query_points(
     mask_dir: Optional[str] = None,
     cell_size: Optional[float] = None,
     include_disabled: bool = False,
+    scale_factor: Optional[float] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Match world-frame query points ``qc`` to camera views and classify them, as
@@ -2198,6 +1346,8 @@ def classify_query_points(
         learn: Loaded classifier.
         include_disabled: Also use cameras with ``enabled`` False.
         cell_size: Only for the crop footprint report of a crop classifier.
+        scale_factor: The project's ``scale_factor``: metres per model unit
+            when ``world_transform`` is the identity (ground resolutions).
         Others: as for :func:`segment_point_cloud`.
 
     Returns:
@@ -2215,12 +1365,10 @@ def classify_query_points(
         crop_size = settings.TRAIN_CROP_SIZE
     qc = np.asarray(qc, dtype=float).reshape(-1, 3)
     point_clf = pointfeatures.is_point_classifier(learn)
-    # Depths are in the original frame; convert to world metres via the
-    # world_transform's linear scale (cbrt of its 3x3 determinant).
-    depth_scale = 1.0
-    if world_transform is not None:
-        lin = np.asarray(world_transform, dtype=float)[:3, :3]
-        depth_scale = float(np.cbrt(abs(np.linalg.det(lin)))) or 1.0
+    # Depths are in the original frame; convert to metres with the project's
+    # metres per model unit (the world_transform's linear scale, else its
+    # scale_factor; pointfeatures.metres_per_unit).
+    depth_scale = pointfeatures.metres_per_unit(world_transform, scale_factor) or 1.0
     use_pcd = pcd if occlusion else None
     classes = getattr(learn, "classes", None)
     if classes is None:
@@ -2240,7 +1388,7 @@ def classify_query_points(
                   "per query on average")
         mask_colors = None
         if mask_dir:
-            mask_colors = _build_label_colors(list(learn.classes), label_colors)
+            mask_colors = build_label_colors(list(learn.classes), label_colors)
         res = _classify_dense_views(
             vc, vx, vy, vd, vr, cam_list, learn, depth_scale,
             mask_dir=mask_dir, mask_colors=mask_colors, verbose=verbose,
@@ -2315,8 +1463,10 @@ def recolor_ply_file(
     Reads ``input_ply`` in chunks (never loading it fully), propagates the
     segmentation's labels to each chunk's points, blends the category colour
     with the point's original luminance, and writes the recoloured cloud to
-    ``output_ply`` — type-preserving (uchar 0-255 or float 0-1). Reuses the PLY
-    header/streaming helpers from :mod:`substrata.pointclouds`.
+    ``output_ply`` — type-preserving (integer colours over their type's full
+    range, float 0-1). The header is read with
+    :func:`substrata.stratified.read_ply_header`; the output is written
+    atomically.
 
     Args:
         input_ply: path to the full-size PLY (raw, original frame).
@@ -2330,23 +1480,23 @@ def recolor_ply_file(
             (``unlabeled="keep"`` retains original colour for unlabeled points).
         chunk_bytes: streaming chunk size.
     """
-    from substrata import pointclouds as pc
+    from substrata.fileio import atomic_write
+    from substrata.stratified import ply_rgb, read_ply_header
 
     wt = None
     if world_transform is not None and not np.allclose(world_transform, np.eye(4)):
         wt = np.asarray(world_transform, dtype=float)
 
     with open(input_ply, "rb") as fin:
-        fmt, endian, n_vertices, vprops, rec_size, _ = pc._parse_ply_header(fin)
-        layout = pc._ply_red_green_blue_layout(vprops)
-        if layout is None:
+        header = read_ply_header(fin)
+        fmt, n_vertices, vprops = header.fmt, header.n_vertices, header.props
+        rec_size, dtype = header.record_size, header.dtype
+        if not header.has("red", "green", "blue"):
             raise ValueError("Input PLY has no red/green/blue properties to recolour.")
-        red_type = layout[3]
 
-        dtype = np.dtype([(name, endian + _PLY_NP_DTYPE[t]) for t, name in vprops])
         recs_per_chunk = max(1, chunk_bytes // rec_size)
 
-        with open(output_ply, "wb") as fout:
+        with atomic_write(output_ply, "wb") as fout:
             fout.write(_seg_output_header(fmt, vprops, n_vertices))
             remaining = n_vertices
             bar = (
@@ -2367,17 +1517,17 @@ def recolor_ply_file(
                     xyz = (np.hstack([xyz, np.ones((k, 1))]) @ wt.T)[:, :3]
 
                 codes = segmentation.propagate(xyz, max_radius=max_radius)
-                orig_rgb = np.column_stack(
-                    [recs["red"], recs["green"], recs["blue"]]
-                ).astype(float)
+                orig_rgb = ply_rgb(recs).astype(float)  # 0-255 whatever the type
                 new_rgb = segmentation.recolor(
                     orig_rgb, codes, value_floor=value_floor, unlabeled=unlabeled,
                 )  # 0-1
 
-                if red_type in ("uchar", "uint8"):
-                    vals = np.round(new_rgb * 255.0).astype(recs["red"].dtype)
+                col_dtype = recs["red"].dtype
+                if col_dtype.kind in "ui":  # integers: full range of the type
+                    top = float(np.iinfo(col_dtype).max)
+                    vals = np.round(new_rgb * top).astype(col_dtype)
                 else:  # float/double stored 0-1
-                    vals = new_rgb.astype(recs["red"].dtype)
+                    vals = new_rgb.astype(col_dtype)
                 recs["red"] = vals[:, 0]
                 recs["green"] = vals[:, 1]
                 recs["blue"] = vals[:, 2]

@@ -43,7 +43,6 @@ from __future__ import annotations
 
 # Standard Library
 import os
-import threading
 from typing import Any, Dict
 
 # Third-Party Libraries
@@ -52,6 +51,8 @@ import yaml
 
 # Local Modules
 from substrata import settings
+from substrata.fileio import atomic_write as _atomic_write
+from substrata.fileio import path_lock as _path_lock
 
 # Sidecar keys that hold file/folder paths (stored relative to the sidecar)
 SIDECAR_PATH_KEYS = (
@@ -110,6 +111,11 @@ def write_annotation_sidecar(
         The sidecar path.
     """
     sidecar = annotation_sidecar_path(csv_path)
+    with _path_lock(sidecar):  # (an update reads and writes it: no other write in between)
+        return _write_sidecar(csv_path, sidecar, payload, update)
+
+
+def _write_sidecar(csv_path: str, sidecar: str, payload: Dict[str, Any], update: bool) -> str:
     folder = os.path.dirname(os.path.abspath(sidecar))
     config = read_annotation_sidecar(csv_path) if update else {}
     config.update(payload)
@@ -122,18 +128,11 @@ def write_annotation_sidecar(
             except ValueError:  # e.g. another drive on Windows
                 config[key] = path
     config = {k: _plain(v) for k, v in config.items() if v is not None}
-    # Written to a temporary file and moved into place: a reader (or a crash)
-    # never sees a half-written sidecar, and an update keeps the old one if
-    # writing fails. (Named per process and thread: two writers never share
-    # one; not tempfile.mkstemp, whose 0600 mode the sidecar would keep.)
-    tmp = f"{sidecar}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp, "w") as f:
-            yaml.dump(config, f, Dumper=_SidecarDumper, sort_keys=False)
-        os.replace(tmp, sidecar)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    # Written atomically (fileio.atomic_write): a reader (or a crash) never sees
+    # a half-written sidecar, an update keeps the old one if writing fails, and
+    # the file keeps its permission mode.
+    with _atomic_write(sidecar, "w") as f:
+        yaml.dump(config, f, Dumper=_SidecarDumper, sort_keys=False)
     return sidecar
 
 
